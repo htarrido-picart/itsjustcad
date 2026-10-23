@@ -22,7 +22,7 @@ mod view;
 
 pub use constraint::{PointRef, SketchConstraint};
 pub use cplane::CPlane;
-pub use document::{Document, EdgeRoleOverride, StreetEdit, SubdivKind, SubdivLink};
+pub use document::{Document, EdgeRoleOverride, LotHeightOverride, StreetEdit, SubdivKind, SubdivLink};
 // Re-export the settings type carried by `SubdivLink` so consumers can build /
 // inspect links without a direct `subdivision` dependency.
 pub use subdivision::SubdivisionSettings;

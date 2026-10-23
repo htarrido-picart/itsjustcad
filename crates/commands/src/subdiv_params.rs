@@ -20,7 +20,7 @@
 
 use itsjustcad_doc::{sanitize_fields, ParamField, ParamMap, ParamValue, Unit, Widget};
 use subdivision::{
-    CornerAlignment, FootprintMode, LoadingType, RegionProfile, RoofType, SkeletonImpl,
+    CornerAlignment, FootprintMode, HeightClass, HeightFalloff, HeightMix, LoadingType, RegionProfile, RoofType, SkeletonImpl,
     StreetPattern, SubdivisionMethod, SubdivisionSettings, Typology,
 };
 
@@ -176,6 +176,22 @@ pub fn footprint_mode_from_token(s: &str) -> Option<FootprintMode> {
 }
 
 const ROOF_TYPE_CHOICES: &[&str] = &["flat", "gable", "hip", "shed", "auto"];
+
+const HEIGHT_FALLOFF_CHOICES: &[&str] = &["none", "center", "street", "point"];
+
+/// The height-mix classes the inspector exposes as weight sliders
+/// (`height_mix_<class>`), with their default floor ranges
+/// ([`HeightMix::default_range`]).
+const MIX_CLASSES: [(&str, &str); 3] = [
+    ("low", "height_mix_low"),
+    ("mid", "height_mix_mid"),
+    ("tower", "height_mix_tower"),
+];
+
+/// The exposed mix weights `[low, mid, tower]` of `mix` (0 when absent).
+fn mix_weights(mix: Option<&HeightMix>) -> [i64; 3] {
+    MIX_CLASSES.map(|(c, _)| mix.map_or(0, |m| m.weight_of(c).round() as i64))
+}
 
 pub fn roof_type_token(r: RoofType) -> &'static str {
     match r {
@@ -564,6 +580,82 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             Widget::Numeric,
             Unit::Degree,
         ),
+        // ── Height variation ──
+        ParamField::int(
+            "floors_min",
+            "param.subdivision.floors_min",
+            0,
+            0,
+            200,
+            1,
+            Widget::Numeric,
+        ),
+        ParamField::int(
+            "floors_max",
+            "param.subdivision.floors_max",
+            0,
+            0,
+            200,
+            1,
+            Widget::Numeric,
+        ),
+        ParamField::int(
+            "height_mix_low",
+            "param.subdivision.height_mix_low",
+            0,
+            0,
+            100,
+            5,
+            Widget::Slider,
+        ),
+        ParamField::int(
+            "height_mix_mid",
+            "param.subdivision.height_mix_mid",
+            0,
+            0,
+            100,
+            5,
+            Widget::Slider,
+        ),
+        ParamField::int(
+            "height_mix_tower",
+            "param.subdivision.height_mix_tower",
+            0,
+            0,
+            100,
+            5,
+            Widget::Slider,
+        ),
+        ParamField::enum_(
+            "height_falloff",
+            "param.subdivision.height_falloff",
+            "none",
+            HEIGHT_FALLOFF_CHOICES,
+        ),
+        ParamField::vec3(
+            "falloff_point",
+            "param.subdivision.falloff_point",
+            glam::DVec3::ZERO,
+        ),
+        ParamField::float(
+            "falloff_strength",
+            "param.subdivision.falloff_strength",
+            0.75,
+            Some(0.0),
+            Some(1.0),
+            0.05,
+            Widget::Slider,
+            Unit::None,
+        ),
+        ParamField::int(
+            "height_seed",
+            "param.subdivision.height_seed",
+            0,
+            0,
+            1_000_000,
+            1,
+            Widget::Numeric,
+        ),
         // ── Open space ──
         ParamField::float(
             "open_space_reserve_frac",
@@ -638,6 +730,15 @@ const FIELD_GROUPS: &[(&str, &[&str])] = &[
             "stepback_depth",
             "roof_type",
             "roof_pitch",
+            "floors_min",
+            "floors_max",
+            "height_mix_low",
+            "height_mix_mid",
+            "height_mix_tower",
+            "height_falloff",
+            "falloff_point",
+            "falloff_strength",
+            "height_seed",
         ],
     ),
     (
@@ -794,6 +895,22 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     m.insert("stepback_depth".into(), ParamValue::Float(s.stepback_depth));
     m.insert("roof_type".into(), ParamValue::Enum(roof_type_token(s.roof_type).into()));
     m.insert("roof_pitch".into(), ParamValue::Float(s.roof_pitch));
+    // Height variation
+    m.insert("floors_min".into(), ParamValue::Int(s.floors_min as i64));
+    m.insert("floors_max".into(), ParamValue::Int(s.floors_max as i64));
+    for ((_, key), w) in MIX_CLASSES.iter().zip(mix_weights(s.height_mix.as_ref())) {
+        m.insert((*key).into(), ParamValue::Int(w));
+    }
+    m.insert(
+        "height_falloff".into(),
+        ParamValue::Enum(s.height_falloff.token().into()),
+    );
+    m.insert(
+        "falloff_point".into(),
+        ParamValue::Vec3([s.falloff_point[0], s.falloff_point[1], 0.0]),
+    );
+    m.insert("falloff_strength".into(), ParamValue::Float(s.falloff_strength));
+    m.insert("height_seed".into(), ParamValue::Int(s.height_seed as i64));
     // Open space
     m.insert(
         "open_space_reserve_frac".into(),
@@ -963,6 +1080,53 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     if let Some(v) = p.get("roof_pitch").and_then(|v| v.as_f64()) {
         s.roof_pitch = v;
     }
+    // Height variation
+    if let Some(v) = p.get("floors_min").and_then(|v| v.as_i64()) {
+        s.floors_min = v.max(0) as usize;
+    }
+    if let Some(v) = p.get("floors_max").and_then(|v| v.as_i64()) {
+        s.floors_max = v.max(0) as usize;
+    }
+    // The mix is rebuilt only when a weight changed, so a custom mix set with
+    // `lotsettings height_mix=…` survives an unrelated edit.
+    let weights =
+        MIX_CLASSES.map(|(_, key)| p.get(key).and_then(|v| v.as_i64()).unwrap_or(0).max(0));
+    if weights != mix_weights(base.height_mix.as_ref()) {
+        let mut mix = base.height_mix.clone().unwrap_or_default();
+        for ((class, _), w) in MIX_CLASSES.iter().zip(weights) {
+            match mix.classes.iter_mut().find(|c| c.name == *class) {
+                Some(c) => c.weight = w as f64,
+                None if w > 0 => {
+                    let (lo, hi) = HeightMix::default_range(class).expect("a standard class");
+                    mix.classes.push(HeightClass {
+                        name: (*class).into(),
+                        weight: w as f64,
+                        floors_min: lo,
+                        floors_max: hi,
+                    });
+                }
+                None => {}
+            }
+        }
+        mix.classes.retain(|c| c.weight > 0.0);
+        s.height_mix = (!mix.classes.is_empty()).then_some(mix);
+    }
+    if let Some(v) = p
+        .get("height_falloff")
+        .and_then(|v| v.as_enum())
+        .and_then(HeightFalloff::parse)
+    {
+        s.height_falloff = v;
+    }
+    if let Some(v) = p.get("falloff_point").and_then(|v| v.as_vec3()) {
+        s.falloff_point = [v.x, v.y];
+    }
+    if let Some(v) = p.get("falloff_strength").and_then(|v| v.as_f64()) {
+        s.falloff_strength = v;
+    }
+    if let Some(v) = p.get("height_seed").and_then(|v| v.as_i64()) {
+        s.height_seed = v.max(0) as u64;
+    }
     // Open space
     if let Some(v) = p.get("open_space_reserve_frac").and_then(|v| v.as_f64()) {
         s.open_space_reserve_frac = v;
@@ -973,6 +1137,46 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The height-variation params round-trip; the mix weight sliders build a
+    /// mix with the default class ranges, and a custom mix survives an
+    /// unrelated edit.
+    #[test]
+    fn height_params_round_trip() {
+        let base = SubdivisionSettings::default();
+        assert_eq!(params_to_settings(&base, &settings_to_params(&base)), base);
+        let s = SubdivisionSettings {
+            floors_min: 2,
+            floors_max: 8,
+            height_seed: 5,
+            height_mix: Some(HeightMix::parse("low:50,podium:10:2-4").unwrap()),
+            height_falloff: HeightFalloff::Point,
+            falloff_point: [10.0, -4.0],
+            falloff_strength: 0.5,
+            ..base.clone()
+        };
+        let mut p = settings_to_params(&s);
+        assert_eq!(params_to_settings(&s, &p), s.clone());
+        // Onto a base without a mix only the standard classes come across.
+        let from_base = params_to_settings(&base, &p);
+        assert_eq!(from_base.height_mix.unwrap().to_string(), "low:50:1-3");
+        assert_eq!(from_base.falloff_point, s.falloff_point);
+        p.insert("roof_pitch".into(), ParamValue::Float(40.0));
+        assert_eq!(params_to_settings(&s, &p).height_mix, s.height_mix);
+        p.insert("height_mix_tower".into(), ParamValue::Int(15));
+        let mix = params_to_settings(&s, &p).height_mix.unwrap();
+        assert_eq!(mix.to_string(), "low:50:1-3,podium:10:2-4,tower:15:9-20");
+        let mut off = settings_to_params(&base);
+        off.insert("height_mix_low".into(), ParamValue::Int(0));
+        assert_eq!(params_to_settings(&base, &off).height_mix, None);
+        let names: Vec<_> = fields_for_kind(itsjustcad_doc::SubdivKind::SitePlan)
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        for n in ["floors_min", "floors_max", "height_mix_mid", "height_falloff", "height_seed"] {
+            assert!(names.contains(&n), "{n}");
+        }
+    }
 
     #[test]
     fn fields_for_kind_filters_by_link_kind() {

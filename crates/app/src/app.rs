@@ -12847,6 +12847,7 @@ mod tests {
                 kind: itsjustcad_doc::SubdivKind::Lots,
                 streets: Default::default(),
                 edge_roles: Vec::new(),
+                lot_heights: Vec::new(),
             },
         );
 

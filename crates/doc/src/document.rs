@@ -74,6 +74,21 @@ pub struct SubdivLink {
     /// it matches (see [`EdgeRoleOverride`]) and dropped when none does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edge_roles: Vec<EdgeRoleOverride>,
+ /// Hand-pinned building floor counts (`lotheight`). Inputs to a SitePlan
+ /// re-derive: each pins the regenerated lot it matches (see
+ /// [`LotHeightOverride`]) and is dropped when none does.
+ #[serde(default, skip_serializing_if = "Vec::is_empty")]
+ pub lot_heights: Vec<LotHeightOverride>,
+}
+
+/// A hand-pinned floor count for the building on one lot of a SitePlan link.
+/// Keyed geometrically like [`EdgeRoleOverride`]: the lot centroid (rounded to
+/// mm). A regenerated lot matches when its centroid lies within
+/// `LOT_HEIGHT_TOL` (commands crate); the nearest wins and re-keys it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LotHeightOverride {
+ pub centroid: glam::DVec2,
+ pub floors: u32,
 }
 
 /// A hand-set role for one lot edge of a link. Lots are regenerated, so the
@@ -746,6 +761,7 @@ mod tests {
                 kind: SubdivKind::Lots,
                 streets: Default::default(),
                 edge_roles: Vec::new(),
+                lot_heights: Vec::new(),
             },
         );
         assert_eq!(doc.subdiv_source_of(lot_b), Some(source));
@@ -783,6 +799,7 @@ mod tests {
                 kind: SubdivKind::Site,
                 streets: Default::default(),
                 edge_roles: Vec::new(),
+                lot_heights: Vec::new(),
             },
         );
         let json = serde_json::to_string(&doc).unwrap();

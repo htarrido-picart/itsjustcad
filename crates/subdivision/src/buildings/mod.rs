@@ -18,11 +18,13 @@
 //! (3D: stepped mass ∪ roof), and the per-floor GFA data.
 
 pub mod footprint;
+pub mod heights;
 pub mod massing;
 pub mod roof;
 pub mod solid;
 
 pub use footprint::{footprint, Footprint};
+pub use heights::{height_seed, lot_floor_counts, varies_heights};
 pub use massing::{massing, Floor, Massing};
 pub use roof::roof;
 

@@ -1695,6 +1695,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "lotsetbacks" => parse_lotsetbacks(&args),
         "streetset" => parse_streetset(&args),
         "edgerole" => parse_edgerole(&args),
+        "lotheight" => parse_lotheight(&args),
         "lotfrontage" => parse_lotfrontage(&args),
         "lotreport" => parse_lotreport(&args),
         "siteoptimize" => parse_siteoptimize(&args),
@@ -2934,6 +2935,34 @@ fn parse_edgerole(args: &[&str]) -> Result<Command, ParseError> {
         targets,
         edge,
         role,
+        ids: None,
+    })
+}
+
+/// `lotheight [selector] floors=<n>|clear`.
+fn parse_lotheight(args: &[&str]) -> Result<Command, ParseError> {
+    const WANT: &str = "floors=<n>|clear";
+    let is_arg = |t: &str| t.contains('=') || t.eq_ignore_ascii_case("clear");
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !is_arg(first) => selector(args, "lotheight")?,
+        _ => (Selector::Selected, args),
+    };
+    let floors = match rest {
+        [t] if t.eq_ignore_ascii_case("clear") || t.eq_ignore_ascii_case("floors=clear") => None,
+        [t] => match t.split_once('=') {
+            Some((k, v)) if k.eq_ignore_ascii_case("floors") => Some(
+                v.parse::<u32>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| ParseError::BadNumber(v.to_string()))?,
+            ),
+            _ => return wrong("lotheight", WANT, args),
+        },
+        _ => return wrong("lotheight", WANT, args),
+    };
+    Ok(Command::LotHeight {
+        targets,
+        floors,
         ids: None,
     })
 }

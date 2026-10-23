@@ -156,7 +156,7 @@ enum Inverse {
         source: ObjectId,
         created: Vec<ObjectId>,
         restored: Vec<(SceneObject, usize)>,
-        prev_link: itsjustcad_doc::SubdivLink,
+        prev_link: Box<itsjustcad_doc::SubdivLink>,
     },
     /// `edgerole` on a lot outside a link: restore its previous edge tags.
     EdgeTags(ObjectId, Option<Vec<itsjustcad_doc::EdgeTag>>),
@@ -994,7 +994,7 @@ impl Session {
                 for (obj, index) in restored.iter().rev() {
                     self.doc.restore(obj.clone(), *index);
                 }
-                self.doc.subdivision_links.insert(*source, prev_link.clone());
+                self.doc.subdivision_links.insert(*source, (**prev_link).clone());
                 self.doc.generation += 1;
             }
             Inverse::LotFrozen { source, prev } => {
@@ -3725,13 +3725,14 @@ pub(crate) fn parse_param_value(
             _ => None,
         },
         FieldKind::Vec3 => {
+            // `x,y,z`, or `x,y` (z = 0) for plan points.
             let parts: Vec<&str> = s.split(',').collect();
-            if parts.len() != 3 {
+            if !(2..=3).contains(&parts.len()) {
                 return None;
             }
             let x = parts[0].trim().parse::<f64>().ok()?;
             let y = parts[1].trim().parse::<f64>().ok()?;
-            let z = parts[2].trim().parse::<f64>().ok()?;
+            let z = parts.get(2).map_or(Some(0.0), |z| z.trim().parse::<f64>().ok())?;
             Some(ParamValue::Vec3([x, y, z]))
         }
         FieldKind::Enum => Some(ParamValue::Enum(s.to_string())),
@@ -5714,6 +5715,7 @@ fn exec_lot_subdivide(
                 kind: itsjustcad_doc::SubdivKind::Lots,
                 streets: Default::default(),
                 edge_roles: Vec::new(),
+                lot_heights: Vec::new(),
             },
         );
         link_sources.push(*src);
@@ -5787,7 +5789,7 @@ fn exec_lot_refresh(
         ));
     }
     let edited = crate::lot::edited_roads(doc, &link);
-    let prev_link = link.clone();
+    let prev_link = Box::new(link.clone());
     let (new_ids, restored, dropped) = rederive_link(doc, source, link, ids, "lotrefresh")?;
 
     let n = new_ids.len();
@@ -5816,16 +5818,33 @@ fn exec_lot_refresh(
     ))
 }
 
-/// New child ids, the removed old children with their order index, and how
-/// many edge role overrides matched no regenerated edge and were dropped.
-type Rederived = (Vec<ObjectId>, Vec<(SceneObject, usize)>, usize);
+/// New child ids, the removed old children with their order index, and the
+/// hand edits that matched nothing regenerated and were dropped.
+type Rederived = (Vec<ObjectId>, Vec<(SceneObject, usize)>, Dropped);
 
-/// The message suffix reporting `n` dropped edge role overrides.
-fn dropped_roles_note(n: usize) -> String {
-    if n == 0 {
-        return String::new();
+/// How many edge role overrides / pinned lot heights a re-derive dropped.
+#[derive(Clone, Copy, Debug, Default)]
+struct Dropped {
+    roles: usize,
+    heights: usize,
+}
+
+/// The message suffix reporting dropped edge role overrides and lot heights.
+fn dropped_roles_note(d: Dropped) -> String {
+    let mut out = String::new();
+    if d.roles > 0 {
+        out += &format!(
+            " ({} edge role override(s) no longer match a lot edge and were dropped)",
+            d.roles
+        );
     }
-    format!(" ({n} edge role override(s) no longer match a lot edge and were dropped)")
+    if d.heights > 0 {
+        out += &format!(
+            " ({} pinned lot height(s) no longer match a lot and were dropped)",
+            d.heights
+        );
+    }
+    out
 }
 
 /// Re-derive the link at `source` as `link` (its settings and street edits)
@@ -5871,7 +5890,7 @@ fn rederive_link(
 
     // Re-derive by kind: Lots → derive_subdivision/insert_lots (produced = lots),
     // Site → generate_site/insert_site (produced = roads ++ blocks).
-    let roles_before = link.edge_roles.len();
+    let (roles_before, heights_before) = (link.edge_roles.len(), link.lot_heights.len());
     let new_ids = regenerate_by_kind(
         doc,
         link.kind,
@@ -5880,10 +5899,14 @@ fn rederive_link(
         &link.settings,
         &link.streets,
         &mut link.edge_roles,
+        &mut link.lot_heights,
         ids,
     )
     .map_err(ExecError::Invalid)?;
-    let dropped = roles_before - link.edge_roles.len();
+    let dropped = Dropped {
+        roles: roles_before - link.edge_roles.len(),
+        heights: heights_before - link.lot_heights.len(),
+    };
     doc.subdivision_links.insert(
         source,
         itsjustcad_doc::SubdivLink {
@@ -5912,6 +5935,7 @@ fn regenerate_by_kind(
     settings: &subdivision::SubdivisionSettings,
     streets: &BTreeMap<u32, itsjustcad_doc::StreetEdit>,
     edge_roles: &mut Vec<itsjustcad_doc::EdgeRoleOverride>,
+    lot_heights: &mut Vec<itsjustcad_doc::LotHeightOverride>,
     ids: Option<Vec<ObjectId>>,
 ) -> Result<Vec<ObjectId>, String> {
     match kind {
@@ -5955,7 +5979,7 @@ fn regenerate_by_kind(
             //   roads ++ blocks ++ lots ++ envelopes ++ buildings(×2) ++ reserves.
             // Deterministic, so replay reuses `ids` sliced by the recomputed
             // counts (same pattern as the Site arm).
-            let plan = crate::lot::plan_site(poly, z, settings, streets, edge_roles)?;
+            let plan = crate::lot::plan_site(poly, z, settings, streets, edge_roles, lot_heights)?;
             let (site, lot_bake) = (&plan.site, &plan.lots);
             let (setbacks, buildings) = (&plan.setbacks, &plan.buildings);
 
@@ -6039,7 +6063,7 @@ fn exec_lot_set_params(
     }
     let new_settings = crate::subdiv_params::params_to_settings(&link.settings, &param_map);
 
-    let prev_link = link.clone();
+    let prev_link = Box::new(link.clone());
     let new_link = itsjustcad_doc::SubdivLink {
         settings: new_settings,
         ..link
@@ -6105,7 +6129,7 @@ fn exec_street_set(
         return Err(err("this result is frozen — unfreeze to recompute"));
     }
 
-    let prev_link = link.clone();
+    let prev_link = Box::new(link.clone());
     let mut new_link = link;
     for sid in street_ids {
         let edit = new_link.streets.entry(sid).or_default();
@@ -6214,7 +6238,7 @@ fn exec_edge_role(
     if link.frozen {
         return Err(err("this result is frozen — unfreeze to recompute"));
     }
-    let prev_link = link.clone();
+    let prev_link = Box::new(link.clone());
     let mut new_link = link;
     let e = &block.edges[k];
     new_link
@@ -6244,6 +6268,128 @@ fn exec_edge_role(
         },
     ))
 }
+/// A point inside the footprint of `obj`: a closed curve's centroid, or the
+/// mean of a mesh's vertices (x, y).
+fn plan_probe(obj: &SceneObject) -> Option<glam::DVec2> {
+    match &obj.geometry {
+        Geometry::Curve(c) => Some(crate::lot::curve_to_polygon(c)?.centroid()),
+        Geometry::Mesh(m) => {
+            let p = m.positions();
+            (!p.is_empty()).then(|| {
+                p.iter().map(|v| v.truncate()).sum::<glam::DVec2>() / p.len() as f64
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `lotheight`: pin (or with `floors: None` unpin) the building floor count of
+/// the selected lots — or the lots under the selected buildings — of one
+/// SitePlan link. Stored on the link and re-derived (one `LotRefreshed` undo
+/// step), like `edgerole`.
+fn exec_lot_height(
+    doc: &mut Document,
+    targets: Selector,
+    floors: Option<u32>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let err = |m: &str| ExecError::Invalid(format!("lotheight: {m}"));
+    if floors == Some(0) {
+        return Err(err("floors must be at least 1"));
+    }
+    let sel = resolve(doc, &targets)?;
+    if sel.is_empty() {
+        return Err(err("select lots or buildings of a site plan"));
+    }
+    let mut source = None;
+    for id in &sel {
+        let src = doc
+            .subdiv_source_of(*id)
+            .filter(|s| {
+                doc.subdiv_link(*s)
+                    .is_some_and(|l| l.kind == itsjustcad_doc::SubdivKind::SitePlan)
+            })
+            .ok_or_else(|| err("select lots or buildings of a site plan (siteplan)"))?;
+        if source.is_some_and(|s| s != src) {
+            return Err(err("the selection spans more than one site plan"));
+        }
+        source = Some(src);
+    }
+    let source = source.expect("non-empty selection");
+    let link = doc.subdivision_links[&source].clone();
+    if link.frozen {
+        return Err(err("this result is frozen — unfreeze to recompute"));
+    }
+    let lots: Vec<(ObjectId, subdivision::Polygon2d)> = link
+        .produced
+        .iter()
+        .filter_map(|id| {
+            let o = doc.get(*id).filter(|o| o.layer == crate::lot::LOTS_LAYER)?;
+            let Geometry::Curve(c) = &o.geometry else {
+                return None;
+            };
+            Some((*id, crate::lot::curve_to_polygon(c)?))
+        })
+        .collect();
+    let mut picked: Vec<&subdivision::Polygon2d> = Vec::new();
+    for id in &sel {
+        let lot = match lots.iter().find(|(l, _)| l == id) {
+            Some((_, p)) => p,
+            None => {
+                let probe = doc
+                    .get(*id)
+                    .and_then(plan_probe)
+                    .ok_or_else(|| err("could not locate the selected object"))?;
+                lots.iter()
+                    .find(|(_, p)| p.contains(probe))
+                    .map(|(_, p)| p)
+                    .ok_or_else(|| err("the selected object is not on a lot"))?
+            }
+        };
+        if !picked.contains(&lot) {
+            picked.push(lot);
+        }
+    }
+    let prev_link = Box::new(link.clone());
+    let mut new_link = link;
+    for lot in &picked {
+        new_link
+            .lot_heights
+            .retain(|o| !crate::lot::lot_height_matches(lot, o));
+        new_link
+            .lot_heights
+            .extend(floors.map(|f| crate::lot::lot_height_override(lot, f)));
+    }
+    let (new_ids, restored, dropped) = rederive_link(doc, source, new_link, ids, "lotheight")?;
+    let what = match floors {
+        Some(f) => format!("pinned to {f} floor(s)"),
+        None => "unpinned".to_string(),
+    };
+    let message = format!(
+        "lotheight: {} lot(s) {what}; {} object(s) recomputed{}",
+        picked.len(),
+        new_ids.len(),
+        dropped_roles_note(dropped)
+    );
+    Ok((
+        Command::LotHeight {
+            targets: Selector::Ids { ids: sel },
+            floors,
+            ids: Some(new_ids.clone()),
+        },
+        Inverse::LotRefreshed {
+            source,
+            created: new_ids.clone(),
+            restored,
+            prev_link,
+        },
+        ApplyOutcome {
+            created: new_ids,
+            message,
+        },
+    ))
+}
+
 /// W1d: toggle a link's `frozen` flag. Frozen bakes the result (recompute is
 /// rejected); unfreeze re-enables it. `prev` carries the old flag for replay.
 fn exec_lot_freeze(
@@ -6451,6 +6597,47 @@ fn exec_lot_settings(
             "stepback_start" | "stepback_start_floor" => {
                 s.stepback_start_floor = (num()?.max(0.0)) as usize
             }
+            // Height variation.
+            "floors_min" | "floorsmin" => s.floors_min = num()?.max(0.0) as usize,
+            "floors_max" | "floorsmax" => s.floors_max = num()?.max(0.0) as usize,
+            "floors_range" | "floorrange" => {
+                let (a, b) = v.split_once('-').unwrap_or((v, v));
+                let n = |t: &str| {
+                    t.trim()
+                        .parse::<usize>()
+                        .map_err(|_| ExecError::Invalid(format!("bad floors range '{v}' (want min-max)")))
+                };
+                let (a, b) = (n(a)?, n(b)?);
+                (s.floors_min, s.floors_max) = (a.min(b), a.max(b));
+            }
+            "height_seed" | "heightseed" => {
+                s.height_seed = v
+                    .parse()
+                    .map_err(|_| ExecError::Invalid(format!("bad height seed '{v}'")))?
+            }
+            "height_mix" | "heightmix" => {
+                s.height_mix = if matches!(v.to_lowercase().as_str(), "none" | "off" | "") {
+                    None
+                } else {
+                    Some(subdivision::HeightMix::parse(v).map_err(ExecError::Invalid)?)
+                }
+            }
+            "height_falloff" | "falloff" => {
+                s.height_falloff = subdivision::HeightFalloff::parse(v).ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "unknown height falloff '{v}' (try none | center | street | point)"
+                    ))
+                })?
+            }
+            "falloff_point" => {
+                let p: Option<Vec<f64>> =
+                    v.split(',').map(|t| t.trim().parse::<f64>().ok()).collect();
+                let Some(&[x, y]) = p.as_deref() else {
+                    return Err(ExecError::Invalid(format!("bad falloff point '{v}' (want x,y)")));
+                };
+                s.falloff_point = [x, y];
+            }
+            "falloff_strength" => s.falloff_strength = num()?.clamp(0.0, 1.0),
             // Skeleton backend — `skeleton=felkel|offset`. Default
             // offset (robust). felkel = true straight skeleton (convex-exact,
             // non-convex fallback to offset).
@@ -6466,7 +6653,8 @@ fn exec_lot_settings(
                     "unknown lot setting '{other}' (try area/area_max/width/irregularity/loose/\
                      force_street/method/seed/region/loading/widthmix/depth/corner/flag/\
                      mergeslivers/front/side/rear/buildto/typology/footprint/floors/floorheight/\
-                     coverage/roof/pitch/stepback/skeleton)"
+                     coverage/roof/pitch/stepback/floors_min/floors_max/floors_range/height_seed/\
+                     height_mix/falloff/falloff_point/falloff_strength/skeleton)"
                 )));
             }
         }
@@ -6630,6 +6818,7 @@ fn exec_lot_generate_site(
             kind: itsjustcad_doc::SubdivKind::Site,
             streets: Default::default(),
             edge_roles: Vec::new(),
+            lot_heights: Vec::new(),
         },
     );
     doc.generation += 1;
@@ -6741,13 +6930,14 @@ fn exec_site_plan(
         &settings,
         &BTreeMap::new(),
         &mut Vec::new(),
+        &mut Vec::new(),
         ids,
     )
     .map_err(ExecError::Invalid)?;
 
     // Count the phases for the message (the chain is deterministic, so a
     // re-run off-document matches what was just baked).
-    let plan = crate::lot::plan_site(&poly, z, &settings, &BTreeMap::new(), &mut Vec::new())
+    let plan = crate::lot::plan_site(&poly, z, &settings, &BTreeMap::new(), &mut Vec::new(), &mut Vec::new())
         .map_err(ExecError::Invalid)?;
     let n_roads = plan.site.roads.len();
     let n_blocks = plan.site.blocks.len();
@@ -6771,6 +6961,7 @@ fn exec_site_plan(
             kind: itsjustcad_doc::SubdivKind::SitePlan,
             streets: Default::default(),
             edge_roles: Vec::new(),
+            lot_heights: Vec::new(),
         },
     );
     doc.generation += 1;
@@ -6814,7 +7005,7 @@ fn exec_site_optimize_apply(
         .subdivision_links
         .get(&source)
         .filter(|l| l.kind == itsjustcad_doc::SubdivKind::SitePlan)
-        .map(|l| l.edge_roles.len());
+        .map(|l| (l.edge_roles.len(), l.lot_heights.len()));
     let replace = roles_before.is_some();
     let (_, inverse, outcome) = if replace {
         exec_lot_set_params(doc, source, params.clone(), ids)?
@@ -6837,8 +7028,12 @@ fn exec_site_optimize_apply(
         })
         .count();
     let which = rank.map_or(String::new(), |r| format!(" #{r}"));
-    let dropped = roles_before.map_or(0, |n| {
-        n - doc.subdivision_links.get(&source).map_or(n, |l| l.edge_roles.len())
+    let dropped = roles_before.map_or(Dropped::default(), |(r, h)| {
+        let link = doc.subdivision_links.get(&source);
+        Dropped {
+            roles: r - link.map_or(r, |l| l.edge_roles.len()),
+            heights: h - link.map_or(h, |l| l.lot_heights.len()),
+        }
     });
     Ok((
         Command::SiteOptimizeApply {
@@ -13420,6 +13615,7 @@ fn apply_forward(
         Command::EdgeRole { targets, edge, role, ids } => {
             exec_edge_role(doc, targets, edge, role, ids)
         }
+        Command::LotHeight { targets, floors, ids } => exec_lot_height(doc, targets, floors, ids),
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
         Command::LotLoading { targets, mode, prev } => exec_lot_loading(doc, targets, mode, prev),
         Command::LotGenerateSite {
@@ -16249,6 +16445,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotFreeze { .. } => "lotfreeze",
         Command::StreetSet { .. } => "streetset",
         Command::EdgeRole { .. } => "edgerole",
+        Command::LotHeight { .. } => "lotheight",
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
@@ -27582,6 +27779,199 @@ mod tests {
         let link = &s.doc.subdivision_links[&source];
         assert_eq!(link.produced, before);
         assert!(link.edge_roles.is_empty());
+    }
+
+    /// Floor count of every baked building mass (mesh z extent / 3 m storeys),
+    /// with the mass centroid, in document order.
+    fn mass_floors(doc: &Document) -> Vec<(glam::DVec2, usize)> {
+        doc.objects()
+            .filter(|o| o.name.as_deref().is_some_and(|n| n.starts_with("building:mass")))
+            .map(|o| {
+                let Geometry::Mesh(m) = &o.geometry else {
+                    unreachable!()
+                };
+                let p = m.positions();
+                let c = p.iter().map(|v| v.truncate()).sum::<glam::DVec2>() / p.len() as f64;
+                // Floors from the name's GFA / footprint (no step-backs or
+                // courtyard here); the mesh height now includes the roof.
+                let val = |key: &str| -> f64 {
+                    let name = o.name.as_deref().unwrap();
+                    name.split_whitespace()
+                        .find_map(|t| t.strip_prefix(key))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap()
+                };
+                (c, (val("gfa=") / val("fp=")).round() as usize)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lotheight_parses() {
+        assert_eq!(
+            crate::parse::parse("lotheight last floors=7").unwrap(),
+            Command::LotHeight {
+                targets: Selector::Last { n: 1 },
+                floors: Some(7),
+                ids: None,
+            }
+        );
+        assert!(matches!(
+            crate::parse::parse("lotheight clear").unwrap(),
+            Command::LotHeight {
+                targets: Selector::Selected,
+                floors: None,
+                ..
+            }
+        ));
+        assert!(crate::parse::parse("lotheight last floors=0").is_err());
+        assert!(crate::parse::parse("lotheight last").is_err());
+        assert!(crate::parse::parse("lotheight last height=3").is_err());
+    }
+
+    /// Height variation through the sticky settings: a floors range varies the
+    /// siteplan buildings, replays identically, and a new height seed
+    /// reshuffles them without moving any lot.
+    #[test]
+    fn siteplan_height_variation_is_deterministic() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "siteplan last");
+        assert!(mass_floors(&s.doc).iter().all(|(_, n)| *n == 2), "default: floor_count");
+        run(&mut s, "rect 1000,0,0 600 450");
+        let source2 = s.doc.objects().last().unwrap().id;
+        run(&mut s, "lotsettings floors_range=2-8 falloff=center");
+        run(&mut s, &format!("siteplan id:{source2}"));
+        let varied: Vec<usize> = mass_floors(&s.doc)
+            .iter()
+            .filter(|(c, _)| c.x > 900.0)
+            .map(|(_, n)| *n)
+            .collect();
+        assert!(varied.iter().all(|n| (2..=8).contains(n)), "{varied:?}");
+        assert!(varied.iter().min() < varied.iter().max(), "{varied:?}");
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(mass_floors(&replayed.doc), mass_floors(&s.doc));
+
+        // Reseed: same lots, different heights.
+        let lots = |doc: &Document| {
+            doc.objects()
+                .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+                .map(|o| o.geometry.clone())
+                .collect::<Vec<_>>()
+        };
+        let before = (lots(&s.doc), mass_floors(&s.doc));
+        let params = BTreeMap::from([("height_seed".to_string(), "17".to_string())]);
+        s.run(Command::LotSetParams {
+            source: source2,
+            params,
+            ids: None,
+        })
+        .unwrap();
+        assert_eq!(lots(&s.doc), before.0);
+        assert_ne!(mass_floors(&s.doc), before.1);
+        assert_eq!(s.doc.subdivision_links[&source2].settings.height_seed, 17);
+        // The first plan kept its own (default) settings.
+        assert_eq!(s.doc.subdivision_links[&source].settings.floors_max, 0);
+    }
+
+    /// `lotheight` pins one lot's building: it survives `lotrefresh` and an
+    /// unrelated `lotsetparams`, can be set by picking the building, undoes in
+    /// one step, and a change that moves the lot drops it (reported).
+    #[test]
+    fn lotheight_pin_survives_rederive() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "siteplan last");
+        let before = s.doc.subdivision_links[&source].produced.clone();
+        let lot = s
+            .doc
+            .objects()
+            .find(|o| o.layer == crate::lot::LOTS_LAYER)
+            .unwrap();
+        let Geometry::Curve(c) = &lot.geometry else {
+            unreachable!()
+        };
+        let poly = crate::lot::curve_to_polygon(c).unwrap();
+        let lot = lot.id;
+        let pinned = |doc: &Document| {
+            mass_floors(doc)
+                .into_iter()
+                .filter(|(c, _)| poly.contains(*c))
+                .map(|(_, n)| n)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pinned(&s.doc), vec![2]);
+        let out = s
+            .run(Command::LotHeight {
+                targets: Selector::Ids { ids: vec![lot] },
+                floors: Some(9),
+                ids: None,
+            })
+            .unwrap();
+        assert!(out.message.starts_with("lotheight: 1 lot(s) pinned to 9"), "{}", out.message);
+        assert_eq!(pinned(&s.doc), vec![9]);
+        let others = mass_floors(&s.doc).iter().filter(|(_, n)| *n == 2).count();
+        assert_eq!(others, mass_floors(&s.doc).len() - 1, "only the pinned lot changed");
+
+
+        s.run(Command::LotRefresh { source, ids: None }).unwrap();
+        assert_eq!(pinned(&s.doc), vec![9]);
+        let params = BTreeMap::from([("roof_pitch".to_string(), "35".to_string())]);
+        s.run(Command::LotSetParams { source, params, ids: None }).unwrap();
+        assert_eq!(pinned(&s.doc), vec![9]);
+        // Variation never overrides the pin.
+        let params = BTreeMap::from([
+            ("floors_min".to_string(), "3".to_string()),
+            ("floors_max".to_string(), "5".to_string()),
+        ]);
+        s.run(Command::LotSetParams { source, params, ids: None }).unwrap();
+        assert_eq!(pinned(&s.doc), vec![9]);
+
+        // Picking the building re-pins its lot.
+        let mass = s
+            .doc
+            .objects()
+            .find(|o| {
+                o.name.as_deref().is_some_and(|n| n.starts_with("building:mass"))
+                    && matches!(&o.geometry, Geometry::Mesh(m)
+                        if poly.contains(m.positions()[0].truncate()))
+            })
+            .unwrap()
+            .id;
+        run(&mut s, &format!("lotheight id:{mass} floors=4"));
+        assert_eq!(pinned(&s.doc), vec![4]);
+        assert_eq!(s.doc.subdivision_links[&source].lot_heights.len(), 1);
+
+        // Replay and save/load reproduce it.
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(mass_floors(&replayed.doc), mass_floors(&s.doc));
+        let json = serde_json::to_string(&s.doc).unwrap();
+        let loaded: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.subdivision_links, s.doc.subdivision_links);
+
+        // A big change moves the lot: the pin is dropped and reported.
+        let area = s.doc.subdivision_links[&source].settings.lot_area_min * 10.0;
+        let params = BTreeMap::from([("lot_area_min".to_string(), area.to_string())]);
+        let out = s.run(Command::LotSetParams { source, params, ids: None }).unwrap();
+        assert!(
+            out.message.contains("1 pinned lot height(s) no longer match"),
+            "{}",
+            out.message
+        );
+        assert!(s.doc.subdivision_links[&source].lot_heights.is_empty());
+
+        // One undo step each, back to the original plan.
+        for _ in 0..5 {
+            run(&mut s, "undo");
+        }
+        assert_eq!(pinned(&s.doc), vec![9]);
+        run(&mut s, "undo");
+        let link = &s.doc.subdivision_links[&source];
+        assert_eq!(link.produced, before);
+        assert!(link.lot_heights.is_empty());
+        assert_eq!(pinned(&s.doc), vec![2]);
     }
 
     /// `role=auto` clears a link override; on a curve outside any link the
