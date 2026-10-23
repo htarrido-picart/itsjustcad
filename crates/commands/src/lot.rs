@@ -538,6 +538,16 @@ fn parse_mass_name(name: &str) -> Option<(f64, f64)> {
     Some((gfa.unwrap_or(0.0), fp.unwrap_or(0.0)))
 }
 
+/// The yield summary for `ids` (the whole document when empty) — what
+/// `lotreport` tabulates, as data. Pure: stores no snapshot.
+pub fn yield_report(
+    doc: &Document,
+    ids: &[ObjectId],
+    settings: &SubdivisionSettings,
+) -> subdivision::YieldReport {
+    subdivision::YieldReport::compute(&gather_yield_inputs(doc, ids, settings))
+}
+
 /// Gather the yield inputs from the current document.
 ///
 /// - **Lots**: closed curves on the `lots` layer. If `sel_ids` is non-empty,
@@ -551,16 +561,6 @@ fn parse_mass_name(name: &str) -> Option<(f64, f64)> {
 /// - **Built yield**: GFA + footprint parsed off each `building:mass` object
 ///   name (persisted by `lotbuilding`).
 /// - **Frontage**: measured at the setback line for each lot.
-/// The yield summary for `ids` (the whole document when empty) — what
-/// `lotreport` tabulates, as data. Pure: stores no snapshot.
-pub fn yield_report(
-    doc: &Document,
-    ids: &[ObjectId],
-    settings: &SubdivisionSettings,
-) -> subdivision::YieldReport {
-    subdivision::YieldReport::compute(&gather_yield_inputs(doc, ids, settings))
-}
-
 pub fn gather_yield_inputs(
     doc: &Document,
     sel_ids: &[ObjectId],
