@@ -3180,6 +3180,167 @@ fn param_value_json(v: &itsjustcad_doc::param_schema::ParamValue) -> serde_json:
     }
 }
 
+/// One schema field, as `ijc_parametric_json` and `ijc_subdivisions_json` list it.
+fn field_json(f: &itsjustcad_doc::param_schema::ParamField) -> serde_json::Value {
+    serde_json::json!({
+        "name": f.name,
+        "labelKey": f.label_key,
+        "kind": f.kind,
+        "widget": f.widget,
+        "unit": f.unit,
+        "min": f.min,
+        "max": f.max,
+        "step": f.step,
+        "default": param_value_json(&f.default),
+        "choices": f.choices,
+    })
+}
+
+/// Every associative subdivision (lots, site, site plan) as JSON, for the
+/// host's inspector — the desktop Parameters tab's subdivision inspector:
+/// `[{"source","uuid","kind","frozen","produced","selected","params":{…},
+///   "groups":[{"key","fields":[…]}]}]`. `source` is the short id of the
+/// boundary block; `kind` is `lots`/`site`/`site_plan`; `produced` counts the
+/// generated objects; `selected` is true when the source or anything it
+/// produced is selected. `groups` are the kind's phase-grouped fields (same
+/// shape as `ijc_parametric_json`'s `fields`) and `params` their current
+/// values. Edit with [`ijc_subdivision_set_params`], [`ijc_subdivision_freeze`]
+/// and [`ijc_subdivision_refresh`]. Returns `"[]"` for a null/invalid handle.
+/// Caller must [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_subdivisions_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::from("[]"));
+        };
+        into_c_string(subdivisions_json(&app.session.doc))
+    })
+}
+
+fn subdivisions_json(doc: &itsjustcad_doc::Document) -> String {
+    use itsjustcad_commands::subdiv_params;
+    let mut links: Vec<_> = doc.subdivision_links.iter().collect();
+    links.sort_by_key(|(id, _)| id.to_string());
+    let items: Vec<serde_json::Value> = links
+        .into_iter()
+        .filter(|(id, _)| doc.get(**id).is_some())
+        .map(|(id, link)| {
+            let params: serde_json::Map<String, serde_json::Value> = subdiv_params::settings_to_params(&link.settings)
+                .iter()
+                .map(|(k, v)| (k.clone(), param_value_json(v)))
+                .collect();
+            let groups: Vec<serde_json::Value> = subdiv_params::grouped_fields_for_kind(link.kind)
+                .into_iter()
+                .map(|(key, fields)| {
+                    serde_json::json!({ "key": key, "fields": fields.iter().map(field_json).collect::<Vec<_>>() })
+                })
+                .collect();
+            let selected =
+                doc.selection.contains(id) || link.produced.iter().any(|p| doc.selection.contains(p));
+            serde_json::json!({
+                "source": id.to_string(),
+                "uuid": id.0.to_string(),
+                "kind": link.kind,
+                "frozen": link.frozen,
+                "produced": link.produced.len(),
+                "selected": selected,
+                "params": params,
+                "groups": groups,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(items).to_string()
+}
+
+/// The subdivision source with short id `source`, if it has a link.
+fn subdivision_source(doc: &itsjustcad_doc::Document, source: &str) -> Option<itsjustcad_doc::ObjectId> {
+    doc.subdivision_links.keys().find(|id| id.to_string() == source).copied()
+}
+
+/// Shared body of the subdivision edits: resolve `source`, build the command,
+/// run it now (queued ops first) as one undoable op, return run-result JSON.
+fn subdivision_edit(
+    h: *mut AppHandle,
+    source: *const c_char,
+    make: impl FnOnce(itsjustcad_doc::ObjectId) -> Result<Command, String>,
+) -> *mut c_char {
+    let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+    let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+        return fail("invalid or busy handle");
+    };
+    let app: &mut AppHandle = &mut guard;
+    if source.is_null() {
+        return fail("source is null");
+    }
+    let Ok(source) = (unsafe { CStr::from_ptr(source) }).to_str() else {
+        return fail("source is not valid UTF-8");
+    };
+    apply_pending(app);
+    let Some(id) = subdivision_source(&app.session.doc, source) else {
+        return fail("no subdivision for that object");
+    };
+    match make(id) {
+        Ok(cmd) => into_c_string(run_cmd_json(&mut app.session, cmd)),
+        Err(e) => fail(&e),
+    }
+}
+
+/// Set a subdivision's exposed params from a JSON object of `name → token`
+/// strings (numbers as text, enums as their token, bools `true`/`false`) and
+/// re-derive it: one undoable `LotSetParams` op. Returns run-result JSON.
+///
+/// # Safety
+/// `h` must be null or a live handle; `source` and `params_json` must be null
+/// or valid NUL-terminated C strings. Free the result with [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_subdivision_set_params(
+    h: *mut AppHandle,
+    source: *const c_char,
+    params_json: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let params = if params_json.is_null() {
+            None
+        } else {
+            (unsafe { CStr::from_ptr(params_json) })
+                .to_str()
+                .ok()
+                .and_then(|s| serde_json::from_str::<std::collections::BTreeMap<String, String>>(s).ok())
+        };
+        subdivision_edit(h, source, |source| {
+            let params = params.ok_or("params must be a JSON object of name → string token")?;
+            Ok(Command::LotSetParams { source, params, ids: None })
+        })
+    })
+}
+
+/// Freeze (bake) or unfreeze a subdivision: frozen results no longer recompute
+/// from their source. One undoable `LotFreeze` op; returns run-result JSON.
+///
+/// # Safety
+/// As [`ijc_subdivision_set_params`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_subdivision_freeze(h: *mut AppHandle, source: *const c_char, frozen: bool) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        subdivision_edit(h, source, |source| Ok(Command::LotFreeze { source, frozen, prev: None }))
+    })
+}
+
+/// Recompute a subdivision from its source's current boundary (the desktop's
+/// Refresh). One undoable `LotRefresh` op; returns run-result JSON.
+///
+/// # Safety
+/// As [`ijc_subdivision_set_params`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_subdivision_refresh(h: *mut AppHandle, source: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        subdivision_edit(h, source, |source| Ok(Command::LotRefresh { source, ids: None }))
+    })
+}
+
 /// Serialize every parametric object with its current params and schema.
 fn parametric_json(doc: &itsjustcad_doc::Document) -> String {
     let items: Vec<serde_json::Value> = doc
@@ -3194,24 +3355,7 @@ fn parametric_json(doc: &itsjustcad_doc::Document) -> String {
                 .iter()
                 .map(|(k, v)| (k.clone(), param_value_json(v)))
                 .collect();
-            let fields: Vec<serde_json::Value> = schema
-                .fields
-                .iter()
-                .map(|f| {
-                    serde_json::json!({
-                        "name": f.name,
-                        "labelKey": f.label_key,
-                        "kind": f.kind,
-                        "widget": f.widget,
-                        "unit": f.unit,
-                        "min": f.min,
-                        "max": f.max,
-                        "step": f.step,
-                        "default": param_value_json(&f.default),
-                        "choices": f.choices,
-                    })
-                })
-                .collect();
+            let fields: Vec<serde_json::Value> = schema.fields.iter().map(field_json).collect();
             Some(serde_json::json!({
                 "id": obj.id.to_string(),
                 "uuid": obj.id.0.to_string(),
@@ -5794,6 +5938,52 @@ mod headless_tests {
         unsafe {
             assert_eq!(ijc_box_select(h, 0.0, 0.0, 1.0, 1.0, false), -1, "headless has no drawable");
             assert_eq!(ijc_box_select(std::ptr::null_mut(), 0.0, 0.0, 1.0, 1.0, false), -1);
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn subdivisions_list_edit_freeze_and_refresh() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["polyline 0,0,0 40,0,0 40,30,0 0,30,0 close", "lotsubdivide last area=200 width=10"] {
+                let out = r(ijc_run_command_result(h, c(line).as_ptr()));
+                assert_eq!(out["ok"], true, "{line}: {out}");
+            }
+            let list = r(ijc_subdivisions_json(h));
+            let link = &list[0];
+            assert_eq!(link["kind"], "lots");
+            assert_eq!(link["frozen"], false);
+            assert!(link["produced"].as_u64().unwrap() > 0);
+            assert!(!link["groups"].as_array().unwrap().is_empty());
+            let source = link["source"].as_str().unwrap().to_string();
+            let field = link["groups"][0]["fields"][0]["name"].as_str().unwrap().to_string();
+            assert!(link["params"].get(&field).is_some(), "params cover the fields");
+
+            let before = ijc_undo_cursor(h);
+            // A numeric field nudged one step from its current value.
+            let num = link["groups"].as_array().unwrap().iter()
+                .flat_map(|g| g["fields"].as_array().unwrap().iter())
+                .find(|f| f["kind"] == "float" && f["step"].as_f64().unwrap_or(0.0) > 0.0)
+                .expect("a float field");
+            let name = num["name"].as_str().unwrap();
+            let value = link["params"][name].as_f64().unwrap() + num["step"].as_f64().unwrap();
+            let tokens = serde_json::json!({ name: value.to_string() }).to_string();
+            let edit = r(ijc_subdivision_set_params(h, c(&source).as_ptr(), c(&tokens).as_ptr()));
+            assert_eq!(edit["ok"], true, "{edit}");
+            assert_eq!(ijc_undo_cursor(h), before + 1, "one undoable op");
+
+            let frozen = r(ijc_subdivision_freeze(h, c(&source).as_ptr(), true));
+            assert_eq!(frozen["ok"], true, "{frozen}");
+            assert_eq!(r(ijc_subdivisions_json(h))[0]["frozen"], true);
+            assert_eq!(r(ijc_subdivision_refresh(h, c(&source).as_ptr()))["ok"], false, "frozen won't refresh");
+            assert_eq!(r(ijc_subdivision_freeze(h, c(&source).as_ptr(), false))["ok"], true);
+            assert_eq!(r(ijc_subdivision_refresh(h, c(&source).as_ptr()))["ok"], true);
+
+            assert_eq!(r(ijc_subdivision_refresh(h, c("nope").as_ptr()))["ok"], false);
+            assert_eq!(r(ijc_subdivision_set_params(h, c(&source).as_ptr(), c("[1]").as_ptr()))["ok"], false);
+            assert_eq!(r(ijc_subdivisions_json(std::ptr::null_mut())), serde_json::json!([]));
             ijc_free(h);
         }
     }
