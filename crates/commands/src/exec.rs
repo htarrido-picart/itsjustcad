@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::error::ExecError;
 use crate::{
-    BoolKind, CPlaneOp, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, PlotStyleOp,
+    BoolKind, CPlaneOp, Command, CompassDir, DimAnchorSpec, LotEdit, LotField, MirrorPlane, OptionOp, PlotStyleOp,
     RegionMode, Selector, SheetSetOp, SimilarBy,
 };
 
@@ -5715,7 +5715,7 @@ fn exec_lot_subdivide(
                 kind: itsjustcad_doc::SubdivKind::Lots,
                 streets: Default::default(),
                 edge_roles: Vec::new(),
-                lot_heights: Vec::new(),
+                lot_overrides: Vec::new(),
             },
         );
         link_sources.push(*src);
@@ -5840,7 +5840,7 @@ fn dropped_roles_note(d: Dropped) -> String {
     }
     if d.heights > 0 {
         out += &format!(
-            " ({} pinned lot height(s) no longer match a lot and were dropped)",
+            " ({} lot override(s) no longer match a lot and were dropped)",
             d.heights
         );
     }
@@ -5890,7 +5890,7 @@ fn rederive_link(
 
     // Re-derive by kind: Lots → derive_subdivision/insert_lots (produced = lots),
     // Site → generate_site/insert_site (produced = roads ++ blocks).
-    let (roles_before, heights_before) = (link.edge_roles.len(), link.lot_heights.len());
+    let (roles_before, heights_before) = (link.edge_roles.len(), link.lot_overrides.len());
     let new_ids = regenerate_by_kind(
         doc,
         link.kind,
@@ -5899,13 +5899,13 @@ fn rederive_link(
         &link.settings,
         &link.streets,
         &mut link.edge_roles,
-        &mut link.lot_heights,
+        &mut link.lot_overrides,
         ids,
     )
     .map_err(ExecError::Invalid)?;
     let dropped = Dropped {
         roles: roles_before - link.edge_roles.len(),
-        heights: heights_before - link.lot_heights.len(),
+        heights: heights_before - link.lot_overrides.len(),
     };
     doc.subdivision_links.insert(
         source,
@@ -5935,7 +5935,7 @@ fn regenerate_by_kind(
     settings: &subdivision::SubdivisionSettings,
     streets: &BTreeMap<u32, itsjustcad_doc::StreetEdit>,
     edge_roles: &mut Vec<itsjustcad_doc::EdgeRoleOverride>,
-    lot_heights: &mut Vec<itsjustcad_doc::LotHeightOverride>,
+    lot_overrides: &mut Vec<itsjustcad_doc::LotOverride>,
     ids: Option<Vec<ObjectId>>,
 ) -> Result<Vec<ObjectId>, String> {
     match kind {
@@ -5979,7 +5979,7 @@ fn regenerate_by_kind(
             //   roads ++ blocks ++ lots ++ envelopes ++ buildings(×2) ++ reserves.
             // Deterministic, so replay reuses `ids` sliced by the recomputed
             // counts (same pattern as the Site arm).
-            let plan = crate::lot::plan_site(poly, z, settings, streets, edge_roles, lot_heights)?;
+            let plan = crate::lot::plan_site(poly, z, settings, streets, edge_roles, lot_overrides)?;
             let (site, lot_bake) = (&plan.site, &plan.lots);
             let (setbacks, buildings) = (&plan.setbacks, &plan.buildings);
 
@@ -6284,25 +6284,120 @@ fn plan_probe(obj: &SceneObject) -> Option<glam::DVec2> {
 }
 
 /// `lotheight`: pin (or with `floors: None` unpin) the building floor count of
-/// the selected lots — or the lots under the selected buildings — of one
-/// SitePlan link. Stored on the link and re-derived (one `LotRefreshed` undo
-/// step), like `edgerole`.
+/// the selected lots — an alias for `lotset floors=<n>` / `lotset clear
+/// floors`, logged under its own name.
 fn exec_lot_height(
     doc: &mut Document,
     targets: Selector,
     floors: Option<u32>,
     ids: Option<Vec<ObjectId>>,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
-    let err = |m: &str| ExecError::Invalid(format!("lotheight: {m}"));
-    if floors == Some(0) {
-        return Err(err("floors must be at least 1"));
+    let edit = match floors {
+        Some(f) => LotEdit {
+            floors: Some(f),
+            ..LotEdit::default()
+        },
+        None => LotEdit {
+            clear: vec![LotField::Floors],
+            ..LotEdit::default()
+        },
+    };
+    let done = lot_set(doc, &targets, &edit, ids, "lotheight")?;
+    let what = match floors {
+        Some(f) => format!("pinned to {f} floor(s)"),
+        None => "unpinned".to_string(),
+    };
+    let message = format!(
+        "lotheight: {} lot(s) {what}; {} object(s) recomputed{}",
+        done.lots,
+        done.created.len(),
+        done.note
+    );
+    Ok((
+        Command::LotHeight {
+            targets: Selector::Ids { ids: done.sel },
+            floors,
+            ids: Some(done.created.clone()),
+        },
+        done.inverse,
+        ApplyOutcome {
+            created: done.created,
+            message,
+        },
+    ))
+}
+
+/// `lotset`: set and/or reset per-lot rule overrides on the selected lots — or
+/// the lots under the selected buildings — of one SitePlan link. Stored on the
+/// link and re-derived (one `LotRefreshed` undo step), like `edgerole`.
+fn exec_lot_set(
+    doc: &mut Document,
+    targets: Selector,
+    edit: LotEdit,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let done = lot_set(doc, &targets, &edit, ids, "lotset")?;
+    let mut parts: Vec<String> = Vec::new();
+    if !edit.clear.is_empty() {
+        let names: Vec<&str> = edit.clear.iter().map(|f| f.name()).collect();
+        parts.push(format!("reset {}", names.join(", ")));
     }
-    let sel = resolve(doc, &targets)?;
+    let mut set: Vec<String> = Vec::new();
+    if let Some(f) = edit.floors {
+        set.push(format!("floors={f}"));
+    }
+    if let Some(t) = edit.typology {
+        set.push(format!("typology={}", crate::lot::typology_name(t)));
+    }
+    for (k, v) in [
+        ("setback_front", edit.setback_front),
+        ("setback_side", edit.setback_side),
+        ("setback_street_side", edit.setback_street_side),
+        ("setback_rear", edit.setback_rear),
+    ] {
+        if let Some(v) = v {
+            set.push(format!("{k}={v}"));
+        }
+    }
+    if !set.is_empty() {
+        parts.push(format!("set {}", set.join(" ")));
+    }
+    let message = format!(
+        "lotset: {} lot(s) {}; {} object(s) recomputed{}",
+        done.lots,
+        parts.join(", "),
+        done.created.len(),
+        done.note
+    );
+    Ok((
+        Command::LotSet {
+            targets: Selector::Ids { ids: done.sel },
+            edit,
+            ids: Some(done.created.clone()),
+        },
+        done.inverse,
+        ApplyOutcome {
+            created: done.created,
+            message,
+        },
+    ))
+}
+
+/// The SitePlan source and lots `sel` targets: each selected id is a lot of
+/// the plan, or an object standing on one (a building, an envelope). Errors
+/// (prefixed `verb`) when the selection is empty, spans plans, is off any lot,
+/// or the plan is frozen.
+pub(crate) fn picked_lots(
+    doc: &Document,
+    sel: &[ObjectId],
+    verb: &str,
+) -> Result<(ObjectId, Vec<(ObjectId, subdivision::Polygon2d)>), ExecError> {
+    let err = |m: &str| ExecError::Invalid(format!("{verb}: {m}"));
     if sel.is_empty() {
         return Err(err("select lots or buildings of a site plan"));
     }
     let mut source = None;
-    for id in &sel {
+    for id in sel {
         let src = doc
             .subdiv_source_of(*id)
             .filter(|s| {
@@ -6316,7 +6411,7 @@ fn exec_lot_height(
         source = Some(src);
     }
     let source = source.expect("non-empty selection");
-    let link = doc.subdivision_links[&source].clone();
+    let link = &doc.subdivision_links[&source];
     if link.frozen {
         return Err(err("this result is frozen — unfreeze to recompute"));
     }
@@ -6331,10 +6426,10 @@ fn exec_lot_height(
             Some((*id, crate::lot::curve_to_polygon(c)?))
         })
         .collect();
-    let mut picked: Vec<&subdivision::Polygon2d> = Vec::new();
-    for id in &sel {
+    let mut picked: Vec<(ObjectId, subdivision::Polygon2d)> = Vec::new();
+    for id in sel {
         let lot = match lots.iter().find(|(l, _)| l == id) {
-            Some((_, p)) => p,
+            Some(l) => l,
             None => {
                 let probe = doc
                     .get(*id)
@@ -6342,52 +6437,110 @@ fn exec_lot_height(
                     .ok_or_else(|| err("could not locate the selected object"))?;
                 lots.iter()
                     .find(|(_, p)| p.contains(probe))
-                    .map(|(_, p)| p)
                     .ok_or_else(|| err("the selected object is not on a lot"))?
             }
         };
-        if !picked.contains(&lot) {
-            picked.push(lot);
+        if !picked.iter().any(|(l, _)| *l == lot.0) {
+            picked.push(lot.clone());
         }
     }
+    Ok((source, picked))
+}
+
+/// `edit` applied to `overrides` for `lot`: the matching record (if any) has
+/// `edit.clear` reset, then the set fields written; an emptied record is
+/// removed.
+fn edit_lot_override(
+    overrides: &mut Vec<itsjustcad_doc::LotOverride>,
+    lot: &subdivision::Polygon2d,
+    edit: &LotEdit,
+) {
+    let mut o = itsjustcad_doc::LotOverride {
+        centroid: crate::lot::lot_key(lot),
+        ..Default::default()
+    };
+    overrides.retain(|x| {
+        let hit = crate::lot::lot_override_matches(lot, x);
+        if hit {
+            o = crate::lot::merge_lot_override(x, &o);
+        }
+        !hit
+    });
+    for f in &edit.clear {
+        match f {
+            LotField::Floors => o.floors = None,
+            LotField::Typology => o.typology = None,
+            LotField::SetbackFront => o.setback_front = None,
+            LotField::SetbackSide => o.setback_side = None,
+            LotField::SetbackStreetSide => o.setback_street_side = None,
+            LotField::SetbackRear => o.setback_rear = None,
+        }
+    }
+    o.floors = edit.floors.or(o.floors);
+    o.typology = edit.typology.or(o.typology);
+    o.setback_front = edit.setback_front.or(o.setback_front);
+    o.setback_side = edit.setback_side.or(o.setback_side);
+    o.setback_street_side = edit.setback_street_side.or(o.setback_street_side);
+    o.setback_rear = edit.setback_rear.or(o.setback_rear);
+    if !o.is_empty() {
+        overrides.push(o);
+    }
+}
+
+/// What [`lot_set`] did: the resolved selection, how many lots it edited, the
+/// re-derived children, the undo step and the dropped-overrides note.
+struct LotSetDone {
+    sel: Vec<ObjectId>,
+    lots: usize,
+    created: Vec<ObjectId>,
+    inverse: Inverse,
+    note: String,
+}
+
+/// Shared body of `lotset` / `lotheight`: apply `edit` to every targeted lot's
+/// override and re-derive the plan once (one undo step).
+fn lot_set(
+    doc: &mut Document,
+    targets: &Selector,
+    edit: &LotEdit,
+    ids: Option<Vec<ObjectId>>,
+    verb: &str,
+) -> Result<LotSetDone, ExecError> {
+    let err = |m: &str| ExecError::Invalid(format!("{verb}: {m}"));
+    if edit.floors == Some(0) {
+        return Err(err("floors must be at least 1"));
+    }
+    if [edit.setback_front, edit.setback_side, edit.setback_street_side, edit.setback_rear]
+        .iter()
+        .flatten()
+        .any(|m| !m.is_finite() || *m < 0.0)
+    {
+        return Err(err("setbacks must be finite and non-negative"));
+    }
+    if edit.is_noop() {
+        return Err(err("nothing to set or clear"));
+    }
+    let sel = resolve(doc, targets)?;
+    let (source, picked) = picked_lots(doc, &sel, verb)?;
+    let link = doc.subdivision_links[&source].clone();
     let prev_link = Box::new(link.clone());
     let mut new_link = link;
-    for lot in &picked {
-        new_link
-            .lot_heights
-            .retain(|o| !crate::lot::lot_height_matches(lot, o));
-        new_link
-            .lot_heights
-            .extend(floors.map(|f| crate::lot::lot_height_override(lot, f)));
+    for (_, lot) in &picked {
+        edit_lot_override(&mut new_link.lot_overrides, lot, edit);
     }
-    let (new_ids, restored, dropped) = rederive_link(doc, source, new_link, ids, "lotheight")?;
-    let what = match floors {
-        Some(f) => format!("pinned to {f} floor(s)"),
-        None => "unpinned".to_string(),
-    };
-    let message = format!(
-        "lotheight: {} lot(s) {what}; {} object(s) recomputed{}",
-        picked.len(),
-        new_ids.len(),
-        dropped_roles_note(dropped)
-    );
-    Ok((
-        Command::LotHeight {
-            targets: Selector::Ids { ids: sel },
-            floors,
-            ids: Some(new_ids.clone()),
-        },
-        Inverse::LotRefreshed {
+    let (created, restored, dropped) = rederive_link(doc, source, new_link, ids, verb)?;
+    Ok(LotSetDone {
+        sel,
+        lots: picked.len(),
+        inverse: Inverse::LotRefreshed {
             source,
-            created: new_ids.clone(),
+            created: created.clone(),
             restored,
             prev_link,
         },
-        ApplyOutcome {
-            created: new_ids,
-            message,
-        },
-    ))
+        created,
+        note: dropped_roles_note(dropped),
+    })
 }
 
 /// W1d: toggle a link's `frozen` flag. Frozen bakes the result (recompute is
@@ -6818,7 +6971,7 @@ fn exec_lot_generate_site(
             kind: itsjustcad_doc::SubdivKind::Site,
             streets: Default::default(),
             edge_roles: Vec::new(),
-            lot_heights: Vec::new(),
+            lot_overrides: Vec::new(),
         },
     );
     doc.generation += 1;
@@ -6961,7 +7114,7 @@ fn exec_site_plan(
             kind: itsjustcad_doc::SubdivKind::SitePlan,
             streets: Default::default(),
             edge_roles: Vec::new(),
-            lot_heights: Vec::new(),
+            lot_overrides: Vec::new(),
         },
     );
     doc.generation += 1;
@@ -7005,7 +7158,7 @@ fn exec_site_optimize_apply(
         .subdivision_links
         .get(&source)
         .filter(|l| l.kind == itsjustcad_doc::SubdivKind::SitePlan)
-        .map(|l| (l.edge_roles.len(), l.lot_heights.len()));
+        .map(|l| (l.edge_roles.len(), l.lot_overrides.len()));
     let replace = roles_before.is_some();
     let (_, inverse, outcome) = if replace {
         exec_lot_set_params(doc, source, params.clone(), ids)?
@@ -7032,7 +7185,7 @@ fn exec_site_optimize_apply(
         let link = doc.subdivision_links.get(&source);
         Dropped {
             roles: r - link.map_or(r, |l| l.edge_roles.len()),
-            heights: h - link.map_or(h, |l| l.lot_heights.len()),
+            heights: h - link.map_or(h, |l| l.lot_overrides.len()),
         }
     });
     Ok((
@@ -13616,6 +13769,7 @@ fn apply_forward(
             exec_edge_role(doc, targets, edge, role, ids)
         }
         Command::LotHeight { targets, floors, ids } => exec_lot_height(doc, targets, floors, ids),
+        Command::LotSet { targets, edit, ids } => exec_lot_set(doc, targets, edit, ids),
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
         Command::LotLoading { targets, mode, prev } => exec_lot_loading(doc, targets, mode, prev),
         Command::LotGenerateSite {
@@ -16446,6 +16600,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::StreetSet { .. } => "streetset",
         Command::EdgeRole { .. } => "edgerole",
         Command::LotHeight { .. } => "lotheight",
+        Command::LotSet { .. } => "lotset",
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
@@ -27942,7 +28097,7 @@ mod tests {
             .id;
         run(&mut s, &format!("lotheight id:{mass} floors=4"));
         assert_eq!(pinned(&s.doc), vec![4]);
-        assert_eq!(s.doc.subdivision_links[&source].lot_heights.len(), 1);
+        assert_eq!(s.doc.subdivision_links[&source].lot_overrides.len(), 1);
 
         // Replay and save/load reproduce it.
         let replayed = Session::replay(s.save_log()).unwrap();
@@ -27956,11 +28111,11 @@ mod tests {
         let params = BTreeMap::from([("lot_area_min".to_string(), area.to_string())]);
         let out = s.run(Command::LotSetParams { source, params, ids: None }).unwrap();
         assert!(
-            out.message.contains("1 pinned lot height(s) no longer match"),
+            out.message.contains("1 lot override(s) no longer match"),
             "{}",
             out.message
         );
-        assert!(s.doc.subdivision_links[&source].lot_heights.is_empty());
+        assert!(s.doc.subdivision_links[&source].lot_overrides.is_empty());
 
         // One undo step each, back to the original plan.
         for _ in 0..5 {
@@ -27970,8 +28125,250 @@ mod tests {
         run(&mut s, "undo");
         let link = &s.doc.subdivision_links[&source];
         assert_eq!(link.produced, before);
-        assert!(link.lot_heights.is_empty());
+        assert!(link.lot_overrides.is_empty());
         assert_eq!(pinned(&s.doc), vec![2]);
+    }
+
+    #[test]
+    fn lotset_parses() {
+        let p = |l: &str| crate::parse::parse(l);
+        assert_eq!(
+            p("lotset last floors=12 typology=midrise setback_front=4.5").unwrap(),
+            Command::LotSet {
+                targets: Selector::Last { n: 1 },
+                edit: LotEdit {
+                    floors: Some(12),
+                    typology: Some(subdivision::Typology::Slab),
+                    setback_front: Some(4.5),
+                    ..LotEdit::default()
+                },
+                ids: None,
+            }
+        );
+        let Command::LotSet { targets, edit, .. } = p("lotset clear").unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(targets, Selector::Selected);
+        assert_eq!(edit.clear, LotField::ALL.to_vec());
+        let Command::LotSet { edit, .. } = p("lotset last clear floors rear").unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(edit.clear, vec![LotField::Floors, LotField::SetbackRear]);
+        let Command::LotSet { edit, .. } = p("lotset typology=clear side=0").unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(edit.clear, vec![LotField::Typology]);
+        assert_eq!(edit.setback_side, Some(0.0));
+        for bad in [
+            "lotset last",
+            "lotset last floors=0",
+            "lotset last typology=igloo",
+            "lotset last setback_front=-1",
+            "lotset last height=3",
+            "lotset last clear bogus",
+        ] {
+            assert!(p(bad).is_err(), "{bad}");
+        }
+        // The logged form round-trips through JSON.
+        let cmd = p("lotset last floors=3 clear setback_rear").unwrap();
+        let back: Command = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        assert_eq!(back, cmd);
+    }
+
+    /// Each building mass's `gfa=` keyed by its centroid, in document order.
+    fn mass_gfa(doc: &Document) -> Vec<(glam::DVec2, f64)> {
+        doc.objects()
+            .filter_map(|o| {
+                let n = o.name.as_deref()?.strip_prefix("building:mass gfa=")?;
+                let gfa: f64 = n.split_whitespace().next()?.parse().ok()?;
+                let Geometry::Mesh(m) = &o.geometry else {
+                    return None;
+                };
+                let p = m.positions();
+                Some((p.iter().map(|v| v.truncate()).sum::<glam::DVec2>() / p.len() as f64, gfa))
+            })
+            .collect()
+    }
+
+    /// A siteplan with varied floors; returns the session, source and the
+    /// first lot (id, polygon).
+    fn varied_plan() -> (Session, ObjectId, ObjectId, subdivision::Polygon2d) {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "lotsettings floors_range=2-8");
+        run(&mut s, "siteplan last");
+        let lot = s
+            .doc
+            .objects()
+            .find(|o| o.layer == crate::lot::LOTS_LAYER)
+            .unwrap();
+        let Geometry::Curve(c) = &lot.geometry else {
+            unreachable!()
+        };
+        let (poly, lot) = (crate::lot::curve_to_polygon(c).unwrap(), lot.id);
+        (s, source, lot, poly)
+    }
+
+    /// `lotset floors=12 typology=midrise` on one lot rebuilds only that
+    /// building (one undo step); total GFA moves by exactly its difference;
+    /// the FFI view reports effective vs rule values; reset restores the rule.
+    #[test]
+    fn lotset_typology_changes_only_that_building() {
+        let (mut s, source, lot, poly) = varied_plan();
+        let before = mass_gfa(&s.doc);
+        let total = |v: &[(glam::DVec2, f64)]| v.iter().map(|(_, g)| g).sum::<f64>();
+        let on = |v: &[(glam::DVec2, f64)]| {
+            v.iter().filter(|(c, _)| poly.contains(*c)).map(|(_, g)| *g).sum::<f64>()
+        };
+        let off = |v: &[(glam::DVec2, f64)]| {
+            v.iter().filter(|(c, _)| !poly.contains(*c)).copied().collect::<Vec<_>>()
+        };
+        let rule = crate::lot::lot_overrides_json(&s.doc, lot).unwrap();
+        assert_eq!(rule["overridden"], serde_json::json!([]));
+        assert_eq!(rule["effective"], rule["rule"]);
+
+        let out = run(&mut s, &format!("lotset id:{lot} floors=12 typology=midrise"));
+        assert!(out.message.starts_with("lotset: 1 lot(s) set floors=12 typology=slab"), "{}", out.message);
+        let after = mass_gfa(&s.doc);
+        assert_eq!(off(&after), off(&before), "other buildings untouched");
+        assert!(on(&after) > on(&before));
+        assert!(((total(&after) - total(&before)) - (on(&after) - on(&before))).abs() < 1e-6);
+        let floors: Vec<usize> = mass_floors(&s.doc)
+            .into_iter()
+            .filter(|(c, _)| poly.contains(*c))
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(floors, vec![12], "slab: no step-backs, full floors");
+
+        let v = crate::lot::lot_overrides_json(&s.doc, lot_at(&s.doc, &poly)).unwrap();
+        assert_eq!(v["effective"]["floors"], 12);
+        assert_eq!(v["effective"]["typology"], "slab");
+        assert_eq!(v["rule"]["typology"], "detached");
+        assert!((2..=8).contains(&v["rule"]["floors"].as_u64().unwrap()));
+        assert_eq!(v["overridden"], serde_json::json!(["floors", "typology"]));
+
+        // Reset one field, then the rest.
+        let l = lot_at(&s.doc, &poly);
+        run(&mut s, &format!("lotset id:{l} clear typology"));
+        let v = crate::lot::lot_overrides_json(&s.doc, lot_at(&s.doc, &poly)).unwrap();
+        assert_eq!(v["overridden"], serde_json::json!(["floors"]));
+        let l = lot_at(&s.doc, &poly);
+        run(&mut s, &format!("lotset id:{l} clear"));
+        assert!(s.doc.subdivision_links[&source].lot_overrides.is_empty());
+        assert_eq!(mass_gfa(&s.doc), before);
+        // Undo restores the override, step by step.
+        run(&mut s, "undo");
+        let v = crate::lot::lot_overrides_json(&s.doc, lot_at(&s.doc, &poly)).unwrap();
+        assert_eq!(v["overridden"], serde_json::json!(["floors"]));
+        run(&mut s, "undo");
+        assert_eq!(mass_gfa(&s.doc), after);
+        run(&mut s, "undo");
+        assert_eq!(mass_gfa(&s.doc), before);
+
+        // A setback override moves only that lot's envelope.
+        let envs = |doc: &Document| {
+            doc.objects()
+                .filter(|o| o.layer == crate::lot::SETBACKS_LAYER)
+                .map(|o| o.geometry.clone())
+                .collect::<Vec<_>>()
+        };
+        let e0 = envs(&s.doc);
+        let l = lot_at(&s.doc, &poly);
+        run(&mut s, &format!("lotset id:{l} setback_front=9"));
+        let e1 = envs(&s.doc);
+        assert_eq!(e0.len(), e1.len());
+        assert_eq!(e0.iter().zip(&e1).filter(|(a, b)| a != b).count(), 1);
+    }
+
+    /// The lot of the plan whose curve matches `poly`'s centroid.
+    fn lot_at(doc: &Document, poly: &subdivision::Polygon2d) -> ObjectId {
+        doc.objects()
+            .find(|o| {
+                o.layer == crate::lot::LOTS_LAYER
+                    && matches!(&o.geometry, Geometry::Curve(c)
+                        if crate::lot::curve_to_polygon(c)
+                            .is_some_and(|p| p.centroid().distance(poly.centroid()) <= 1.0))
+            })
+            .unwrap()
+            .id
+    }
+
+    /// Several lots (or their buildings) edit together as ONE undo step, and
+    /// replay reproduces it.
+    #[test]
+    fn lotset_multi_select_is_one_undo_step() {
+        let (mut s, source, _, _) = varied_plan();
+        let before = mass_gfa(&s.doc);
+        let lots: Vec<ObjectId> = s
+            .doc
+            .objects()
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .take(3)
+            .map(|o| o.id)
+            .collect();
+        let out = s
+            .run(Command::LotSet {
+                targets: Selector::Ids { ids: lots.clone() },
+                edit: LotEdit {
+                    floors: Some(10),
+                    typology: Some(subdivision::Typology::Courtyard),
+                    ..LotEdit::default()
+                },
+                ids: None,
+            })
+            .unwrap();
+        assert!(out.message.starts_with("lotset: 3 lot(s)"), "{}", out.message);
+        assert_eq!(s.doc.subdivision_links[&source].lot_overrides.len(), 3);
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(mass_gfa(&replayed.doc), mass_gfa(&s.doc));
+        run(&mut s, "undo");
+        assert!(s.doc.subdivision_links[&source].lot_overrides.is_empty());
+        assert_eq!(mass_gfa(&s.doc), before);
+    }
+
+    /// Overrides follow the lot through `seed`, `lot_area` and `height_seed`
+    /// changes while a lot stays within 1 m; one whose lot disappears is
+    /// dropped and reported.
+    #[test]
+    fn lotset_override_survives_param_changes() {
+        let (mut s, source, lot, poly) = varied_plan();
+        run(&mut s, &format!("lotset id:{lot} floors=12 typology=midrise"));
+        let pinned = |doc: &Document| {
+            mass_floors(doc)
+                .into_iter()
+                .filter(|(c, _)| poly.contains(*c))
+                .map(|(_, n)| n)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pinned(&s.doc), vec![12]);
+        let mut kept = 0;
+        for (k, v) in [
+            ("height_seed", "99".to_string()),
+            ("seed", "7".to_string()),
+            ("lot_area_min", {
+                let a = s.doc.subdivision_links[&source].settings.lot_area_min;
+                (a * 1.05).to_string()
+            }),
+            ("lot_area_min", {
+                let a = s.doc.subdivision_links[&source].settings.lot_area_min;
+                (a * 10.0).to_string()
+            }),
+        ] {
+            let params = BTreeMap::from([(k.to_string(), v)]);
+            let out = s.run(Command::LotSetParams { source, params, ids: None }).unwrap();
+            let overrides = &s.doc.subdivision_links[&source].lot_overrides;
+            if overrides.is_empty() {
+                assert!(out.message.contains("1 lot override(s) no longer match"), "{k}: {}", out.message);
+                break;
+            }
+            kept += 1;
+            let o = &overrides[0];
+            assert!(o.centroid.distance(poly.centroid()) <= 1.0, "{k}: same position");
+            assert_eq!(pinned(&s.doc), vec![12], "{k}");
+        }
+        assert_eq!(kept, 3, "height_seed, seed and a 5% lot_area change keep the lot");
+        assert!(s.doc.subdivision_links[&source].lot_overrides.is_empty(), "10× lot area drops it");
     }
 
     /// `role=auto` clears a link override; on a curve outside any link the

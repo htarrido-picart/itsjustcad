@@ -3434,7 +3434,8 @@ pub unsafe extern "C" fn ijc_edge_role_set(
 }
 /// Pin the building floor count of lot `id` (short id or full uuid) of a site
 /// plan — `id` may also be a building standing on the lot — to `floors`; `floors
-/// <= 0` clears the pin. One undoable `lotheight` op; the pin is stored on the
+/// <= 0` clears the pin. A shim over [`ijc_lot_set`] (`{"floors": n}` / `{"floors": null}`),
+/// kept for #156 hosts. One undoable `lotheight` op; the pin is stored on the
 /// plan and survives a refresh. Returns run-result JSON (as
 /// [`ijc_run_command_result`]). Free with [`ijc_string_free`].
 ///
@@ -3477,6 +3478,169 @@ pub unsafe extern "C" fn ijc_lot_height_set(
         into_c_string(run_cmd_json(&mut app.session, cmd))
     })
 }
+
+// ── per-lot rule overrides (#158) ───────────────────────────────────────────
+
+/// The object `id` (short id or full uuid) names, if any.
+fn object_by_id(doc: &itsjustcad_doc::Document, id: &str) -> Option<itsjustcad_doc::ObjectId> {
+    doc.objects()
+        .find(|o| o.id.to_string() == id || o.id.0.to_string() == id)
+        .map(|o| o.id)
+}
+
+/// A `lotset` edit from its JSON form: `floors` (int ≥ 1), `typology` (name,
+/// `midrise` = slab), `setback_front` / `setback_side` / `setback_street_side`
+/// / `setback_rear` (m ≥ 0); a field set to `null` resets it to the rule, and
+/// `clear` is `true` (reset every field) or a list of field names.
+fn lot_edit_from_json(v: &serde_json::Value) -> Result<itsjustcad_commands::LotEdit, String> {
+    use itsjustcad_commands::{LotEdit, LotField};
+    let obj = v.as_object().ok_or("expected a JSON object")?;
+    let mut edit = LotEdit::default();
+    for (k, val) in obj {
+        if k == "clear" {
+            match val {
+                serde_json::Value::Bool(true) => edit.clear = LotField::ALL.to_vec(),
+                serde_json::Value::Bool(false) => {}
+                serde_json::Value::Array(names) => {
+                    for n in names {
+                        let n = n.as_str().ok_or("clear: expected field names")?;
+                        edit.clear.push(LotField::parse(n).ok_or(format!("clear: unknown field '{n}'"))?);
+                    }
+                }
+                _ => return Err("clear: expected true or a list of field names".into()),
+            }
+            continue;
+        }
+        let f = LotField::parse(k).ok_or(format!("unknown field '{k}'"))?;
+        if val.is_null() {
+            edit.clear.push(f);
+            continue;
+        }
+        let len = || {
+            val.as_f64()
+                .filter(|m| m.is_finite() && *m >= 0.0)
+                .ok_or(format!("{k}: expected a length in metres ≥ 0"))
+        };
+        match f {
+            LotField::Floors => {
+                edit.floors = Some(
+                    val.as_u64()
+                        .filter(|n| (1..=u32::MAX as u64).contains(n))
+                        .ok_or("floors: expected an integer ≥ 1")? as u32,
+                )
+            }
+            LotField::Typology => {
+                edit.typology = Some(
+                    val.as_str()
+                        .and_then(itsjustcad_commands::lot::parse_typology)
+                        .ok_or("typology: expected detached, row, courtyard, slab or midrise")?,
+                )
+            }
+            LotField::SetbackFront => edit.setback_front = Some(len()?),
+            LotField::SetbackSide => edit.setback_side = Some(len()?),
+            LotField::SetbackStreetSide => edit.setback_street_side = Some(len()?),
+            LotField::SetbackRear => edit.setback_rear = Some(len()?),
+        }
+    }
+    if edit.is_noop() {
+        return Err("nothing to set or clear".into());
+    }
+    Ok(edit)
+}
+
+/// Set and/or reset the rule overrides of lot `lot_id` (short id or full
+/// uuid) of a site plan — `lot_id` may also be a building standing on the lot.
+/// `json` is an object such as `{"floors": 12, "typology": "midrise",
+/// "setback_front": 4}`; a field set to `null` resets it to the plan's rule and
+/// `"clear": true` (or a list of field names) resets several. One undoable
+/// `lotset` op; overrides are stored on the plan and survive a refresh.
+/// Returns run-result JSON (as [`ijc_run_command_result`]). Free with
+/// [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `lot_id` and `json` must be null or
+/// valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_lot_set(
+    h: *mut AppHandle,
+    lot_id: *const c_char,
+    json: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        if lot_id.is_null() || json.is_null() {
+            return fail("lot_id or json is null");
+        }
+        let (Ok(id), Ok(json)) = (
+            unsafe { CStr::from_ptr(lot_id) }.to_str(),
+            unsafe { CStr::from_ptr(json) }.to_str(),
+        ) else {
+            return fail("lot_id or json is not valid UTF-8");
+        };
+        let edit = match serde_json::from_str::<serde_json::Value>(json)
+            .map_err(|e| e.to_string())
+            .and_then(|v| lot_edit_from_json(&v))
+        {
+            Ok(e) => e,
+            Err(e) => return fail(&format!("lotset: {e}")),
+        };
+        apply_pending(app);
+        let Some(id) = object_by_id(&app.session.doc, id) else {
+            return fail("no object with that id");
+        };
+        let cmd = Command::LotSet {
+            targets: Selector::Ids { ids: vec![id] },
+            edit,
+            ids: None,
+        };
+        into_c_string(run_cmd_json(&mut app.session, cmd))
+    })
+}
+
+/// The rule overrides of the site-plan lot `lot_id` (short id or full uuid;
+/// a building standing on the lot works too) as JSON: `{"lot", "source",
+/// "effective": {floors, typology, setback_front, setback_side,
+/// setback_street_side, setback_rear}, "rule": {…same keys…}, "overridden":
+/// [field…]}`. `rule` is what the plan's settings give this lot (floors include
+/// the height variation); `effective` is what it is built with. `lot` is the
+/// lot's own id. Returns `null` for an unknown id, an object not on a site-plan
+/// lot, or a null/invalid handle. Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `lot_id` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_lot_overrides_json(
+    h: *mut AppHandle,
+    lot_id: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let null = || into_c_string(String::from("null"));
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return null();
+        };
+        if lot_id.is_null() {
+            return null();
+        }
+        let Ok(id) = (unsafe { CStr::from_ptr(lot_id) }).to_str() else {
+            return null();
+        };
+        let doc = &app.session.doc;
+        let Some(id) = object_by_id(doc, id) else {
+            return null();
+        };
+        match itsjustcad_commands::lot::lot_overrides_json(doc, id) {
+            Ok(v) => into_c_string(v.to_string()),
+            Err(_) => null(),
+        }
+    })
+}
+
+// ── end per-lot rule overrides ──────────────────────────────────────────────
 
 /// Every generated street (#143 phase 4), from `siteplan` / `lotgeneratesite`
 /// links: `[{"source","id","name"?,"class","width","objects":[…],"edited"}]`.
@@ -6511,7 +6675,7 @@ mod headless_tests {
                     .doc
                     .subdivision_links
                     .values()
-                    .map(|l| l.lot_heights.len())
+                    .map(|l| l.lot_overrides.len())
                     .sum::<usize>()
             };
             assert_eq!(pins(h), 1);
@@ -6523,6 +6687,88 @@ mod headless_tests {
             let out = r(ijc_lot_height_set(h, c(&lot(h)).as_ptr(), 0));
             assert_eq!(out["ok"], true, "{out}");
             assert_eq!(pins(h), 0);
+            ijc_free(h);
+        }
+    }
+
+    /// `ijc_lot_set` writes overrides (picked by lot or by its building) as one
+    /// undoable op; `ijc_lot_overrides_json` reads effective / rule /
+    /// overridden back; `null` and `clear` reset; bad input fails cleanly.
+    #[test]
+    fn lot_set_round_trip() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 600 450", "siteplan last"] {
+                assert_eq!(r(ijc_run_command_result(h, c(line).as_ptr()))["ok"], true);
+            }
+            let first = |h: *mut AppHandle, layer: &str| {
+                let guard = handle_mut(h).unwrap();
+                guard
+                    .session
+                    .doc
+                    .objects()
+                    .find(|o| o.layer == layer)
+                    .expect("an object")
+                    .id
+                    .to_string()
+            };
+            let lot = first(h, "lots");
+            let v = r(ijc_lot_overrides_json(h, c(&lot).as_ptr()));
+            assert_eq!(v["lot"], lot.as_str());
+            assert_eq!(v["overridden"], serde_json::json!([]));
+            assert_eq!(v["rule"]["typology"], "detached");
+
+            let out = r(ijc_lot_set(
+                h,
+                c(&lot).as_ptr(),
+                c(r#"{"floors": 12, "typology": "midrise", "setback_rear": 5}"#).as_ptr(),
+            ));
+            assert_eq!(out["ok"], true, "{out}");
+            // The lot was re-derived (new id); its building targets it too.
+            let building = first(h, "buildings");
+            let v = r(ijc_lot_overrides_json(h, c(&building).as_ptr()));
+            assert_eq!(v["overridden"], serde_json::json!(["floors", "typology", "setback_rear"]));
+            assert_eq!(v["effective"]["floors"], 12);
+            assert_eq!(v["effective"]["typology"], "slab");
+            assert_eq!(v["effective"]["setback_rear"], 5.0);
+            assert_eq!(v["rule"]["floors"], 2);
+            let lot = v["lot"].as_str().unwrap().to_string();
+
+            let out = r(ijc_lot_set(h, c(&lot).as_ptr(), c(r#"{"typology": null}"#).as_ptr()));
+            assert_eq!(out["ok"], true, "{out}");
+            let lot = first(h, "lots");
+            let v = r(ijc_lot_overrides_json(h, c(&lot).as_ptr()));
+            assert_eq!(v["overridden"], serde_json::json!(["floors", "setback_rear"]));
+            let out = r(ijc_lot_set(h, c(&lot).as_ptr(), c(r#"{"clear": true}"#).as_ptr()));
+            assert_eq!(out["ok"], true, "{out}");
+            let lot = first(h, "lots");
+            assert_eq!(r(ijc_lot_overrides_json(h, c(&lot).as_ptr()))["overridden"], serde_json::json!([]));
+            // Undo restores the override.
+            assert_eq!(r(ijc_run_command_result(h, c("undo").as_ptr()))["ok"], true);
+            let lot = first(h, "lots");
+            let v = r(ijc_lot_overrides_json(h, c(&lot).as_ptr()));
+            assert_eq!(v["overridden"], serde_json::json!(["floors", "setback_rear"]));
+
+            for bad in [r#"{"floors": 0}"#, r#"{"typology": "igloo"}"#, "{}", "[1]", "nope", r#"{"height": 3}"#] {
+                let out = r(ijc_lot_set(h, c(&lot).as_ptr(), c(bad).as_ptr()));
+                assert_eq!(out["ok"], false, "{bad}");
+            }
+            let null = serde_json::Value::Null;
+            let rect = {
+                let guard = handle_mut(h).unwrap();
+                guard.session.doc.subdivision_links.keys().next().unwrap().to_string()
+            };
+            assert_eq!(r(ijc_lot_overrides_json(h, c(&rect).as_ptr())), null);
+            assert_eq!(r(ijc_lot_overrides_json(h, c("nope").as_ptr())), null);
+            assert_eq!(r(ijc_lot_overrides_json(h, std::ptr::null())), null);
+            assert_eq!(r(ijc_lot_overrides_json(std::ptr::null_mut(), c("x").as_ptr())), null);
+            assert_eq!(r(ijc_lot_set(h, c("nope").as_ptr(), c("{\"floors\":3}").as_ptr()))["ok"], false);
+            assert_eq!(r(ijc_lot_set(h, c(&lot).as_ptr(), std::ptr::null()))["ok"], false);
+            assert_eq!(
+                r(ijc_lot_set(std::ptr::null_mut(), c("x").as_ptr(), c("{}").as_ptr()))["ok"],
+                false
+            );
             ijc_free(h);
         }
     }

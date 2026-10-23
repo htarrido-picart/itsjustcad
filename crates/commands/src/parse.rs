@@ -11,7 +11,8 @@ use itsjustcad_doc::{
 use crate::error::ParseError;
 use crate::registry::registry;
 use crate::{
-    BoolKind, CPlaneOp, Command, CompassDir, DimAnchorSpec, MirrorPlane, OptionOp, PlotStyleOp,
+    BoolKind, CPlaneOp, Command, CompassDir, DimAnchorSpec, LotEdit, LotField, MirrorPlane, OptionOp,
+    PlotStyleOp,
     SheetSetOp,
     SheetViewSet,
     Selector,
@@ -1696,6 +1697,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "streetset" => parse_streetset(&args),
         "edgerole" => parse_edgerole(&args),
         "lotheight" => parse_lotheight(&args),
+        "lotset" => parse_lotset(&args),
         "lotfrontage" => parse_lotfrontage(&args),
         "lotreport" => parse_lotreport(&args),
         "siteoptimize" => parse_siteoptimize(&args),
@@ -2963,6 +2965,84 @@ fn parse_lotheight(args: &[&str]) -> Result<Command, ParseError> {
     Ok(Command::LotHeight {
         targets,
         floors,
+        ids: None,
+    })
+}
+
+/// `lotset [selector] [floors=<n>] [typology=<name>] [setback_front=<m>]
+/// [setback_side=<m>] [setback_street_side=<m>] [setback_rear=<m>]
+/// [clear [field…]]`. Bare `clear` resets every field; `<field>=clear` resets
+/// one.
+fn parse_lotset(args: &[&str]) -> Result<Command, ParseError> {
+    const WANT: &str =
+        "floors=<n> typology=<name> setback_front|side|street_side|rear=<m> or clear [field…]";
+    let is_arg = |t: &str| t.contains('=') || t.eq_ignore_ascii_case("clear");
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !is_arg(first) => selector(args, "lotset")?,
+        _ => (Selector::Selected, args),
+    };
+    let mut edit = LotEdit::default();
+    let mut clearing = false;
+    let field = |k: &str| {
+        let k = k.to_lowercase();
+        let k = match k.as_str() {
+            "front" | "side" | "rear" | "street_side" => format!("setback_{k}"),
+            _ => k,
+        };
+        LotField::parse(&k).ok_or_else(|| wrong_err("lotset", WANT, args))
+    };
+    for tok in rest {
+        if tok.eq_ignore_ascii_case("clear") {
+            clearing = true;
+            continue;
+        }
+        let Some((k, v)) = tok.split_once('=') else {
+            if !clearing {
+                return wrong("lotset", WANT, args);
+            }
+            edit.clear.push(field(tok)?);
+            continue;
+        };
+        let f = field(k)?;
+        if v.eq_ignore_ascii_case("clear") {
+            edit.clear.push(f);
+            continue;
+        }
+        let len = |v: &str| match number(v)? {
+            m if m.is_finite() && m >= 0.0 => Ok(m),
+            _ => Err(ParseError::BadNumber(v.to_string())),
+        };
+        match f {
+            LotField::Floors => {
+                edit.floors = Some(
+                    v.parse::<u32>()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| ParseError::BadNumber(v.to_string()))?,
+                )
+            }
+            LotField::Typology => {
+                edit.typology = Some(
+                    subdivision::Typology::parse(v).ok_or_else(|| {
+                        wrong_err("lotset", "typology=detached|row|courtyard|slab|midrise", args)
+                    })?,
+                )
+            }
+            LotField::SetbackFront => edit.setback_front = Some(len(v)?),
+            LotField::SetbackSide => edit.setback_side = Some(len(v)?),
+            LotField::SetbackStreetSide => edit.setback_street_side = Some(len(v)?),
+            LotField::SetbackRear => edit.setback_rear = Some(len(v)?),
+        }
+    }
+    if clearing && !rest.iter().any(|t| !t.contains('=') && !t.eq_ignore_ascii_case("clear")) {
+        edit.clear = LotField::ALL.to_vec();
+    }
+    if edit.is_noop() {
+        return wrong("lotset", WANT, args);
+    }
+    Ok(Command::LotSet {
+        targets,
+        edit,
         ids: None,
     })
 }

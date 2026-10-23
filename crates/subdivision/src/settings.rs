@@ -110,7 +110,8 @@ pub enum Typology {
     Row,
     /// Courtyard: a ring footprint with an interior void.
     Courtyard,
-    /// Apartment slab: a single large mass ~= the envelope.
+    /// Apartment slab: a single large mass ~= the envelope (aliases:
+    /// `apartment`, `midrise`).
     Slab,
 }
 
@@ -121,7 +122,9 @@ impl Typology {
             "detached" | "house" | "single" => Some(Typology::Detached),
             "row" | "terrace" | "townhouse" | "rowhouse" => Some(Typology::Row),
             "courtyard" | "court" | "perimeter" => Some(Typology::Courtyard),
-            "slab" | "apartment" | "apt" | "block" => Some(Typology::Slab),
+            "slab" | "apartment" | "apt" | "block" | "midrise" | "mid_rise" | "mid-rise" => {
+                Some(Typology::Slab)
+            }
             _ => None,
         }
     }

@@ -22,7 +22,7 @@ use glam::{DVec2, DVec3};
 use std::collections::BTreeMap;
 
 use itsjustcad_doc::{
-    Document, EdgeRoleOverride, EdgeTag, LotHeightOverride, Geometry, LayerStyle, ObjectId, SceneObject, StreetClass,
+    Document, EdgeRoleOverride, EdgeTag, Geometry, LotOverride, LayerStyle, ObjectId, SceneObject, StreetClass,
     StreetEdit, StreetInfo,
 };
 use kernel_curve::Curve;
@@ -186,48 +186,157 @@ pub fn apply_edge_roles<'a>(
 }
 
 /// How far (m) a regenerated lot's centroid may move and still pick up a
-/// [`LotHeightOverride`] keyed on the old lot.
-pub const LOT_HEIGHT_TOL: f64 = 1.0;
+/// [`LotOverride`] keyed on the old lot.
+pub const LOT_OVERRIDE_TOL: f64 = 1.0;
 
-/// A [`LotHeightOverride`] pinning `lot` to `floors`, keyed on its centroid
-/// rounded to the mm.
-pub fn lot_height_override(lot: &Polygon2d, floors: u32) -> LotHeightOverride {
-    LotHeightOverride {
-        centroid: (lot.centroid() * 1e3).round() / 1e3,
-        floors,
-    }
+/// `lot`'s centroid rounded to the mm: the key a [`LotOverride`] stores.
+pub fn lot_key(lot: &Polygon2d) -> DVec2 {
+    (lot.centroid() * 1e3).round() / 1e3
 }
 
 /// True when `o` is keyed on `lot`.
-pub fn lot_height_matches(lot: &Polygon2d, o: &LotHeightOverride) -> bool {
-    lot.centroid().distance(o.centroid) <= LOT_HEIGHT_TOL
+pub fn lot_override_matches(lot: &Polygon2d, o: &LotOverride) -> bool {
+    lot.centroid().distance(o.centroid) <= LOT_OVERRIDE_TOL
 }
 
-/// Match a link's pinned lot heights to freshly derived `lots`: each pins the
-/// lot whose centroid is nearest (within [`LOT_HEIGHT_TOL`]) and is re-keyed to
-/// it. Pins that match no lot are removed from `pins`. Returns the pinned floor
-/// count per lot (parallel to `lots`) and how many pins were dropped.
-pub fn apply_lot_heights(
+/// `top`'s set fields over `base`'s (both keyed on the same lot).
+pub fn merge_lot_override(base: &LotOverride, top: &LotOverride) -> LotOverride {
+    LotOverride {
+        centroid: top.centroid,
+        floors: top.floors.or(base.floors),
+        typology: top.typology.or(base.typology),
+        setback_front: top.setback_front.or(base.setback_front),
+        setback_side: top.setback_side.or(base.setback_side),
+        setback_street_side: top.setback_street_side.or(base.setback_street_side),
+        setback_rear: top.setback_rear.or(base.setback_rear),
+    }
+}
+
+/// Match a link's lot overrides to freshly derived `lots`: each applies to the
+/// lot whose centroid is nearest (within [`LOT_OVERRIDE_TOL`]) and is re-keyed
+/// to it. Overrides that match no lot are removed from `overrides`. Returns the
+/// override per lot (parallel to `lots`; two on one lot merge, later fields
+/// winning) and how many were dropped.
+pub fn apply_lot_overrides(
     lots: &[&Polygon2d],
-    pins: &mut Vec<LotHeightOverride>,
-) -> (Vec<Option<usize>>, usize) {
-    let mut out = vec![None; lots.len()];
-    let before = pins.len();
-    pins.retain_mut(|o| {
+    overrides: &mut Vec<LotOverride>,
+) -> (Vec<Option<LotOverride>>, usize) {
+    let mut out: Vec<Option<LotOverride>> = vec![None; lots.len()];
+    let before = overrides.len();
+    overrides.retain_mut(|o| {
         let best = lots
             .iter()
             .enumerate()
             .map(|(k, l)| (k, l.centroid().distance(o.centroid)))
-            .filter(|(_, d)| *d <= LOT_HEIGHT_TOL)
+            .filter(|(_, d)| *d <= LOT_OVERRIDE_TOL)
             .min_by(|a, b| a.1.total_cmp(&b.1));
         let Some((k, _)) = best else {
             return false;
         };
-        out[k] = Some(o.floors.max(1) as usize);
-        *o = lot_height_override(lots[k], o.floors);
+        o.centroid = lot_key(lots[k]);
+        out[k] = Some(match &out[k] {
+            Some(prev) => merge_lot_override(prev, o),
+            None => o.clone(),
+        });
         true
     });
-    (out, before - pins.len())
+    (out, before - overrides.len())
+}
+
+/// `settings` with one lot's overridden rule values applied (`floors` →
+/// `floor_count`, typology, setbacks). `None` returns a plain clone.
+pub fn lot_settings(settings: &SubdivisionSettings, o: Option<&LotOverride>) -> SubdivisionSettings {
+    let mut s = settings.clone();
+    if let Some(o) = o {
+        if let Some(f) = o.floors {
+            s.floor_count = f.max(1) as usize;
+        }
+        if let Some(t) = o.typology {
+            s.typology = t;
+        }
+        if let Some(v) = o.setback_front {
+            s.setback_front = v;
+        }
+        if let Some(v) = o.setback_side {
+            s.setback_side = v;
+        }
+        if let Some(v) = o.setback_street_side {
+            s.setback_street_side = Some(v);
+        }
+        if let Some(v) = o.setback_rear {
+            s.setback_rear = v;
+        }
+    }
+    s
+}
+
+/// The per-lot rule fields of `s` for a lot drawing `floors` storeys, as JSON
+/// keyed like `lotset`.
+fn lot_values_json(s: &SubdivisionSettings, floors: usize) -> serde_json::Value {
+    serde_json::json!({
+        "floors": floors,
+        "typology": typology_name(s.typology),
+        "setback_front": s.setback_front,
+        "setback_side": s.setback_side,
+        "setback_street_side": s.street_side_setback(),
+        "setback_rear": s.setback_rear,
+    })
+}
+
+/// The rule overrides of the SitePlan lot `id` targets (a lot, or an object
+/// standing on one such as its building): `{lot, source, effective, rule,
+/// overridden}`. `rule` is what the plan's settings give this lot (floors
+/// include the height variation), `effective` what it is built with, and
+/// `overridden` lists the `lotset` keys pinned on it. Errors when `id` is not
+/// on a lot of a SitePlan.
+pub fn lot_overrides_json(doc: &Document, id: ObjectId) -> Result<serde_json::Value, String> {
+    let (source, picked) =
+        crate::exec::picked_lots(doc, &[id], "lot").map_err(|e| e.to_string())?;
+    let (lot_id, poly) = picked.into_iter().next().ok_or("lot: not on a lot")?;
+    let link = &doc.subdivision_links[&source];
+    let lots: Vec<(ObjectId, Block)> = link
+        .produced
+        .iter()
+        .filter_map(|id| {
+            let o = doc.get(*id).filter(|o| o.layer == LOTS_LAYER)?;
+            let Geometry::Curve(c) = &o.geometry else {
+                return None;
+            };
+            Some((*id, doc_block(o, curve_to_polygon(c)?)))
+        })
+        .collect();
+    let blocks: Vec<&Block> = lots.iter().map(|(_, b)| b).collect();
+    let floors = subdivision::lot_floor_counts(&blocks, &link.settings);
+    let k = lots.iter().position(|(l, _)| *l == lot_id).ok_or("lot: not on a lot")?;
+    let o = link
+        .lot_overrides
+        .iter()
+        .filter(|o| lot_override_matches(&poly, o))
+        .fold(None, |acc: Option<LotOverride>, o| {
+            Some(acc.map_or_else(|| o.clone(), |a| merge_lot_override(&a, o)))
+        });
+    let effective = lot_settings(&link.settings, o.as_ref());
+    let eff_floors = o.as_ref().and_then(|o| o.floors).map_or(floors[k], |f| f.max(1) as usize);
+    let overridden: Vec<&str> = o.as_ref().map_or(Vec::new(), |o| {
+        [
+            ("floors", o.floors.is_some()),
+            ("typology", o.typology.is_some()),
+            ("setback_front", o.setback_front.is_some()),
+            ("setback_side", o.setback_side.is_some()),
+            ("setback_street_side", o.setback_street_side.is_some()),
+            ("setback_rear", o.setback_rear.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(k, on)| on.then_some(k))
+        .collect()
+    });
+    Ok(serde_json::json!({
+        "lot": lot_id.to_string(),
+        "source": source.to_string(),
+        "effective": lot_values_json(&effective, eff_floors),
+        "rule": lot_values_json(&link.settings, floors[k]),
+        "overridden": overridden,
+    }))
 }
 
 /// `front` | `street_side` | `side` | `rear` → that role; `auto` → `None`.
@@ -726,15 +835,29 @@ pub fn compute_setbacks(
     lots: &[(Block, f64)],
     settings: &SubdivisionSettings,
 ) -> Result<SetbackBake, String> {
+    compute_setbacks_overridden(lots, settings, &[])
+}
+
+/// [`compute_setbacks`] with per-lot overrides (`lotset`; parallel to `lots`,
+/// missing / `None` = the plan's rules): an overridden setback moves that
+/// lot's envelope only.
+pub fn compute_setbacks_overridden(
+    lots: &[(Block, f64)],
+    settings: &SubdivisionSettings,
+    overrides: &[Option<LotOverride>],
+) -> Result<SetbackBake, String> {
     let mut envelopes = Vec::new();
     let mut collapsed = 0usize;
     let mut build_to_used = false;
     let mut z_acc = 0.0;
     let mut z_n = 0usize;
-    for (block, z) in lots {
+    for (i, (block, z)) in lots.iter().enumerate() {
         // An untagged lot (a baked lot curve has no tags) fronts its longest
         // edge, matching the subdivision "usable without a street graph" spirit.
-        let env = subdivision::buildable_envelope(block, settings);
+        let env = match overrides.get(i).and_then(Option::as_ref) {
+            Some(o) => subdivision::buildable_envelope(block, &lot_settings(settings, Some(o))),
+            None => subdivision::buildable_envelope(block, settings),
+        };
         build_to_used |= env.build_to_used;
         match env.polygon {
             Some(p) => envelopes.push(p),
@@ -1196,6 +1319,16 @@ pub fn parse_typology(s: &str) -> Option<Typology> {
     Typology::parse(s)
 }
 
+/// The canonical keyword for `t` (its serde name).
+pub fn typology_name(t: Typology) -> &'static str {
+    match t {
+        Typology::Detached => "detached",
+        Typology::Row => "row",
+        Typology::Courtyard => "courtyard",
+        Typology::Slab => "slab",
+    }
+}
+
 /// Parse a footprint-mode keyword → [`FootprintMode`].
 pub fn parse_footprint_mode(s: &str) -> Option<FootprintMode> {
     FootprintMode::parse(s)
@@ -1217,14 +1350,15 @@ pub fn compute_buildings(
     compute_buildings_pinned(lots, settings, &[])
 }
 
-/// [`compute_buildings`] with per-lot floor counts: each lot gets its pinned
-/// count from `pinned` (parallel to `lots`; missing / `None` = not pinned),
-/// else the varied count from [`subdivision::lot_floor_counts`] (which is
-/// `floor_count` when no height-variation option is on).
+/// [`compute_buildings`] with per-lot overrides (`lotset`; parallel to `lots`,
+/// missing / `None` = the plan's rules). An overridden lot's floors win over
+/// the varied count from [`subdivision::lot_floor_counts`] (which is
+/// `floor_count` when no height-variation option is on); its typology and
+/// setbacks drive that lot's envelope, footprint and roof only.
 pub fn compute_buildings_pinned(
     lots: &[(Block, f64)],
     settings: &SubdivisionSettings,
-    pinned: &[Option<usize>],
+    overrides: &[Option<LotOverride>],
 ) -> Result<BuildingBake, String> {
     let mut buildings = Vec::new();
     let mut collapsed = 0usize;
@@ -1233,16 +1367,17 @@ pub fn compute_buildings_pinned(
     let blocks: Vec<&Block> = lots.iter().map(|(b, _)| b).collect();
     let floors = subdivision::lot_floor_counts(&blocks, settings);
     for (i, (block, z)) in lots.iter().enumerate() {
-        let n = pinned.get(i).copied().flatten().unwrap_or(floors[i]);
-        let lot_settings;
-        let settings = if n == settings.floor_count {
+        let o = overrides.get(i).and_then(Option::as_ref);
+        let n = o.and_then(|o| o.floors).map_or(floors[i], |f| f.max(1) as usize);
+        let own;
+        let settings = if o.is_none() && n == settings.floor_count {
             settings
         } else {
-            lot_settings = SubdivisionSettings {
+            own = SubdivisionSettings {
                 floor_count: n,
-                ..settings.clone()
+                ..lot_settings(settings, o)
             };
-            &lot_settings
+            &own
         };
         // Buildings generate INSIDE the buildable envelope. A baked lot
         // curve carries no street tags → longest edge is the front (same spirit
@@ -1385,8 +1520,8 @@ pub struct SitePlanBake {
 
 /// Run the site-plan chain on `site`. Deterministic: the output depends only on
 /// the boundary, settings, street edits (`streetset`), role overrides
-/// (`edgerole`) and pinned lot heights (`lotheight`, matched and re-keyed by
-/// [`apply_lot_heights`]; unmatched pins are removed). `edge_roles` are re-keyed to the regenerated edges, and the
+/// (`edgerole`) and per-lot overrides (`lotset` / `lotheight`, matched and
+/// re-keyed by [`apply_lot_overrides`]; unmatched ones are removed). `edge_roles` are re-keyed to the regenerated edges, and the
 /// ones that match no edge are removed (see [`apply_edge_roles`]). A block
 /// that fails to subdivide (too small, …) and setbacks/buildings that fail are
 /// skipped, never aborting the plan.
@@ -1396,7 +1531,7 @@ pub fn plan_site(
     settings: &SubdivisionSettings,
     streets: &BTreeMap<u32, StreetEdit>,
     edge_roles: &mut Vec<EdgeRoleOverride>,
-    lot_heights: &mut Vec<LotHeightOverride>,
+    lot_overrides: &mut Vec<LotOverride>,
 ) -> Result<SitePlanBake, String> {
     let bake = generate_site(site, z, settings, streets)?;
     // Reserved blocks are picked among the blocks that bake (still baked as
@@ -1426,10 +1561,10 @@ pub fn plan_site(
     }
     apply_edge_roles(lots.lots.iter_mut(), edge_roles);
     let lots_z: Vec<(Block, f64)> = lots.lots.iter().map(|l| (l.clone(), bake.z)).collect();
-    let setbacks = compute_setbacks(&lots_z, settings).ok();
     let polys: Vec<&Polygon2d> = lots.lots.iter().map(|l| &l.polygon).collect();
-    let (pinned, _) = apply_lot_heights(&polys, lot_heights);
-    let buildings = compute_buildings_pinned(&lots_z, settings, &pinned).ok();
+    let (per_lot, _) = apply_lot_overrides(&polys, lot_overrides);
+    let setbacks = compute_setbacks_overridden(&lots_z, settings, &per_lot).ok();
+    let buildings = compute_buildings_pinned(&lots_z, settings, &per_lot).ok();
     Ok(SitePlanBake {
         site: bake,
         reserved,
@@ -1503,7 +1638,10 @@ mod tests {
             ..SubdivisionSettings::default()
         };
         let mut pinned = vec![None; lots.len()];
-        pinned[3] = Some(11);
+        pinned[3] = Some(LotOverride {
+            floors: Some(11),
+            ..LotOverride::default()
+        });
         let bake = compute_buildings_pinned(&lots, &s, &pinned).unwrap();
         assert_eq!(bake.buildings[3].floor_areas.len(), 11);
         let floors: Vec<usize> = bake.buildings.iter().map(|b| b.floor_areas.len()).collect();

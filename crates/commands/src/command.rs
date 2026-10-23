@@ -2196,6 +2196,18 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Set and/or reset per-lot rule overrides (floors, typology, setbacks) on
+    /// the selected lots of one SitePlan link — lots, or buildings standing on
+    /// them. Stored on the link keyed by lot centroid, so they survive
+    /// `lotrefresh` / `lotsetparams`; the link is re-derived and `ids` written
+    /// back as the re-derived children. Logged; one undo step.
+    LotSet {
+        targets: Selector,
+        #[serde(flatten)]
+        edit: LotEdit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// Show or set the sticky `SubdivisionSettings` on the document.
     /// With no `sets`, the exec message reports the current
     /// settings; otherwise each `key=value` updates one field. Logged so saved
@@ -2414,6 +2426,79 @@ pub enum Command {
     /// Design options: named branches of the op-log. Meta-level, like Undo —
     /// mutates the session's branch table (and may replay), never itself logged.
     Option(OptionOp),
+}
+
+/// One overridable per-lot rule field (`lotset … clear <field>`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LotField {
+    Floors,
+    Typology,
+    SetbackFront,
+    SetbackSide,
+    SetbackStreetSide,
+    SetbackRear,
+}
+
+impl LotField {
+    pub const ALL: [LotField; 6] = [
+        LotField::Floors,
+        LotField::Typology,
+        LotField::SetbackFront,
+        LotField::SetbackSide,
+        LotField::SetbackStreetSide,
+        LotField::SetbackRear,
+    ];
+
+    /// The command-line / JSON key.
+    pub fn name(self) -> &'static str {
+        match self {
+            LotField::Floors => "floors",
+            LotField::Typology => "typology",
+            LotField::SetbackFront => "setback_front",
+            LotField::SetbackSide => "setback_side",
+            LotField::SetbackStreetSide => "setback_street_side",
+            LotField::SetbackRear => "setback_rear",
+        }
+    }
+
+    /// The field named `s` (case-insensitive).
+    pub fn parse(s: &str) -> Option<LotField> {
+        Self::ALL.into_iter().find(|f| f.name().eq_ignore_ascii_case(s))
+    }
+}
+
+/// A `lotset` edit: fields in `clear` reset to the plan's rule first, then
+/// each `Some` field is overridden.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LotEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floors: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typology: Option<subdivision::Typology>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setback_front: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setback_side: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setback_street_side: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setback_rear: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear: Vec<LotField>,
+}
+
+impl LotEdit {
+    /// True when the edit neither sets nor clears anything.
+    pub fn is_noop(&self) -> bool {
+        self.clear.is_empty()
+            && self.floors.is_none()
+            && self.typology.is_none()
+            && self.setback_front.is_none()
+            && self.setback_side.is_none()
+            && self.setback_street_side.is_none()
+            && self.setback_rear.is_none()
+    }
 }
 
 /// Constraint kind as typed on the command line. `Equal` and `Tangent` pick
