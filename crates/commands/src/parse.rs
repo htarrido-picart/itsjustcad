@@ -1693,6 +1693,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         }
         "lotloading" => parse_lotloading(&args),
         "lotsetbacks" => parse_lotsetbacks(&args),
+        "streetset" => parse_streetset(&args),
         "lotfrontage" => parse_lotfrontage(&args),
         "lotreport" => parse_lotreport(&args),
         "lotopenspace" => parse_lotopenspace(&args),
@@ -2852,6 +2853,54 @@ fn parse_lotloading(args: &[&str]) -> Result<Command, ParseError> {
     }
     let mode = mode.ok_or_else(|| wrong_err("lotloading", "a mode (front|alley)", args))?;
     Ok(Command::LotLoading { targets, mode, prev: None })
+}
+
+/// `streetset [selector] [name=<text> class=arterial|collector|local|alley width=<m>]`.
+/// A bare token after `name=` continues the name, so `name=Main Street` works.
+fn parse_streetset(args: &[&str]) -> Result<Command, ParseError> {
+    const WANT: &str = "name=/class=/width= params";
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !first.contains('=') => selector(args, "streetset")?,
+        _ => (Selector::Selected, args),
+    };
+    let (mut name, mut class, mut width) = (None::<String>, None, None);
+    let mut in_name = false;
+    for tok in rest {
+        let Some((k, v)) = tok.split_once('=') else {
+            match name.as_mut() {
+                Some(n) if in_name => {
+                    n.push(' ');
+                    n.push_str(tok);
+                    continue;
+                }
+                _ => return wrong("streetset", WANT, args),
+            }
+        };
+        in_name = false;
+        match k.to_lowercase().as_str() {
+            "name" => {
+                name = Some(v.to_string());
+                in_name = true;
+            }
+            "class" => {
+                class = Some(itsjustcad_doc::StreetClass::parse(v).ok_or_else(|| {
+                    wrong_err("streetset", "class=arterial|collector|local|alley", args)
+                })?)
+            }
+            "width" => width = Some(number(v)?),
+            _ => return wrong("streetset", WANT, args),
+        }
+    }
+    if name.is_none() && class.is_none() && width.is_none() {
+        return wrong("streetset", WANT, args);
+    }
+    Ok(Command::StreetSet {
+        targets,
+        name,
+        class,
+        width,
+        ids: None,
+    })
 }
 
 /// `lotsetbacks [selector] [front=<> side=<> rear=<> buildto=<> envelope=on|off]`.

@@ -65,6 +65,21 @@ pub struct SubdivLink {
     /// unchanged. For `Site`, `produced` is roads first then blocks.
     #[serde(default)]
     pub kind: SubdivKind,
+    /// Per-street property edits (`streetset`, #143 phase 4), keyed by street
+    /// id. Inputs to a Site/SitePlan re-derive, so they survive regeneration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub streets: BTreeMap<u32, StreetEdit>,
+}
+
+/// User edits to one generated street. `None` keeps the generator's value.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StreetEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<crate::StreetClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
 }
 
 /// Which associative subdivision generator a `SubdivLink` drives. Serialized
@@ -711,6 +726,7 @@ mod tests {
                 source_z: 3.5,
                 frozen: false,
                 kind: SubdivKind::Lots,
+                streets: Default::default(),
             },
         );
         assert_eq!(doc.subdiv_source_of(lot_b), Some(source));
@@ -746,6 +762,7 @@ mod tests {
                 source_z: 0.0,
                 frozen: false,
                 kind: SubdivKind::Site,
+                streets: Default::default(),
             },
         );
         let json = serde_json::to_string(&doc).unwrap();
@@ -771,6 +788,7 @@ mod tests {
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Mesh(mesh),
         }
     }
@@ -786,6 +804,7 @@ mod tests {
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Line { a, b }),
         }
     }
@@ -860,6 +879,7 @@ mod tests {
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Annotation(Annotation::LinearDim {
                 a: DimAnchor::Object { id: lid, which: EndpointRef::Start, last: DVec3::ZERO },
                 b: DimAnchor::Object {

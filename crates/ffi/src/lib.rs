@@ -3204,7 +3204,9 @@ fn field_json(f: &itsjustcad_doc::param_schema::ParamField) -> serde_json::Value
 /// generated objects; `selected` is true when the source or anything it
 /// produced is selected. `groups` are the kind's phase-grouped fields (same
 /// shape as `ijc_parametric_json`'s `fields`) and `params` their current
-/// values. Edit with [`ijc_subdivision_set_params`], [`ijc_subdivision_freeze`]
+/// values. `edited_roads` counts generated roads moved or reshaped by hand
+/// since the bake: when non-zero the result is stale, and a refresh replaces
+/// those edits. Edit with [`ijc_subdivision_set_params`], [`ijc_subdivision_freeze`]
 /// and [`ijc_subdivision_refresh`]. Returns `"[]"` for a null/invalid handle.
 /// Caller must [`ijc_string_free`] the result.
 ///
@@ -3246,6 +3248,7 @@ fn subdivisions_json(doc: &itsjustcad_doc::Document) -> String {
                 "kind": link.kind,
                 "frozen": link.frozen,
                 "produced": link.produced.len(),
+                "edited_roads": itsjustcad_commands::lot::edited_roads(doc, link),
                 "selected": selected,
                 "params": params,
                 "groups": groups,
@@ -3303,8 +3306,10 @@ pub unsafe extern "C" fn ijc_subdivision_yield_json(h: *mut AppHandle, source: *
 /// `[{"is_street"?,"street_id"?,"street_width"?,"is_alley"?,"role"?,"length"}, …]`,
 /// one entry per edge, edge `i` running from curve point `i` to `i + 1`.
 /// Absent keys mean false / none / 0. `role` is `front` | `street_side` |
-/// `side` | `rear` (lots only). `id` is the object's short id or full uuid.
-/// Returns `null` for an unknown id, an untagged object, tags invalidated by
+/// `side` | `rear` (lots only). A street edge also carries `street_object`
+/// (the generated road's short id), `street_class` and `street_name`? from
+/// that road (#143 phase 4) while the road exists. `id` is the object's short
+/// id or full uuid. Returns `null` for an unknown id, an untagged object, tags invalidated by
 /// a geometry edit, or a null/invalid handle. Free with [`ijc_string_free`].
 ///
 /// # Safety
@@ -3323,19 +3328,89 @@ pub unsafe extern "C" fn ijc_edge_tags_json(h: *mut AppHandle, id: *const c_char
         let Ok(id) = (unsafe { CStr::from_ptr(id) }).to_str() else {
             return null();
         };
-        let tags = app
-            .session
-            .doc
+        let doc = &app.session.doc;
+        let Some((obj, tags)) = doc
             .objects()
             .find(|o| o.id.to_string() == id || o.id.0.to_string() == id)
-            .and_then(|o| o.valid_edge_tags());
-        match tags {
-            Some(tags) => {
-                into_c_string(serde_json::to_string(tags).unwrap_or_else(|_| String::from("null")))
-            }
-            None => null(),
-        }
+            .and_then(|o| Some((o.id, o.valid_edge_tags()?)))
+        else {
+            return null();
+        };
+        let tags: Vec<serde_json::Value> = tags
+            .iter()
+            .map(|t| {
+                let mut v = serde_json::to_value(t).unwrap_or_default();
+                let road = t
+                    .street_id
+                    .and_then(|sid| itsjustcad_commands::lot::street_of(doc, obj, sid));
+                if let (Some(road), Some(map)) = (road, v.as_object_mut()) {
+                    let info = road.street.as_ref().expect("street_of returns roads");
+                    map.insert("street_object".into(), road.id.to_string().into());
+                    map.insert("street_class".into(), info.class.as_str().into());
+                    if let Some(name) = &info.name {
+                        map.insert("street_name".into(), name.clone().into());
+                    }
+                }
+                v
+            })
+            .collect();
+        into_c_string(serde_json::Value::Array(tags).to_string())
     })
+}
+
+/// Every generated street (#143 phase 4), from `siteplan` / `lotgeneratesite`
+/// links: `[{"source","id","name"?,"class","width","objects":[…],"edited"}]`.
+/// `source` is the short id of the site boundary; `id` the street id that lot
+/// and block edge tags carry (unique within one source); `class` is
+/// `arterial` | `collector` | `local` | `alley`; `width` the right-of-way in
+/// metres; `objects` the short ids of its road curves; `edited` is true when a
+/// road was moved or reshaped by hand since the bake (the plan is stale).
+/// Sorted by source, then id. Edit with the `streetset` command. Returns `"[]"`
+/// for a null/invalid handle. Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_streets_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::from("[]"));
+        };
+        into_c_string(streets_json(&app.session.doc))
+    })
+}
+
+fn streets_json(doc: &itsjustcad_doc::Document) -> String {
+    // (source, street id) → (info, edited, road ids)
+    let mut streets = std::collections::BTreeMap::new();
+    for (source, link) in &doc.subdivision_links {
+        for road in link.produced.iter().filter_map(|id| doc.get(*id)) {
+            let Some(info) = &road.street else { continue };
+            let entry = streets
+                .entry((source.to_string(), info.id))
+                .or_insert_with(|| (info, false, Vec::new()));
+            entry.1 |= road.street_edited();
+            entry.2.push(road.id.to_string());
+        }
+    }
+    let items: Vec<serde_json::Value> = streets
+        .into_iter()
+        .map(|((source, id), (info, edited, objects))| {
+            let mut v = serde_json::json!({
+                "source": source,
+                "id": id,
+                "class": info.class.as_str(),
+                "width": info.width,
+                "objects": objects,
+                "edited": edited,
+            });
+            if let Some(name) = &info.name {
+                v["name"] = name.clone().into();
+            }
+            v
+        })
+        .collect();
+    serde_json::Value::Array(items).to_string()
 }
 
 /// The subdivision source with short id `source`, if it has a link.
@@ -6044,7 +6119,15 @@ mod headless_tests {
             let (id, want) = (lot.id, serde_json::to_value(lot.valid_edge_tags()).unwrap());
             drop(guard);
             for key in [id.to_string(), id.0.to_string()] {
-                let tags = r(ijc_edge_tags_json(h, c(&key).as_ptr()));
+                let mut tags = r(ijc_edge_tags_json(h, c(&key).as_ptr()));
+                for t in tags.as_array_mut().unwrap() {
+                    let t = t.as_object_mut().unwrap();
+                    assert_eq!(t.contains_key("street_object"), t.contains_key("street_id"));
+                    if t.contains_key("street_id") {
+                        assert!(t.remove("street_class").unwrap().is_string());
+                        t.remove("street_object");
+                    }
+                }
                 assert_eq!(tags, want);
                 assert!(
                     tags.as_array()
@@ -6059,6 +6142,47 @@ mod headless_tests {
             assert_eq!(
                 r(ijc_edge_tags_json(std::ptr::null_mut(), c("x").as_ptr())),
                 null
+            );
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn streets_json_lists_and_follows_streetset() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            assert_eq!(r(ijc_streets_json(h)), serde_json::json!([]));
+            for line in ["rect 0,0,0 600 450", "siteplan last"] {
+                assert_eq!(r(ijc_run_command_result(h, c(line).as_ptr()))["ok"], true);
+            }
+            let streets = r(ijc_streets_json(h));
+            let first = &streets[0];
+            assert!(streets.as_array().unwrap().len() > 1);
+            assert_eq!(first["edited"], false);
+            assert!(first.get("name").is_none());
+            let road = first["objects"][0].as_str().unwrap();
+            let mut guard = handle_mut(h).unwrap();
+            let doc = &mut guard.session.doc;
+            let id = doc.objects().find(|o| o.id.to_string() == road).unwrap().id;
+            doc.selection = [id].into();
+            drop(guard);
+            let line = "streetset name=Main Street class=arterial width=20";
+            let out = r(ijc_run_command_result(h, c(line).as_ptr()));
+            assert_eq!(out["ok"], true, "{out}");
+            let streets = r(ijc_streets_json(h));
+            let s0 = streets
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == first["id"])
+                .unwrap();
+            assert_eq!(s0["name"], "Main Street");
+            assert_eq!(s0["class"], "arterial");
+            assert_eq!(s0["width"], 20.0);
+            assert_eq!(
+                r(ijc_streets_json(std::ptr::null_mut())),
+                serde_json::json!([])
             );
             ijc_free(h);
         }

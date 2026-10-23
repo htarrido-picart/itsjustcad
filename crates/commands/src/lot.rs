@@ -19,7 +19,12 @@
 //! byte-identical lots (the subdivider is deterministic for a fixed seed).
 
 use glam::{DVec2, DVec3};
-use itsjustcad_doc::{Document, EdgeTag, Geometry, LayerStyle, ObjectId, SceneObject};
+use std::collections::BTreeMap;
+
+use itsjustcad_doc::{
+    Document, EdgeTag, Geometry, LayerStyle, ObjectId, SceneObject, StreetClass, StreetEdit,
+    StreetInfo,
+};
 use kernel_curve::Curve;
 use subdivision::{
     Block, BlockEdge, Polygon2d, StreetPattern, SubdivisionMethod, SubdivisionSettings,
@@ -115,6 +120,25 @@ pub fn doc_block(obj: &SceneObject, poly: Polygon2d) -> Block {
         polygon: poly,
         edges,
     }
+}
+
+/// The generated road that edge tag `street_id` of object `obj` refers to: the
+/// road with that street id among the outputs of the link that produced `obj`.
+pub fn street_of(doc: &Document, obj: ObjectId, street_id: u32) -> Option<&SceneObject> {
+    let link = doc.subdiv_link(doc.subdiv_source_of(obj)?)?;
+    link.produced
+        .iter()
+        .filter_map(|id| doc.get(*id))
+        .find(|o| o.street.as_ref().is_some_and(|s| s.id == street_id))
+}
+
+/// How many of a link's generated roads were edited by hand since the bake.
+/// A re-derive regenerates them, so these edits are what it would discard.
+pub fn edited_roads(doc: &Document, link: &itsjustcad_doc::SubdivLink) -> usize {
+    link.produced
+        .iter()
+        .filter(|id| doc.get(**id).is_some_and(SceneObject::street_edited))
+        .count()
 }
 
 /// A subdivision method string (`grid`/`perimeter`/`streetfollowing`) → enum.
@@ -331,6 +355,7 @@ pub fn insert_lots(doc: &mut Document, bake: &LotBake, ids: &[ObjectId]) {
             material: None,
             lineweight_mm: None,
             edge_tags: bake.lots.get(k).and_then(|l| edge_tags_of(l, true)),
+            street: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -359,6 +384,8 @@ pub struct SiteBake {
     pub roads: Vec<Vec<DVec2>>,
     /// Whether each road centerline is a closed loop (cul-de-sac bulb).
     pub road_closed: Vec<bool>,
+    /// Street identity of each road (fingerprint filled in by [`insert_site`]).
+    pub streets: Vec<StreetInfo>,
     /// Blocks with their per-edge street tags.
     pub blocks: Vec<Block>,
     /// How many block edges are street-tagged (frontage) / alley-tagged.
@@ -370,9 +397,21 @@ pub struct SiteBake {
 /// Core site-generation bridge: generate roads + blocks for `site` with
 /// `settings`. Deterministic — output depends only on the site + settings (seed).
 /// Handles all seven patterns: the four rectilinear plus the three
-/// non-rectilinear radial/hexagonal/Voronoi generators.
-pub fn generate_site(site: &Polygon2d, z: f64, settings: &SubdivisionSettings) -> Result<SiteBake, String> {
-    let graph = subdivision::generate_streets(site, settings);
+/// non-rectilinear radial/hexagonal/Voronoi generators. `edits` (a link's
+/// `streetset` overrides, keyed by street id) set widths before the blocks are
+/// cut, and names/classes on the baked roads.
+pub fn generate_site(
+    site: &Polygon2d,
+    z: f64,
+    settings: &SubdivisionSettings,
+    edits: &BTreeMap<u32, StreetEdit>,
+) -> Result<SiteBake, String> {
+    let mut graph = subdivision::generate_streets(site, settings);
+    for s in &mut graph.streets {
+        if let Some(w) = edits.get(&s.id).and_then(|e| e.width) {
+            s.width = w;
+        }
+    }
     if graph.is_empty() {
         return Err(
             "lotgeneratesite produced no roads (site too small for the given blockdepth?)".into(),
@@ -385,7 +424,16 @@ pub fn generate_site(site: &Polygon2d, z: f64, settings: &SubdivisionSettings) -
 
     let mut roads = Vec::new();
     let mut road_closed = Vec::new();
+    let mut streets = Vec::new();
     for s in &graph.streets {
+        let edit = edits.get(&s.id);
+        streets.push(StreetInfo {
+            id: s.id,
+            name: edit.and_then(|e| e.name.clone()),
+            class: edit.and_then(|e| e.class).unwrap_or(default_class(s.tier)),
+            width: s.width,
+            fingerprint: 0,
+        });
         let closed = s.centerline.len() >= 3
             && s.centerline.first().unwrap().distance(*s.centerline.last().unwrap()) < 1e-6;
         roads.push(s.centerline.clone());
@@ -397,11 +445,22 @@ pub fn generate_site(site: &Polygon2d, z: f64, settings: &SubdivisionSettings) -
     Ok(SiteBake {
         roads,
         road_closed,
+        streets,
         blocks,
         street_edges,
         alley_edges,
         z,
     })
+}
+
+/// The class a generated street starts with: the spine is a collector, the rear
+/// lane an alley, every other tier local.
+fn default_class(tier: subdivision::StreetTier) -> StreetClass {
+    match tier {
+        subdivision::StreetTier::Spine => StreetClass::Collector,
+        subdivision::StreetTier::Alley => StreetClass::Alley,
+        _ => StreetClass::Local,
+    }
 }
 
 /// Ensure a layer exists; returns `Some(name)` if newly created.
@@ -432,20 +491,27 @@ pub fn ensure_blocks_layer(doc: &mut Document) -> Option<String> {
 /// Insert baked roads onto the `roads` layer and blocks onto the `blocks` layer
 /// with the given ids (roads first, then blocks — the id order the exec records).
 pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], block_ids: &[ObjectId]) {
-    for ((pts, closed), id) in bake.roads.iter().zip(&bake.road_closed).zip(road_ids) {
+    for (((pts, closed), info), id) in
+        bake.roads.iter().zip(&bake.road_closed).zip(&bake.streets).zip(road_ids)
+    {
+        let geometry = Geometry::Curve(Curve::Polyline {
+            points: pts.iter().map(|v| DVec3::new(v.x, v.y, bake.z)).collect(),
+            closed: *closed,
+        });
         doc.insert(SceneObject {
             visible: true,
             id: *id,
-            name: Some("road".to_string()),
+            name: Some(info.name.clone().unwrap_or_else(|| "road".to_string())),
             layer: ROADS_LAYER.to_string(),
             color: None,
             material: None,
             lineweight_mm: None,
             edge_tags: None,
-            geometry: Geometry::Curve(Curve::Polyline {
-                points: pts.iter().map(|v| DVec3::new(v.x, v.y, bake.z)).collect(),
-                closed: *closed,
+            street: Some(StreetInfo {
+                fingerprint: itsjustcad_doc::geometry_fingerprint(&geometry),
+                ..info.clone()
             }),
+            geometry,
         });
     }
     // Blocks carry a stable spatial index too: row-major order over
@@ -463,6 +529,7 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
             material: None,
             lineweight_mm: None,
             edge_tags: edge_tags_of(block, false),
+            street: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -554,6 +621,7 @@ pub fn insert_setbacks(doc: &mut Document, bake: &SetbackBake, ids: &[ObjectId])
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -910,6 +978,7 @@ pub fn insert_open_space(doc: &mut Document, bake: &OpenSpaceBake, ids: &[Object
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -1075,6 +1144,7 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(polygon_to_curve(&b.footprint, b.z)),
         });
         // Mass (3D mesh). The name carries the GFA + footprint area so a later
@@ -1093,6 +1163,7 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Mesh(b.mass.clone()),
         });
         // Roof (3D mesh).
@@ -1105,6 +1176,7 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Mesh(b.roof.clone()),
         });
     }
@@ -1254,7 +1326,7 @@ mod tests {
             seed: 7,
             ..SubdivisionSettings::default()
         };
-        let bake = generate_site(&poly, 0.0, &s).unwrap();
+        let bake = generate_site(&poly, 0.0, &s, &BTreeMap::new()).unwrap();
         assert!(!bake.roads.is_empty(), "expected roads");
         assert!(!bake.blocks.is_empty(), "expected blocks");
         // Blocks stay inside the site.
@@ -1281,7 +1353,7 @@ mod tests {
                 seed: 7,
                 ..SubdivisionSettings::default()
             };
-            let bake = generate_site(&poly, 0.0, &s)
+            let bake = generate_site(&poly, 0.0, &s, &BTreeMap::new())
                 .unwrap_or_else(|e| panic!("{p:?} errored: {e}"));
             assert!(!bake.roads.is_empty(), "{p:?}: expected roads");
             assert!(!bake.blocks.is_empty(), "{p:?}: expected blocks");
@@ -1413,7 +1485,7 @@ mod tests {
             seed: 7,
             ..SubdivisionSettings::default()
         };
-        let bake = generate_site(&poly, 0.0, &gs).unwrap();
+        let bake = generate_site(&poly, 0.0, &gs, &BTreeMap::new()).unwrap();
         // Take the largest generated block and subdivide it.
         let block = bake
             .blocks
@@ -1452,7 +1524,7 @@ mod tests {
             region: RegionProfile::UsSuburban,
             ..SubdivisionSettings::default()
         };
-        let site = generate_site(&poly, 0.0, &s).unwrap();
+        let site = generate_site(&poly, 0.0, &s, &BTreeMap::new()).unwrap();
         let near_road = |p: DVec2| {
             site.roads.iter().any(|road| {
                 road.windows(2).any(|w| {

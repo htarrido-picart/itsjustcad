@@ -22,7 +22,7 @@ mod view;
 
 pub use constraint::{PointRef, SketchConstraint};
 pub use cplane::CPlane;
-pub use document::{Document, SubdivKind, SubdivLink};
+pub use document::{Document, StreetEdit, SubdivKind, SubdivLink};
 // Re-export the settings type carried by `SubdivLink` so consumers can build /
 // inspect links without a direct `subdivision` dependency.
 pub use subdivision::SubdivisionSettings;
@@ -33,7 +33,8 @@ pub use object::{
     default_layer_color,
     EdgeTag, EndpointRef, FieldExpr, FrameKind, Geometry,
     HatchPattern, HatchPatternDef, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial,
-    ParamBlockDef, ParamBlockParam, PatLine, SceneObject, DEFAULT_LAYER,
+    ParamBlockDef, ParamBlockParam, PatLine, SceneObject, StreetClass, StreetInfo, DEFAULT_LAYER,
+    geometry_fingerprint,
 };
 pub use param_schema::{
     clamp_field, derive_mesh, derive_segments, param_summary, sanitize_fields, DeriveError,

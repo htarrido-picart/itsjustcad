@@ -880,6 +880,9 @@ pub struct App {
     /// geometry. A change (after the first observation) fires a `lotrefresh` so
     /// non-frozen subdivisions track edits to their boundary block.
     subdiv_sig_cache: std::collections::HashMap<itsjustcad_doc::ObjectId, u64>,
+    /// Site links already reported stale because a generated road was edited
+    /// by hand (#143), so the notice prints once per episode.
+    subdiv_stale_roads: std::collections::HashSet<itsjustcad_doc::ObjectId>,
     /// Auto-recompute: the `doc.generation` at the last signature scan. Lets the
     /// per-frame check early-out on idle frames (no mutation since last scan).
     subdiv_last_generation: u64,
@@ -1291,6 +1294,28 @@ fn subdivisions_to_refresh(
     to_refresh
 }
 
+/// Non-frozen links that just became stale because a generated road was moved
+/// or reshaped by hand (#143 phase 4), with the edited-road count. Hand road
+/// edits never auto-regenerate: a re-derive would replace them. `seen` holds
+/// the links already reported; a link leaves it once no road is edited.
+fn newly_stale_road_links(
+    doc: &itsjustcad_doc::Document,
+    seen: &mut std::collections::HashSet<itsjustcad_doc::ObjectId>,
+) -> Vec<(itsjustcad_doc::ObjectId, usize)> {
+    let stale: Vec<_> = doc
+        .subdivision_links
+        .iter()
+        .filter(|(_, link)| !link.frozen)
+        .map(|(src, link)| (*src, itsjustcad_commands::lot::edited_roads(doc, link)))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    seen.retain(|src| stale.iter().any(|(s, _)| s == src));
+    stale
+        .into_iter()
+        .filter(|(src, _)| seen.insert(*src))
+        .collect()
+}
+
 /// Per-platform symbol-font candidates, lightest-with-arrow-coverage first.
 /// Each entry MUST cover the arrows `←` `→` (U+2190/U+2192) — the glyphs that
 /// otherwise tofu-box in menus and guided-command prompts. Keep at least one
@@ -1536,6 +1561,7 @@ impl App {
             param_pending: None,
             subdiv_pending: None,
             subdiv_sig_cache: std::collections::HashMap::new(),
+            subdiv_stale_roads: std::collections::HashSet::new(),
             subdiv_last_generation: 0,
             blocklib_cache: None,
             show_plugins: std::env::var("ITSJUSTCAD_PLUGINS_POPUP").is_ok(),
@@ -8534,6 +8560,13 @@ impl App {
                 .session
                 .run(itsjustcad_commands::Command::LotRefresh { source, ids: None });
         }
+        for (source, n) in newly_stale_road_links(&self.session.doc, &mut self.subdiv_stale_roads) {
+            self.command_line.push_line(format!(
+                "site plan {source} is stale: {n} generated road(s) edited by hand. Use \
+                 streetset to change a road's width/class/name, lotrefresh to regenerate \
+                 (replaces the hand edit), or lotfreeze to keep it."
+            ));
+        }
         // Refresh bumps generation but does NOT change the source geometry, so
         // its signature is unchanged; re-latch the generation to avoid a churn
         // of re-scans triggered by our own refresh ops.
@@ -12677,6 +12710,7 @@ mod tests {
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(square(40.0)),
         });
         doc.subdivision_links.insert(
@@ -12687,6 +12721,7 @@ mod tests {
                 source_z: 0.0,
                 frozen: false,
                 kind: itsjustcad_doc::SubdivKind::Lots,
+                streets: Default::default(),
             },
         );
 
@@ -12706,6 +12741,36 @@ mod tests {
         doc.subdivision_links.get_mut(&block).unwrap().frozen = true;
         doc.get_mut(block).unwrap().geometry = Geometry::Curve(square(80.0));
         assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
+    }
+
+    /// A hand-moved generated road never triggers a refresh; it reports the
+    /// plan stale once, until the edit is gone.
+    #[test]
+    fn edited_road_reports_stale_once_and_never_refreshes() {
+        use itsjustcad_commands::{Command, Selector, Session};
+        let mut s = Session::default();
+        for line in ["rect 0,0,0 600 450", "siteplan last"] {
+            s.run(itsjustcad_commands::parse(line).unwrap()).unwrap();
+        }
+        let source = *s.doc.subdivision_links.keys().next().unwrap();
+        let road = s.doc.objects().find(|o| o.street.is_some()).unwrap().id;
+        let (mut cache, mut seen) = (Default::default(), Default::default());
+        assert!(subdivisions_to_refresh(&s.doc, &mut cache).is_empty());
+        assert!(newly_stale_road_links(&s.doc, &mut seen).is_empty());
+        let mv = Command::Move {
+            targets: Selector::Ids { ids: vec![road] },
+            delta: glam::DVec3::X,
+        };
+        s.run(mv).unwrap();
+        assert!(subdivisions_to_refresh(&s.doc, &mut cache).is_empty());
+        assert_eq!(newly_stale_road_links(&s.doc, &mut seen), vec![(source, 1)]);
+        assert!(
+            newly_stale_road_links(&s.doc, &mut seen).is_empty(),
+            "reported once"
+        );
+        s.run(itsjustcad_commands::parse("undo").unwrap()).unwrap();
+        assert!(newly_stale_road_links(&s.doc, &mut seen).is_empty());
+        assert!(seen.is_empty());
     }
 
     #[test]

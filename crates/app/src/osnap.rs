@@ -662,6 +662,7 @@ mod tests {
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry,
         });
         doc
@@ -679,6 +680,7 @@ mod tests {
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: g,
             });
         }
@@ -1104,6 +1106,7 @@ mod tests {
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, corner + DVec3::ONE)),
             });
         }

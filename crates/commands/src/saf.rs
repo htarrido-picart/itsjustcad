@@ -969,6 +969,7 @@ mod tests {
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Frame {
                 kind: FrameKind::Column,
                 a: DVec3::new(0.0, 0.0, 0.0),
@@ -993,6 +994,7 @@ mod tests {
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Frame {
                 kind: FrameKind::Beam,
                 a: DVec3::new(0.0, 0.0, 3.0),
