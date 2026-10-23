@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
+mod focus_inspector;
+
 use itsjustcad_commands::Session;
 use itsjustcad_render::{
     ColorMode, DisplayMode, OrbitCamera, SceneRenderer, StandardView, UnderlayData,
@@ -880,6 +882,9 @@ pub struct App {
     subdiv_segment: usize,
     /// Yield of the inspected subdivision, cached by (source, doc generation).
     subdiv_yield: Option<(itsjustcad_doc::ObjectId, u64, subdivision::YieldReport)>,
+    /// The lot/street focus whose "Site plan ›" breadcrumb was clicked: while
+    /// the focus is unchanged the subdivision inspector shows instead (#159).
+    focus_site_override: Option<itsjustcad_commands::lot::Focus>,
     /// Auto-recompute: per-source signature of the last-observed source block
     /// geometry. A change (after the first observation) fires a `lotrefresh` so
     /// non-frozen subdivisions track edits to their boundary block.
@@ -1566,6 +1571,7 @@ impl App {
             subdiv_pending: None,
             subdiv_segment: 0,
             subdiv_yield: None,
+            focus_site_override: None,
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
             subdiv_last_generation: 0,
@@ -4862,6 +4868,8 @@ impl App {
             self.draw_annotations(ui, rect, view_proj, theme);
             // Structural loads (arrows) and supports (symbols) overlay.
             self.draw_struct_overlays(ui, rect, view_proj);
+            // Focused lot / street outline and pinned-lot badges (#159).
+            self.draw_focus_overlay(ui, rect, view_proj);
             // Lineweight overlay: when showweights is on, re-draw curves with
             // physical stroke widths via the egui painter (wgpu cannot vary
             // line width per-draw-call on WebGPU/Metal/Vulkan).
@@ -8341,17 +8349,9 @@ impl App {
             // front so the tab still renders its inspector when there are no
             // parametric (expressive-structure) objects but there IS a
             // subdivision to edit (the common case).
-            let subdiv_source = if self.session.doc.selection.len() == 1 {
-                let sel = *self.session.doc.selection.iter().next().unwrap();
-                if self.session.doc.subdivision_links.contains_key(&sel) {
-                    Some(sel)
-                } else {
-                    self.session.doc.subdiv_source_of(sel)
-                }
-            } else {
-                None
-            };
-            if rows.is_empty() && subdiv_source.is_none() {
+            let doc = &self.session.doc;
+            let focus = itsjustcad_commands::lot::focus_target(doc, &doc.selection);
+            if rows.is_empty() && focus.source().is_none() {
                 ui.weak(t("parameters.empty"));
                 ui.weak(t("parameters.empty.hint"));
                 return;
@@ -8414,11 +8414,11 @@ impl App {
                 self.parametric_editor(ui, row);
             }
 
-            // Subdivision inspector (source resolved up front, so it renders even
-            // with no parametric objects present — source block OR a lot child).
-            if let Some(source) = subdiv_source {
+            // Lot / Street / subdivision inspector (focus resolved up front, so
+            // it renders even with no parametric objects present).
+            if focus.source().is_some() {
                 ui.separator();
-                self.subdivision_inspector(ui, source);
+                self.focused_inspector(ui, &focus);
             }
         });
     }

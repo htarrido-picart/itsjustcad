@@ -1698,6 +1698,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "edgerole" => parse_edgerole(&args),
         "lotheight" => parse_lotheight(&args),
         "lotset" => parse_lotset(&args),
+        "lotreset" => parse_lotreset(&args),
         "lotfrontage" => parse_lotfrontage(&args),
         "lotreport" => parse_lotreport(&args),
         "siteoptimize" => parse_siteoptimize(&args),
@@ -3045,6 +3046,18 @@ fn parse_lotset(args: &[&str]) -> Result<Command, ParseError> {
         edit,
         ids: None,
     })
+}
+
+/// `lotreset [selector]`.
+fn parse_lotreset(args: &[&str]) -> Result<Command, ParseError> {
+    let targets = match args {
+        [] => Selector::Selected,
+        _ => match selector(args, "lotreset")? {
+            (t, []) => t,
+            _ => return wrong("lotreset", "[selector]", args),
+        },
+    };
+    Ok(Command::LotReset { targets, ids: None })
 }
 
 /// `lotsetbacks [selector] [front=<> side=<> rear=<> buildto=<> envelope=on|off]`.

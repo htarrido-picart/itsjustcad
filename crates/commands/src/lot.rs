@@ -18,6 +18,12 @@
 //! precedent) so undo is one `CreatedOnLayer` inverse and op-log replay recreates
 //! byte-identical lots (the subdivider is deterministic for a fixed seed).
 
+pub mod focus;
+pub use focus::{
+    Focus, FocusAnchor, LotView, StreetView, focus_anchor, focus_target, link_lots, lot_under,
+    lot_view, plan_probe, refocus, street_view,
+};
+
 use glam::{DVec2, DVec3};
 use std::collections::BTreeMap;
 
@@ -270,9 +276,67 @@ pub fn lot_settings(settings: &SubdivisionSettings, o: Option<&LotOverride>) -> 
     s
 }
 
+/// One lot's per-lot rules: what the plan gives it, what it is built with,
+/// and which `lotset` fields are pinned on it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LotRules {
+    /// The plan's settings (`floor_count` is the plan-wide value).
+    pub rule: SubdivisionSettings,
+    /// The plan's floor count for this lot (height variation included).
+    pub rule_floors: usize,
+    /// The settings the lot is built with (its override applied).
+    pub effective: SubdivisionSettings,
+    /// The floor count the lot is built with.
+    pub floors: usize,
+    /// The `lotset` fields pinned on the lot, in [`crate::LotField::ALL`] order.
+    pub overridden: Vec<crate::LotField>,
+}
+
+impl LotRules {
+    /// `field` is pinned on the lot.
+    pub fn is_overridden(&self, field: crate::LotField) -> bool {
+        self.overridden.contains(&field)
+    }
+}
+
+/// The per-lot rules of lot `k` of `link`, whose lots are `blocks` (bake
+/// order, as [`subdivision::lot_floor_counts`] takes them).
+pub fn lot_rules(link: &itsjustcad_doc::SubdivLink, blocks: &[&Block], k: usize) -> LotRules {
+    use crate::LotField as F;
+    let rule_floors = subdivision::lot_floor_counts(blocks, &link.settings)[k];
+    let poly = &blocks[k].polygon;
+    let o = link
+        .lot_overrides
+        .iter()
+        .filter(|o| lot_override_matches(poly, o))
+        .fold(None, |acc: Option<LotOverride>, o| {
+            Some(acc.map_or_else(|| o.clone(), |a| merge_lot_override(&a, o)))
+        });
+    let overridden = o.as_ref().map_or(Vec::new(), |o| {
+        F::ALL
+            .into_iter()
+            .filter(|f| match f {
+                F::Floors => o.floors.is_some(),
+                F::Typology => o.typology.is_some(),
+                F::SetbackFront => o.setback_front.is_some(),
+                F::SetbackSide => o.setback_side.is_some(),
+                F::SetbackStreetSide => o.setback_street_side.is_some(),
+                F::SetbackRear => o.setback_rear.is_some(),
+            })
+            .collect()
+    });
+    LotRules {
+        rule: link.settings.clone(),
+        rule_floors,
+        effective: lot_settings(&link.settings, o.as_ref()),
+        floors: o.as_ref().and_then(|o| o.floors).map_or(rule_floors, |f| f.max(1) as usize),
+        overridden,
+    }
+}
+
 /// The per-lot rule fields of `s` for a lot drawing `floors` storeys, as JSON
 /// keyed like `lotset`.
-fn lot_values_json(s: &SubdivisionSettings, floors: usize) -> serde_json::Value {
+pub fn lot_values_json(s: &SubdivisionSettings, floors: usize) -> serde_json::Value {
     serde_json::json!({
         "floors": floors,
         "typology": typology_name(s.typology),
@@ -292,7 +356,7 @@ fn lot_values_json(s: &SubdivisionSettings, floors: usize) -> serde_json::Value 
 pub fn lot_overrides_json(doc: &Document, id: ObjectId) -> Result<serde_json::Value, String> {
     let (source, picked) =
         crate::exec::picked_lots(doc, &[id], "lot").map_err(|e| e.to_string())?;
-    let (lot_id, poly) = picked.into_iter().next().ok_or("lot: not on a lot")?;
+    let (lot_id, _) = picked.into_iter().next().ok_or("lot: not on a lot")?;
     let link = &doc.subdivision_links[&source];
     let lots: Vec<(ObjectId, Block)> = link
         .produced
@@ -306,35 +370,14 @@ pub fn lot_overrides_json(doc: &Document, id: ObjectId) -> Result<serde_json::Va
         })
         .collect();
     let blocks: Vec<&Block> = lots.iter().map(|(_, b)| b).collect();
-    let floors = subdivision::lot_floor_counts(&blocks, &link.settings);
     let k = lots.iter().position(|(l, _)| *l == lot_id).ok_or("lot: not on a lot")?;
-    let o = link
-        .lot_overrides
-        .iter()
-        .filter(|o| lot_override_matches(&poly, o))
-        .fold(None, |acc: Option<LotOverride>, o| {
-            Some(acc.map_or_else(|| o.clone(), |a| merge_lot_override(&a, o)))
-        });
-    let effective = lot_settings(&link.settings, o.as_ref());
-    let eff_floors = o.as_ref().and_then(|o| o.floors).map_or(floors[k], |f| f.max(1) as usize);
-    let overridden: Vec<&str> = o.as_ref().map_or(Vec::new(), |o| {
-        [
-            ("floors", o.floors.is_some()),
-            ("typology", o.typology.is_some()),
-            ("setback_front", o.setback_front.is_some()),
-            ("setback_side", o.setback_side.is_some()),
-            ("setback_street_side", o.setback_street_side.is_some()),
-            ("setback_rear", o.setback_rear.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(k, on)| on.then_some(k))
-        .collect()
-    });
+    let r = lot_rules(link, &blocks, k);
+    let overridden: Vec<&str> = r.overridden.iter().map(|f| f.name()).collect();
     Ok(serde_json::json!({
         "lot": lot_id.to_string(),
         "source": source.to_string(),
-        "effective": lot_values_json(&effective, eff_floors),
-        "rule": lot_values_json(&link.settings, floors[k]),
+        "effective": lot_values_json(&r.effective, r.floors),
+        "rule": lot_values_json(&r.rule, r.rule_floors),
         "overridden": overridden,
     }))
 }
@@ -1318,6 +1361,10 @@ pub struct BuildingBake {
 pub fn parse_typology(s: &str) -> Option<Typology> {
     Typology::parse(s)
 }
+
+/// Every typology `lotset typology=` accepts, in menu order.
+pub const TYPOLOGIES: [Typology; 4] =
+    [Typology::Detached, Typology::Row, Typology::Courtyard, Typology::Slab];
 
 /// The canonical keyword for `t` (its serde name).
 pub fn typology_name(t: Typology) -> &'static str {
