@@ -73,11 +73,7 @@ impl Gumball {
     ) -> GumballOutput {
         let mut out = GumballOutput { command: None, consumed: false };
 
-        let ids: Vec<ObjectId> = doc
-            .objects()
-            .filter(|o| doc.selection.contains(&o.id))
-            .map(|o| o.id)
-            .collect();
+        let ids = gumball_targets(doc);
         if ids.is_empty() {
             self.drag = None;
             return out;
@@ -247,6 +243,17 @@ impl Gumball {
         }
         out
     }
+}
+
+/// The selected objects the gumball manipulates — none (gumball hidden) when
+/// the selection holds a generated building: it is a parametric output of its
+/// subdivision link, driven by the building parameters. Roads stay movable.
+fn gumball_targets(doc: &Document) -> Vec<ObjectId> {
+    let ids: Vec<ObjectId> = doc.objects().filter(|o| doc.selection.contains(&o.id)).map(|o| o.id).collect();
+    if ids.iter().any(|id| itsjustcad_commands::lot::is_locked_generated(doc, *id)) {
+        return Vec::new();
+    }
+    ids
 }
 
 /// Combined AABB center of the given (resolved) selection.
@@ -570,6 +577,24 @@ mod tests {
             }
             other => panic!("expected scale, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn no_gumball_on_generated_buildings_roads_still_move() {
+        let mut s = itsjustcad_commands::Session::default();
+        for line in ["rect 0,0,0 200 150", "siteplan last"] {
+            s.run(itsjustcad_commands::parse(line).unwrap()).unwrap();
+        }
+        let on = |layer: &str| s.doc.objects().find(|o| o.layer == layer).unwrap().id;
+        let (building, road) =
+            (on(itsjustcad_commands::lot::BUILDINGS_LAYER), on(itsjustcad_commands::lot::ROADS_LAYER));
+        let mut doc = s.doc.clone();
+        doc.selection = [building].into();
+        assert!(gumball_targets(&doc).is_empty(), "no gumball on a generated building");
+        doc.selection = [building, road].into();
+        assert!(gumball_targets(&doc).is_empty(), "nor on a mixed selection holding one");
+        doc.selection = [road].into();
+        assert_eq!(gumball_targets(&doc), vec![road], "roads keep the gumball");
     }
 
     #[test]
