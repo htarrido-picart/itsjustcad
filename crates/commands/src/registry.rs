@@ -960,6 +960,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "streetset",
+            usage: "streetset [selector] [name=<text> class=arterial|collector|local|alley width=<m>]",
+            summary: "Name, classify or widen generated road(s) from a siteplan / lotgeneratesite (#143). The selected roads must come from one site plan. The values are stored on the plan as inputs, then the plan is re-derived: a new width re-cuts the blocks, so lots, setbacks and buildings follow, and a later lotrefresh keeps the edits. Lot and block edge tags reference the street by id. An empty name= clears it. Moving or reshaping a generated road by hand does not regenerate the plan: the plan is reported stale, and lotrefresh replaces the hand edit. One undo step. Example: streetset selected name=Main Street class=collector width=16",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "lotfrontage",
             usage: "lotfrontage [selector] [at=setback|curb]",
             summary: "Report the street frontage length of the selected lot(s), measured along the front SETBACK line by default (at=setback) or along the curb (at=curb, the street edge as drawn). The two differ on cul-de-sac bulbs and curved streets, where the outer curb arc is longer than the inset setback line — the most common reason automated layouts get rejected by reviewers, hence setback is the default. A read-only query (never logged): results go to the report plane as an AnalysisReport keyed 'lotfrontage' (count, min/avg/max, distribution, extreme lots) so `report` can re-show it and the deck can critique. Example: lotfrontage last · lotfrontage at=curb",

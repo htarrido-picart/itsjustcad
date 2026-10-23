@@ -3033,6 +3033,7 @@ fn insert_curve(
         material: None,
         lineweight_mm: None,
         edge_tags: None,
+        street: None,
         geometry: Geometry::Curve(curve),
     });
     let outcome = ApplyOutcome {
@@ -3602,6 +3603,7 @@ fn mesh_object(doc: &mut Document, id: Option<ObjectId>, mesh: kernel_mesh::Mesh
         material: None,
         lineweight_mm: None,
         edge_tags: None,
+        street: None,
         geometry: Geometry::Mesh(mesh),
     });
     id
@@ -3642,6 +3644,7 @@ fn parametric_object(
         material: None,
         lineweight_mm: None,
         edge_tags: None,
+        street: None,
         geometry: Geometry::Parametric {
             generator,
             params,
@@ -3945,6 +3948,7 @@ fn replace_with_result(
         material: None,
         lineweight_mm: None,
         edge_tags: None,
+        street: None,
         geometry: Geometry::Mesh(result),
     });
     Ok((
@@ -4620,6 +4624,7 @@ fn section_meshes(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Polyline { points, closed }),
         });
     }
@@ -4633,6 +4638,7 @@ fn section_meshes(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -4710,6 +4716,7 @@ fn exec_curvature_graph(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(c),
         });
     };
@@ -5194,6 +5201,7 @@ fn exec_codecheck(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
         });
     }
@@ -5327,6 +5335,7 @@ fn exec_shadow_study(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Polyline { points: poly.pts.clone(), closed: true }),
         });
     }
@@ -5492,6 +5501,7 @@ fn exec_radiation(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -5656,6 +5666,7 @@ fn exec_lot_subdivide(
                 source_z: *z,
                 frozen: false,
                 kind: itsjustcad_doc::SubdivKind::Lots,
+                streets: Default::default(),
             },
         );
         link_sources.push(*src);
@@ -5728,17 +5739,62 @@ fn exec_lot_refresh(
             "lotrefresh: this result is frozen — unfreeze to recompute".into(),
         ));
     }
+    let edited = crate::lot::edited_roads(doc, &link);
+    let prev_link = link.clone();
+    let (new_ids, restored) = rederive_link(doc, source, link, ids, "lotrefresh")?;
+
+    let n = new_ids.len();
+    let mut message = format!("lotrefresh: {n} object(s) recomputed");
+    if edited > 0 {
+        message.push_str(&format!(
+            " (hand edits to {edited} generated road(s) replaced)"
+        ));
+    }
+    Ok((
+        Command::LotRefresh {
+            source,
+            ids: Some(new_ids.clone()),
+        },
+        Inverse::LotRefreshed {
+            source,
+            created: new_ids.clone(),
+            restored,
+            prev_link,
+        },
+        ApplyOutcome {
+            created: new_ids,
+            message,
+        },
+    ))
+}
+
+/// New child ids, and the removed old children with their order index.
+type Rederived = (Vec<ObjectId>, Vec<(SceneObject, usize)>);
+
+/// Re-derive the link at `source` as `link` (its settings and street edits)
+/// from the source boundary's CURRENT geometry, replacing `link.produced`.
+/// Stores the link with the new children and returns their ids plus the
+/// removed old children (for the `LotRefreshed` inverse). `verb` prefixes
+/// errors.
+fn rederive_link(
+    doc: &mut Document,
+    source: ObjectId,
+    link: itsjustcad_doc::SubdivLink,
+    ids: Option<Vec<ObjectId>>,
+    verb: &str,
+) -> Result<Rederived, ExecError> {
+    let err = |m: &str| ExecError::Invalid(format!("{verb}: {m}"));
     let Some(obj) = doc.get(source) else {
-        return Err(ExecError::Invalid("lotrefresh: source block no longer exists".into()));
+        return Err(err("source block no longer exists"));
     };
     let Geometry::Curve(c) = &obj.geometry else {
-        return Err(ExecError::Invalid("lotrefresh: source is not a curve".into()));
+        return Err(err("source is not a curve"));
     };
     if !c.is_closed() {
-        return Err(ExecError::Invalid("lotrefresh: source block curve must be closed".into()));
+        return Err(err("source block curve must be closed"));
     }
     let Some(poly) = crate::lot::curve_to_polygon(c) else {
-        return Err(ExecError::Invalid("lotrefresh: could not read source block polygon".into()));
+        return Err(err("could not read source block polygon"));
     };
     let pts = c.tessellate(PROFILE_TOL);
     let z = if pts.is_empty() {
@@ -5758,27 +5814,19 @@ fn exec_lot_refresh(
 
     // Re-derive by kind: Lots → derive_subdivision/insert_lots (produced = lots),
     // Site → generate_site/insert_site (produced = roads ++ blocks).
-    let new_ids = regenerate_by_kind(doc, link.kind, &poly, z, &link.settings, ids)
+    let new_ids = regenerate_by_kind(doc, link.kind, &poly, z, &link.settings, &link.streets, ids)
         .map_err(ExecError::Invalid)?;
-    let prev_link = link.clone();
     doc.subdivision_links.insert(
         source,
         itsjustcad_doc::SubdivLink {
-            settings: link.settings.clone(),
             produced: new_ids.clone(),
             source_z: z,
             frozen: false,
-            kind: link.kind,
+            ..link
         },
     );
     doc.generation += 1;
-
-    let n = new_ids.len();
-    Ok((
-        Command::LotRefresh { source, ids: Some(new_ids.clone()) },
-        Inverse::LotRefreshed { source, created: new_ids.clone(), restored, prev_link },
-        ApplyOutcome { created: new_ids, message: format!("lotrefresh: {n} object(s) recomputed") },
-    ))
+    Ok((new_ids, restored))
 }
 
 /// Re-derive an associative subdivision result by kind, inserting the new
@@ -5793,6 +5841,7 @@ fn regenerate_by_kind(
     poly: &subdivision::Polygon2d,
     z: f64,
     settings: &subdivision::SubdivisionSettings,
+    streets: &BTreeMap<u32, itsjustcad_doc::StreetEdit>,
     ids: Option<Vec<ObjectId>>,
 ) -> Result<Vec<ObjectId>, String> {
     match kind {
@@ -5807,7 +5856,7 @@ fn regenerate_by_kind(
             Ok(new_ids)
         }
         itsjustcad_doc::SubdivKind::Site => {
-            let bake = crate::lot::generate_site(poly, z, settings)?;
+            let bake = crate::lot::generate_site(poly, z, settings, streets)?;
             let n_roads = bake.roads.len();
             let n_blocks = bake.blocks.len();
             // Slice the flat incoming ids as roads ++ blocks when they line up;
@@ -5837,7 +5886,7 @@ fn regenerate_by_kind(
             // counts (same pattern as the Site arm).
 
             // Step 1: streets + blocks.
-            let site = crate::lot::generate_site(poly, z, settings)?;
+            let site = crate::lot::generate_site(poly, z, settings, streets)?;
 
             // Step 2: subdivide EACH block (skip a block that fails — too
             // small, etc. — never abort the whole plan).
@@ -5941,48 +5990,12 @@ fn exec_lot_set_params(
     }
     let new_settings = crate::subdiv_params::params_to_settings(&link.settings, &param_map);
 
-    // Read the source block's CURRENT geometry (same as exec_lot_refresh).
-    let Some(obj) = doc.get(source) else {
-        return Err(ExecError::Invalid("lotsetparams: source block no longer exists".into()));
-    };
-    let Geometry::Curve(c) = &obj.geometry else {
-        return Err(ExecError::Invalid("lotsetparams: source is not a curve".into()));
-    };
-    if !c.is_closed() {
-        return Err(ExecError::Invalid("lotsetparams: source block curve must be closed".into()));
-    }
-    let Some(poly) = crate::lot::curve_to_polygon(c) else {
-        return Err(ExecError::Invalid("lotsetparams: could not read source block polygon".into()));
-    };
-    let pts = c.tessellate(PROFILE_TOL);
-    let z = if pts.is_empty() {
-        link.source_z
-    } else {
-        pts.iter().map(|p| p.z).sum::<f64>() / pts.len() as f64
-    };
-
-    // Snapshot + remove the OLD produced children (for undo), then re-derive by
-    // kind onto the folded settings (Lots → lots, Site → roads ++ blocks).
-    let mut restored: Vec<(SceneObject, usize)> = Vec::new();
-    for id in &link.produced {
-        if let Some(removed) = doc.remove(*id) {
-            restored.push(removed);
-        }
-    }
-    let new_ids = regenerate_by_kind(doc, link.kind, &poly, z, &new_settings, ids)
-        .map_err(ExecError::Invalid)?;
     let prev_link = link.clone();
-    doc.subdivision_links.insert(
-        source,
-        itsjustcad_doc::SubdivLink {
-            settings: new_settings,
-            produced: new_ids.clone(),
-            source_z: z,
-            frozen: false,
-            kind: link.kind,
-        },
-    );
-    doc.generation += 1;
+    let new_link = itsjustcad_doc::SubdivLink {
+        settings: new_settings,
+        ..link
+    };
+    let (new_ids, restored) = rederive_link(doc, source, new_link, ids, "lotsetparams")?;
 
     let n = new_ids.len();
     Ok((
@@ -5991,6 +6004,89 @@ fn exec_lot_set_params(
         // restores both the prior lots and the prior params — exactly right.
         Inverse::LotRefreshed { source, created: new_ids.clone(), restored, prev_link },
         ApplyOutcome { created: new_ids, message: format!("lotsetparams: {n} lot(s) recomputed") },
+    ))
+}
+
+/// `streetset` (#143 phase 4): store name/class/width edits for the selected
+/// generated roads on their site link, then re-derive the link so blocks, lots,
+/// setbacks and buildings follow. One undo step (`LotRefreshed`).
+fn exec_street_set(
+    doc: &mut Document,
+    targets: Selector,
+    name: Option<String>,
+    class: Option<itsjustcad_doc::StreetClass>,
+    width: Option<f64>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let err = |m: &str| ExecError::Invalid(format!("streetset: {m}"));
+    if name.is_none() && class.is_none() && width.is_none() {
+        return Err(err("nothing to set (name=, class= or width=)"));
+    }
+    if width.is_some_and(|w| !(w.is_finite() && w > 0.0)) {
+        return Err(err("width must be a positive number"));
+    }
+    let roads = resolve(doc, &targets)?;
+    let mut source = None;
+    let mut street_ids = Vec::new();
+    for id in &roads {
+        let street = doc.get(*id).and_then(|o| o.street.as_ref());
+        let src = doc.subdiv_source_of(*id);
+        let (Some(street), Some(src)) = (street, src) else {
+            return Err(err(
+                "select generated roads (from siteplan or lotgeneratesite)",
+            ));
+        };
+        if source.is_some_and(|s| s != src) {
+            return Err(err("the selected roads come from different site plans"));
+        }
+        source = Some(src);
+        street_ids.push(street.id);
+    }
+    let Some(source) = source else {
+        return Err(err(
+            "select generated roads (from siteplan or lotgeneratesite)",
+        ));
+    };
+    let link = doc.subdivision_links[&source].clone();
+    if link.frozen {
+        return Err(err("this result is frozen — unfreeze to recompute"));
+    }
+
+    let prev_link = link.clone();
+    let mut new_link = link;
+    for sid in street_ids {
+        let edit = new_link.streets.entry(sid).or_default();
+        if let Some(n) = &name {
+            edit.name = (!n.is_empty()).then(|| n.clone());
+        }
+        edit.class = class.or(edit.class);
+        edit.width = width.or(edit.width);
+    }
+    let (new_ids, restored) = rederive_link(doc, source, new_link, ids, "streetset")?;
+
+    let message = format!(
+        "streetset: {} street(s) updated; {} object(s) recomputed",
+        roads.len(),
+        new_ids.len()
+    );
+    Ok((
+        Command::StreetSet {
+            targets: Selector::Ids { ids: roads },
+            name,
+            class,
+            width,
+            ids: Some(new_ids.clone()),
+        },
+        Inverse::LotRefreshed {
+            source,
+            created: new_ids.clone(),
+            restored,
+            prev_link,
+        },
+        ApplyOutcome {
+            created: new_ids,
+            message,
+        },
     ))
 }
 
@@ -6340,7 +6436,8 @@ fn exec_lot_generate_site(
         ));
     };
 
-    let bake = crate::lot::generate_site(&site, z, &settings).map_err(ExecError::Invalid)?;
+    let bake = crate::lot::generate_site(&site, z, &settings, &BTreeMap::new())
+        .map_err(ExecError::Invalid)?;
 
     // Written-back ids: roads first, then blocks. Reuse on replay.
     let new_road_ids: Vec<ObjectId> = match road_ids {
@@ -6377,6 +6474,7 @@ fn exec_lot_generate_site(
             source_z: z,
             frozen: false,
             kind: itsjustcad_doc::SubdivKind::Site,
+            streets: Default::default(),
         },
     );
     doc.generation += 1;
@@ -6482,6 +6580,7 @@ fn exec_site_plan(
         &poly,
         z,
         &settings,
+        &BTreeMap::new(),
         ids,
     )
     .map_err(ExecError::Invalid)?;
@@ -6490,7 +6589,7 @@ fn exec_site_plan(
     // deterministic). Re-deriving here would double-insert, so derive counts
     // from the produced slicing by recomputing just the geometry totals cheaply.
     // Simplest: recompute the phase counts without inserting.
-    let site = crate::lot::generate_site(&poly, z, &settings)
+    let site = crate::lot::generate_site(&poly, z, &settings, &BTreeMap::new())
         .map_err(ExecError::Invalid)?;
     let n_roads = site.roads.len();
     let n_blocks = site.blocks.len();
@@ -6519,6 +6618,7 @@ fn exec_site_plan(
             source_z: z,
             frozen: false,
             kind: itsjustcad_doc::SubdivKind::SitePlan,
+            streets: Default::default(),
         },
     );
     doc.generation += 1;
@@ -7129,6 +7229,7 @@ fn exec_contours(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Polyline {
                 points: line.points.clone(),
                 closed: line.closed,
@@ -7337,6 +7438,7 @@ fn exec_flow_arrows(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Polyline { points: pts, closed: false }),
         });
     }
@@ -7429,6 +7531,7 @@ fn exec_ponding(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
         });
     }
@@ -7540,6 +7643,7 @@ fn exec_site_path(
         material: None,
         lineweight_mm: None,
         edge_tags: None,
+        street: None,
         geometry: Geometry::Mesh(kernel_mesh::Mesh::new(positions, faces)),
     });
     doc.generation += 1;
@@ -7852,6 +7956,7 @@ fn exec_sun_path(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Polyline {
                 points: line.pts.clone(),
                 closed: line.closed,
@@ -8010,6 +8115,7 @@ fn exec_sun_hours(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -8175,6 +8281,7 @@ fn exec_face_sun_hours(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -8283,6 +8390,7 @@ fn elevation_meshes(
             material: None,
             lineweight_mm: None,
             edge_tags: None,
+            street: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -9040,6 +9148,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, size)),
             });
             Ok((
@@ -9081,6 +9190,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(extrude_profile(&profile2d, base_z, height)),
             });
             Ok((
@@ -9128,6 +9238,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9192,6 +9303,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(mesh),
             });
             let message = if n_guides > 0 {
@@ -9241,6 +9353,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9281,6 +9394,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9318,6 +9432,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9362,6 +9477,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -9401,6 +9517,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -10240,6 +10357,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Curve(rebuilt),
             });
             Ok((
@@ -10295,6 +10413,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Annotation(Annotation::LinearDim {
                     a: anchor_a,
                     b: anchor_b,
@@ -10335,6 +10454,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Annotation(Annotation::AngularDim {
                     vertex,
                     p1,
@@ -10368,6 +10488,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Annotation(Annotation::Text {
                     pos,
                     text: text.clone(),
@@ -10401,6 +10522,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Annotation(Annotation::Field {
                     pos,
                     expr: expr.clone(),
@@ -10493,6 +10615,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Annotation(Annotation::Hatch {
                     boundary,
                     pattern: pattern.clone(),
@@ -10622,6 +10745,7 @@ fn apply_forward(
                     material: None,
                     lineweight_mm: None,
                     edge_tags: None,
+                    street: None,
                     geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
                 });
             }
@@ -10665,6 +10789,7 @@ fn apply_forward(
                     material: None,
                     lineweight_mm: None,
                     edge_tags: None,
+                    street: None,
                     geometry: Geometry::Annotation(Annotation::LinearDim {
                         a: DimAnchor::Free(*a),
                         b: DimAnchor::Free(*b),
@@ -10790,6 +10915,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(mesh),
             });
             let path = if exact {
@@ -11062,6 +11188,7 @@ fn apply_forward(
                         material: e.obj.material,
                         lineweight_mm: e.obj.lineweight_mm,
                         edge_tags: None,
+                        street: None,
                         geometry: Geometry::Curve(seg),
                     });
                 }
@@ -11298,6 +11425,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Annotation(Annotation::LinearDim {
                     a: anchor_a,
                     b: anchor_b,
@@ -11384,6 +11512,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Points { positions },
             });
             Ok((
@@ -11426,6 +11555,7 @@ fn apply_forward(
                     material: None,
                     lineweight_mm: None,
                     edge_tags: None,
+                    street: None,
                     geometry: Geometry::Curve(piece),
                 });
             }
@@ -11536,6 +11666,7 @@ fn apply_forward(
                         material: None,
                         lineweight_mm: None,
                         edge_tags: None,
+                        street: None,
                         geometry: Geometry::Curve(cur),
                     });
                     extended += 1;
@@ -11587,6 +11718,7 @@ fn apply_forward(
                         material: None,
                         lineweight_mm: None,
                         edge_tags: None,
+                        street: None,
                         geometry: Geometry::Curve(piece.clone()),
                     });
                 }
@@ -11679,6 +11811,7 @@ fn apply_forward(
                     material: None,
                     lineweight_mm: None,
                     edge_tags: None,
+                    street: None,
                     geometry: Geometry::Curve(piece.clone()),
                 });
             }
@@ -11767,6 +11900,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Curve(joined),
             });
             Ok((
@@ -11852,6 +11986,7 @@ fn apply_forward(
                     material: None,
                     lineweight_mm: None,
                     edge_tags: None,
+                    street: None,
                     geometry: Geometry::Curve(joined),
                 });
                 return Ok((
@@ -11891,6 +12026,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Curve(arc),
             });
             Ok((
@@ -11951,6 +12087,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Curve(bevel),
             });
             Ok((
@@ -12021,6 +12158,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Curve(offset),
             });
             Ok((
@@ -13056,6 +13194,9 @@ fn apply_forward(
             exec_lot_set_params(doc, source, params, ids)
         }
         Command::LotFreeze { source, frozen, prev } => exec_lot_freeze(doc, source, frozen, prev),
+        Command::StreetSet { targets, name, class, width, ids } => {
+            exec_street_set(doc, targets, name, class, width, ids)
+        }
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
         Command::LotLoading { targets, mode, prev } => exec_lot_loading(doc, targets, mode, prev),
         Command::LotGenerateSite {
@@ -13996,6 +14137,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -14027,6 +14169,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Points { positions: positions.clone() },
             });
             Ok((
@@ -14121,6 +14264,7 @@ fn apply_forward(
                     material: None,
                     lineweight_mm: None,
                     edge_tags: None,
+                    street: None,
                     geometry: Geometry::Instance {
                         block: key.clone(),
                         position,
@@ -14156,6 +14300,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Instance {
                     block: name.clone(),
                     position,
@@ -14436,6 +14581,7 @@ fn apply_forward(
                         material: inst.material,
                         lineweight_mm: inst.lineweight_mm,
                         edge_tags: None,
+                        street: None,
                         geometry,
                     });
                 }
@@ -14553,6 +14699,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Instance {
                     block: name.clone(),
                     position: pos,
@@ -14717,6 +14864,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry,
             });
             doc.generation += 1;
@@ -15079,6 +15227,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Frame {
                     kind,
                     a,
@@ -15142,6 +15291,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Area {
                     kind,
                     boundary: boundary.clone(),
@@ -15224,6 +15374,7 @@ fn apply_forward(
                 material: None,
                 lineweight_mm: None,
                 edge_tags: None,
+                street: None,
                 geometry: Geometry::Curve(Curve::Polyline { points: centerline, closed: false }),
             });
             let runs = layout
@@ -15427,6 +15578,7 @@ fn apply_forward(
                     material: None,
                     lineweight_mm: None,
                     edge_tags: None,
+                    street: None,
                     geometry: Geometry::Area {
                         kind: AreaKind::Wall,
                         boundary,
@@ -15853,6 +16005,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotRefresh { .. } => "lotrefresh",
         Command::LotSetParams { .. } => "lotsetparams",
         Command::LotFreeze { .. } => "lotfreeze",
+        Command::StreetSet { .. } => "streetset",
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
@@ -26788,6 +26941,206 @@ mod tests {
         run(&mut s, "lotsubdivide last area=200 width=10");
         assert!(s.doc.objects().all(|o| o.edge_tags.is_none()));
         assert!(!serde_json::to_string(&s.doc).unwrap().contains("edge_tags"));
+    }
+
+    /// The generated roads of a session, as (object id, street info).
+    fn street_roads(doc: &Document) -> Vec<(ObjectId, itsjustcad_doc::StreetInfo)> {
+        doc.objects()
+            .filter_map(|o| Some((o.id, o.street.clone()?)))
+            .collect()
+    }
+
+    /// #143 phase 4: siteplan roads carry a street identity that the lot edge
+    /// tags resolve to; it survives save/load and replay, and old JSON loads.
+    #[test]
+    fn siteplan_roads_store_street_identity() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        run(&mut s, "siteplan last");
+        let roads = street_roads(&s.doc);
+        assert_eq!(roads.len(), layer_count(&s, crate::lot::ROADS_LAYER));
+        let mut ids: Vec<u32> = roads.iter().map(|(_, r)| r.id).collect();
+        ids.dedup();
+        assert_eq!(ids.len(), roads.len(), "one street id per road");
+        assert!(roads.iter().all(|(_, r)| r.name.is_none() && r.width > 0.0));
+        assert!(
+            roads
+                .iter()
+                .all(|(id, _)| !s.doc.get(*id).unwrap().street_edited())
+        );
+
+        let mut resolved = 0;
+        for lot in s
+            .doc
+            .objects()
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+        {
+            for t in lot.valid_edge_tags().into_iter().flatten() {
+                if let Some(sid) = t.street_id {
+                    let road = crate::lot::street_of(&s.doc, lot.id, sid).expect("tag → road");
+                    assert_eq!(road.street.as_ref().unwrap().width, t.street_width);
+                    resolved += 1;
+                }
+            }
+        }
+        assert!(resolved > 0, "lot street edges reference roads");
+
+        let json = serde_json::to_string(&s.doc).unwrap();
+        let loaded: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(street_roads(&loaded), roads);
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(street_roads(&replayed.doc), roads);
+
+        // Pre-phase-4 JSON (no `street`, no link `streets`) loads unchanged.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for o in v["objects"].as_object_mut().unwrap().values_mut() {
+            o.as_object_mut().unwrap().remove("street");
+        }
+        let old: Document = serde_json::from_value(v).unwrap();
+        assert!(old.objects().all(|o| o.street.is_none()));
+        assert!(old.subdivision_links.values().all(|l| l.streets.is_empty()));
+    }
+
+    #[test]
+    fn streetset_parses() {
+        let cmd = crate::parse::parse("streetset last name=Main Street class=collector width=16")
+            .unwrap();
+        assert_eq!(
+            cmd,
+            Command::StreetSet {
+                targets: Selector::Last { n: 1 },
+                name: Some("Main Street".into()),
+                class: Some(itsjustcad_doc::StreetClass::Collector),
+                width: Some(16.0),
+                ids: None,
+            }
+        );
+        assert!(crate::parse::parse("streetset last").is_err());
+        assert!(crate::parse::parse("streetset class=boulevard").is_err());
+    }
+
+    /// `streetset` widens one street as one undo step: the plan re-derives
+    /// (lots and setbacks change), the edit survives `lotrefresh`, and replay
+    /// reproduces it.
+    #[test]
+    fn streetset_regenerates_dependents_in_one_undo_step() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "siteplan last");
+        let before = s.doc.subdivision_links[&source].produced.clone();
+        let polys = |s: &Session, layer: &str| -> Vec<Geometry> {
+            s.doc
+                .objects()
+                .filter(|o| o.layer == layer)
+                .map(|o| o.geometry.clone())
+                .collect()
+        };
+        let (lots0, env0) = (
+            polys(&s, crate::lot::LOTS_LAYER),
+            polys(&s, crate::lot::SETBACKS_LAYER),
+        );
+        let (road, info) = street_roads(&s.doc)[0].clone();
+
+        let out = s
+            .run(Command::StreetSet {
+                targets: Selector::Ids { ids: vec![road] },
+                name: Some("Main Street".into()),
+                class: Some(itsjustcad_doc::StreetClass::Arterial),
+                width: Some(info.width + 20.0),
+                ids: None,
+            })
+            .expect("streetset");
+        assert!(out.message.starts_with("streetset: 1 street(s) updated"));
+        let after = street_roads(&s.doc);
+        let (_, new) = after.iter().find(|(_, r)| r.id == info.id).unwrap();
+        assert_eq!(new.name.as_deref(), Some("Main Street"));
+        assert_eq!(new.class, itsjustcad_doc::StreetClass::Arterial);
+        assert_eq!(new.width, info.width + 20.0);
+        assert_ne!(polys(&s, crate::lot::LOTS_LAYER), lots0, "lots re-cut");
+        assert_ne!(
+            polys(&s, crate::lot::SETBACKS_LAYER),
+            env0,
+            "setbacks follow"
+        );
+        assert!(
+            s.doc
+                .objects()
+                .filter_map(|o| o.valid_edge_tags())
+                .flatten()
+                .any(|t| t.street_id == Some(info.id) && t.street_width == info.width + 20.0),
+            "edge tags carry the new width"
+        );
+
+        // lotrefresh keeps the edit; replay reproduces both.
+        s.run(Command::LotRefresh { source, ids: None }).unwrap();
+        assert_eq!(
+            street_roads(&s.doc)
+                .iter()
+                .find(|(_, r)| r.id == info.id)
+                .unwrap()
+                .1
+                .width,
+            info.width + 20.0
+        );
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(
+            s.doc.objects().collect::<Vec<_>>(),
+            replayed.doc.objects().collect::<Vec<_>>()
+        );
+
+        run(&mut s, "undo");
+        run(&mut s, "undo");
+        let link = &s.doc.subdivision_links[&source];
+        assert_eq!(link.produced, before, "one undo step per streetset");
+        assert!(link.streets.is_empty());
+        assert_eq!(polys(&s, crate::lot::LOTS_LAYER), lots0);
+    }
+
+    /// Moving a generated road does not regenerate: it reads as edited (the
+    /// plan is stale), undo clears it, and `lotrefresh` replaces the edit.
+    #[test]
+    fn hand_edited_road_marks_plan_stale() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "siteplan last");
+        let stale =
+            |s: &Session| crate::lot::edited_roads(&s.doc, &s.doc.subdivision_links[&source]);
+        let road = street_roads(&s.doc)[0].0;
+        s.run(Command::Move {
+            targets: Selector::Ids { ids: vec![road] },
+            delta: DVec3::new(5.0, 0.0, 0.0),
+        })
+        .unwrap();
+        assert_eq!(stale(&s), 1);
+        run(&mut s, "undo");
+        assert_eq!(stale(&s), 0);
+        s.run(Command::Move {
+            targets: Selector::Ids { ids: vec![road] },
+            delta: DVec3::new(5.0, 0.0, 0.0),
+        })
+        .unwrap();
+        let out = s.run(Command::LotRefresh { source, ids: None }).unwrap();
+        assert!(
+            out.message
+                .contains("hand edits to 1 generated road(s) replaced"),
+            "{}",
+            out.message
+        );
+        assert_eq!(stale(&s), 0);
+
+        // Roads from one plan only; non-roads rejected.
+        let err = s
+            .run(Command::StreetSet {
+                targets: Selector::Ids { ids: vec![source] },
+                name: None,
+                class: None,
+                width: Some(10.0),
+                ids: None,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("select generated roads"));
     }
 
     #[test]

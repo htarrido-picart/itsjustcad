@@ -1209,6 +1209,74 @@ pub struct EdgeTag {
     pub length: f64,
 }
 
+/// Functional class of a generated street (#143 phase 4). Metadata only: it
+/// does not change geometry or setbacks yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreetClass {
+    Arterial,
+    Collector,
+    #[default]
+    Local,
+    Alley,
+}
+
+impl StreetClass {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "arterial" => Some(Self::Arterial),
+            "collector" => Some(Self::Collector),
+            "local" => Some(Self::Local),
+            "alley" | "lane" => Some(Self::Alley),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Arterial => "arterial",
+            Self::Collector => "collector",
+            Self::Local => "local",
+            Self::Alley => "alley",
+        }
+    }
+}
+
+/// Street identity of a generated road centerline (#143 phase 4). `id` is the
+/// `street_id` the lot/block [`EdgeTag`]s carry, unique within one site link.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StreetInfo {
+    pub id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub class: StreetClass,
+    /// Right-of-way width the blocks were cut with.
+    pub width: f64,
+    /// [`geometry_fingerprint`] of the road as generated: a differing value
+    /// means the road was edited by hand since.
+    pub fingerprint: u64,
+}
+
+/// A stable hash (FNV-1a over the coordinate bits) of a polyline's points;
+/// 0 for any other geometry. Any move or vertex edit changes it.
+pub fn geometry_fingerprint(g: &Geometry) -> u64 {
+    let Geometry::Curve(Curve::Polyline { points, closed }) = g else {
+        return 0;
+    };
+    let words = points
+        .iter()
+        .flat_map(|p| [p.x, p.y, p.z])
+        .map(f64::to_bits);
+    std::iter::once(*closed as u64)
+        .chain(words)
+        .fold(0xcbf2_9ce4_8422_2325, |h, w| {
+            w.to_le_bytes()
+                .iter()
+                .fold(h, |h, b| (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3))
+        })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SceneObject {
     pub id: ObjectId,
@@ -1238,10 +1306,21 @@ pub struct SceneObject {
     /// [`SceneObject::valid_edge_tags`]. Serde default keeps old JSON loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_tags: Option<Vec<EdgeTag>>,
+    /// Street identity of a generated road (#143 phase 4). Serde default keeps
+    /// old JSON loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub street: Option<StreetInfo>,
     pub geometry: Geometry,
 }
 
 impl SceneObject {
+    /// True for a generated road whose geometry no longer matches its bake.
+    pub fn street_edited(&self) -> bool {
+        self.street
+            .as_ref()
+            .is_some_and(|s| s.fingerprint != geometry_fingerprint(&self.geometry))
+    }
+
     /// The stored edge tags, if they still describe the geometry: a closed
     /// polyline with one edge per tag whose edge lengths are the baked ones up
     /// to a single scale factor. Move/rotate/mirror/uniform scale keep the

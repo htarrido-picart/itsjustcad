@@ -2149,6 +2149,25 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prev: Option<bool>,
     },
+    /// Edit generated streets (#143 phase 4): `name` / `class` / `width` of
+    /// the selected road(s), which must come from one site link. The edits are
+    /// stored on the link as inputs and applied by re-deriving it (like
+    /// `LotSetParams`), so lots, setbacks and buildings follow a width change
+    /// and `lotrefresh` keeps them. An empty `name` clears it. `targets` is
+    /// written back as the resolved road ids and `ids` as the re-derived
+    /// children, so replay is byte-identical. Logged; the inverse (reused
+    /// `LotRefreshed`) restores the previous children and link.
+    StreetSet {
+        targets: Selector,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<itsjustcad_doc::StreetClass>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// Show or set the sticky `SubdivisionSettings` on the document.
     /// With no `sets`, the exec message reports the current
     /// settings; otherwise each `key=value` updates one field. Logged so saved
