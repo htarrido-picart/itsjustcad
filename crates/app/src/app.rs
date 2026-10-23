@@ -12722,6 +12722,7 @@ mod tests {
                 frozen: false,
                 kind: itsjustcad_doc::SubdivKind::Lots,
                 streets: Default::default(),
+                edge_roles: Vec::new(),
             },
         );
 

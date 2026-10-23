@@ -15,6 +15,8 @@
 
 use glam::DVec2;
 
+use crate::subdivision::setbacks::EdgeRole;
+
 /// The street-adjacency tag of a single block edge (from vertex `a` to `b`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlockEdge {
@@ -32,6 +34,11 @@ pub struct BlockEdge {
     pub street_length: f64,
     /// True if this edge is a rear-lane (alley) edge (alley tier).
     pub is_alley: bool,
+    /// A hand-set setback role (#143 phase 5) that [`classify_edges`] uses
+    /// instead of its own. `None` = automatic.
+    ///
+    /// [`classify_edges`]: crate::subdivision::setbacks::classify_edges
+    pub role: Option<EdgeRole>,
 }
 
 impl BlockEdge {
@@ -45,6 +52,7 @@ impl BlockEdge {
             street_width: 0.0,
             street_length: 0.0,
             is_alley: false,
+            role: None,
         }
     }
 

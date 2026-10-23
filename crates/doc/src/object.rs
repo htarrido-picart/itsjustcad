@@ -1204,6 +1204,9 @@ pub struct EdgeTag {
     /// Setback role from `classify_edges` (lots only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<subdivision::EdgeRole>,
+    /// `role` was set by hand (`edgerole`, #143 phase 5), not classified.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overridden: bool,
     /// Edge length at bake time: the fingerprint [`SceneObject::valid_edge_tags`]
     /// checks the current curve against.
     pub length: f64,
@@ -1382,6 +1385,7 @@ mod tests {
             street_width: 0.0,
             is_alley: false,
             role: None,
+            overridden: false,
             length,
         };
         obj.edge_tags = Some([1.0, 2.0, 1.0, 2.0].map(tag).to_vec());

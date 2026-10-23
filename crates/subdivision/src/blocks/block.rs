@@ -47,7 +47,12 @@ impl Block {
                     .edges
                     .iter()
                     .find(|e| on_segment(a, e.a, e.b) && on_segment(b, e.a, e.b))
-                    .map_or(BlockEdge::boundary(a, b), |e| BlockEdge { a, b, ..*e })
+                    .map_or(BlockEdge::boundary(a, b), |e| BlockEdge {
+                        a,
+                        b,
+                        role: None,
+                        ..*e
+                    })
             })
             .collect();
         Block { polygon, edges }

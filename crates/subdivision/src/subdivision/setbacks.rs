@@ -100,6 +100,12 @@ impl Envelope {
 ///   front's outward normal → Rear (the "opposite" edge); any non-front edge
 ///   when every other edge is a street.
 /// - Everything else → Side.
+///
+/// A hand-set [`BlockEdge::role`] (#143 phase 5) wins over all of this: an
+/// edge overridden to Front replaces the automatic front (the rear is then
+/// recomputed opposite it, street edges included, unless an edge is
+/// overridden to Rear), and the automatic choices only consider edges that are
+/// not overridden.
 pub fn classify_edges(lot: &Block) -> Vec<EdgeRole> {
     let poly = &lot.polygon;
     let n = poly.len();
@@ -108,12 +114,18 @@ pub fn classify_edges(lot: &Block) -> Vec<EdgeRole> {
     }
     let verts = poly.verts();
     let tags: Vec<Option<&BlockEdge>> = (0..n).map(|i| street_tag(&lot.edges, poly, i)).collect();
+    let ov: Vec<Option<EdgeRole>> = (0..n)
+        .map(|i| edge_at(&lot.edges, poly, i).and_then(|e| e.role))
+        .collect();
+    let forced_front = ov.contains(&Some(EdgeRole::Front));
 
     // Primary front: the street edge on the widest street, ties → the longer
     // edge (deterministic: first on ties).
     let mut primary: Option<(usize, f64, f64)> = None;
     for (i, tag) in tags.iter().enumerate() {
-        let Some(t) = tag else { continue };
+        let (Some(t), None) = (tag, ov[i]) else {
+            continue;
+        };
         let len = verts[i].distance(verts[(i + 1) % n]);
         let better = primary.is_none_or(|(_, w, l)| {
             t.street_width > w + 1e-9 || ((t.street_width - w).abs() <= 1e-9 && len > l + 1e-12)
@@ -125,18 +137,23 @@ pub fn classify_edges(lot: &Block) -> Vec<EdgeRole> {
 
     // Front edges.
     let mut is_front = vec![false; n];
-    if let Some((p, _, _)) = primary {
+    if forced_front {
+        for (front, o) in is_front.iter_mut().zip(&ov) {
+            *front = *o == Some(EdgeRole::Front);
+        }
+    } else if let Some((p, _, _)) = primary {
         let (p_id, p_normal) = (tags[p].and_then(|t| t.street_id), outward_normal(verts, p));
         for (i, front) in is_front.iter_mut().enumerate() {
-            *front = tags[i].is_some_and(|t| {
-                t.street_id == p_id && outward_normal(verts, i).dot(p_normal) > 0.5
-            });
+            *front = ov[i].is_none()
+                && tags[i].is_some_and(|t| {
+                    t.street_id == p_id && outward_normal(verts, i).dot(p_normal) > 0.5
+                });
         }
-    } else {
+    } else if ov.iter().any(Option::is_none) {
         // Longest edge is the front (deterministic: first on ties).
         let mut best = 0usize;
         let mut best_len = -1.0;
-        for i in 0..n {
+        for i in (0..n).filter(|&i| ov[i].is_none()) {
             let len = verts[i].distance(verts[(i + 1) % n]);
             if len > best_len + 1e-12 {
                 best_len = len;
@@ -163,10 +180,12 @@ pub fn classify_edges(lot: &Block) -> Vec<EdgeRole> {
     // the front normal (dot most negative); any non-front edge when every other
     // edge is a street. None if no non-front edge exists.
     let all_streets = (0..n).all(|i| is_front[i] || tags[i].is_some());
+    let forced_rear = ov.contains(&Some(EdgeRole::Rear));
     let mut rear = None;
     let mut rear_dot = f64::INFINITY;
     for (i, &front) in is_front.iter().enumerate() {
-        if front || (tags[i].is_some() && !all_streets) {
+        let street_side = tags[i].is_some() && !all_streets && !forced_front;
+        if forced_rear || front || ov[i].is_some() || street_side {
             continue;
         }
         let d = outward_normal(verts, i).dot(front_normal);
@@ -178,7 +197,9 @@ pub fn classify_edges(lot: &Block) -> Vec<EdgeRole> {
 
     (0..n)
         .map(|i| {
-            if is_front[i] {
+            if let Some(role) = ov[i] {
+                role
+            } else if is_front[i] {
                 EdgeRole::Front
             } else if Some(i) == rear {
                 EdgeRole::Rear
@@ -374,14 +395,18 @@ fn front_setback_extent(
 /// `edges` (matched by endpoint geometry, robust to reordering). Mirrors
 /// `skeleton_sub`.
 fn street_tag<'a>(edges: &'a [BlockEdge], poly: &Polygon2d, i: usize) -> Option<&'a BlockEdge> {
+    edge_at(edges, poly, i).filter(|e| e.is_street)
+}
+
+/// The entry of `edges` for contour edge `i` of `poly`, matched by endpoints.
+fn edge_at<'a>(edges: &'a [BlockEdge], poly: &Polygon2d, i: usize) -> Option<&'a BlockEdge> {
     let verts = poly.verts();
     let n = verts.len();
     let a = verts[i];
     let b = verts[(i + 1) % n];
     edges.iter().find(|e| {
-        e.is_street
-            && ((e.a.distance(a) < 1e-6 && e.b.distance(b) < 1e-6)
-                || (e.a.distance(b) < 1e-6 && e.b.distance(a) < 1e-6))
+        (e.a.distance(a) < 1e-6 && e.b.distance(b) < 1e-6)
+            || (e.a.distance(b) < 1e-6 && e.b.distance(a) < 1e-6)
     })
 }
 
@@ -413,6 +438,7 @@ mod tests {
                         street_width: 12.0,
                         street_length: w,
                         is_alley: false,
+                        role: None,
                     }
                 } else {
                     BlockEdge::boundary(a, b)
@@ -552,6 +578,7 @@ mod tests {
                         street_width: 12.0,
                         street_length: 40.0,
                         is_alley: false,
+                        role: None,
                     }
                 } else {
                     BlockEdge::boundary(a, b)
@@ -626,6 +653,23 @@ mod tests {
         // untagged-boundary bottom/sides are longer.
         let lot = rect_tagged(10.0, 40.0, &[(2, 1, 12.0)]);
         assert_eq!(classify_edges(&lot), vec![Rear, Side, Front, Side]);
+    }
+
+    #[test]
+    fn overridden_front_moves_the_rear() {
+        use EdgeRole::*;
+        // Street on the bottom; the user makes the top edge the front instead:
+        // the rear flips to the bottom, street or not.
+        let mut lot = rect_tagged(30.0, 40.0, &[(0, 1, 12.0)]);
+        lot.edges[2].role = Some(Front);
+        assert_eq!(classify_edges(&lot), vec![Rear, Side, Front, Side]);
+        // An explicit rear wins over the recomputed one.
+        lot.edges[1].role = Some(Rear);
+        assert_eq!(classify_edges(&lot), vec![StreetSide, Rear, Front, Side]);
+        // A non-front override on the automatic front lets the next edge front.
+        let mut lot = Block::untagged(rect(30.0, 40.0));
+        lot.edges[1].role = Some(Side);
+        assert_eq!(classify_edges(&lot), vec![Rear, Side, Side, Front]);
     }
 
     #[test]

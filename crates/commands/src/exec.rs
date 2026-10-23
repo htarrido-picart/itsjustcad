@@ -158,6 +158,8 @@ enum Inverse {
         restored: Vec<(SceneObject, usize)>,
         prev_link: itsjustcad_doc::SubdivLink,
     },
+    /// `edgerole` on a lot outside a link: restore its previous edge tags.
+    EdgeTags(ObjectId, Option<Vec<itsjustcad_doc::EdgeTag>>),
     /// `lotfreeze` (W1 associative): restore the link's prior `frozen` flag.
     LotFrozen {
         source: ObjectId,
@@ -1021,6 +1023,12 @@ impl Session {
                         obj.visible = visible;
                     }
                 }
+            }
+            Inverse::EdgeTags(id, prev) => {
+                if let Some(obj) = self.doc.get_mut(*id) {
+                    obj.edge_tags = prev.clone();
+                }
+                self.doc.generation += 1;
             }
             Inverse::ObjectLineweight(prev) => {
                 for (id, lw) in prev.clone() {
@@ -5667,6 +5675,7 @@ fn exec_lot_subdivide(
                 frozen: false,
                 kind: itsjustcad_doc::SubdivKind::Lots,
                 streets: Default::default(),
+                edge_roles: Vec::new(),
             },
         );
         link_sources.push(*src);
@@ -5741,7 +5750,7 @@ fn exec_lot_refresh(
     }
     let edited = crate::lot::edited_roads(doc, &link);
     let prev_link = link.clone();
-    let (new_ids, restored) = rederive_link(doc, source, link, ids, "lotrefresh")?;
+    let (new_ids, restored, dropped) = rederive_link(doc, source, link, ids, "lotrefresh")?;
 
     let n = new_ids.len();
     let mut message = format!("lotrefresh: {n} object(s) recomputed");
@@ -5750,6 +5759,7 @@ fn exec_lot_refresh(
             " (hand edits to {edited} generated road(s) replaced)"
         ));
     }
+    message.push_str(&dropped_roles_note(dropped));
     Ok((
         Command::LotRefresh {
             source,
@@ -5768,8 +5778,17 @@ fn exec_lot_refresh(
     ))
 }
 
-/// New child ids, and the removed old children with their order index.
-type Rederived = (Vec<ObjectId>, Vec<(SceneObject, usize)>);
+/// New child ids, the removed old children with their order index, and how
+/// many edge role overrides matched no regenerated edge and were dropped.
+type Rederived = (Vec<ObjectId>, Vec<(SceneObject, usize)>, usize);
+
+/// The message suffix reporting `n` dropped edge role overrides.
+fn dropped_roles_note(n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    format!(" ({n} edge role override(s) no longer match a lot edge and were dropped)")
+}
 
 /// Re-derive the link at `source` as `link` (its settings and street edits)
 /// from the source boundary's CURRENT geometry, replacing `link.produced`.
@@ -5779,7 +5798,7 @@ type Rederived = (Vec<ObjectId>, Vec<(SceneObject, usize)>);
 fn rederive_link(
     doc: &mut Document,
     source: ObjectId,
-    link: itsjustcad_doc::SubdivLink,
+    mut link: itsjustcad_doc::SubdivLink,
     ids: Option<Vec<ObjectId>>,
     verb: &str,
 ) -> Result<Rederived, ExecError> {
@@ -5814,8 +5833,19 @@ fn rederive_link(
 
     // Re-derive by kind: Lots → derive_subdivision/insert_lots (produced = lots),
     // Site → generate_site/insert_site (produced = roads ++ blocks).
-    let new_ids = regenerate_by_kind(doc, link.kind, &poly, z, &link.settings, &link.streets, ids)
-        .map_err(ExecError::Invalid)?;
+    let roles_before = link.edge_roles.len();
+    let new_ids = regenerate_by_kind(
+        doc,
+        link.kind,
+        &poly,
+        z,
+        &link.settings,
+        &link.streets,
+        &mut link.edge_roles,
+        ids,
+    )
+    .map_err(ExecError::Invalid)?;
+    let dropped = roles_before - link.edge_roles.len();
     doc.subdivision_links.insert(
         source,
         itsjustcad_doc::SubdivLink {
@@ -5826,7 +5856,7 @@ fn rederive_link(
         },
     );
     doc.generation += 1;
-    Ok((new_ids, restored))
+    Ok((new_ids, restored, dropped))
 }
 
 /// Re-derive an associative subdivision result by kind, inserting the new
@@ -5835,6 +5865,7 @@ fn rederive_link(
 /// replay stays byte-identical; otherwise fresh ids are minted. Ensures the
 /// destination layer(s) exist (the caller already captured those for undo on
 /// first creation; a refresh onto an existing layer creates none).
+#[allow(clippy::too_many_arguments)]
 fn regenerate_by_kind(
     doc: &mut Document,
     kind: itsjustcad_doc::SubdivKind,
@@ -5842,11 +5873,13 @@ fn regenerate_by_kind(
     z: f64,
     settings: &subdivision::SubdivisionSettings,
     streets: &BTreeMap<u32, itsjustcad_doc::StreetEdit>,
+    edge_roles: &mut Vec<itsjustcad_doc::EdgeRoleOverride>,
     ids: Option<Vec<ObjectId>>,
 ) -> Result<Vec<ObjectId>, String> {
     match kind {
         itsjustcad_doc::SubdivKind::Lots => {
-            let bake = crate::lot::derive_subdivision(poly, z, settings)?;
+            let mut bake = crate::lot::derive_subdivision(poly, z, settings)?;
+            crate::lot::apply_edge_roles(bake.lots.iter_mut(), edge_roles);
             let new_ids: Vec<ObjectId> = match ids {
                 Some(ids) if ids.len() == bake.polygons.len() => ids,
                 _ => (0..bake.polygons.len()).map(|_| ObjectId::new()).collect(),
@@ -5901,6 +5934,9 @@ fn regenerate_by_kind(
                     lots_z.extend(lb.lots.into_iter().map(|l| (l, site.z)));
                 }
             }
+
+            // Hand-set edge roles before setbacks + buildings read them.
+            crate::lot::apply_edge_roles(lots_z.iter_mut().map(|(l, _)| l), edge_roles);
 
             // Steps 3 + 4: setbacks + buildings (robust: empty on failure, never abort the plan).
             let setbacks = crate::lot::compute_setbacks(&lots_z, settings).ok();
@@ -5995,15 +6031,19 @@ fn exec_lot_set_params(
         settings: new_settings,
         ..link
     };
-    let (new_ids, restored) = rederive_link(doc, source, new_link, ids, "lotsetparams")?;
+    let (new_ids, restored, dropped) = rederive_link(doc, source, new_link, ids, "lotsetparams")?;
 
     let n = new_ids.len();
+    let message = format!(
+        "lotsetparams: {n} lot(s) recomputed{}",
+        dropped_roles_note(dropped)
+    );
     Ok((
         Command::LotSetParams { source, params, ids: Some(new_ids.clone()) },
         // Reuse LotRefreshed: prev_link carries the OLD settings, so undo
         // restores both the prior lots and the prior params — exactly right.
         Inverse::LotRefreshed { source, created: new_ids.clone(), restored, prev_link },
-        ApplyOutcome { created: new_ids, message: format!("lotsetparams: {n} lot(s) recomputed") },
+        ApplyOutcome { created: new_ids, message },
     ))
 }
 
@@ -6062,12 +6102,13 @@ fn exec_street_set(
         edit.class = class.or(edit.class);
         edit.width = width.or(edit.width);
     }
-    let (new_ids, restored) = rederive_link(doc, source, new_link, ids, "streetset")?;
+    let (new_ids, restored, dropped) = rederive_link(doc, source, new_link, ids, "streetset")?;
 
     let message = format!(
-        "streetset: {} street(s) updated; {} object(s) recomputed",
+        "streetset: {} street(s) updated; {} object(s) recomputed{}",
         roads.len(),
-        new_ids.len()
+        new_ids.len(),
+        dropped_roles_note(dropped)
     );
     Ok((
         Command::StreetSet {
@@ -6090,6 +6131,106 @@ fn exec_street_set(
     ))
 }
 
+/// `edgerole` (#143 phase 5): override (or with `role: None` clear) the setback
+/// role of curve edge `edge` of one lot. A lot of a Lots/SitePlan link stores
+/// the override on the link and re-derives it (one `LotRefreshed` undo step);
+/// any other closed polyline gets it written into its own edge tags.
+fn exec_edge_role(
+    doc: &mut Document,
+    targets: Selector,
+    edge: usize,
+    role: Option<subdivision::EdgeRole>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let err = |m: &str| ExecError::Invalid(format!("edgerole: {m}"));
+    let &[lot] = resolve(doc, &targets)?.as_slice() else {
+        return Err(err("select exactly one lot"));
+    };
+    let obj = doc.get(lot).ok_or_else(|| err("no such object"))?;
+    let Geometry::Curve(
+        c @ Curve::Polyline {
+            points,
+            closed: true,
+        },
+    ) = &obj.geometry
+    else {
+        return Err(err("select a closed lot polyline"));
+    };
+    let n = points.len();
+    if edge >= n {
+        return Err(err(&format!("edge must be 0..{}", n - 1)));
+    }
+    let poly = crate::lot::curve_to_polygon(c).ok_or_else(|| err("could not read the lot"))?;
+    let mut block = crate::lot::doc_block(obj, poly);
+    let k = crate::lot::edge_index(&block, points, edge)
+        .ok_or_else(|| err("could not read the lot edge"))?;
+    let label = crate::lot::edge_role_name(role);
+    let command = |ids| Command::EdgeRole {
+        targets: Selector::Ids { ids: vec![lot] },
+        edge,
+        role,
+        ids,
+    };
+
+    let link_source = doc.subdiv_source_of(lot).filter(|src| {
+        obj.layer == crate::lot::LOTS_LAYER
+            && doc.subdiv_link(*src).is_some_and(|l| {
+                matches!(
+                    l.kind,
+                    itsjustcad_doc::SubdivKind::Lots | itsjustcad_doc::SubdivKind::SitePlan
+                )
+            })
+    });
+    let Some(source) = link_source else {
+        block.edges[k].role = role;
+        let tags = crate::lot::edge_tags_along(&block, points);
+        let obj = doc.get_mut(lot).expect("resolved above");
+        let prev = std::mem::replace(&mut obj.edge_tags, tags);
+        doc.generation += 1;
+        return Ok((
+            command(None),
+            Inverse::EdgeTags(lot, prev),
+            ApplyOutcome {
+                created: Vec::new(),
+                message: format!("edgerole: edge {edge} set to {label}"),
+            },
+        ));
+    };
+
+    let link = doc.subdivision_links[&source].clone();
+    if link.frozen {
+        return Err(err("this result is frozen — unfreeze to recompute"));
+    }
+    let prev_link = link.clone();
+    let mut new_link = link;
+    let e = &block.edges[k];
+    new_link
+        .edge_roles
+        .retain(|o| !crate::lot::override_matches(e, o));
+    new_link
+        .edge_roles
+        .extend(role.map(|r| crate::lot::edge_override(e, r)));
+    let (new_ids, restored, dropped) = rederive_link(doc, source, new_link, ids, "edgerole")?;
+
+    let message = format!(
+        "edgerole: edge {edge} set to {label}; {} object(s) recomputed{}",
+        new_ids.len(),
+        dropped_roles_note(dropped)
+    );
+    Ok((
+        command(Some(new_ids.clone())),
+        Inverse::LotRefreshed {
+            source,
+            created: new_ids.clone(),
+            restored,
+            prev_link,
+        },
+        ApplyOutcome {
+            created: new_ids,
+            message,
+        },
+    ))
+}
 /// W1d: toggle a link's `frozen` flag. Frozen bakes the result (recompute is
 /// rejected); unfreeze re-enables it. `prev` carries the old flag for replay.
 fn exec_lot_freeze(
@@ -6475,6 +6616,7 @@ fn exec_lot_generate_site(
             frozen: false,
             kind: itsjustcad_doc::SubdivKind::Site,
             streets: Default::default(),
+            edge_roles: Vec::new(),
         },
     );
     doc.generation += 1;
@@ -6581,6 +6723,7 @@ fn exec_site_plan(
         z,
         &settings,
         &BTreeMap::new(),
+        &mut Vec::new(),
         ids,
     )
     .map_err(ExecError::Invalid)?;
@@ -6619,6 +6762,7 @@ fn exec_site_plan(
             frozen: false,
             kind: itsjustcad_doc::SubdivKind::SitePlan,
             streets: Default::default(),
+            edge_roles: Vec::new(),
         },
     );
     doc.generation += 1;
@@ -13197,6 +13341,9 @@ fn apply_forward(
         Command::StreetSet { targets, name, class, width, ids } => {
             exec_street_set(doc, targets, name, class, width, ids)
         }
+        Command::EdgeRole { targets, edge, role, ids } => {
+            exec_edge_role(doc, targets, edge, role, ids)
+        }
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
         Command::LotLoading { targets, mode, prev } => exec_lot_loading(doc, targets, mode, prev),
         Command::LotGenerateSite {
@@ -16006,6 +16153,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotSetParams { .. } => "lotsetparams",
         Command::LotFreeze { .. } => "lotfreeze",
         Command::StreetSet { .. } => "streetset",
+        Command::EdgeRole { .. } => "edgerole",
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
@@ -27143,6 +27291,218 @@ mod tests {
         assert!(err.to_string().contains("select generated roads"));
     }
 
+    /// The one lot carrying a hand-set edge role, with its tags.
+    fn overridden_lot(doc: &Document) -> Option<(ObjectId, Vec<itsjustcad_doc::EdgeTag>)> {
+        let mut lots = doc.objects().filter_map(|o| {
+            let tags = o.valid_edge_tags()?;
+            tags.iter()
+                .any(|t| t.overridden)
+                .then(|| (o.id, tags.to_vec()))
+        });
+        let lot = lots.next();
+        assert!(lots.next().is_none(), "one overridden lot");
+        lot
+    }
+
+    #[test]
+    fn edgerole_parses() {
+        assert_eq!(
+            crate::parse::parse("edgerole last edge=2 role=street_side").unwrap(),
+            Command::EdgeRole {
+                targets: Selector::Last { n: 1 },
+                edge: 2,
+                role: Some(subdivision::EdgeRole::StreetSide),
+                ids: None,
+            }
+        );
+        assert!(matches!(
+            crate::parse::parse("edgerole edge=0 role=auto").unwrap(),
+            Command::EdgeRole {
+                targets: Selector::Selected,
+                role: None,
+                ..
+            }
+        ));
+        assert!(crate::parse::parse("edgerole last edge=1").is_err());
+        assert!(crate::parse::parse("edgerole last edge=1 role=back").is_err());
+        assert!(crate::parse::parse("edgerole last edge=x role=front").is_err());
+    }
+
+    /// `edgerole` on a site plan lot: the rear edge made the front flips the
+    /// rear onto the old (street) front, moves the envelope, survives
+    /// `lotrefresh` / `lotsetparams`, replays, saves, and undoes in one step.
+    /// A big parameter change that moves the edge drops it, reported.
+    #[test]
+    fn edgerole_override_survives_rederive() {
+        use subdivision::EdgeRole::{Front, Rear};
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 600 450");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "siteplan last");
+        let before = s.doc.subdivision_links[&source].produced.clone();
+        let (lot, tags) = s
+            .doc
+            .objects()
+            .filter(|o| o.layer == crate::lot::LOTS_LAYER)
+            .find_map(|o| {
+                let t = o.valid_edge_tags()?;
+                let one = |r| t.iter().filter(|e| e.role == Some(r)).count() == 1;
+                (one(Front) && one(Rear)).then(|| (o.id, t.to_vec()))
+            })
+            .expect("a lot with one front and one rear");
+        let at = |r| tags.iter().position(|t| t.role == Some(r)).unwrap();
+        let (front, rear) = (at(Front), at(Rear));
+        let geom = s.doc.get(lot).unwrap().geometry.clone();
+        let envelope = |doc: &Document, id| {
+            let obj = doc.get(id).unwrap();
+            let Geometry::Curve(c) = &obj.geometry else {
+                unreachable!()
+            };
+            let block = crate::lot::doc_block(obj, crate::lot::curve_to_polygon(c).unwrap());
+            let settings = subdivision::SubdivisionSettings {
+                setback_front: 6.0,
+                setback_rear: 1.0,
+                ..Default::default()
+            };
+            subdivision::buildable_envelope(&block, &settings)
+                .polygon
+                .unwrap()
+                .centroid()
+        };
+        let env0 = envelope(&s.doc, lot);
+
+        let out = s
+            .run(Command::EdgeRole {
+                targets: Selector::Ids { ids: vec![lot] },
+                edge: rear,
+                role: Some(Front),
+                ids: None,
+            })
+            .expect("edgerole");
+        assert!(out.message.starts_with("edgerole: edge"), "{}", out.message);
+        let (new_lot, t) = overridden_lot(&s.doc).expect("override applied");
+        assert_eq!(
+            s.doc.get(new_lot).unwrap().geometry,
+            geom,
+            "same lot re-derived"
+        );
+        assert_eq!((t[rear].role, t[rear].overridden), (Some(Front), true));
+        assert_eq!((t[front].role, t[front].overridden), (Some(Rear), false));
+        assert_ne!(
+            envelope(&s.doc, new_lot),
+            env0,
+            "setbacks follow the new front"
+        );
+        assert_eq!(s.doc.subdivision_links[&source].edge_roles.len(), 1);
+
+        // lotrefresh and an unchanged-geometry lotsetparams keep it.
+        s.run(Command::LotRefresh { source, ids: None }).unwrap();
+        assert!(overridden_lot(&s.doc).is_some_and(|(_, t)| t[rear].overridden));
+        let seed = s.doc.subdivision_links[&source].settings.seed;
+        let params = BTreeMap::from([("seed".to_string(), seed.to_string())]);
+        s.run(Command::LotSetParams {
+            source,
+            params,
+            ids: None,
+        })
+        .unwrap();
+        assert!(overridden_lot(&s.doc).is_some_and(|(_, t)| t[rear].overridden));
+
+        // Replay and save/load reproduce it.
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(
+            s.doc.objects().collect::<Vec<_>>(),
+            replayed.doc.objects().collect::<Vec<_>>()
+        );
+        let json = serde_json::to_string(&s.doc).unwrap();
+        let loaded: Document = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.subdivision_links, s.doc.subdivision_links);
+        assert!(overridden_lot(&loaded).is_some());
+        // Pre-phase-5 JSON (no `edge_roles`, no `overridden`) loads unchanged.
+        let old = json.replace(",\"overridden\":true", "");
+        let mut v: serde_json::Value = serde_json::from_str(&old).unwrap();
+        for l in v["subdivision_links"].as_object_mut().unwrap().values_mut() {
+            l.as_object_mut().unwrap().remove("edge_roles");
+        }
+        let old: Document = serde_json::from_value(v).unwrap();
+        assert!(overridden_lot(&old).is_none());
+        assert!(
+            old.subdivision_links
+                .values()
+                .all(|l| l.edge_roles.is_empty())
+        );
+
+        // A big change moves the edge: the override is dropped and reported.
+        let area = s.doc.subdivision_links[&source].settings.lot_area_min * 10.0;
+        let params = BTreeMap::from([("lot_area_min".to_string(), area.to_string())]);
+        let out = s
+            .run(Command::LotSetParams {
+                source,
+                params,
+                ids: None,
+            })
+            .unwrap();
+        assert!(
+            out.message
+                .contains("1 edge role override(s) no longer match"),
+            "{}",
+            out.message
+        );
+        assert!(s.doc.subdivision_links[&source].edge_roles.is_empty());
+        assert!(overridden_lot(&s.doc).is_none());
+
+        // One undo step each, back to the original plan.
+        for _ in 0..4 {
+            run(&mut s, "undo");
+        }
+        let link = &s.doc.subdivision_links[&source];
+        assert_eq!(link.produced, before);
+        assert!(link.edge_roles.is_empty());
+    }
+
+    /// `role=auto` clears a link override; on a curve outside any link the
+    /// role is written into its own edge tags, and undo removes them.
+    #[test]
+    fn edgerole_auto_clears_and_tags_plain_lots() {
+        use subdivision::EdgeRole::{Front, Rear, Side};
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 100");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "lotsubdivide last");
+        let lot = s.doc.subdivision_links[&source].produced[0];
+        run(&mut s, &format!("edgerole id:{lot} edge=0 role=side"));
+        assert!(overridden_lot(&s.doc).is_some_and(|(_, t)| t[0].role == Some(Side)));
+        let lot = overridden_lot(&s.doc).unwrap().0;
+        run(&mut s, &format!("edgerole id:{lot} edge=0 role=auto"));
+        assert!(s.doc.subdivision_links[&source].edge_roles.is_empty());
+        assert!(overridden_lot(&s.doc).is_none());
+
+        // A plain rectangle (no link): edge 1 (40 m) made the front.
+        run(&mut s, "rect 1000,0,0 30 40");
+        let plain = s.doc.objects().last().unwrap().id;
+        assert!(s.doc.get(plain).unwrap().edge_tags.is_none());
+        let err = s
+            .run(Command::EdgeRole {
+                targets: Selector::Ids { ids: vec![plain] },
+                edge: 4,
+                role: Some(Front),
+                ids: None,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("edge must be 0..3"), "{err}");
+        run(&mut s, "edgerole last edge=0 role=front");
+        let tags = s
+            .doc
+            .get(plain)
+            .unwrap()
+            .valid_edge_tags()
+            .unwrap()
+            .to_vec();
+        assert_eq!((tags[0].role, tags[0].overridden), (Some(Front), true));
+        assert_eq!(tags[2].role, Some(Rear));
+        run(&mut s, "undo");
+        assert!(s.doc.get(plain).unwrap().edge_tags.is_none());
+    }
     #[test]
     fn lotgeneratesite_nonrectilinear_patterns_bake() {
         // Non-rectilinear patterns: radial / hexagonal / voronoi generate

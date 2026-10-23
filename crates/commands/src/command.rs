@@ -2168,6 +2168,22 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Override the setback role of edge `edge` (curve edge `i` runs from
+    /// point `i` to `i + 1`) of one lot (#143 phase 5); `role: None` (`auto`)
+    /// clears the override. On a lot of a Lots/SitePlan link the override is
+    /// stored on the link, keyed by the edge's geometry, and the link is
+    /// re-derived (like `StreetSet`), so it survives `lotrefresh` /
+    /// `lotsetparams`; `ids` is written back as the re-derived children.
+    /// Otherwise it is written into the lot's own `edge_tags`. Logged; one
+    /// undo step.
+    EdgeRole {
+        targets: Selector,
+        edge: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<subdivision::EdgeRole>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// Show or set the sticky `SubdivisionSettings` on the document.
     /// With no `sets`, the exec message reports the current
     /// settings; otherwise each `key=value` updates one field. Logged so saved
