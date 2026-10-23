@@ -8530,11 +8530,6 @@ impl App {
                 }
             });
         });
-        ui.weak(format!(
-            "{} lot(s){}",
-            link.produced.len(),
-            if link.frozen { " · frozen" } else { "" }
-        ));
     }
 
     /// The `Yield` segment: the link's yield (source + produced objects, as
@@ -8556,60 +8551,81 @@ impl App {
                 itsjustcad_commands::lot::yield_report(&self.session.doc, &ids, &link.settings);
             self.subdiv_yield = Some((source, generation, report));
         }
-        let Some((_, _, r)) = &self.subdiv_yield else {
+        let Some((_, _, r)) = self.subdiv_yield.as_ref() else {
             return;
         };
         if r.is_empty() {
             ui.weak(t("param.subdivision.yield.empty"));
             return;
         }
-        let area = |a: f64| format!("{a:.0} m²");
-        let pct = |f: f64| format!("{:.1}%", f * 100.0);
-        let opt = |v: Option<f64>, f: &dyn Fn(f64) -> String| v.map_or("—".to_string(), f);
-        let mut rows: Vec<(&str, String)> = vec![
-            (t("param.subdivision.yield.lots"), r.lot_count.to_string()),
-            (t("param.subdivision.yield.lot_area_avg"), area(r.avg_lot_area)),
-            (
-                t("param.subdivision.yield.lot_area_range"),
-                format!("{:.0} – {:.0} m²", r.min_lot_area, r.max_lot_area),
-            ),
-        ];
-        if let Some(f) = &r.frontage {
-            rows.push((t("param.subdivision.yield.frontage_avg"), format!("{:.1} m", f.avg)));
+        // Baked objects per layer (roads / blocks / setbacks); zero rows hide.
+        let count = |layer: &str| {
+            link.produced
+                .iter()
+                .filter(|id| self.session.doc.get(**id).is_some_and(|o| o.layer == layer))
+                .count()
+        };
+        use itsjustcad_commands::lot::{BLOCKS_LAYER, ROADS_LAYER, SETBACKS_LAYER};
+        let n = |v: usize| v.to_string();
+        let m2 = |a: f64| format!("{a:.0}");
+        let pct = |f: f64| format!("{:.1}", f * 100.0);
+        let ratio = |v: Option<f64>| v.map_or("—".to_string(), |v| format!("{v:.2}"));
+        // (label, value, unit): values right-aligned, units in their own
+        // leading-aligned column so both line up.
+        let mut rows: Vec<(&str, String, &str)> = Vec::new();
+        for (key, layer) in [
+            ("param.subdivision.yield.roads", ROADS_LAYER),
+            ("param.subdivision.yield.blocks", BLOCKS_LAYER),
+        ] {
+            let c = count(layer);
+            if c > 0 {
+                rows.push((t(key), n(c), ""));
+            }
         }
         rows.extend([
-            (t("param.subdivision.yield.gross"), area(r.gross_site_area)),
+            (t("param.subdivision.yield.lots"), n(r.lot_count), ""),
+            (t("param.subdivision.yield.lot_area_avg"), m2(r.avg_lot_area), "m²"),
+            (
+                t("param.subdivision.yield.lot_area_range"),
+                format!("{:.0} – {:.0}", r.min_lot_area, r.max_lot_area),
+                "m²",
+            ),
+        ]);
+        if let Some(f) = &r.frontage {
+            rows.push((t("param.subdivision.yield.frontage_avg"), format!("{:.1}", f.avg), "m"));
+        }
+        let setbacks = count(SETBACKS_LAYER);
+        if setbacks > 0 {
+            rows.push((t("param.subdivision.yield.setbacks"), n(setbacks), ""));
+        }
+        rows.extend([
+            (t("param.subdivision.yield.gross"), m2(r.gross_site_area), "m²"),
             (
                 t("param.subdivision.yield.open_space"),
-                format!(
-                    "{} ({})",
-                    area(r.open_space_feature_area + r.reserved_block_area),
-                    pct(r.open_space_ratio)
-                ),
+                m2(r.open_space_feature_area + r.reserved_block_area),
+                "m²",
             ),
-            (t("param.subdivision.yield.net"), area(r.net_developable_area)),
-            (t("param.subdivision.yield.buildings"), r.building_count.to_string()),
-            (t("param.subdivision.yield.gfa"), area(r.total_gfa)),
+            (t("param.subdivision.yield.open_space_ratio"), pct(r.open_space_ratio), "%"),
+            (t("param.subdivision.yield.net"), m2(r.net_developable_area), "m²"),
+            (t("param.subdivision.yield.buildings"), n(r.building_count), ""),
+            (t("param.subdivision.yield.gfa"), m2(r.total_gfa), "m²"),
+            (t("param.subdivision.yield.far"), format!("{} / {}", ratio(r.far_net), ratio(r.far_gross)), ""),
             (
-                t("param.subdivision.yield.far"),
-                format!(
-                    "{} / {}",
-                    opt(r.far_net, &|v| format!("{v:.2}")),
-                    opt(r.far_gross, &|v| format!("{v:.2}"))
-                ),
+                t("param.subdivision.yield.coverage"),
+                r.lot_coverage.map_or("—".to_string(), pct),
+                if r.lot_coverage.is_some() { "%" } else { "" },
             ),
-            (t("param.subdivision.yield.coverage"), opt(r.lot_coverage, &pct)),
         ]);
         // Side padding so the table doesn't run edge to edge with the panel.
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::M as i8, 4))
             .show(ui, |ui| {
                 egui::Grid::new(("subdiv_yield", source))
-                    .num_columns(2)
+                    .num_columns(3)
                     .striped(true)
-                    .spacing([crate::theme::Spacing::L, 6.0])
+                    .spacing([crate::theme::Spacing::S, 6.0])
                     .show(ui, |ui| {
-                        for (label, value) in rows {
+                        for (label, value, unit) in rows {
                             ui.label(label);
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -8617,6 +8633,7 @@ impl App {
                                     ui.monospace(value);
                                 },
                             );
+                            ui.monospace(unit);
                             ui.end_row();
                         }
                     });
