@@ -27049,6 +27049,10 @@ mod tests {
     #[test]
     fn baked_lot_commands_read_stored_street_tags() {
         let mut s = Session::default();
+        // Distinct front and side setbacks, so the street tag moves the envelope.
+        s.doc.subdivision_settings.setback_front = 6.0;
+        s.doc.subdivision_settings.setback_side = 2.0;
+        s.doc.subdivision_settings.setback_rear = 4.0;
         run(&mut s, "rect 0,0,0 600 450");
         run(&mut s, "siteplan last");
         let (id, tagged, plain) = lot_where_tags_matter(&s);
