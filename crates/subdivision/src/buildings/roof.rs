@@ -14,8 +14,10 @@
 //!   the opposite eave.
 //!
 //! `pitch` is the roof slope in degrees; the peak height is derived from the
-//! footprint half-span × tan(pitch). All roofs are emitted as a closed
-//! [`kernel_mesh::Mesh`] sitting on the ring at the eave elevation. Rings are the
+//! footprint half-span × tan(pitch). Pitched roofs are emitted as a
+//! [`kernel_mesh::Mesh`] open only at its eave rectangle (outward-facing
+//! winding), so `solid.rs` closes the top tier with it; a flat roof is the
+//! slab over the ring. Rings are the
 //! rectangular / ring footprints the building generator produces, so the gable/hip geometry is
 //! built on the ring's bounding rectangle (robust + deterministic).
 
@@ -87,9 +89,9 @@ fn gable(lo: DVec2, hi: DVec2, z: f64, pitch: f64) -> Mesh {
         // Slope 2 (y = hi side): 3,4,5,2 wound the other way.
         faces.push([2, 3, 4]);
         faces.push([2, 4, 5]);
-        // Gable ends (triangles): lo-x end 0,3,4 ; hi-x end 1,2,5.
+        // Gable ends (triangles, facing out): lo-x end 0,4,3 ; hi-x end 1,2,5.
         faces.push([0, 4, 3]);
-        faces.push([1, 5, 2]);
+        faces.push([1, 2, 5]);
     } else {
         // Ridge along y; slopes fall in ±x. Half-span = w/2.
         let r = rise(w * 0.5, pitch);
@@ -174,8 +176,8 @@ fn hip(lo: DVec2, hi: DVec2, z: f64, pitch: f64) -> Mesh {
 }
 
 /// Shed / mono-pitch: a single plane sloping from the low eave (y=lo) up to the
-/// high eave (y=hi), plus the two triangular side walls + the high gable wall to
-/// keep it closed.
+/// high eave (y=hi), plus the two triangular side walls + the high wall, so it
+/// closes over the eave ring like the other roofs.
 fn shed(lo: DVec2, hi: DVec2, z: f64, pitch: f64) -> Mesh {
     let d = hi.y - lo.y;
     let r = rise(d, pitch);
@@ -184,10 +186,18 @@ fn shed(lo: DVec2, hi: DVec2, z: f64, pitch: f64) -> Mesh {
         DVec3::new(hi.x, lo.y, z),         // 1 low eave
         DVec3::new(hi.x, hi.y, z + r),     // 2 high eave
         DVec3::new(lo.x, hi.y, z + r),     // 3 high eave
+        DVec3::new(hi.x, hi.y, z),         // 4 high wall foot
+        DVec3::new(lo.x, hi.y, z),         // 5 high wall foot
     ];
     let positions = p.to_vec();
-    // The single sloped plane.
-    let faces = vec![[0, 1, 2], [0, 2, 3]];
+    let faces = vec![
+        [0, 1, 2], // the sloped plane
+        [0, 2, 3],
+        [1, 4, 2], // hi-x side triangle
+        [0, 3, 5], // lo-x side triangle
+        [4, 5, 3], // high wall
+        [4, 3, 2],
+    ];
     Mesh::new(positions, faces)
 }
 

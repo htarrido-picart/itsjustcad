@@ -5952,7 +5952,7 @@ fn regenerate_by_kind(
         itsjustcad_doc::SubdivKind::SitePlan => {
             // META: compose the whole chain from the site boundary. Produced
             // ids are a FLAT vec in insertion order:
-            //   roads ++ blocks ++ lots ++ envelopes ++ buildings(×3) ++ reserves.
+            //   roads ++ blocks ++ lots ++ envelopes ++ buildings(×2) ++ reserves.
             // Deterministic, so replay reuses `ids` sliced by the recomputed
             // counts (same pattern as the Site arm).
             let plan = crate::lot::plan_site(poly, z, settings, streets, edge_roles)?;
@@ -7245,7 +7245,8 @@ fn exec_lot_openspace(
 
 /// `lotbuilding`: generate a footprint + stepped 3D mass +
 /// roof inside each selected lot's buildable envelope, baking footprint (2D) +
-/// mass (3D mesh) + roof (3D mesh) onto the `buildings` layer. Per-run args
+/// the building solid (3D: mass ∪ roof, one closed mesh) onto the `buildings`
+/// layer. Per-run args
 /// override the sticky settings and are baked into the op so replay is
 /// self-contained; written-back ids make replay byte-identical. Per-floor areas
 /// are stored on the buildings so the yield report can compute GFA/FAR. A lot with
@@ -7329,7 +7330,7 @@ fn exec_lot_building(
 
     let bake = crate::lot::compute_buildings(&lots, &settings).map_err(ExecError::Invalid)?;
 
-    // 3 objects per building (footprint + mass + roof).
+    // 2 objects per building (footprint curve + building solid).
     let want = bake.buildings.len() * crate::lot::OBJECTS_PER_BUILDING;
     let new_ids: Vec<ObjectId> = match ids {
         Some(ids) if ids.len() == want => ids,
@@ -26933,6 +26934,30 @@ mod tests {
         assert!(layer_count(&s, crate::lot::LOTS_LAYER) > 0, "lots baked");
     }
 
+    /// Generated buildings of a live (or frozen) link are locked against
+    /// direct manipulation; roads (and everything else) are not.
+    #[test]
+    fn siteplan_buildings_are_locked_generated_roads_are_not() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 150");
+        let source = s.doc.objects().next().expect("site boundary").id;
+        run(&mut s, "siteplan last");
+        let produced = s.doc.subdivision_links[&source].produced.clone();
+        let on = |s: &Session, layer: &str| -> Vec<ObjectId> {
+            produced.iter().copied().filter(|id| s.doc.get(*id).is_some_and(|o| o.layer == layer)).collect()
+        };
+        let buildings = on(&s, crate::lot::BUILDINGS_LAYER);
+        let roads = on(&s, crate::lot::ROADS_LAYER);
+        assert!(!buildings.is_empty() && !roads.is_empty(), "siteplan baked buildings + roads");
+        assert!(buildings.iter().all(|id| crate::lot::is_locked_generated(&s.doc, *id)));
+        assert!(roads.iter().all(|id| !crate::lot::is_locked_generated(&s.doc, *id)));
+        assert!(!crate::lot::is_locked_generated(&s.doc, source), "the source boundary is free");
+        // One footprint curve + one solid per building.
+        assert_eq!(buildings.len() % crate::lot::OBJECTS_PER_BUILDING, 0);
+        s.doc.subdivision_links.get_mut(&source).unwrap().frozen = true;
+        assert!(buildings.iter().all(|id| crate::lot::is_locked_generated(&s.doc, *id)), "frozen stays locked");
+    }
+
     /// F1: LotRefresh on a SitePlan link recomputes the WHOLE chain with fresh
     /// ids (old gone, new present); undo restores the prior chain. This is the
     /// free associativity — refresh routes through regenerate_by_kind by kind.
@@ -28070,11 +28095,57 @@ mod tests {
         run(&mut s, "lotsettings region=us_suburban front=5 side=3 rear=7");
         let out = run(&mut s, "lotbuilding last typology=detached floors=3 roof=gable");
         assert!(s.doc.layers.contains_key(crate::lot::BUILDINGS_LAYER));
-        // 3 objects per building: footprint (curve) + mass (mesh) + roof (mesh).
-        assert_eq!(buildings_count(&s), 3, "footprint + mass + roof");
-        assert_eq!(building_meshes(&s), 2, "mass + roof are meshes");
+        // 2 objects per building: footprint (curve) + the building solid
+        // (mesh: mass ∪ roof).
+        assert_eq!(buildings_count(&s), 2, "footprint + solid");
+        assert_eq!(building_meshes(&s), 1, "mass + roof are ONE mesh");
         assert!(out.message.contains("GFA"), "message reports GFA: {}", out.message);
-        assert_eq!(out.created.len(), 3);
+        assert_eq!(out.created.len(), 2);
+    }
+
+    #[test]
+    fn baked_building_is_one_closed_solid_with_its_roof() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 40 50");
+        run(&mut s, "lotsettings region=us_suburban front=5 side=3 rear=7");
+        run(&mut s, "lotbuilding last typology=slab floors=6 stepback=2 roof=gable");
+        let meshes: Vec<_> = s
+            .doc
+            .objects()
+            .filter(|o| o.layer == crate::lot::BUILDINGS_LAYER)
+            .filter_map(|o| match &o.geometry {
+                Geometry::Mesh(m) => Some((o.name.clone().unwrap_or_default(), m.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(meshes.len(), 1, "mass + roof baked as one object");
+        let (name, m) = &meshes[0];
+        assert!(name.starts_with("building:mass gfa="), "name contract kept: {name}");
+        assert!(s.doc.objects().all(|o| o.name.as_deref() != Some("building:roof")));
+        // Watertight: every edge shared by exactly two faces, consistently wound.
+        let mut directed = std::collections::BTreeMap::<(u32, u32), usize>::new();
+        for f in m.faces() {
+            for k in 0..3 {
+                *directed.entry((f[k], f[(k + 1) % 3])).or_default() += 1;
+            }
+        }
+        for (&(a, b), &c) in &directed {
+            assert_eq!(c, 1, "edge {a}->{b} used {c}×");
+            assert_eq!(directed.get(&(b, a)), Some(&1), "edge {a}-{b} not shared by 2 faces");
+        }
+        // Stepped: several distinct horizontal ledges, but none inside a tier
+        // (floors 0..stepback share one ring → no slab at their joins).
+        let p = m.positions();
+        let z0 = p.iter().map(|v| v.z).fold(f64::MAX, f64::min);
+        let flat_at = |z: f64| {
+            m.faces().iter().any(|f| f.iter().all(|&i| (p[i as usize].z - z).abs() < 1e-9))
+        };
+        // Default step-back starts at floor 3: floors 0-2 are one tier.
+        assert!(!flat_at(z0 + 3.0) && !flat_at(z0 + 6.0), "no slab between identical floors");
+        assert!(flat_at(z0 + 9.0), "step-back ledge at the first step");
+        // The roof rises above the eave of the 6-floor mass.
+        let top = p.iter().map(|v| v.z).fold(f64::MIN, f64::max);
+        assert!(top > z0 + 18.0, "roof is part of the solid (top {top})");
     }
 
     #[test]

@@ -9,7 +9,8 @@
 //! massing — each step above the threshold pulls the perimeter in further),
 //! giving the classic ziggurat / wedding-cake upper-floor step-backs.
 //!
-//! The mass is emitted as an indexed triangle mesh ([`kernel_mesh::Mesh`]) so
+//! The mass is emitted as one closed indexed triangle mesh (flat-topped; see
+//! `solid.rs`, which also unions the roof on) ([`kernel_mesh::Mesh`]) so
 //! the commands crate can bake it directly onto a 3D layer. Per-floor areas are
 //! recorded on [`Massing::floors`] so yield reporting can compute GFA / FAR:
 //! **GFA = Σ per-floor (net) areas** (net of step-backs and any courtyard void).
@@ -19,10 +20,12 @@
 //! level (height clamps to the floors that survived) — never a panic.
 
 use crate::buildings::footprint::Footprint;
+use crate::buildings::solid::{building_solid, is_axis_rect};
+use crate::geometry::clip_bridge;
 use crate::geometry::polygon2d::Polygon2d;
-use crate::settings::SubdivisionSettings;
-use glam::{DVec2, DVec3};
-use kernel_mesh::{earcut, Mesh};
+use crate::settings::{RoofType, SubdivisionSettings};
+use glam::DVec2;
+use kernel_mesh::Mesh;
 
 /// One floor of a stepped mass: its base elevation, its (possibly stepped-back)
 /// outer ring, its net floor area (outer minus void), and whether it carries the
@@ -46,7 +49,7 @@ pub struct Floor {
 /// step-back collapsed the upper floors).
 #[derive(Debug, Clone)]
 pub struct Massing {
-    /// The extruded, stepped 3D mass (triangulated).
+    /// The extruded, stepped 3D mass as one closed solid with a flat top.
     pub mesh: Mesh,
     /// Per-floor records for yield reporting.
     pub floors: Vec<Floor>,
@@ -88,18 +91,25 @@ pub fn massing(footprint: &Footprint, base_z: f64, settings: &SubdivisionSetting
         } else {
             0.0
         };
-        let outer = inset_rect(&footprint.outer, inset);
+        let outer = if is_axis_rect(&footprint.outer) {
+            inset_rect(&footprint.outer, inset)
+        } else {
+            inset_outline(&footprint.outer, inset)
+        };
         let Some(outer) = outer else {
             // This floor stepped back to nothing — stop adding floors above.
             break;
         };
         // The void (courtyard) grows with the same inset so the wall band holds;
-        // if the void meets the outer the floor becomes solid (no void).
-        let void = footprint
-            .void
-            .as_ref()
-            .and_then(|v| inset_rect(v, -inset))
-            .filter(|v| v.area() < outer.area());
+        // once the band closes (the void no longer fits strictly inside the
+        // outer ring) the courtyard building stops adding floors.
+        let void = match &footprint.void {
+            None => None,
+            Some(v) => match inset_rect(v, -inset).filter(|v| strictly_inside(v, &outer)) {
+                Some(v) => Some(v),
+                None => break,
+            },
+        };
         let area = outer.area() - void.as_ref().map(|v| v.area()).unwrap_or(0.0);
         if area <= 1e-6 {
             break;
@@ -117,9 +127,33 @@ pub fn massing(footprint: &Footprint, base_z: f64, settings: &SubdivisionSetting
         return None;
     }
 
-    let mesh = build_mesh(&floors, floor_h);
+    let (mesh, _) = building_solid(&floors, floor_h, RoofType::Flat, 0.0);
     let height = floors.len() as f64 * floor_h;
     Some(Massing { mesh, floors, height, floor_height: floor_h })
+}
+
+/// Inset a non-rectangular outline by `margin` along its own edges (a true
+/// polygon offset, so the stepped floor stays inside the one below). Keeps the
+/// largest piece if the inset splits it; `None` if it collapses.
+fn inset_outline(poly: &Polygon2d, margin: f64) -> Option<Polygon2d> {
+    if margin.abs() < 1e-9 {
+        return Some(poly.clone());
+    }
+    clip_bridge::offset(poly, -margin)
+        .into_iter()
+        .filter(|p| p.area() > 1e-6)
+        .max_by(|a, b| a.area().total_cmp(&b.area()))
+}
+
+/// True if every vertex of `inner` lies strictly inside `outer` (by > 1 mm
+/// from its bounding box, for the rectangular rings massing produces).
+fn strictly_inside(inner: &Polygon2d, outer: &Polygon2d) -> bool {
+    let ((ilo, ihi), (olo, ohi)) = (inner.aabb(), outer.aabb());
+    ilo.x > olo.x + 1e-3
+        && ilo.y > olo.y + 1e-3
+        && ihi.x < ohi.x - 1e-3
+        && ihi.y < ohi.y - 1e-3
+        && inner.verts().iter().all(|v| outer.contains(*v))
 }
 
 /// Inset an axis-aligned-ish rectangle by `margin` (shrinking its bbox toward
@@ -141,95 +175,6 @@ fn inset_rect(poly: &Polygon2d, margin: f64) -> Option<Polygon2d> {
         (nhi.x, nhi.y),
         (nlo.x, nhi.y),
     ])
-}
-
-/// Build the closed triangle mesh for a stepped stack of floors. Each floor
-/// contributes its vertical side walls; the ground floor gets a floor slab (cap
-/// down) and the top floor a roof-less cap up (roofs are added separately by
-/// `roof.rs`, but we cap the top here so the raw mass is watertight when no roof
-/// is requested). Courtyard voids get inner side walls too.
-fn build_mesh(floors: &[Floor], floor_h: f64) -> Mesh {
-    let mut positions: Vec<DVec3> = Vec::new();
-    let mut faces: Vec<[u32; 3]> = Vec::new();
-
-    for floor in floors {
-        let z0 = floor.base_z;
-        let z1 = floor.base_z + floor_h;
-        // Outer side walls.
-        add_walls(&mut positions, &mut faces, floor.outer.verts(), z0, z1, true);
-        // Inner (courtyard) side walls, wound the other way.
-        if let Some(v) = &floor.void {
-            add_walls(&mut positions, &mut faces, v.verts(), z0, z1, false);
-        }
-    }
-
-    // Bottom cap (ground floor) — the floor slab, facing down.
-    if let Some(ground) = floors.first() {
-        add_cap(&mut positions, &mut faces, ground, ground.base_z, false);
-    }
-    // Top cap (highest floor) — facing up. A roof mesh may be baked on top of
-    // this by roof.rs; keeping the cap makes the bare mass watertight.
-    if let Some(top) = floors.last() {
-        add_cap(&mut positions, &mut faces, top, top.base_z + floor_h, true);
-    }
-
-    Mesh::new(positions, faces)
-}
-
-/// Add a vertical wall band around `ring` from `z0` to `z1`. `outward` selects
-/// the winding so outer walls face out and void walls face in.
-fn add_walls(
-    positions: &mut Vec<DVec3>,
-    faces: &mut Vec<[u32; 3]>,
-    ring: &[DVec2],
-    z0: f64,
-    z1: f64,
-    outward: bool,
-) {
-    let n = ring.len();
-    for i in 0..n {
-        let a = ring[i];
-        let b = ring[(i + 1) % n];
-        let base = positions.len() as u32;
-        positions.push(DVec3::new(a.x, a.y, z0));
-        positions.push(DVec3::new(b.x, b.y, z0));
-        positions.push(DVec3::new(b.x, b.y, z1));
-        positions.push(DVec3::new(a.x, a.y, z1));
-        if outward {
-            faces.push([base, base + 1, base + 2]);
-            faces.push([base, base + 2, base + 3]);
-        } else {
-            faces.push([base, base + 2, base + 1]);
-            faces.push([base, base + 3, base + 2]);
-        }
-    }
-}
-
-/// Add a horizontal cap (slab) for a floor's ring at elevation `z`. `up` selects
-/// the facing. A courtyard void punches a hole via triangulation of the ring
-/// with the hole removed (simple: triangulate the outer, drop triangles whose
-/// centroid falls inside the void).
-fn add_cap(positions: &mut Vec<DVec3>, faces: &mut Vec<[u32; 3]>, floor: &Floor, z: f64, up: bool) {
-    let ring = floor.outer.verts();
-    let tris = earcut(ring);
-    let base = positions.len() as u32;
-    for &v in ring {
-        positions.push(DVec3::new(v.x, v.y, z));
-    }
-    for t in tris {
-        // Skip triangles whose centroid falls in the courtyard void.
-        if let Some(void) = &floor.void {
-            let c = (ring[t[0] as usize] + ring[t[1] as usize] + ring[t[2] as usize]) / 3.0;
-            if void.contains(c) {
-                continue;
-            }
-        }
-        if up {
-            faces.push([base + t[0], base + t[1], base + t[2]]);
-        } else {
-            faces.push([base + t[0], base + t[2], base + t[1]]);
-        }
-    }
 }
 
 #[cfg(test)]

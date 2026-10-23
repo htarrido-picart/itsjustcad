@@ -10,14 +10,17 @@
 //! 2. [`massing::massing`] — extrude the footprint by floors, stepping upper
 //!    floors back, recording per-floor areas for GFA / FAR (yield reporting).
 //! 3. [`roof::roof`] — cap the top floor's ring with flat / gable / hip / shed.
+//! 4. [`solid::building_solid`] — union the tiers and the roof into ONE closed
+//!    solid (built directly: no internal faces, no coincident duplicates).
 //!
 //! [`build_on_envelope`] runs the whole pipeline for one lot and returns a
-//! [`BuildingResult`] carrying the footprint polygon (2D), the stepped mass mesh
-//! (3D), the roof mesh (3D), and the per-floor GFA data.
+//! [`BuildingResult`] carrying the footprint polygon (2D), the building solid
+//! (3D: stepped mass ∪ roof), and the per-floor GFA data.
 
 pub mod footprint;
 pub mod massing;
 pub mod roof;
+pub mod solid;
 
 pub use footprint::{footprint, Footprint};
 pub use massing::{massing, Floor, Massing};
@@ -27,25 +30,25 @@ use crate::geometry::polygon2d::Polygon2d;
 use crate::settings::{RoofType, SubdivisionSettings, Typology};
 use kernel_mesh::Mesh;
 
-/// The full result of building on one lot: the 2D footprint + 3D stepped mass +
-/// roof mesh + per-floor GFA data (for yield / FAR).
+/// The full result of building on one lot: the 2D footprint + the 3D building
+/// solid (stepped mass ∪ roof) + per-floor GFA data (for yield / FAR).
 #[derive(Debug, Clone)]
 pub struct BuildingResult {
     /// The footprint outer polygon (bake as a 2D curve).
     pub footprint: Polygon2d,
     /// The courtyard void, if the typology has one.
     pub void: Option<Polygon2d>,
-    /// The stepped 3D mass (bake as a mesh).
+    /// The building as ONE closed solid: the stepped tiers unioned with the
+    /// roof (bake as a single mesh).
     pub mass: Mesh,
-    /// The roof mesh (bake as a mesh; a flat roof is a slab).
-    pub roof: Mesh,
     /// Per-floor records (index, base z, area) for yield reporting.
     pub floors: Vec<Floor>,
     /// Fixed mass height = floors × floor_height.
     pub height: f64,
     /// Gross floor area = Σ per-floor net areas (for FAR = GFA / site area).
     pub gfa: f64,
-    /// Roof type used (per settings or per typology default).
+    /// Roof type built (per settings or per typology default; a pitched roof
+    /// on a non-rectangular top floor falls back to flat).
     pub roof_type: RoofType,
 }
 
@@ -78,21 +81,20 @@ pub fn build_on_envelope(
     let fp = footprint::footprint(envelope, lot, settings)?;
     let mass = massing::massing(&fp, base_z, settings)?;
 
-    // Roof sits on the TOP floor's outer ring at the mass top.
-    let top = mass.floors.last()?;
-    let eave_z = base_z + mass.height;
+    // The roof sits on the TOP floor's outer ring at the mass top, unioned
+    // with the stepped tiers into one solid.
     let roof_type = match settings.roof_type {
         RoofType::PerTypology => default_roof_for(settings.typology),
         rt => rt,
     };
-    let roof_mesh = roof::roof(&top.outer, eave_z, roof_type, settings.roof_pitch);
+    let (solid, roof_type) =
+        solid::building_solid(&mass.floors, mass.floor_height, roof_type, settings.roof_pitch);
 
     let gfa = mass.gfa();
     Some(BuildingResult {
         footprint: fp.outer,
         void: fp.void,
-        mass: mass.mesh,
-        roof: roof_mesh,
+        mass: solid,
         floors: mass.floors,
         height: mass.height,
         gfa,
@@ -126,11 +128,10 @@ mod tests {
         assert!((b.height - 6.0).abs() < 1e-9);
         assert!(b.gfa > 0.0);
         assert!(!b.mass.faces().is_empty());
-        assert!(!b.roof.faces().is_empty());
         // PerTypology → detached gets a gable.
         assert_eq!(b.roof_type, RoofType::Gable);
-        // Roof peak above the eave.
-        let peak = b.roof.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        // Roof peak (part of the one solid) above the eave.
+        let peak = b.mass.positions().iter().map(|p| p.z).fold(f64::MIN, f64::max);
         assert!(peak > 6.0, "gable peak {peak} above eave 6");
     }
 
@@ -189,7 +190,7 @@ mod tests {
         let b = build_on_envelope(&e, &e, 0.0, &s).unwrap();
         assert_eq!(a.footprint.verts(), b.footprint.verts());
         assert_eq!(a.mass.positions(), b.mass.positions());
-        assert_eq!(a.roof.positions(), b.roof.positions());
+        assert_eq!(a.mass.faces(), b.mass.faces());
         assert!((a.gfa - b.gfa).abs() < 1e-12);
     }
 }
