@@ -12,5 +12,5 @@ pub mod recursive_obb;
 pub mod setbacks;
 pub mod skeleton_sub;
 
-pub use recursive_obb::{subdivide, Lot};
+pub use recursive_obb::{subdivide, subdivide_block, Lot};
 pub use setbacks::{buildable_envelope, frontage, EdgeRole, Envelope, FrontageAt};

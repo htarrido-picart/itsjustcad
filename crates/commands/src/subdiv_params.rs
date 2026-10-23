@@ -289,6 +289,16 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             Unit::Meter,
         ),
         ParamField::float(
+            "setback_street_side",
+            "param.subdivision.setback_street_side",
+            5.0,
+            Some(0.0),
+            Some(500.0),
+            1.0,
+            Widget::Numeric,
+            Unit::Meter,
+        ),
+        ParamField::float(
             "setback_rear",
             "param.subdivision.setback_rear",
             20.0,
@@ -608,6 +618,7 @@ const FIELD_GROUPS: &[(&str, &[&str])] = &[
         &[
             "setback_front",
             "setback_side",
+            "setback_street_side",
             "setback_rear",
             "build_to_line",
             "frontage_at_setback",
@@ -713,6 +724,10 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     );
     m.insert("setback_front".into(), ParamValue::Float(s.setback_front));
     m.insert("setback_side".into(), ParamValue::Float(s.setback_side));
+    m.insert(
+        "setback_street_side".into(),
+        ParamValue::Float(s.street_side_setback()),
+    );
     m.insert("setback_rear".into(), ParamValue::Float(s.setback_rear));
     m.insert("road_width".into(), ParamValue::Float(s.road_width));
     m.insert("block_depth".into(), ParamValue::Float(s.block_depth));
@@ -823,6 +838,12 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     }
     if let Some(v) = p.get("setback_side").and_then(|v| v.as_f64()) {
         s.setback_side = v;
+    }
+    // Unset street side follows `setback_side`; only an edited value pins it.
+    if let Some(v) = p.get("setback_street_side").and_then(|v| v.as_f64())
+        && v != base.street_side_setback()
+    {
+        s.setback_street_side = Some(v);
     }
     if let Some(v) = p.get("setback_rear").and_then(|v| v.as_f64()) {
         s.setback_rear = v;

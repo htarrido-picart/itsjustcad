@@ -273,6 +273,9 @@ pub struct SubdivisionSettings {
     // ── Setbacks + buildable envelopes ──
     pub setback_front: f64,
     pub setback_side: f64,
+    /// Setback from a corner lot's secondary street edge(s). `None` (old
+    /// documents / settings) = same as `setback_side`.
+    pub setback_street_side: Option<f64>,
     pub setback_rear: f64,
     pub build_to_line: f64,
     pub draw_buildable_envelope: bool,
@@ -345,6 +348,7 @@ impl Default for SubdivisionSettings {
             frontage_at_setback: true,
             setback_front: 25.0,
             setback_side: 5.0,
+            setback_street_side: None,
             setback_rear: 20.0,
             build_to_line: 0.0,
             draw_buildable_envelope: true,
@@ -372,6 +376,12 @@ impl SubdivisionSettings {
         } else {
             IRREGULARITY_CAP_TIGHT
         }
+    }
+
+    /// The street-side setback: `setback_street_side`, or `setback_side` when
+    /// unset.
+    pub fn street_side_setback(&self) -> f64 {
+        self.setback_street_side.unwrap_or(self.setback_side)
     }
 
     /// `irregularity` clamped to `[0, cap]` (cap widened by `loose`).

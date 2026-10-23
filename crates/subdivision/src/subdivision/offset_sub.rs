@@ -21,6 +21,7 @@
 //! block hash + `settings.seed`, identical to `recursive_obb` — same input →
 //! byte-identical output, so op-log replay is stable.
 
+use crate::blocks::block::Block;
 use crate::geometry::clip_bridge;
 use crate::geometry::oriented_box::OrientedBox;
 use crate::geometry::polygon2d::Polygon2d;
@@ -90,8 +91,8 @@ fn point_on_segment(p: DVec2, a: DVec2, b: DVec2, tol: f64) -> bool {
     p.distance(proj) < tol
 }
 
-/// Whether `lot` touches the original block boundary (its street edge —
-/// like `method=grid`, any original block boundary edge counts as frontage).
+/// Whether `lot` touches the block frontage (its street edges, or any boundary
+/// edge of an untagged block — like `method=grid`).
 fn touches_boundary(lot: &Polygon2d, block_edges: &[(DVec2, DVec2)]) -> bool {
     for (a, b) in lot.edges() {
         let mid = (a + b) * 0.5;
@@ -108,28 +109,34 @@ fn touches_boundary(lot: &Polygon2d, block_edges: &[(DVec2, DVec2)]) -> bool {
 /// Deterministic for a fixed `settings.seed`. Falls back to `recursive_obb` on
 /// any degenerate offset.
 pub fn subdivide(block: &Polygon2d, settings: &SubdivisionSettings) -> Vec<Lot> {
+    subdivide_block(&Block::untagged(block.clone()), settings)
+}
+
+/// Subdivide a tagged `block`; `has_street` is judged against its street edges.
+pub fn subdivide_block(tagged: &Block, settings: &SubdivisionSettings) -> Vec<Lot> {
+    let block = &tagged.polygon;
     let width = settings.offset_width;
 
     // Fallback 1: offset_width ≈ 0 → nothing to inset, plain recursive OBB.
     if width.abs() < OFFSET_EPS {
-        return recursive_obb::subdivide(block, settings);
+        return recursive_obb::subdivide_block(tagged, settings);
     }
 
     // Inward offset (negative delta shrinks). If it collapses to empty or a
     // degenerate ring, the inset is deeper than the block is wide → fallback.
     let core = pick_core(block, width);
     let Some(core) = core else {
-        return recursive_obb::subdivide(block, settings);
+        return recursive_obb::subdivide_block(tagged, settings);
     };
 
     // The perimeter strip = block − core. If the difference is empty or the strip
     // is essentially the whole block (core vanished), fall back.
     let strip_area = block.area() - core.area();
     if core.area() < 1e-9 || strip_area < 1e-9 {
-        return recursive_obb::subdivide(block, settings);
+        return recursive_obb::subdivide_block(tagged, settings);
     }
 
-    let block_edges: Vec<(DVec2, DVec2)> = block.edges().collect();
+    let block_edges = tagged.frontage_edges();
     let mut rng = SplitMix64::new(block_seed(block, settings.seed));
     let irregularity = settings.clamped_irregularity();
 
@@ -172,7 +179,7 @@ pub fn subdivide(block: &Polygon2d, settings: &SubdivisionSettings) -> Vec<Lot> 
     // fall back rather than emit an under-covered block.
     let covered: f64 = out.iter().map(|l| l.polygon.area()).sum();
     if out.is_empty() || (block.area() - covered).abs() / block.area() > 1e-3 {
-        return recursive_obb::subdivide(block, settings);
+        return recursive_obb::subdivide_block(tagged, settings);
     }
 
     out

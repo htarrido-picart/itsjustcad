@@ -83,7 +83,7 @@ pub fn subdivide_block(block: &Block, settings: &SubdivisionSettings) -> Vec<Lot
     // 3 + 4. For each group, slice perpendicular to the street edge(s) at
     // lot_width_min spacing.
     let mut lots: Vec<Lot> = Vec::new();
-    let block_edges: Vec<(DVec2, DVec2)> = poly.edges().collect();
+    let block_edges = block.frontage_edges();
     for group in &groups {
         slice_group(group, &faces, settings, &block_edges, &mut lots);
     }
@@ -491,7 +491,7 @@ fn arc_points(closed: &[DVec2], s0: f64, s1: f64) -> Vec<DVec2> {
     out
 }
 
-/// Build a `Lot`, computing `has_street` against the block boundary.
+/// Build a `Lot`, computing `has_street` against the block frontage edges.
 fn make_lot(poly: Polygon2d, block_edges: &[(DVec2, DVec2)]) -> Lot {
     let has_street = touches_boundary(&poly, block_edges);
     Lot {

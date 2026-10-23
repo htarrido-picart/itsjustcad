@@ -93,14 +93,16 @@ pub use straight_skeleton::{
     felkel::FelkelSkeleton, offset_approx::OffsetApproxSkeleton, SkeletonFace, StraightSkeleton,
 };
 pub use streets::{extract_blocks, generate_streets, Street, StreetGraph, StreetTier};
-pub use subdivision::offset_sub::subdivide as subdivide_offset;
+pub use subdivision::offset_sub::{
+    subdivide as subdivide_offset, subdivide_block as subdivide_offset_block,
+};
 pub use subdivision::setbacks::{
     buildable_envelope, frontage, EdgeRole, Envelope, FrontageAt,
 };
 pub use subdivision::skeleton_sub::{
     subdivide as subdivide_skeleton, subdivide_block as subdivide_skeleton_block,
 };
-pub use subdivision::{subdivide, Lot};
+pub use subdivision::{subdivide, subdivide_block, Lot};
 
 use glam::DVec2;
 

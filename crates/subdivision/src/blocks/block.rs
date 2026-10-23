@@ -6,8 +6,10 @@
 //! The `edges` are in the same order and winding (CCW) as the polygon, so
 //! `edges[i]` runs from `polygon.verts()[i]` to `verts()[(i+1)%n]`.
 //!
-//! Downstream `lotsubdivide` consumes the plain `polygon`; the tags survive
-//! into the bake so a later subdivide can honour `force_street_access`.
+//! The tags are carried in memory through `siteplan` / `lotgeneratesite` into
+//! subdivision, setbacks and frontage (lots inherit them via [`Block::inherit`]).
+//! They are NOT stored on the baked curves: a later `lotsubdivide` /
+//! `lotsetbacks` on a baked block or lot curve sees an untagged polygon.
 
 use crate::blocks::block_edge::BlockEdge;
 use crate::geometry::polygon2d::Polygon2d;
@@ -30,6 +32,39 @@ impl Block {
             .map(|(a, b)| BlockEdge::boundary(a, b))
             .collect();
         Block { polygon, edges }
+    }
+
+    /// Tag a lot `polygon` cut from `parent`: each lot edge lying on a parent
+    /// edge inherits that edge's tag (street id, width, alley); cut edges
+    /// interior to the parent stay plain boundary edges.
+    pub fn inherit(polygon: Polygon2d, parent: &Block) -> Block {
+        let edges = polygon
+            .edges()
+            .map(|(a, b)| {
+                parent
+                    .edges
+                    .iter()
+                    .find(|e| on_segment(a, e.a, e.b) && on_segment(b, e.a, e.b))
+                    .map_or(BlockEdge::boundary(a, b), |e| BlockEdge { a, b, ..*e })
+            })
+            .collect();
+        Block { polygon, edges }
+    }
+
+    /// The edges that count as street frontage (`has_street`,
+    /// `force_street_access`): the street-tagged edges when the block carries
+    /// road-network tags, else every edge (an untagged block treats its whole
+    /// boundary as frontage).
+    pub fn frontage_edges(&self) -> Vec<(DVec2, DVec2)> {
+        if self.has_street() {
+            self.edges
+                .iter()
+                .filter(|e| e.is_street)
+                .map(|e| (e.a, e.b))
+                .collect()
+        } else {
+            self.polygon.edges().collect()
+        }
     }
 
     /// Area of the block polygon.
@@ -69,4 +104,16 @@ impl Block {
     pub fn centroid(&self) -> DVec2 {
         self.polygon.centroid()
     }
+}
+
+/// Is `p` within 1e-4 of the segment `a→b`? (Same tolerance as the
+/// subdividers' frontage test.)
+fn on_segment(p: DVec2, a: DVec2, b: DVec2) -> bool {
+    let ab = b - a;
+    let len2 = ab.length_squared();
+    if len2 < 1e-18 {
+        return p.distance(a) < 1e-4;
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    p.distance(a + ab * t) < 1e-4
 }
