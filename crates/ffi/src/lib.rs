@@ -3264,8 +3264,10 @@ fn subdivisions_json(doc: &itsjustcad_doc::Document) -> String {
 /// "max_lot_area","frontage":{…}|null,"gross_site_area",
 /// "open_space_feature_area","reserved_block_area","net_developable_area",
 /// "open_space_ratio","building_count","total_gfa","far_net","far_gross",
-/// "lot_coverage"}` (m², ratios dimensionless; nullable when undefined).
-/// Pure: stores no `lotreport` snapshot. Returns `null` for an unknown source,
+/// "lot_coverage","road_count","block_count","setback_count"}` (m², ratios
+/// dimensionless; nullable when undefined). The `*_count`s are the link's
+/// produced objects on the roads / blocks / setbacks layers (0 for a Lots
+/// link). Pure: stores no `lotreport` snapshot. Returns `null` for an unknown source,
 /// an empty result, or a null/invalid handle. Free with [`ijc_string_free`].
 ///
 /// # Safety
@@ -3297,7 +3299,23 @@ pub unsafe extern "C" fn ijc_subdivision_yield_json(h: *mut AppHandle, source: *
         if report.is_empty() {
             return null();
         }
-        into_c_string(serde_json::to_string(&report).unwrap_or_else(|_| String::from("null")))
+        let Ok(serde_json::Value::Object(mut out)) = serde_json::to_value(&report) else {
+            return null();
+        };
+        use itsjustcad_commands::lot::{BLOCKS_LAYER, ROADS_LAYER, SETBACKS_LAYER};
+        for (key, layer) in [
+            ("road_count", ROADS_LAYER),
+            ("block_count", BLOCKS_LAYER),
+            ("setback_count", SETBACKS_LAYER),
+        ] {
+            let n = link
+                .produced
+                .iter()
+                .filter(|id| doc.get(**id).is_some_and(|o| o.layer == layer))
+                .count();
+            out.insert(key.into(), n.into());
+        }
+        into_c_string(serde_json::Value::Object(out).to_string())
     })
 }
 
@@ -6507,6 +6525,24 @@ mod headless_tests {
     }
 
     #[test]
+    fn subdivision_yield_counts_site_plan_layers() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 200 150", "siteplan last"] {
+                let out = r(ijc_run_command_result(h, c(line).as_ptr()));
+                assert_eq!(out["ok"], true, "{line}: {out}");
+            }
+            let source = r(ijc_subdivisions_json(h))[0]["source"].as_str().unwrap().to_string();
+            let y = r(ijc_subdivision_yield_json(h, c(&source).as_ptr()));
+            assert!(y["road_count"].as_u64().unwrap() > 0, "{y}");
+            assert!(y["block_count"].as_u64().unwrap() > 0, "{y}");
+            assert_eq!(y["setback_count"], y["lot_count"], "one setback per lot: {y}");
+            ijc_free(h);
+        }
+    }
+
+    #[test]
     fn subdivisions_list_edit_freeze_and_refresh() {
         let h = ijc_init_headless();
         unsafe {
@@ -6541,6 +6577,7 @@ mod headless_tests {
             let y = r(ijc_subdivision_yield_json(h, c(&source).as_ptr()));
             assert!(y["lot_count"].as_u64().unwrap() > 0, "{y}");
             assert!(y["gross_site_area"].as_f64().unwrap() > 0.0, "{y}");
+            assert_eq!(y["road_count"], 0, "a Lots link bakes no roads: {y}");
             assert_eq!(r(ijc_subdivision_yield_json(h, c("nope").as_ptr())), serde_json::Value::Null);
 
             let frozen = r(ijc_subdivision_freeze(h, c(&source).as_ptr(), true));
