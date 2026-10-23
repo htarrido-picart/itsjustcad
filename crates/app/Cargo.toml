@@ -23,6 +23,7 @@ kernel-occt = ["itsjustcad-commands/kernel-occt"]
 
 [dependencies]
 itsjustcad-doc.workspace = true
+subdivision.workspace = true
 itsjustcad-solar.workspace = true
 kernel-curve.workspace = true
 itsjustcad-commands.workspace = true

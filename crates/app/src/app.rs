@@ -876,6 +876,10 @@ pub struct App {
     /// last change — committed once the gesture settles (mirrors `param_pending`
     /// but keyed on the subdivision source rather than a parametric object).
     subdiv_pending: Option<ParamPending>,
+    /// Subdivision inspector `Controls | Yield` segment (0 = Controls).
+    subdiv_segment: usize,
+    /// Yield of the inspected subdivision, cached by (source, doc generation).
+    subdiv_yield: Option<(itsjustcad_doc::ObjectId, u64, subdivision::YieldReport)>,
     /// Auto-recompute: per-source signature of the last-observed source block
     /// geometry. A change (after the first observation) fires a `lotrefresh` so
     /// non-frozen subdivisions track edits to their boundary block.
@@ -1560,6 +1564,8 @@ impl App {
             parametric_selected: None,
             param_pending: None,
             subdiv_pending: None,
+            subdiv_segment: 0,
+            subdiv_yield: None,
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
             subdiv_last_generation: 0,
@@ -8438,6 +8444,20 @@ impl App {
             ui.weak(short_id);
         });
 
+        // `Controls | Yield` for links that bake lots (a Site link has none).
+        if link.kind != itsjustcad_doc::SubdivKind::Site {
+            let roles = self.live_roles(ui.visuals().dark_mode);
+            let labels = [t("param.subdivision.controls"), t("param.subdivision.yield")];
+            if let Some(i) = crate::widgets::segmented(ui, &roles, &labels, self.subdiv_segment) {
+                self.subdiv_segment = i;
+            }
+            ui.add_space(4.0);
+            if self.subdiv_segment == 1 {
+                self.subdivision_yield_table(ui, source, &link);
+                return;
+            }
+        }
+
         // Current values = the link's settings projected to the exposed map; the
         // live editing map is the pending edit if a gesture is in flight here.
         let current = subdiv_params::settings_to_params(&link.settings);
@@ -8514,6 +8534,83 @@ impl App {
             link.produced.len(),
             if link.frozen { " · frozen" } else { "" }
         ));
+    }
+
+    /// The `Yield` segment: the link's yield (source + produced objects, as
+    /// `ijc_subdivision_yield_json` reports it), recomputed only when the
+    /// document changes.
+    fn subdivision_yield_table(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: itsjustcad_doc::ObjectId,
+        link: &itsjustcad_doc::SubdivLink,
+    ) {
+        use crate::i18n::t;
+        let generation = self.session.doc.generation;
+        let fresh = matches!(&self.subdiv_yield, Some((id, g, _)) if *id == source && *g == generation);
+        if !fresh {
+            let mut ids = vec![source];
+            ids.extend(link.produced.iter().copied());
+            let report =
+                itsjustcad_commands::lot::yield_report(&self.session.doc, &ids, &link.settings);
+            self.subdiv_yield = Some((source, generation, report));
+        }
+        let Some((_, _, r)) = &self.subdiv_yield else {
+            return;
+        };
+        if r.is_empty() {
+            ui.weak(t("param.subdivision.yield.empty"));
+            return;
+        }
+        let area = |a: f64| format!("{a:.0} m²");
+        let pct = |f: f64| format!("{:.1}%", f * 100.0);
+        let opt = |v: Option<f64>, f: &dyn Fn(f64) -> String| v.map_or("—".to_string(), f);
+        let mut rows: Vec<(&str, String)> = vec![
+            (t("param.subdivision.yield.lots"), r.lot_count.to_string()),
+            (t("param.subdivision.yield.lot_area_avg"), area(r.avg_lot_area)),
+            (
+                t("param.subdivision.yield.lot_area_range"),
+                format!("{:.0} – {:.0} m²", r.min_lot_area, r.max_lot_area),
+            ),
+        ];
+        if let Some(f) = &r.frontage {
+            rows.push((t("param.subdivision.yield.frontage_avg"), format!("{:.1} m", f.avg)));
+        }
+        rows.extend([
+            (t("param.subdivision.yield.gross"), area(r.gross_site_area)),
+            (
+                t("param.subdivision.yield.open_space"),
+                format!(
+                    "{} ({})",
+                    area(r.open_space_feature_area + r.reserved_block_area),
+                    pct(r.open_space_ratio)
+                ),
+            ),
+            (t("param.subdivision.yield.net"), area(r.net_developable_area)),
+            (t("param.subdivision.yield.buildings"), r.building_count.to_string()),
+            (t("param.subdivision.yield.gfa"), area(r.total_gfa)),
+            (
+                t("param.subdivision.yield.far"),
+                format!(
+                    "{} / {}",
+                    opt(r.far_net, &|v| format!("{v:.2}")),
+                    opt(r.far_gross, &|v| format!("{v:.2}"))
+                ),
+            ),
+            (t("param.subdivision.yield.coverage"), opt(r.lot_coverage, &pct)),
+        ]);
+        egui::Grid::new(("subdiv_yield", source))
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                for (label, value) in rows {
+                    ui.label(label);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.monospace(value);
+                    });
+                    ui.end_row();
+                }
+            });
     }
 
     /// Commit a debounced subdivision params edit as one `lotsetparams` op.
