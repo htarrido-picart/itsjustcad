@@ -69,7 +69,7 @@ pub mod subdivision;
 pub use blocks::{Block, BlockEdge};
 pub use buildings::{
     build_on_envelope, default_roof_for, footprint as building_footprint, massing as building_massing,
-    roof as building_roof, BuildingResult, Floor, Footprint, Massing,
+    roof as building_roof, lot_floor_counts, BuildingResult, Floor, Footprint, Massing,
 };
 pub use geometry::clip_bridge;
 pub use indexing::ConsistentIndexing;
@@ -83,7 +83,7 @@ pub use reporting::{FrontageStats, YieldComparison, YieldInputs, YieldReport};
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
 pub use settings::{
-    CornerAlignment, FootprintMode, LoadingType, LotWidthMix, RegionProfile, RoofType,
+    CornerAlignment, FootprintMode, HeightClass, HeightFalloff, HeightMix, LoadingType, LotWidthMix, RegionProfile, RoofType,
     SkeletonImpl, StreetPattern, SubdivisionMethod, SubdivisionSettings, Typology,
 };
 pub use subdivision::lot_rules::{

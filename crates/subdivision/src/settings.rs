@@ -189,6 +189,123 @@ impl RoofType {
     }
 }
 
+/// One class of a [`HeightMix`]: a relative weight and the floor range a lot
+/// of this class draws from (inclusive).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeightClass {
+    /// Class name (`low` / `mid` / `tower`, or any user label).
+    pub name: String,
+    /// Relative weight (proportions need not sum to 100).
+    pub weight: f64,
+    pub floors_min: usize,
+    pub floors_max: usize,
+}
+
+/// A weighted building-height mix: each lot picks a class by weight, then a
+/// floor count inside that class's range. Overrides `floors_min`/`floors_max`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct HeightMix {
+    pub classes: Vec<HeightClass>,
+}
+
+impl HeightMix {
+    /// The default floor range of a named class: `low` 1–3, `mid` 4–8,
+    /// `tower` (alias `high`) 9–20. `None` for any other name.
+    pub fn default_range(name: &str) -> Option<(usize, usize)> {
+        match name {
+            "low" => Some((1, 3)),
+            "mid" | "medium" => Some((4, 8)),
+            "tower" | "high" => Some((9, 20)),
+            _ => None,
+        }
+    }
+
+    /// Parse `low:50,mid:35,tower:15`; a class may give its own range as
+    /// `name:weight:min-max` (required for names other than low/mid/tower).
+    pub fn parse(s: &str) -> Result<HeightMix, String> {
+        let mut classes = Vec::new();
+        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let mut it = part.split(':');
+            let name = it.next().unwrap_or_default().trim().to_lowercase();
+            let weight: f64 = it
+                .next()
+                .and_then(|w| w.trim().trim_end_matches('%').parse().ok())
+                .filter(|w: &f64| w.is_finite() && *w >= 0.0)
+                .ok_or_else(|| format!("bad height mix class '{part}' (want name:weight)"))?;
+            let (lo, hi) = match it.next() {
+                Some(r) => {
+                    let (a, b) = r.split_once('-').unwrap_or((r, r));
+                    let n = |v: &str| v.trim().parse::<usize>().ok().filter(|n| *n >= 1);
+                    n(a).zip(n(b))
+                        .ok_or_else(|| format!("bad floor range '{r}' (want min-max)"))?
+                }
+                None => HeightMix::default_range(&name)
+                    .ok_or_else(|| format!("height mix class '{name}' needs a range (name:weight:min-max)"))?,
+            };
+            classes.push(HeightClass {
+                name,
+                weight,
+                floors_min: lo.min(hi),
+                floors_max: lo.max(hi),
+            });
+        }
+        if classes.iter().map(|c| c.weight).sum::<f64>() <= 0.0 {
+            return Err("height mix needs a class with a positive weight".into());
+        }
+        Ok(HeightMix { classes })
+    }
+
+    /// The weight of class `name` (0 when absent).
+    pub fn weight_of(&self, name: &str) -> f64 {
+        self.classes.iter().find(|c| c.name == name).map_or(0.0, |c| c.weight)
+    }
+}
+
+impl std::fmt::Display for HeightMix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, c) in self.classes.iter().enumerate() {
+            let sep = if i == 0 { "" } else { "," };
+            write!(f, "{sep}{}:{}:{}-{}", c.name, c.weight, c.floors_min, c.floors_max)?;
+        }
+        Ok(())
+    }
+}
+
+/// Where building heights peak: `None` (no gradient), the site `Center`
+/// (centroid of all lots), the nearest `Street` edge, or a `Point`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HeightFalloff {
+    #[default]
+    None,
+    Center,
+    Street,
+    Point,
+}
+
+impl HeightFalloff {
+    /// Parse a falloff keyword. `None` if unknown.
+    pub fn parse(s: &str) -> Option<HeightFalloff> {
+        match s.to_lowercase().as_str() {
+            "none" | "off" => Some(HeightFalloff::None),
+            "center" | "centre" | "centroid" => Some(HeightFalloff::Center),
+            "street" | "streets" => Some(HeightFalloff::Street),
+            "point" => Some(HeightFalloff::Point),
+            _ => None,
+        }
+    }
+
+    /// The stable keyword.
+    pub fn token(self) -> &'static str {
+        match self {
+            HeightFalloff::None => "none",
+            HeightFalloff::Center => "center",
+            HeightFalloff::Street => "street",
+            HeightFalloff::Point => "point",
+        }
+    }
+}
+
 /// A named default profile. `EuroLatam` carries the metric European /
 /// Latin-American placeholder numbers; `UsSuburban` is a stub for later. **Every
 /// EuroLatam value is a placeholder** pending the client's answers — surfaced in
@@ -310,6 +427,25 @@ pub struct SubdivisionSettings {
     /// Roof pitch (degrees) for gable / hip / shed. **euro_latam placeholder**
     /// (30°) — confirm with the client.
     pub roof_pitch: f64,
+
+    // ── Building height variation (CityEngine-style) ──
+    /// Random floors per lot: lower bound (0 = unset → 1 when `floors_max` is set).
+    pub floors_min: usize,
+    /// Random floors per lot: upper bound. 0 = off (every lot gets
+    /// `floor_count`).
+    pub floors_max: usize,
+    /// Seed of the per-lot height draw. 0 = follow `seed`. Change it to
+    /// reshuffle heights without changing the layout.
+    pub height_seed: u64,
+    /// Weighted height classes; overrides `floors_min`/`floors_max` when set.
+    pub height_mix: Option<HeightMix>,
+    /// Height gradient. Default `None`.
+    pub height_falloff: HeightFalloff,
+    /// Peak point (x, y) for `HeightFalloff::Point`.
+    pub falloff_point: [f64; 2],
+    /// 0..1: how much the gradient (vs the random draw) sets a lot's place in
+    /// its floor range. 1 = pure gradient, 0 = pure random.
+    pub falloff_strength: f64,
 }
 
 impl Default for SubdivisionSettings {
@@ -364,6 +500,13 @@ impl Default for SubdivisionSettings {
             stepback_depth: 0.0,
             roof_type: RoofType::PerTypology,
             roof_pitch: 30.0,
+            floors_min: 0,
+            floors_max: 0,
+            height_seed: 0,
+            height_mix: None,
+            height_falloff: HeightFalloff::None,
+            falloff_point: [0.0, 0.0],
+            falloff_strength: 0.75,
         }
     }
 }

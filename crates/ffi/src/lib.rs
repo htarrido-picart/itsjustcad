@@ -3432,6 +3432,52 @@ pub unsafe extern "C" fn ijc_edge_role_set(
         into_c_string(run_cmd_json(&mut app.session, cmd))
     })
 }
+/// Pin the building floor count of lot `id` (short id or full uuid) of a site
+/// plan — `id` may also be a building standing on the lot — to `floors`; `floors
+/// <= 0` clears the pin. One undoable `lotheight` op; the pin is stored on the
+/// plan and survives a refresh. Returns run-result JSON (as
+/// [`ijc_run_command_result`]). Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `id` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_lot_height_set(
+    h: *mut AppHandle,
+    id: *const c_char,
+    floors: i32,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        if id.is_null() {
+            return fail("id is null");
+        }
+        let Ok(id) = unsafe { CStr::from_ptr(id) }.to_str() else {
+            return fail("id is not valid UTF-8");
+        };
+        apply_pending(app);
+        let Some(id) = app
+            .session
+            .doc
+            .objects()
+            .find(|o| o.id.to_string() == id || o.id.0.to_string() == id)
+            .map(|o| o.id)
+        else {
+            return fail("no object with that id");
+        };
+        let cmd = Command::LotHeight {
+            targets: itsjustcad_commands::Selector::Ids { ids: vec![id] },
+            floors: (floors > 0).then_some(floors as u32),
+            ids: None,
+        };
+        into_c_string(run_cmd_json(&mut app.session, cmd))
+    })
+}
+
 /// Every generated street (#143 phase 4), from `siteplan` / `lotgeneratesite`
 /// links: `[{"source","id","name"?,"class","width","objects":[…],"edited"}]`.
 /// `source` is the short id of the site boundary; `id` the street id that lot
@@ -6432,6 +6478,51 @@ mod headless_tests {
                 r(ijc_edge_tags_json(std::ptr::null_mut(), c("x").as_ptr())),
                 null
             );
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn lot_height_set_round_trip() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 600 450", "siteplan last"] {
+                assert_eq!(r(ijc_run_command_result(h, c(line).as_ptr()))["ok"], true);
+            }
+            let lot = |h: *mut AppHandle| {
+                let guard = handle_mut(h).unwrap();
+                guard
+                    .session
+                    .doc
+                    .objects()
+                    .find(|o| o.layer == "lots")
+                    .expect("a lot")
+                    .id
+                    .to_string()
+            };
+            let id = lot(h);
+            let out = r(ijc_lot_height_set(h, c(&id).as_ptr(), 9));
+            assert_eq!(out["ok"], true, "{out}");
+            let pins = |h: *mut AppHandle| {
+                let guard = handle_mut(h).unwrap();
+                guard
+                    .session
+                    .doc
+                    .subdivision_links
+                    .values()
+                    .map(|l| l.lot_heights.len())
+                    .sum::<usize>()
+            };
+            assert_eq!(pins(h), 1);
+            assert_eq!(r(ijc_lot_height_set(h, c("nope").as_ptr(), 3))["ok"], false);
+            assert_eq!(
+                r(ijc_lot_height_set(std::ptr::null_mut(), c("x").as_ptr(), 3))["ok"],
+                false
+            );
+            let out = r(ijc_lot_height_set(h, c(&lot(h)).as_ptr(), 0));
+            assert_eq!(out["ok"], true, "{out}");
+            assert_eq!(pins(h), 0);
             ijc_free(h);
         }
     }

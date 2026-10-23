@@ -16,7 +16,9 @@
 
 use std::collections::BTreeMap;
 
-use itsjustcad_doc::{Document, EdgeRoleOverride, FieldKind, Geometry, ObjectId, StreetEdit};
+use itsjustcad_doc::{
+    Document, EdgeRoleOverride, FieldKind, Geometry, LotHeightOverride, ObjectId, StreetEdit,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use subdivision::{FrontageAt, Polygon2d, SubdivisionSettings, YieldInputs, YieldReport};
@@ -263,6 +265,7 @@ fn lot_fronts(plan: &SitePlanBake, settings: &SubdivisionSettings) -> Fronts {
 pub struct PlanEdits {
     pub streets: BTreeMap<u32, StreetEdit>,
     pub edge_roles: Vec<EdgeRoleOverride>,
+    pub lot_heights: Vec<LotHeightOverride>,
 }
 
 /// Evaluate one site plan off-document: run the chain, compute the yield,
@@ -274,7 +277,8 @@ pub fn evaluate(
     req: &OptimizeRequest,
 ) -> Result<Evaluation, String> {
     let mut roles = edits.edge_roles.clone();
-    let plan = lot::plan_site(site, 0.0, settings, &edits.streets, &mut roles)?;
+    let mut heights = edits.lot_heights.clone();
+    let plan = lot::plan_site(site, 0.0, settings, &edits.streets, &mut roles, &mut heights)?;
     if plan.lots.polygons.is_empty() {
         return Err("the plan has no lots".into());
     }
@@ -890,6 +894,7 @@ pub fn base_plan(doc: &Document, source: ObjectId) -> (SubdivisionSettings, Plan
             PlanEdits {
                 streets: l.streets.clone(),
                 edge_roles: l.edge_roles.clone(),
+                lot_heights: l.lot_heights.clone(),
             },
         ),
         _ => (doc.subdivision_settings.clone(), PlanEdits::default()),
@@ -969,7 +974,7 @@ mod tests {
     fn beats_default_siteplan_lot_count() {
         let site = rect(200.0, 150.0);
         let base = SubdivisionSettings::default();
-        let default_lots = lot::plan_site(&site, 0.0, &base, &BTreeMap::new(), &mut Vec::new())
+        let default_lots = lot::plan_site(&site, 0.0, &base, &BTreeMap::new(), &mut Vec::new(), &mut Vec::new())
             .unwrap()
             .lots
             .polygons

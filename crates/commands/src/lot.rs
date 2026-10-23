@@ -22,7 +22,7 @@ use glam::{DVec2, DVec3};
 use std::collections::BTreeMap;
 
 use itsjustcad_doc::{
-    Document, EdgeRoleOverride, EdgeTag, Geometry, LayerStyle, ObjectId, SceneObject, StreetClass,
+    Document, EdgeRoleOverride, EdgeTag, LotHeightOverride, Geometry, LayerStyle, ObjectId, SceneObject, StreetClass,
     StreetEdit, StreetInfo,
 };
 use kernel_curve::Curve;
@@ -183,6 +183,51 @@ pub fn apply_edge_roles<'a>(
         true
     });
     before - roles.len()
+}
+
+/// How far (m) a regenerated lot's centroid may move and still pick up a
+/// [`LotHeightOverride`] keyed on the old lot.
+pub const LOT_HEIGHT_TOL: f64 = 1.0;
+
+/// A [`LotHeightOverride`] pinning `lot` to `floors`, keyed on its centroid
+/// rounded to the mm.
+pub fn lot_height_override(lot: &Polygon2d, floors: u32) -> LotHeightOverride {
+    LotHeightOverride {
+        centroid: (lot.centroid() * 1e3).round() / 1e3,
+        floors,
+    }
+}
+
+/// True when `o` is keyed on `lot`.
+pub fn lot_height_matches(lot: &Polygon2d, o: &LotHeightOverride) -> bool {
+    lot.centroid().distance(o.centroid) <= LOT_HEIGHT_TOL
+}
+
+/// Match a link's pinned lot heights to freshly derived `lots`: each pins the
+/// lot whose centroid is nearest (within [`LOT_HEIGHT_TOL`]) and is re-keyed to
+/// it. Pins that match no lot are removed from `pins`. Returns the pinned floor
+/// count per lot (parallel to `lots`) and how many pins were dropped.
+pub fn apply_lot_heights(
+    lots: &[&Polygon2d],
+    pins: &mut Vec<LotHeightOverride>,
+) -> (Vec<Option<usize>>, usize) {
+    let mut out = vec![None; lots.len()];
+    let before = pins.len();
+    pins.retain_mut(|o| {
+        let best = lots
+            .iter()
+            .enumerate()
+            .map(|(k, l)| (k, l.centroid().distance(o.centroid)))
+            .filter(|(_, d)| *d <= LOT_HEIGHT_TOL)
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let Some((k, _)) = best else {
+            return false;
+        };
+        out[k] = Some(o.floors.max(1) as usize);
+        *o = lot_height_override(lots[k], o.floors);
+        true
+    });
+    (out, before - pins.len())
 }
 
 /// `front` | `street_side` | `side` | `rear` → that role; `auto` → `None`.
@@ -1169,11 +1214,36 @@ pub fn compute_buildings(
     lots: &[(Block, f64)],
     settings: &SubdivisionSettings,
 ) -> Result<BuildingBake, String> {
+    compute_buildings_pinned(lots, settings, &[])
+}
+
+/// [`compute_buildings`] with per-lot floor counts: each lot gets its pinned
+/// count from `pinned` (parallel to `lots`; missing / `None` = not pinned),
+/// else the varied count from [`subdivision::lot_floor_counts`] (which is
+/// `floor_count` when no height-variation option is on).
+pub fn compute_buildings_pinned(
+    lots: &[(Block, f64)],
+    settings: &SubdivisionSettings,
+    pinned: &[Option<usize>],
+) -> Result<BuildingBake, String> {
     let mut buildings = Vec::new();
     let mut collapsed = 0usize;
     let mut total_gfa = 0.0;
     let mut total_floors = 0usize;
-    for (block, z) in lots {
+    let blocks: Vec<&Block> = lots.iter().map(|(b, _)| b).collect();
+    let floors = subdivision::lot_floor_counts(&blocks, settings);
+    for (i, (block, z)) in lots.iter().enumerate() {
+        let n = pinned.get(i).copied().flatten().unwrap_or(floors[i]);
+        let lot_settings;
+        let settings = if n == settings.floor_count {
+            settings
+        } else {
+            lot_settings = SubdivisionSettings {
+                floor_count: n,
+                ..settings.clone()
+            };
+            &lot_settings
+        };
         // Buildings generate INSIDE the buildable envelope. A baked lot
         // curve carries no street tags → longest edge is the front (same spirit
         // as lotsetbacks).
@@ -1314,8 +1384,9 @@ pub struct SitePlanBake {
 }
 
 /// Run the site-plan chain on `site`. Deterministic: the output depends only on
-/// the boundary, settings, street edits (`streetset`) and role overrides
-/// (`edgerole`). `edge_roles` are re-keyed to the regenerated edges, and the
+/// the boundary, settings, street edits (`streetset`), role overrides
+/// (`edgerole`) and pinned lot heights (`lotheight`, matched and re-keyed by
+/// [`apply_lot_heights`]; unmatched pins are removed). `edge_roles` are re-keyed to the regenerated edges, and the
 /// ones that match no edge are removed (see [`apply_edge_roles`]). A block
 /// that fails to subdivide (too small, …) and setbacks/buildings that fail are
 /// skipped, never aborting the plan.
@@ -1325,6 +1396,7 @@ pub fn plan_site(
     settings: &SubdivisionSettings,
     streets: &BTreeMap<u32, StreetEdit>,
     edge_roles: &mut Vec<EdgeRoleOverride>,
+    lot_heights: &mut Vec<LotHeightOverride>,
 ) -> Result<SitePlanBake, String> {
     let bake = generate_site(site, z, settings, streets)?;
     // Reserved blocks are picked among the blocks that bake (still baked as
@@ -1355,7 +1427,9 @@ pub fn plan_site(
     apply_edge_roles(lots.lots.iter_mut(), edge_roles);
     let lots_z: Vec<(Block, f64)> = lots.lots.iter().map(|l| (l.clone(), bake.z)).collect();
     let setbacks = compute_setbacks(&lots_z, settings).ok();
-    let buildings = compute_buildings(&lots_z, settings).ok();
+    let polys: Vec<&Polygon2d> = lots.lots.iter().map(|l| &l.polygon).collect();
+    let (pinned, _) = apply_lot_heights(&polys, lot_heights);
+    let buildings = compute_buildings_pinned(&lots_z, settings, &pinned).ok();
     Ok(SitePlanBake {
         site: bake,
         reserved,
@@ -1408,6 +1482,52 @@ mod tests {
             closed: false,
         };
         assert!(curve_to_polygon(&c).is_none());
+    }
+
+    /// Varied and pinned floor counts feed GFA: each building's GFA is the sum
+    /// of its own floor areas, the bake total sums them, and the yield report
+    /// sees the per-building GFA.
+    #[test]
+    fn varied_floors_drive_gfa_and_yield() {
+        let lots: Vec<(Block, f64)> = (0..12)
+            .map(|i| {
+                let x = i as f64 * 15.0;
+                let p = Polygon2d::from_pairs([(x, 0.0), (x + 15.0, 0.0), (x + 15.0, 30.0), (x, 30.0)])
+                    .unwrap();
+                (Block::untagged(p), 0.0)
+            })
+            .collect();
+        let s = SubdivisionSettings {
+            floors_min: 2,
+            floors_max: 8,
+            ..SubdivisionSettings::default()
+        };
+        let mut pinned = vec![None; lots.len()];
+        pinned[3] = Some(11);
+        let bake = compute_buildings_pinned(&lots, &s, &pinned).unwrap();
+        assert_eq!(bake.buildings[3].floor_areas.len(), 11);
+        let floors: Vec<usize> = bake.buildings.iter().map(|b| b.floor_areas.len()).collect();
+        assert!(floors.iter().min() < floors.iter().max(), "{floors:?}");
+        for b in &bake.buildings {
+            assert!((b.gfa - b.floor_areas.iter().sum::<f64>()).abs() < 1e-9);
+            assert!((b.height - 3.0 * b.floor_areas.len() as f64).abs() < 1e-9);
+        }
+        let total: f64 = bake.buildings.iter().map(|b| b.gfa).sum();
+        assert!((bake.total_gfa - total).abs() < 1e-6);
+        assert_eq!(bake.total_floors, floors.iter().sum::<usize>());
+        let report = subdivision::YieldReport::compute(&subdivision::YieldInputs {
+            lot_areas: lots.iter().map(|(l, _)| l.area()).collect(),
+            lot_frontages: Vec::new(),
+            gross_site_area: 180.0 * 30.0,
+            open_space_feature_areas: Vec::new(),
+            reserved_block_areas: Vec::new(),
+            building_gfas: bake.buildings.iter().map(|b| b.gfa).collect(),
+            building_footprints: bake.buildings.iter().map(|b| b.footprint.area()).collect(),
+        });
+        assert!((report.total_gfa - total).abs() < 1e-6);
+        // No variation, no pins: the same as `compute_buildings`.
+        let plain = compute_buildings(&lots, &SubdivisionSettings::default()).unwrap();
+        assert!(plain.buildings.iter().all(|b| b.floor_areas.len() == 2));
     }
 
     #[test]

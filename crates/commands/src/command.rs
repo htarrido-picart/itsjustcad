@@ -2184,6 +2184,18 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Pin (or with `floors: None`, unpin) the building floor count of the
+    /// selected lots of one SitePlan link — lots, or buildings standing on
+    /// them. Stored on the link keyed by lot centroid (like `EdgeRole`), so it
+    /// survives `lotrefresh` / `lotsetparams`; the link is re-derived and
+    /// `ids` written back as the re-derived children. Logged; one undo step.
+    LotHeight {
+        targets: Selector,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floors: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// Show or set the sticky `SubdivisionSettings` on the document.
     /// With no `sets`, the exec message reports the current
     /// settings; otherwise each `key=value` updates one field. Logged so saved
