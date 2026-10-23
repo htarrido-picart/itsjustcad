@@ -22,12 +22,12 @@ use glam::{DVec2, DVec3};
 use std::collections::BTreeMap;
 
 use itsjustcad_doc::{
-    Document, EdgeTag, Geometry, LayerStyle, ObjectId, SceneObject, StreetClass, StreetEdit,
-    StreetInfo,
+    Document, EdgeRoleOverride, EdgeTag, Geometry, LayerStyle, ObjectId, SceneObject, StreetClass,
+    StreetEdit, StreetInfo,
 };
 use kernel_curve::Curve;
 use subdivision::{
-    Block, BlockEdge, Polygon2d, StreetPattern, SubdivisionMethod, SubdivisionSettings,
+    Block, BlockEdge, EdgeRole, Polygon2d, StreetPattern, SubdivisionMethod, SubdivisionSettings,
 };
 
 /// Chord tolerance for tessellating a block boundary curve to a polygon.
@@ -65,10 +65,10 @@ pub fn polygon_to_curve(poly: &Polygon2d, z: f64) -> Curve {
 
 /// The stored edge tags for a baked `block` (#143), in its polygon edge order
 /// (= the baked curve's point order, see [`polygon_to_curve`]). `None` when no
-/// edge is a street or alley, so untagged bakes store nothing. `roles` (lots
-/// only) records each edge's setback role.
+/// edge is a street or alley or carries a role override, so untagged bakes
+/// store nothing. `roles` (lots only) records each edge's setback role.
 fn edge_tags_of(block: &Block, roles: bool) -> Option<Vec<EdgeTag>> {
-    if !block.edges.iter().any(|e| e.is_street || e.is_alley) {
+    if !has_tags(block) {
         return None;
     }
     let roles = roles.then(|| subdivision::classify_edges(block));
@@ -77,18 +77,136 @@ fn edge_tags_of(block: &Block, roles: bool) -> Option<Vec<EdgeTag>> {
             .edges
             .iter()
             .enumerate()
-            .map(|(i, e)| EdgeTag {
-                is_street: e.is_street,
-                street_id: e.street_id,
-                street_width: e.street_width,
-                is_alley: e.is_alley,
-                role: roles.as_ref().and_then(|r| r.get(i).copied()),
-                length: e.length(),
-            })
+            .map(|(i, e)| edge_tag(e, roles.as_ref().and_then(|r| r.get(i).copied())))
             .collect(),
     )
 }
 
+fn has_tags(block: &Block) -> bool {
+    block
+        .edges
+        .iter()
+        .any(|e| e.is_street || e.is_alley || e.role.is_some())
+}
+
+fn edge_tag(e: &BlockEdge, role: Option<EdgeRole>) -> EdgeTag {
+    EdgeTag {
+        is_street: e.is_street,
+        street_id: e.street_id,
+        street_width: e.street_width,
+        is_alley: e.is_alley,
+        role,
+        overridden: e.role.is_some(),
+        length: e.length(),
+    }
+}
+
+/// [`edge_tags_of`] (with roles) for a lot whose curve edge order is `points`
+/// rather than its polygon's (a hand-drawn curve may run clockwise).
+pub fn edge_tags_along(lot: &Block, points: &[DVec3]) -> Option<Vec<EdgeTag>> {
+    if !has_tags(lot) {
+        return None;
+    }
+    let roles = subdivision::classify_edges(lot);
+    (0..points.len())
+        .map(|i| {
+            let k = edge_index(lot, points, i)?;
+            Some(edge_tag(&lot.edges[k], roles.get(k).copied()))
+        })
+        .collect()
+}
+
+/// The index in `lot.edges` of curve edge `i` (from `points[i]` to
+/// `points[i + 1]`), matched by endpoints in either direction.
+pub fn edge_index(lot: &Block, points: &[DVec3], i: usize) -> Option<usize> {
+    let n = points.len();
+    let (p, q) = (points[i].truncate(), points[(i + 1) % n].truncate());
+    lot.edges
+        .iter()
+        .position(|e| (e.a, e.b) == (p, q) || (e.a, e.b) == (q, p))
+}
+
+/// How far (m) a regenerated lot edge's midpoint may move and still pick up an
+/// [`EdgeRoleOverride`] keyed on the old edge.
+pub const EDGE_ROLE_TOL: f64 = 0.5;
+
+/// The geometric key of lot edge `e` (on a CCW lot) with `role`: its midpoint
+/// rounded to the mm and its unit outward normal rounded to 1e-6.
+pub fn edge_override(e: &BlockEdge, role: EdgeRole) -> EdgeRoleOverride {
+    let round = |v: DVec2, k: f64| (v * k).round() / k;
+    EdgeRoleOverride {
+        mid: round(e.midpoint(), 1e3),
+        normal: round(outward(e), 1e6),
+        role,
+    }
+}
+
+fn outward(e: &BlockEdge) -> DVec2 {
+    let d = e.b - e.a;
+    DVec2::new(d.y, -d.x).normalize_or_zero()
+}
+
+/// Whether lot edge `e` matches override `o`'s key, and how far apart they are.
+fn key_distance(e: &BlockEdge, o: &EdgeRoleOverride) -> Option<f64> {
+    let d = e.midpoint().distance(o.mid);
+    (d <= EDGE_ROLE_TOL && outward(e).dot(o.normal) >= 0.99).then_some(d)
+}
+
+/// True when `o` is keyed on lot edge `e`.
+pub fn override_matches(e: &BlockEdge, o: &EdgeRoleOverride) -> bool {
+    key_distance(e, o).is_some()
+}
+
+/// Re-apply a link's edge role overrides to freshly derived `lots`: each sets
+/// the role of the nearest matching edge (see [`EdgeRoleOverride`]) and is
+/// re-keyed to it, so small drifts do not accumulate. Overrides that match no
+/// edge are removed from `roles`; returns how many.
+pub fn apply_edge_roles<'a>(
+    lots: impl Iterator<Item = &'a mut Block>,
+    roles: &mut Vec<EdgeRoleOverride>,
+) -> usize {
+    let mut lots: Vec<&mut Block> = lots.collect();
+    let before = roles.len();
+    roles.retain_mut(|o| {
+        let best = lots
+            .iter()
+            .enumerate()
+            .flat_map(|(k, l)| l.edges.iter().enumerate().map(move |(i, e)| (k, i, e)))
+            .filter_map(|(k, i, e)| Some((k, i, key_distance(e, o)?)))
+            .min_by(|a, b| a.2.total_cmp(&b.2));
+        let Some((k, i, _)) = best else {
+            return false;
+        };
+        let e = &mut lots[k].edges[i];
+        e.role = Some(o.role);
+        *o = edge_override(e, o.role);
+        true
+    });
+    before - roles.len()
+}
+
+/// `front` | `street_side` | `side` | `rear` → that role; `auto` → `None`.
+pub fn parse_edge_role(s: &str) -> Option<Option<EdgeRole>> {
+    match s.to_lowercase().as_str() {
+        "auto" => Some(None),
+        "front" => Some(Some(EdgeRole::Front)),
+        "street_side" | "streetside" => Some(Some(EdgeRole::StreetSide)),
+        "side" => Some(Some(EdgeRole::Side)),
+        "rear" => Some(Some(EdgeRole::Rear)),
+        _ => None,
+    }
+}
+
+/// The `edgerole` token for `role`.
+pub fn edge_role_name(role: Option<EdgeRole>) -> &'static str {
+    match role {
+        None => "auto",
+        Some(EdgeRole::Front) => "front",
+        Some(EdgeRole::StreetSide) => "street_side",
+        Some(EdgeRole::Side) => "side",
+        Some(EdgeRole::Rear) => "rear",
+    }
+}
 /// A baked lot/block curve as a [`Block`]: `poly` (from [`curve_to_polygon`])
 /// tagged from the object's stored edge tags while they are valid, else
 /// untagged (the longest edge fronts, as before #143 phase 3).
@@ -112,6 +230,7 @@ pub fn doc_block(obj: &SceneObject, poly: Polygon2d) -> Block {
                     street_id: tags[i].street_id,
                     street_width: tags[i].street_width,
                     is_alley: tags[i].is_alley,
+                    role: tags[i].role.filter(|_| tags[i].overridden),
                     ..plain
                 })
         })

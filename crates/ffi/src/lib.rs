@@ -3306,7 +3306,8 @@ pub unsafe extern "C" fn ijc_subdivision_yield_json(h: *mut AppHandle, source: *
 /// `[{"is_street"?,"street_id"?,"street_width"?,"is_alley"?,"role"?,"length"}, …]`,
 /// one entry per edge, edge `i` running from curve point `i` to `i + 1`.
 /// Absent keys mean false / none / 0. `role` is `front` | `street_side` |
-/// `side` | `rear` (lots only). A street edge also carries `street_object`
+/// `side` | `rear` (lots only); `overridden` (always present) is true when the
+/// role was set by hand (#143 phase 5, [`ijc_edge_role_set`]). A street edge also carries `street_object`
 /// (the generated road's short id), `street_class` and `street_name`? from
 /// that road (#143 phase 4) while the road exists. `id` is the object's short
 /// id or full uuid. Returns `null` for an unknown id, an untagged object, tags invalidated by
@@ -3340,6 +3341,9 @@ pub unsafe extern "C" fn ijc_edge_tags_json(h: *mut AppHandle, id: *const c_char
             .iter()
             .map(|t| {
                 let mut v = serde_json::to_value(t).unwrap_or_default();
+                if let Some(map) = v.as_object_mut() {
+                    map.insert("overridden".into(), t.overridden.into());
+                }
                 let road = t
                     .street_id
                     .and_then(|sid| itsjustcad_commands::lot::street_of(doc, obj, sid));
@@ -3358,6 +3362,58 @@ pub unsafe extern "C" fn ijc_edge_tags_json(h: *mut AppHandle, id: *const c_char
     })
 }
 
+/// Override the setback role of edge `edge` of lot `id` (short id or full
+/// uuid) — `role` is `front` | `street_side` | `side` | `rear`, or `auto` to
+/// clear the override (#143 phase 5). One undoable `edgerole` op; on a lot of a
+/// subdivision the override is stored on it and survives a refresh. Returns
+/// run-result JSON (as [`ijc_run_command_result`]). Free with
+/// [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `id` and `role` must be null or valid
+/// NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_edge_role_set(
+    h: *mut AppHandle,
+    id: *const c_char,
+    edge: u32,
+    role: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        if id.is_null() || role.is_null() {
+            return fail("id or role is null");
+        }
+        let (id, role) = unsafe { (CStr::from_ptr(id), CStr::from_ptr(role)) };
+        let (Ok(id), Ok(role)) = (id.to_str(), role.to_str()) else {
+            return fail("id or role is not valid UTF-8");
+        };
+        let Some(role) = itsjustcad_commands::lot::parse_edge_role(role) else {
+            return fail("role must be front, street_side, side, rear or auto");
+        };
+        apply_pending(app);
+        let Some(id) = app
+            .session
+            .doc
+            .objects()
+            .find(|o| o.id.to_string() == id || o.id.0.to_string() == id)
+            .map(|o| o.id)
+        else {
+            return fail("no object with that id");
+        };
+        let cmd = Command::EdgeRole {
+            targets: itsjustcad_commands::Selector::Ids { ids: vec![id] },
+            edge: edge as usize,
+            role,
+            ids: None,
+        };
+        into_c_string(run_cmd_json(&mut app.session, cmd))
+    })
+}
 /// Every generated street (#143 phase 4), from `siteplan` / `lotgeneratesite`
 /// links: `[{"source","id","name"?,"class","width","objects":[…],"edited"}]`.
 /// `source` is the short id of the site boundary; `id` the street id that lot
@@ -6122,6 +6178,7 @@ mod headless_tests {
                 let mut tags = r(ijc_edge_tags_json(h, c(&key).as_ptr()));
                 for t in tags.as_array_mut().unwrap() {
                     let t = t.as_object_mut().unwrap();
+                    assert_eq!(t.remove("overridden"), Some(false.into()));
                     assert_eq!(t.contains_key("street_object"), t.contains_key("street_id"));
                     if t.contains_key("street_id") {
                         assert!(t.remove("street_class").unwrap().is_string());
@@ -6147,6 +6204,81 @@ mod headless_tests {
         }
     }
 
+    #[test]
+    fn edge_role_set_round_trip() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 600 450", "siteplan last"] {
+                assert_eq!(r(ijc_run_command_result(h, c(line).as_ptr()))["ok"], true);
+            }
+            let guard = handle_mut(h).unwrap();
+            let lot = guard
+                .session
+                .doc
+                .objects()
+                .find(|o| o.layer == "lots" && o.valid_edge_tags().is_some())
+                .expect("a tagged lot")
+                .id;
+            drop(guard);
+            let set = |role: &str| {
+                r(ijc_edge_role_set(
+                    h,
+                    c(&lot.to_string()).as_ptr(),
+                    1,
+                    c(role).as_ptr(),
+                ))
+            };
+            let out = set("rear");
+            assert_eq!(out["ok"], true, "{out}");
+            assert!(!out["created"].as_array().unwrap().is_empty());
+            // The lot was re-derived with the same geometry: find it by edge.
+            let guard = handle_mut(h).unwrap();
+            let lot = guard
+                .session
+                .doc
+                .objects()
+                .find(|o| {
+                    o.valid_edge_tags()
+                        .is_some_and(|t| t.iter().any(|t| t.overridden))
+                })
+                .expect("overridden lot")
+                .id;
+            drop(guard);
+            let tags = r(ijc_edge_tags_json(h, c(&lot.to_string()).as_ptr()));
+            assert_eq!(tags[1]["role"], "rear");
+            assert_eq!(tags[1]["overridden"], true);
+            assert_eq!(tags[0]["overridden"], false);
+
+            assert_eq!(set("back")["ok"], false);
+            assert_eq!(
+                r(ijc_edge_role_set(
+                    h,
+                    c("nope").as_ptr(),
+                    0,
+                    c("front").as_ptr()
+                ))["ok"],
+                false
+            );
+            assert_eq!(
+                r(ijc_edge_role_set(
+                    std::ptr::null_mut(),
+                    c("x").as_ptr(),
+                    0,
+                    c("front").as_ptr()
+                ))["ok"],
+                false
+            );
+            let out = r(ijc_edge_role_set(
+                h,
+                c(&lot.to_string()).as_ptr(),
+                1,
+                c("auto").as_ptr(),
+            ));
+            assert_eq!(out["ok"], true, "{out}");
+            ijc_free(h);
+        }
+    }
     #[test]
     fn streets_json_lists_and_follows_streetset() {
         let h = ijc_init_headless();

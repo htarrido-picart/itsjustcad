@@ -1694,6 +1694,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "lotloading" => parse_lotloading(&args),
         "lotsetbacks" => parse_lotsetbacks(&args),
         "streetset" => parse_streetset(&args),
+        "edgerole" => parse_edgerole(&args),
         "lotfrontage" => parse_lotfrontage(&args),
         "lotreport" => parse_lotreport(&args),
         "lotopenspace" => parse_lotopenspace(&args),
@@ -2899,6 +2900,39 @@ fn parse_streetset(args: &[&str]) -> Result<Command, ParseError> {
         name,
         class,
         width,
+        ids: None,
+    })
+}
+
+/// `edgerole [selector] edge=<index> role=front|street_side|side|rear|auto`.
+fn parse_edgerole(args: &[&str]) -> Result<Command, ParseError> {
+    const WANT: &str = "edge=<index> role=front|street_side|side|rear|auto";
+    let (targets, rest): (Selector, &[&str]) = match args.split_first() {
+        Some((first, _)) if !first.contains('=') => selector(args, "edgerole")?,
+        _ => (Selector::Selected, args),
+    };
+    let (mut edge, mut role) = (None, None);
+    for tok in rest {
+        match tok.split_once('=') {
+            Some((k, v)) if k.eq_ignore_ascii_case("edge") => {
+                edge = Some(v.parse::<usize>().map_err(|_| ParseError::BadNumber(v.to_string()))?)
+            }
+            Some((k, v)) if k.eq_ignore_ascii_case("role") => {
+                role = Some(
+                    crate::lot::parse_edge_role(v)
+                        .ok_or_else(|| wrong_err("edgerole", WANT, args))?,
+                )
+            }
+            _ => return wrong("edgerole", WANT, args),
+        }
+    }
+    let (Some(edge), Some(role)) = (edge, role) else {
+        return wrong("edgerole", WANT, args);
+    };
+    Ok(Command::EdgeRole {
+        targets,
+        edge,
+        role,
         ids: None,
     })
 }

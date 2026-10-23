@@ -157,6 +157,7 @@ fn tag_block(poly: Polygon2d, graph: &StreetGraph, site: &Polygon2d) -> Block {
                     street_width: s.width,
                     street_length: s.length(),
                     is_alley: s.is_alley(),
+                    role: None,
                 };
             }
             BlockEdge::boundary(a, b)
@@ -252,6 +253,7 @@ fn retag_with_alley(poly: Polygon2d, parent: &Block, line: Line2d, alley_w: f64)
                     street_width: alley_w,
                     street_length: 0.0,
                     is_alley: true,
+                    role: None,
                 };
             }
             // Inherit the parent edge whose segment contains this midpoint.

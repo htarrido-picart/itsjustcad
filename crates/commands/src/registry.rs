@@ -966,6 +966,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "edgerole",
+            usage: "edgerole [selector] edge=<index> role=front|street_side|side|rear|auto",
+            summary: "Override the setback role of one lot edge (#143). Edge i runs from curve point i to i+1 (see the lot's edge tags). An overridden front becomes the primary front: the rear is recomputed opposite it unless an edge is set to rear, and setbacks, frontage and buildings use the new roles. role=auto clears the override. On a lot from lotsubdivide / siteplan the override is stored on the plan, keyed by the edge's midpoint and facing, so lotrefresh and lotsetparams keep it; after a change that moves the edge more than 0.5 m (or turns it) the override is dropped and reported. On any other closed lot curve it is written into the curve's edge tags. One undo step. Example: edgerole selected edge=2 role=front",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "lotfrontage",
             usage: "lotfrontage [selector] [at=setback|curb]",
             summary: "Report the street frontage length of the selected lot(s), measured along the front SETBACK line by default (at=setback) or along the curb (at=curb, the street edge as drawn). The two differ on cul-de-sac bulbs and curved streets, where the outer curb arc is longer than the inset setback line — the most common reason automated layouts get rejected by reviewers, hence setback is the default. A read-only query (never logged): results go to the report plane as an AnalysisReport keyed 'lotfrontage' (count, min/avg/max, distribution, extreme lots) so `report` can re-show it and the deck can critique. Example: lotfrontage last · lotfrontage at=curb",

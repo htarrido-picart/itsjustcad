@@ -172,6 +172,7 @@ After generating a layout (lotgeneratesite / lotsubdivide, plus lotopenspace and
   - Small min lot area or wildly varying lot areas (min vs max) hint at slivers or an over-aggressive subdivide — suggest merge or a coarser area=.
 To compare options: `lotreport`, change a setting (e.g. lotsettings, re-subdivide, add open space), `lotreport` again, then `lotreport compare` for the A/B diff (Δ lot count, Δ GFA, Δ FAR, Δ net area). Ground each observation in a table number and propose a concrete command.
 To widen, name or reclassify a generated road, use `streetset <road> width=<m> name=<text> class=arterial|collector|local|alley`: the plan re-derives around it (never move the road by hand — that only marks the plan stale).
+To change which lot edge is the front (or rear / side / street side), use `edgerole <lot> edge=<index> role=front|street_side|side|rear|auto`: it survives lotrefresh and lotsetparams; `auto` clears it.
 ";
 
 /// The "Ask before guessing" section: when a request is ambiguous the model

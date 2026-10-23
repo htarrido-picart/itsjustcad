@@ -69,6 +69,24 @@ pub struct SubdivLink {
     /// id. Inputs to a Site/SitePlan re-derive, so they survive regeneration.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub streets: BTreeMap<u32, StreetEdit>,
+    /// Hand-set lot edge roles (`edgerole`, #143 phase 5). Inputs to a
+    /// Lots/SitePlan re-derive: each is re-applied to the regenerated lot edge
+    /// it matches (see [`EdgeRoleOverride`]) and dropped when none does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_roles: Vec<EdgeRoleOverride>,
+}
+
+/// A hand-set role for one lot edge of a link. Lots are regenerated, so the
+/// key is geometric, not an id or index: the edge's midpoint and its unit
+/// outward normal (rounded to mm / 1e-6 when stored). A regenerated lot edge
+/// matches when its midpoint lies within `EDGE_ROLE_TOL` (commands crate) and
+/// its outward normal within ~8° (dot ≥ 0.99); the nearest such edge wins. The
+/// normal tells apart the two lots sharing an interior edge.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EdgeRoleOverride {
+    pub mid: glam::DVec2,
+    pub normal: glam::DVec2,
+    pub role: subdivision::EdgeRole,
 }
 
 /// User edits to one generated street. `None` keeps the generator's value.
@@ -727,6 +745,7 @@ mod tests {
                 frozen: false,
                 kind: SubdivKind::Lots,
                 streets: Default::default(),
+                edge_roles: Vec::new(),
             },
         );
         assert_eq!(doc.subdiv_source_of(lot_b), Some(source));
@@ -763,6 +782,7 @@ mod tests {
                 frozen: false,
                 kind: SubdivKind::Site,
                 streets: Default::default(),
+                edge_roles: Vec::new(),
             },
         );
         let json = serde_json::to_string(&doc).unwrap();

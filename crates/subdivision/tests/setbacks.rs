@@ -127,6 +127,7 @@ fn build_to_pins_front_on_rect() {
                     street_width: 12.0,
                     street_length: 30.0,
                     is_alley: false,
+                    role: None,
                 }
             } else {
                 subdivision::BlockEdge::boundary(a, b)
