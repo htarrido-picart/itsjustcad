@@ -3255,6 +3255,49 @@ fn subdivisions_json(doc: &itsjustcad_doc::Document) -> String {
     serde_json::Value::Array(items).to_string()
 }
 
+/// One subdivision's yield, as data — what `lotreport` tabulates for its
+/// boundary and everything it generated, computed from the link's own
+/// settings: `{"lot_count","total_lot_area","avg_lot_area","min_lot_area",
+/// "max_lot_area","frontage":{…}|null,"gross_site_area",
+/// "open_space_feature_area","reserved_block_area","net_developable_area",
+/// "open_space_ratio","building_count","total_gfa","far_net","far_gross",
+/// "lot_coverage"}` (m², ratios dimensionless; nullable when undefined).
+/// Pure: stores no `lotreport` snapshot. Returns `null` for an unknown source,
+/// an empty result, or a null/invalid handle. Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `source` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_subdivision_yield_json(h: *mut AppHandle, source: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let null = || into_c_string(String::from("null"));
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return null();
+        };
+        if source.is_null() {
+            return null();
+        }
+        let Ok(source) = (unsafe { CStr::from_ptr(source) }).to_str() else {
+            return null();
+        };
+        let doc = &app.session.doc;
+        let Some(id) = subdivision_source(doc, source) else {
+            return null();
+        };
+        let Some(link) = doc.subdiv_link(id) else {
+            return null();
+        };
+        let mut ids = vec![id];
+        ids.extend(link.produced.iter().copied());
+        let report = itsjustcad_commands::lot::yield_report(doc, &ids, &link.settings);
+        if report.is_empty() {
+            return null();
+        }
+        into_c_string(serde_json::to_string(&report).unwrap_or_else(|_| String::from("null")))
+    })
+}
+
 /// The subdivision source with short id `source`, if it has a link.
 fn subdivision_source(doc: &itsjustcad_doc::Document, source: &str) -> Option<itsjustcad_doc::ObjectId> {
     doc.subdivision_links.keys().find(|id| id.to_string() == source).copied()
@@ -5973,6 +6016,11 @@ mod headless_tests {
             let edit = r(ijc_subdivision_set_params(h, c(&source).as_ptr(), c(&tokens).as_ptr()));
             assert_eq!(edit["ok"], true, "{edit}");
             assert_eq!(ijc_undo_cursor(h), before + 1, "one undoable op");
+
+            let y = r(ijc_subdivision_yield_json(h, c(&source).as_ptr()));
+            assert!(y["lot_count"].as_u64().unwrap() > 0, "{y}");
+            assert!(y["gross_site_area"].as_f64().unwrap() > 0.0, "{y}");
+            assert_eq!(r(ijc_subdivision_yield_json(h, c("nope").as_ptr())), serde_json::Value::Null);
 
             let frozen = r(ijc_subdivision_freeze(h, c(&source).as_ptr(), true));
             assert_eq!(frozen["ok"], true, "{frozen}");
