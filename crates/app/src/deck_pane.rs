@@ -3086,7 +3086,12 @@ impl DeckPane {
                 content: feedback,
             });
             self.start_turn(session, handle);
-        } else if self.should_force_draft_retry_now(had_commands, &reply_text, was_vision_turn) {
+        } else if self.should_force_draft_retry_now(
+            // A batch held by the first-run gate was emitted, just not run yet.
+            had_commands || !self.pending_firstrun.is_empty(),
+            &reply_text,
+            was_vision_turn,
+        ) {
             // FORMAT NON-COMPLIANCE (claude-code/sonnet): the model answered in
             // prose and drew NOTHING for a clear draw request — e.g. "Sheet
             // created with four views" with no ```draft block, so no geometry
@@ -5549,6 +5554,33 @@ mod plan_tests {
         assert!(pane.transcript.iter().any(
             |e| matches!(e, Entry::Status(s) if s.contains("no draft commands emitted"))
         ));
+        pane.stop_turn();
+    }
+
+    #[test]
+    fn force_retry_skips_batch_held_by_firstrun_gate() {
+        // A draft batch held for first-run approval WAS emitted — nudging the
+        // model re-emits it and the approval then runs every command twice.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut session = Session::default();
+        let mut pane = claude_code_pane();
+        pane.deck_run_approved = false;
+        pane.last_user_message = "rect 0,0,0 200 150, siteplan last".into();
+        pane.handle_extract_events(
+            vec![
+                ExtractEvent::Command("rect 0,0,0 200 150".into()),
+                ExtractEvent::Command("siteplan last".into()),
+            ],
+            &mut session,
+        );
+        pane.current_response = "Drew the rectangle and the site plan.".into();
+        pane.finish_turn(&session, rt.handle());
+        assert!(!pane.forced_draft_retry, "held batch must not trigger the nudge");
+        assert!(
+            !pane.messages.iter().any(|m| m.content.contains("without any")),
+            "no corrective follow-up queued"
+        );
+        assert_eq!(pane.pending_firstrun.len(), 2, "batch still awaits approval");
         pane.stop_turn();
     }
 
