@@ -174,7 +174,7 @@ To search for the best layout instead of hand-tuning: `siteoptimize <site> objec
 To compare options: `lotreport`, change a setting (e.g. lotsettings, re-subdivide, add open space), `lotreport` again, then `lotreport compare` for the A/B diff (Δ lot count, Δ GFA, Δ FAR, Δ net area). Ground each observation in a table number and propose a concrete command.
 To widen, name or reclassify a generated road, use `streetset <road> width=<m> name=<text> class=arterial|collector|local|alley`: the plan re-derives around it (never move the road by hand — that only marks the plan stale).
 To change which lot edge is the front (or rear / side / street side), use `edgerole <lot> edge=<index> role=front|street_side|side|rear|auto`: it survives lotrefresh and lotsetparams; `auto` clears it.
-To vary building heights (CityEngine-style), set the height keys with `lotsettings` BEFORE `siteplan` / `lotbuilding`: `floors_range=<min>-<max>` (random floors per lot), `height_mix=low:50,mid:35,tower:15` (weighted classes: low 1-3, mid 4-8, tower 9-20 floors), `falloff=center|street|point` (+ `falloff_point=x,y`, `falloff_strength=0..1`) for taller buildings near the centre / streets / a point, `height_seed=<n>` to reshuffle. E.g. \"vary building heights between 2 and 8 floors, taller near the centre\" → `lotsettings floors_range=2-8 falloff=center` then `siteplan last`. To override one lot's rules, `lotset <lot or building> [floors=<n>] [typology=detached|row|courtyard|slab|midrise] [setback_front=<m> setback_side=<m> setback_rear=<m>]` (`clear` resets to the plan's rules, `clear floors` one field); only that building changes and it survives lotrefresh and lotsetparams. E.g. \"make the corner lot a 12-floor midrise\" → `lotset <corner lot> floors=12 typology=midrise`.
+To vary building heights (CityEngine-style), set the height keys with `lotsettings` BEFORE `siteplan` / `lotbuilding`: `floors_range=<min>-<max>` (random floors per lot), `height_mix=low:50,mid:35,tower:15` (weighted classes: low 1-3, mid 4-8, tower 9-20 floors), `falloff=center|street|point` (+ `falloff_point=x,y`, `falloff_strength=0..1`) for taller buildings near the centre / streets / a point, `height_seed=<n>` to reshuffle. E.g. \"vary building heights between 2 and 8 floors, taller near the centre\" → `lotsettings floors_range=2-8 falloff=center` then `siteplan last`. To override one lot's rules, `lotset <lot or building> [floors=<n>] [typology=detached|row|courtyard|slab|midrise] [setback_front=<m> setback_side=<m> setback_rear=<m>]` (`clear` resets to the plan's rules, `clear floors` one field); only that building changes and it survives lotrefresh and lotsetparams. E.g. \"make the corner lot a 12-floor midrise\" → `lotset <corner lot> floors=12 typology=midrise`. To put lots back on the plan's rules entirely, `lotreset <lots or buildings>` clears all their lotset overrides (floors, typology, setbacks) and hand-set edge roles in one undo step.
 ";
 
 /// The "Ask before guessing" section: when a request is ambiguous the model
@@ -969,12 +969,12 @@ mod tests {
         );
         // The command CATALOG itself is the compact-by-design part: ~10–15 KB for
         // ~190 verbs vs the full prompt's ~45 KB command table. The cap tracks the
-        // growing verb count (CAD-parity batch added ~28 verbs; ramp/stair added 2);
-        // it stays well under the full table so the compact prompt keeps its size
-        // advantage.
+        // growing verb count (CAD-parity batch added ~28 verbs; ramp/stair added 2;
+        // lotset/lotreset added 2); it stays well under the full table so the
+        // compact prompt keeps its size advantage.
         let catalog = compact_command_catalog();
         assert!(
-            catalog.len() < 15_500,
+            catalog.len() < 16_000,
             "compact catalog bloated to {} bytes",
             catalog.len()
         );

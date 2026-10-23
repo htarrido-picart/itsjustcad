@@ -3355,29 +3355,38 @@ pub unsafe extern "C" fn ijc_edge_tags_json(h: *mut AppHandle, id: *const c_char
         else {
             return null();
         };
-        let tags: Vec<serde_json::Value> = tags
-            .iter()
-            .map(|t| {
-                let mut v = serde_json::to_value(t).unwrap_or_default();
-                if let Some(map) = v.as_object_mut() {
-                    map.insert("overridden".into(), t.overridden.into());
-                }
-                let road = t
-                    .street_id
-                    .and_then(|sid| itsjustcad_commands::lot::street_of(doc, obj, sid));
-                if let (Some(road), Some(map)) = (road, v.as_object_mut()) {
-                    let info = road.street.as_ref().expect("street_of returns roads");
-                    map.insert("street_object".into(), road.id.to_string().into());
-                    map.insert("street_class".into(), info.class.as_str().into());
-                    if let Some(name) = &info.name {
-                        map.insert("street_name".into(), name.clone().into());
-                    }
-                }
-                v
-            })
-            .collect();
-        into_c_string(serde_json::Value::Array(tags).to_string())
+        into_c_string(edge_tags_value(doc, obj, tags).to_string())
     })
+}
+
+/// The [`ijc_edge_tags_json`] array for `tags` of object `obj`.
+fn edge_tags_value(
+    doc: &itsjustcad_doc::Document,
+    obj: itsjustcad_doc::ObjectId,
+    tags: &[itsjustcad_doc::EdgeTag],
+) -> serde_json::Value {
+    let tags: Vec<serde_json::Value> = tags
+        .iter()
+        .map(|t| {
+            let mut v = serde_json::to_value(t).unwrap_or_default();
+            if let Some(map) = v.as_object_mut() {
+                map.insert("overridden".into(), t.overridden.into());
+            }
+            let road = t
+                .street_id
+                .and_then(|sid| itsjustcad_commands::lot::street_of(doc, obj, sid));
+            if let (Some(road), Some(map)) = (road, v.as_object_mut()) {
+                let info = road.street.as_ref().expect("street_of returns roads");
+                map.insert("street_object".into(), road.id.to_string().into());
+                map.insert("street_class".into(), info.class.as_str().into());
+                if let Some(name) = &info.name {
+                    map.insert("street_name".into(), name.clone().into());
+                }
+            }
+            v
+        })
+        .collect();
+    serde_json::Value::Array(tags)
 }
 
 /// Override the setback role of edge `edge` of lot `id` (short id or full
@@ -3696,6 +3705,258 @@ fn streets_json(doc: &itsjustcad_doc::Document) -> String {
         .collect();
     serde_json::Value::Array(items).to_string()
 }
+
+// ── focused Lot / Street inspectors (#159) ─────────────────────────────────
+
+/// Borrow a non-null, UTF-8 C string.
+unsafe fn c_str<'a>(s: *const c_char) -> Option<&'a str> {
+    if s.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(s) }.to_str().ok()
+}
+
+/// What the current selection is about (#159), so the host opens the right
+/// inspector: `{"kind":"lot","source","lots":[…]}` (generated lots of one
+/// subdivision, or the lots under selected buildings — selection order,
+/// deduped), `{"kind":"street","source","street_id"}` (roads of one generated
+/// street), `{"kind":"site","source"}` (the boundary, other outputs or a mixed
+/// selection of one subdivision) or `{"kind":"none"}`. Ids are short ids.
+/// Returns `{"kind":"none"}` for a null/invalid handle. Free with
+/// [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_focus_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::from(r#"{"kind":"none"}"#));
+        };
+        let doc = &app.session.doc;
+        let focus = itsjustcad_commands::lot::focus_target(doc, &doc.selection);
+        into_c_string(focus_value(&focus).to_string())
+    })
+}
+
+fn focus_value(focus: &itsjustcad_commands::lot::Focus) -> serde_json::Value {
+    use itsjustcad_commands::lot::Focus;
+    match focus {
+        Focus::None => serde_json::json!({ "kind": "none" }),
+        Focus::Lots { source, lots } => serde_json::json!({
+            "kind": "lot",
+            "source": source.to_string(),
+            "lots": lots.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+        }),
+        Focus::Street { source, street_id } => serde_json::json!({
+            "kind": "street",
+            "source": source.to_string(),
+            "street_id": street_id,
+        }),
+        Focus::Site(source) => serde_json::json!({ "kind": "site", "source": source.to_string() }),
+    }
+}
+
+/// One generated lot, as the Lot inspector shows it (#159):
+/// `{"id","source","area","frontage","floors","floors_pinned","typology",
+/// "setback_front","setback_side","setback_street_side","setback_rear","rule",
+/// "gfa","buildings":[…],"edges":[…]|null,"overridden":{"floors","typology",
+/// "setback_front","setback_side","setback_street_side","setback_rear",
+/// "edge_roles"}}`.
+/// `area` in m²; `frontage` (m) is the primary front at the setback line;
+/// `floors` is the effective building floor count (`null` unless a site plan),
+/// `floors_pinned` true when set by `lotset floors=` / `lotheight`;
+/// `typology` and the `setback_*` (m) are the effective per-lot rules and
+/// `rule` the plan's values for this lot (keys as [`ijc_lot_overrides_json`]),
+/// all `null` unless a site plan;
+/// `gfa` (m², `null` when no building stands on it) and `buildings` (short
+/// ids) are the building(s) on the lot; `edges` is the [`ijc_edge_tags_json`]
+/// array. `overridden` flags what differs from the plan's rule (`lotreset`
+/// clears it). `lot_id` is a lot's short id or full uuid. Returns `null` for
+/// anything but a generated lot, or a null/invalid handle. Free with
+/// [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `lot_id` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_lot_json(h: *mut AppHandle, lot_id: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let null = || into_c_string(String::from("null"));
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return null();
+        };
+        let Some(id) = (unsafe { c_str(lot_id) }) else {
+            return null();
+        };
+        let doc = &app.session.doc;
+        let Some(v) = object_by_id(doc, id).and_then(|id| itsjustcad_commands::lot::lot_view(doc, id))
+        else {
+            return null();
+        };
+        let edges = v.edges.as_deref().map(|t| edge_tags_value(doc, v.id, t));
+        into_c_string(lot_view_value(&v, edges).to_string())
+    })
+}
+
+/// [`ijc_lot_json`]'s object for `v`; `edges` is its edge-tag array.
+fn lot_view_value(
+    v: &itsjustcad_commands::lot::LotView,
+    edges: Option<serde_json::Value>,
+) -> serde_json::Value {
+    use itsjustcad_commands::LotField;
+    let mut out = serde_json::json!({
+        "id": v.id.to_string(),
+        "source": v.source.to_string(),
+        "area": v.area,
+        "frontage": v.frontage,
+        "floors": v.floors,
+        "floors_pinned": v.floors_pinned,
+        "rule": null,
+        "gfa": v.gfa,
+        "buildings": v.buildings.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
+        "edges": edges,
+        "overridden": { "edge_roles": v.edge_roles_overridden() },
+    });
+    let effective = v.rules.as_ref().map(|r| {
+        out["rule"] = itsjustcad_commands::lot::lot_values_json(&r.rule, r.rule_floors);
+        itsjustcad_commands::lot::lot_values_json(&r.effective, r.floors)
+    });
+    for f in LotField::ALL {
+        let key = f.name();
+        if f != LotField::Floors {
+            out[key] = effective.as_ref().map_or(serde_json::Value::Null, |e| e[key].clone());
+        }
+        out["overridden"][key] = v.rules.as_ref().is_some_and(|r| r.is_overridden(f)).into();
+    }
+    out
+}
+
+/// One generated street (#159): `{"source","id","name"?,"class","width",
+/// "length","edited","overridden":{"name","class","width"},"objects":[…],
+/// "lots":[…]}`. `source` (short id or uuid of the site boundary) and
+/// `street_id` identify it as in [`ijc_streets_json`]; `length` is the total
+/// centreline length (m); `overridden` flags the `streetset` edits stored on
+/// the plan; `objects` its road curves; `lots` the lots with an edge fronting
+/// it (short ids). Returns `null` for an unknown street or a null/invalid
+/// handle. Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `source` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_street_json(
+    h: *mut AppHandle,
+    source: *const c_char,
+    street_id: u32,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let null = || into_c_string(String::from("null"));
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return null();
+        };
+        let Some(source) = (unsafe { c_str(source) }) else {
+            return null();
+        };
+        let doc = &app.session.doc;
+        let Some(v) = object_by_id(doc, source)
+            .and_then(|s| itsjustcad_commands::lot::street_view(doc, s, street_id))
+        else {
+            return null();
+        };
+        let ids = |ids: &[itsjustcad_doc::ObjectId]| {
+            ids.iter().map(|i| i.to_string()).collect::<Vec<_>>()
+        };
+        let mut out = serde_json::json!({
+            "source": v.source.to_string(),
+            "id": v.id,
+            "class": v.class.as_str(),
+            "width": v.width,
+            "length": v.length,
+            "edited": v.edited,
+            "overridden": {
+                "name": v.name_overridden,
+                "class": v.class_overridden,
+                "width": v.width_overridden,
+            },
+            "objects": ids(&v.roads),
+            "lots": ids(&v.lots),
+        });
+        if let Some(name) = v.name {
+            out["name"] = name.into();
+        }
+        into_c_string(out.to_string())
+    })
+}
+
+/// Edit generated street `street_id` of site `source` (#159): `json` is
+/// `{"name"?: string, "class"?: "arterial"|"collector"|"local"|"alley",
+/// "width"?: number}` (an empty name clears it). Runs `streetset` on the
+/// street's roads as one undoable op that re-derives the plan. Returns
+/// run-result JSON (as [`ijc_run_command_result`]). Free with
+/// [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `source` and `json` must be null or
+/// valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_street_set(
+    h: *mut AppHandle,
+    source: *const c_char,
+    street_id: u32,
+    json: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        let (Some(source), Some(json)) = (unsafe { c_str(source) }, unsafe { c_str(json) }) else {
+            return fail("source or json is null or not valid UTF-8");
+        };
+        let Ok(serde_json::Value::Object(edit)) = serde_json::from_str::<serde_json::Value>(json)
+        else {
+            return fail("json must be an object");
+        };
+        let name = match edit.get("name") {
+            None => None,
+            Some(serde_json::Value::String(n)) => Some(n.clone()),
+            Some(_) => return fail("name must be a string"),
+        };
+        let class = match edit.get("class") {
+            None => None,
+            Some(c) => match c.as_str().and_then(itsjustcad_doc::StreetClass::parse) {
+                Some(c) => Some(c),
+                None => return fail("class must be arterial, collector, local or alley"),
+            },
+        };
+        let width = match edit.get("width") {
+            None => None,
+            Some(w) => match w.as_f64() {
+                Some(w) => Some(w),
+                None => return fail("width must be a number"),
+            },
+        };
+        apply_pending(app);
+        let doc = &app.session.doc;
+        let Some(view) = object_by_id(doc, source)
+            .and_then(|s| itsjustcad_commands::lot::street_view(doc, s, street_id))
+        else {
+            return fail("no such street");
+        };
+        let cmd = Command::StreetSet {
+            targets: Selector::Ids { ids: view.roads },
+            name,
+            class,
+            width,
+            ids: None,
+        };
+        into_c_string(run_cmd_json(&mut app.session, cmd))
+    })
+}
+
+// ── end focused inspectors (#159) ──────────────────────────────────────────
 
 /// True if object `id` (short id or full uuid) is a building generated by a
 /// subdivision link — live or frozen — so the host must not offer direct
@@ -6910,6 +7171,191 @@ mod headless_tests {
                 r(ijc_streets_json(std::ptr::null_mut())),
                 serde_json::json!([])
             );
+            ijc_free(h);
+        }
+    }
+
+    /// Select `ids` (short ids) on the handle.
+    unsafe fn select(h: *mut AppHandle, ids: &[&str]) {
+        let mut guard = unsafe { handle_mut(h) }.unwrap();
+        let doc = &mut guard.session.doc;
+        doc.selection = ids.iter().map(|i| object_by_id(doc, i).unwrap()).collect();
+    }
+
+    #[test]
+    fn focus_json_follows_the_selection() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 600 450", "siteplan last"] {
+                assert_eq!(r(ijc_run_command_result(h, c(line).as_ptr()))["ok"], true);
+            }
+            assert_eq!(r(ijc_focus_json(h))["kind"], "none");
+            let (lot, mass, road, source) = {
+                let guard = handle_ref(h).unwrap();
+                let doc = &guard.session.doc;
+                let lot = doc.objects().find(|o| o.layer == "lots").unwrap().id;
+                let v = itsjustcad_commands::lot::lot_view(doc, lot).unwrap();
+                let mass = *v.buildings.last().unwrap();
+                let road = doc.objects().find(|o| o.layer == "roads").unwrap().id;
+                (lot.to_string(), mass.to_string(), road.to_string(), v.source.to_string())
+            };
+            select(h, &[&lot]);
+            let f = r(ijc_focus_json(h));
+            assert_eq!(f, serde_json::json!({ "kind": "lot", "source": source, "lots": [lot] }));
+            select(h, &[&mass]);
+            assert_eq!(r(ijc_focus_json(h))["lots"][0], lot.as_str(), "a building focuses its lot");
+            select(h, &[&road]);
+            let f = r(ijc_focus_json(h));
+            assert_eq!(f["kind"], "street");
+            assert!(f["street_id"].is_u64());
+            select(h, &[&source]);
+            assert_eq!(r(ijc_focus_json(h))["kind"], "site");
+            select(h, &[&lot, &road]);
+            assert_eq!(r(ijc_focus_json(h))["kind"], "site", "mixed");
+            assert_eq!(r(ijc_focus_json(std::ptr::null_mut()))["kind"], "none");
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn lot_json_reports_area_floors_and_edges() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 600 450", "siteplan last"] {
+                assert_eq!(r(ijc_run_command_result(h, c(line).as_ptr()))["ok"], true);
+            }
+            let first_lot = |h: *mut AppHandle| {
+                let guard = handle_ref(h).unwrap();
+                let doc = &guard.session.doc;
+                doc.objects().find(|o| o.layer == "lots").unwrap().id.to_string()
+            };
+            let lot = first_lot(h);
+            let v = r(ijc_lot_json(h, c(&lot).as_ptr()));
+            assert_eq!(v["id"], lot.as_str());
+            assert!(v["area"].as_f64().unwrap() > 0.0, "{v}");
+            assert!(v["frontage"].as_f64().unwrap() > 0.0, "{v}");
+            assert!(v["floors"].as_u64().unwrap() >= 1, "{v}");
+            assert_eq!(v["floors_pinned"], false);
+            assert!(v["gfa"].as_f64().unwrap() > 0.0, "{v}");
+            assert!(v["edges"].as_array().unwrap().iter().any(|e| e["role"] == "front"));
+            assert!(v["overridden"].as_object().unwrap().values().all(|f| f == false), "{v}");
+            assert_eq!(v["typology"], v["rule"]["typology"]);
+            assert_eq!(v["setback_front"], v["rule"]["setback_front"]);
+
+            let before = ijc_undo_cursor(h);
+            assert_eq!(r(ijc_lot_height_set(h, c(&lot).as_ptr(), 12))["ok"], true);
+            assert_eq!(ijc_undo_cursor(h), before + 1);
+            let pinned = {
+                let guard = handle_ref(h).unwrap();
+                let doc = &guard.session.doc;
+                doc.objects()
+                    .filter(|o| o.layer == "lots")
+                    .find(|o| itsjustcad_commands::lot::lot_view(doc, o.id).unwrap().floors_pinned)
+                    .unwrap()
+                    .id
+                    .to_string()
+            };
+            let v = r(ijc_lot_json(h, c(&pinned).as_ptr()));
+            assert_eq!(v["floors"], 12);
+            assert_eq!(v["overridden"]["floors"], true);
+
+            let edit = c(r#"{"typology":"row","setback_front":6.5,"setback_street_side":3}"#);
+            assert_eq!(r(ijc_lot_set(h, c(&pinned).as_ptr(), edit.as_ptr()))["ok"], true);
+            let pinned = {
+                let guard = handle_ref(h).unwrap();
+                let doc = &guard.session.doc;
+                doc.objects()
+                    .filter(|o| o.layer == "lots")
+                    .find(|o| itsjustcad_commands::lot::lot_view(doc, o.id).unwrap().floors_pinned)
+                    .unwrap()
+                    .id
+                    .to_string()
+            };
+            let v = r(ijc_lot_json(h, c(&pinned).as_ptr()));
+            assert_eq!(v["typology"], "row", "{v}");
+            assert_eq!(v["setback_front"], 6.5);
+            assert_eq!(v["setback_street_side"], 3.0);
+            assert_eq!(v["setback_rear"], v["rule"]["setback_rear"]);
+            let o = &v["overridden"];
+            assert_eq!(
+                [&o["floors"], &o["typology"], &o["setback_front"], &o["setback_street_side"]],
+                [true, true, true, true]
+            );
+            assert_eq!([&o["setback_side"], &o["setback_rear"]], [false, false]);
+
+            let before = ijc_undo_cursor(h);
+            let reset = c(&format!("lotreset id:{pinned}"));
+            assert_eq!(r(ijc_run_command_result(h, reset.as_ptr()))["ok"], true);
+            assert_eq!(ijc_undo_cursor(h), before + 1);
+            let all_clear = {
+                let guard = handle_ref(h).unwrap();
+                let doc = &guard.session.doc;
+                doc.objects().filter(|o| o.layer == "lots").all(|o| {
+                    !itsjustcad_commands::lot::lot_view(doc, o.id).unwrap().overridden()
+                })
+            };
+            assert!(all_clear, "lotreset clears floors, typology and setbacks");
+
+            let null = serde_json::Value::Null;
+            let road = {
+                let guard = handle_ref(h).unwrap();
+                let doc = &guard.session.doc;
+                doc.objects().find(|o| o.layer == "roads").unwrap().id.to_string()
+            };
+            assert_eq!(r(ijc_lot_json(h, c(&road).as_ptr())), null, "not a lot");
+            assert_eq!(r(ijc_lot_json(h, c("nope").as_ptr())), null);
+            assert_eq!(r(ijc_lot_json(h, std::ptr::null())), null);
+            assert_eq!(r(ijc_lot_json(std::ptr::null_mut(), c(&lot).as_ptr())), null);
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn street_json_and_street_set_one_undo() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 600 450", "siteplan last"] {
+                assert_eq!(r(ijc_run_command_result(h, c(line).as_ptr()))["ok"], true);
+            }
+            let streets = r(ijc_streets_json(h));
+            let (source, id) = (streets[0]["source"].as_str().unwrap().to_string(), streets[0]["id"].as_u64().unwrap() as u32);
+            let v = r(ijc_street_json(h, c(&source).as_ptr(), id));
+            assert_eq!(v["objects"], streets[0]["objects"]);
+            assert!(v["length"].as_f64().unwrap() > 0.0, "{v}");
+            assert!(!v["lots"].as_array().unwrap().is_empty(), "fronting lots: {v}");
+            assert_eq!(v["overridden"], serde_json::json!({ "name": false, "class": false, "width": false }));
+            // Every listed lot really fronts the street.
+            for lot in v["lots"].as_array().unwrap() {
+                let tags = r(ijc_edge_tags_json(h, c(lot.as_str().unwrap()).as_ptr()));
+                assert!(tags.as_array().unwrap().iter().any(|t| t["street_id"] == id), "{lot}");
+            }
+
+            let before = ijc_undo_cursor(h);
+            let edit = r#"{"name":"Main Street","class":"arterial","width":20}"#;
+            let out = r(ijc_street_set(h, c(&source).as_ptr(), id, c(edit).as_ptr()));
+            assert_eq!(out["ok"], true, "{out}");
+            assert_eq!(ijc_undo_cursor(h), before + 1, "one undo step");
+            let v = r(ijc_street_json(h, c(&source).as_ptr(), id));
+            assert_eq!(v["name"], "Main Street");
+            assert_eq!(v["class"], "arterial");
+            assert_eq!(v["width"], 20.0);
+            assert_eq!(v["overridden"], serde_json::json!({ "name": true, "class": true, "width": true }));
+            assert_eq!(r(ijc_run_command_result(h, c("undo").as_ptr()))["ok"], true);
+            let v = r(ijc_street_json(h, c(&source).as_ptr(), id));
+            assert!(v.get("name").is_none(), "undone: {v}");
+
+            for bad in [r#"{"class":"boulevard"}"#, r#"{"width":"wide"}"#, "[1]", "{}"] {
+                assert_eq!(r(ijc_street_set(h, c(&source).as_ptr(), id, c(bad).as_ptr()))["ok"], false, "{bad}");
+            }
+            assert_eq!(r(ijc_street_set(h, c(&source).as_ptr(), 9999, c(edit).as_ptr()))["ok"], false);
+            let null = serde_json::Value::Null;
+            assert_eq!(r(ijc_street_json(h, c(&source).as_ptr(), 9999)), null);
+            assert_eq!(r(ijc_street_json(h, std::ptr::null(), id)), null);
+            assert_eq!(r(ijc_street_json(std::ptr::null_mut(), c(&source).as_ptr(), id)), null);
+            assert_eq!(r(ijc_street_set(std::ptr::null_mut(), c(&source).as_ptr(), id, c(edit).as_ptr()))["ok"], false);
             ijc_free(h);
         }
     }

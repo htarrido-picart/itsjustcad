@@ -6268,20 +6268,7 @@ fn exec_edge_role(
         },
     ))
 }
-/// A point inside the footprint of `obj`: a closed curve's centroid, or the
-/// mean of a mesh's vertices (x, y).
-fn plan_probe(obj: &SceneObject) -> Option<glam::DVec2> {
-    match &obj.geometry {
-        Geometry::Curve(c) => Some(crate::lot::curve_to_polygon(c)?.centroid()),
-        Geometry::Mesh(m) => {
-            let p = m.positions();
-            (!p.is_empty()).then(|| {
-                p.iter().map(|v| v.truncate()).sum::<glam::DVec2>() / p.len() as f64
-            })
-        }
-        _ => None,
-    }
-}
+use crate::lot::plan_probe;
 
 /// `lotheight`: pin (or with `floors: None` unpin) the building floor count of
 /// the selected lots — an alias for `lotset floors=<n>` / `lotset clear
@@ -6541,6 +6528,62 @@ fn lot_set(
         created,
         note: dropped_roles_note(dropped),
     })
+}
+
+/// `lotreset` (#159): clear the whole `lotset` override (floors, typology,
+/// setbacks) and the hand-set edge roles of the selected lots — or the lots under the selected buildings — of one site
+/// plan, then re-derive it (one `LotRefreshed` undo step).
+fn exec_lot_reset(
+    doc: &mut Document,
+    targets: Selector,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let err = |m: &str| ExecError::Invalid(format!("lotreset: {m}"));
+    let sel = resolve(doc, &targets)?;
+    let crate::lot::Focus::Lots { source, lots } = crate::lot::focus_target(doc, &sel) else {
+        return Err(err("select lots or buildings of one site plan"));
+    };
+    let link = doc.subdivision_links[&source].clone();
+    if link.frozen {
+        return Err(err("this result is frozen — unfreeze to recompute"));
+    }
+    let prev_link = Box::new(link.clone());
+    let mut new_link = link;
+    for lot in &lots {
+        let obj = doc.get(*lot).expect("focus_target returns live lots");
+        let Geometry::Curve(c) = &obj.geometry else { continue };
+        let Some(poly) = crate::lot::curve_to_polygon(c) else { continue };
+        let block = crate::lot::doc_block(obj, poly.clone());
+        new_link
+            .lot_overrides
+            .retain(|o| !crate::lot::lot_override_matches(&poly, o));
+        new_link
+            .edge_roles
+            .retain(|o| !block.edges.iter().any(|e| crate::lot::override_matches(e, o)));
+    }
+    let (new_ids, restored, dropped) = rederive_link(doc, source, new_link, ids, "lotreset")?;
+    let message = format!(
+        "lotreset: {} lot(s) reset to the plan's rules; {} object(s) recomputed{}",
+        lots.len(),
+        new_ids.len(),
+        dropped_roles_note(dropped)
+    );
+    Ok((
+        Command::LotReset {
+            targets: Selector::Ids { ids: sel },
+            ids: Some(new_ids.clone()),
+        },
+        Inverse::LotRefreshed {
+            source,
+            created: new_ids.clone(),
+            restored,
+            prev_link,
+        },
+        ApplyOutcome {
+            created: new_ids,
+            message,
+        },
+    ))
 }
 
 /// W1d: toggle a link's `frozen` flag. Frozen bakes the result (recompute is
@@ -13770,6 +13813,7 @@ fn apply_forward(
         }
         Command::LotHeight { targets, floors, ids } => exec_lot_height(doc, targets, floors, ids),
         Command::LotSet { targets, edit, ids } => exec_lot_set(doc, targets, edit, ids),
+        Command::LotReset { targets, ids } => exec_lot_reset(doc, targets, ids),
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
         Command::LotLoading { targets, mode, prev } => exec_lot_loading(doc, targets, mode, prev),
         Command::LotGenerateSite {
@@ -16601,6 +16645,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::EdgeRole { .. } => "edgerole",
         Command::LotHeight { .. } => "lotheight",
         Command::LotSet { .. } => "lotset",
+        Command::LotReset { .. } => "lotreset",
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",

@@ -2208,6 +2208,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Reset the selected lots of one site plan to the plan's rules (#159):
+    /// clear their whole `lotset` override (floors, typology, setbacks) and
+    /// hand-set edge roles (`edgerole`) — lots, or buildings standing on them. The link is
+    /// re-derived and `ids` written back as the re-derived children. Logged;
+    /// one undo step.
+    LotReset {
+        targets: Selector,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// Show or set the sticky `SubdivisionSettings` on the document.
     /// With no `sets`, the exec message reports the current
     /// settings; otherwise each `key=value` updates one field. Logged so saved
