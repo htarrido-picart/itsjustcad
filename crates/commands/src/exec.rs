@@ -395,6 +395,9 @@ pub struct Session {
     /// NEVER part of the op-log or file format. Overwritten by each import,
     /// cleared once the caller takes it via [`Session::take_last_import`].
     last_import: Option<ImportSummary>,
+    /// The last `siteoptimize` result and its site boundary, for `siteoptimize
+    /// apply <rank>`. Session-only: the applied op logs its resolved params.
+    pub(crate) last_site_optimize: Option<(ObjectId, crate::site_optimize::OptimizeResult)>,
 }
 
 /// Structured result of an import, beyond the human message. Drives the app's
@@ -723,6 +726,7 @@ impl Default for Session {
             current_branch: MAIN_BRANCH.to_string(),
             doc_uuid: None,
             last_import: None,
+            last_site_optimize: None,
         }
     }
 }
@@ -761,6 +765,40 @@ impl Session {
                 self.run(Command::CodeCheck { pack, story, rules: Some(rules), ids })
             }
             Command::CheckRulesList => Ok(self.checkrules_list()),
+            Command::SiteOptimize { targets, request } => {
+                let ids = resolve(&self.doc, &targets)?;
+                let (source, result) =
+                    crate::site_optimize::optimize_doc(&self.doc, &ids, &request)
+                        .map_err(ExecError::Invalid)?;
+                let message = result.to_markdown();
+                self.last_site_optimize = Some((source, result));
+                Ok(ApplyOutcome {
+                    message,
+                    created: Vec::new(),
+                })
+            }
+            Command::SiteOptimizeApply {
+                rank: Some(rank),
+                source: None,
+                params: None,
+                ids,
+            } => {
+                let (source, result) = self.last_site_optimize.as_ref().ok_or_else(|| {
+                    ExecError::Invalid("siteoptimize apply: run `siteoptimize` first".into())
+                })?;
+                let params = result.get(rank).map(|c| c.params.clone()).ok_or_else(|| {
+                    ExecError::Invalid(format!(
+                        "siteoptimize apply: no candidate #{rank} in the last result"
+                    ))
+                })?;
+                let source = Some(*source);
+                self.run(Command::SiteOptimizeApply {
+                    rank: Some(rank),
+                    source,
+                    params: Some(params),
+                    ids,
+                })
+            }
             Command::CheckRulesLoad { path } => self.checkrules_load(path),
             // xref attach/reload READ an external file: resolve its geometry on a
             // scratch session, then re-enter the generic logged path with
@@ -3668,7 +3706,7 @@ fn parametric_object(
 /// per the field's declared kind. Vec3 accepts `x,y,z`; bool accepts
 /// `true|false|1|0|on|off`; enum accepts any string (schema sanitize snaps
 /// invalid choices back to the default). Returns `None` on a malformed number.
-fn parse_param_value(
+pub(crate) fn parse_param_value(
     field: &itsjustcad_doc::ParamField,
     s: &str,
 ) -> Option<itsjustcad_doc::ParamValue> {
@@ -5914,41 +5952,21 @@ fn regenerate_by_kind(
         itsjustcad_doc::SubdivKind::SitePlan => {
             // META: compose the whole chain from the site boundary. Produced
             // ids are a FLAT vec in insertion order:
-            //   roads ++ blocks ++ lots ++ envelopes ++ buildings(×3).
+            //   roads ++ blocks ++ lots ++ envelopes ++ buildings(×3) ++ reserves.
             // Deterministic, so replay reuses `ids` sliced by the recomputed
             // counts (same pattern as the Site arm).
-
-            // Step 1: streets + blocks.
-            let site = crate::lot::generate_site(poly, z, settings, streets)?;
-
-            // Step 2: subdivide EACH block (skip a block that fails — too
-            // small, etc. — never abort the whole plan).
-            // Lots keep their block's street tags so setbacks front the roads.
-            let mut lot_polys: Vec<subdivision::Polygon2d> = Vec::new();
-            let mut lots_z: Vec<(subdivision::Block, f64)> = Vec::new();
-            for b in &site.blocks {
-                if let Ok(lb) =
-                    crate::lot::subdivide_tagged_blocks(&[(b.clone(), site.z)], settings)
-                {
-                    lot_polys.extend(lb.polygons);
-                    lots_z.extend(lb.lots.into_iter().map(|l| (l, site.z)));
-                }
-            }
-
-            // Hand-set edge roles before setbacks + buildings read them.
-            crate::lot::apply_edge_roles(lots_z.iter_mut().map(|(l, _)| l), edge_roles);
-
-            // Steps 3 + 4: setbacks + buildings (robust: empty on failure, never abort the plan).
-            let setbacks = crate::lot::compute_setbacks(&lots_z, settings).ok();
-            let buildings = crate::lot::compute_buildings(&lots_z, settings).ok();
+            let plan = crate::lot::plan_site(poly, z, settings, streets, edge_roles)?;
+            let (site, lot_bake) = (&plan.site, &plan.lots);
+            let (setbacks, buildings) = (&plan.setbacks, &plan.buildings);
 
             let n_roads = site.roads.len();
             let n_blocks = site.blocks.len();
-            let n_lots = lot_polys.len();
+            let n_lots = lot_bake.polygons.len();
             let n_env = setbacks.as_ref().map_or(0, |s| s.envelopes.len());
             let n_bld_objs =
                 buildings.as_ref().map_or(0, |b| b.buildings.len() * crate::lot::OBJECTS_PER_BUILDING);
-            let total = n_roads + n_blocks + n_lots + n_env + n_bld_objs;
+            let n_open = plan.reserved.len();
+            let total = n_roads + n_blocks + n_lots + n_env + n_bld_objs + n_open;
 
             let all_ids: Vec<ObjectId> = match ids {
                 Some(v) if v.len() == total => v,
@@ -5958,32 +5976,27 @@ fn regenerate_by_kind(
             let (road_ids, rest) = all_ids.split_at(n_roads);
             let (block_ids, rest) = rest.split_at(n_blocks);
             let (lot_ids, rest) = rest.split_at(n_lots);
-            let (env_ids, bld_ids) = rest.split_at(n_env);
+            let (env_ids, rest) = rest.split_at(n_env);
+            let (bld_ids, open_ids) = rest.split_at(n_bld_objs);
 
             crate::lot::ensure_roads_layer(doc);
             crate::lot::ensure_blocks_layer(doc);
-            crate::lot::insert_site(doc, &site, road_ids, block_ids);
+            crate::lot::insert_site(doc, site, road_ids, block_ids);
 
             crate::lot::ensure_lots_layer(doc);
-            let lot_bake = crate::lot::LotBake {
-                polygons: lot_polys.clone(),
-                lots: lots_z.iter().map(|(l, _)| l.clone()).collect(),
-                z: site.z,
-                with_street: 0,
-                slivers_merged: 0,
-                corners_widened: 0,
-                placeholder_note: None,
-                width_mix_error: None,
-            };
-            crate::lot::insert_lots(doc, &lot_bake, lot_ids);
+            crate::lot::insert_lots(doc, lot_bake, lot_ids);
 
-            if let Some(sb) = &setbacks {
+            if let Some(sb) = setbacks {
                 crate::lot::ensure_setbacks_layer(doc);
                 crate::lot::insert_setbacks(doc, sb, env_ids);
             }
-            if let Some(bb) = &buildings {
+            if let Some(bb) = buildings {
                 crate::lot::ensure_buildings_layer(doc);
                 crate::lot::insert_buildings(doc, bb, bld_ids);
+            }
+            if n_open > 0 {
+                crate::lot::ensure_openspace_layer(doc);
+                crate::lot::insert_open_space(doc, &crate::lot::reserve_bake(&plan), open_ids);
             }
             Ok(all_ids)
         }
@@ -6667,10 +6680,11 @@ fn exec_site_plan(
     doc: &mut Document,
     targets: Selector,
     ids: Option<Vec<ObjectId>>,
+    settings: Option<subdivision::SubdivisionSettings>,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
-    // Sticky settings drive the whole plan (no per-run overrides for v1 — the
-    // inspector drives params through LotSetParams).
-    let settings = doc.subdivision_settings.clone();
+    // Sticky settings drive the whole plan unless the caller (`siteoptimize
+    // apply`) passes its own; the inspector drives params through LotSetParams.
+    let settings = settings.unwrap_or_else(|| doc.subdivision_settings.clone());
 
     // Largest closed boundary among the selection is the site (same as
     // lotgeneratesite). Track its source id for the associative link.
@@ -6709,6 +6723,9 @@ fn exec_site_plan(
         crate::lot::ensure_lots_layer(doc),
         crate::lot::ensure_setbacks_layer(doc),
         crate::lot::ensure_buildings_layer(doc),
+        (settings.open_space_reserve_frac > 0.0)
+            .then(|| crate::lot::ensure_openspace_layer(doc))
+            .flatten(),
     ]
     .into_iter()
     .flatten()
@@ -6728,28 +6745,19 @@ fn exec_site_plan(
     )
     .map_err(ExecError::Invalid)?;
 
-    // Count the phases for the message (recompute from the same poly/settings is
-    // deterministic). Re-deriving here would double-insert, so derive counts
-    // from the produced slicing by recomputing just the geometry totals cheaply.
-    // Simplest: recompute the phase counts without inserting.
-    let site = crate::lot::generate_site(&poly, z, &settings, &BTreeMap::new())
+    // Count the phases for the message (the chain is deterministic, so a
+    // re-run off-document matches what was just baked).
+    let plan = crate::lot::plan_site(&poly, z, &settings, &BTreeMap::new(), &mut Vec::new())
         .map_err(ExecError::Invalid)?;
-    let n_roads = site.roads.len();
-    let n_blocks = site.blocks.len();
-    let mut n_lots = 0usize;
-    let mut lots_z: Vec<(subdivision::Block, f64)> = Vec::new();
-    for b in &site.blocks {
-        if let Ok(lb) = crate::lot::subdivide_tagged_blocks(&[(b.clone(), site.z)], &settings) {
-            n_lots += lb.polygons.len();
-            lots_z.extend(lb.lots.into_iter().map(|l| (l, site.z)));
-        }
-    }
-    let n_env = crate::lot::compute_setbacks(&lots_z, &settings)
-        .map(|s| s.envelopes.len())
-        .unwrap_or(0);
-    let n_bld = crate::lot::compute_buildings(&lots_z, &settings)
-        .map(|b| b.buildings.len())
-        .unwrap_or(0);
+    let n_roads = plan.site.roads.len();
+    let n_blocks = plan.site.blocks.len();
+    let n_lots = plan.lots.polygons.len();
+    let n_env = plan.setbacks.as_ref().map_or(0, |s| s.envelopes.len());
+    let n_bld = plan.buildings.as_ref().map_or(0, |b| b.buildings.len());
+    let open = match plan.reserved.len() {
+        0 => String::new(),
+        n => format!(", {n} open-space blocks"),
+    };
 
     // W1 associativity: record a site→(whole chain) link so editing the site
     // boundary recomputes the whole plan via the auto-recompute scan.
@@ -6777,9 +6785,76 @@ fn exec_site_plan(
         ApplyOutcome {
             message: format!(
                 "siteplan: {n_roads} roads, {n_blocks} blocks, {n_lots} lots, \
-                 {n_env} setbacks, {n_bld} buildings"
+                 {n_env} setbacks, {n_bld} buildings{open}"
             ),
             created: produced,
+        },
+    ))
+}
+
+/// `siteoptimize apply` (#145): bake a candidate's params as ONE `SitePlan`
+/// link. A boundary that already carries a site plan is recomputed in place
+/// (`lotsetparams`, undo restores the previous plan), keeping its street edits
+/// and the edge role overrides that still match a lot edge (the dropped ones
+/// are reported); otherwise this is a
+/// `siteplan` with the candidate folded onto the sticky settings.
+fn exec_site_optimize_apply(
+    doc: &mut Document,
+    rank: Option<usize>,
+    source: Option<ObjectId>,
+    params: Option<BTreeMap<String, String>>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let (Some(source), Some(params)) = (source, params) else {
+        return Err(ExecError::Invalid(
+            "siteoptimize apply: run `siteoptimize` on a site boundary first".into(),
+        ));
+    };
+    let roles_before = doc
+        .subdivision_links
+        .get(&source)
+        .filter(|l| l.kind == itsjustcad_doc::SubdivKind::SitePlan)
+        .map(|l| l.edge_roles.len());
+    let replace = roles_before.is_some();
+    let (_, inverse, outcome) = if replace {
+        exec_lot_set_params(doc, source, params.clone(), ids)?
+    } else {
+        let settings = crate::site_optimize::settings_with(&doc.subdivision_settings, &params)
+            .map_err(ExecError::Invalid)?;
+        exec_site_plan(
+            doc,
+            Selector::Ids { ids: vec![source] },
+            ids,
+            Some(settings),
+        )?
+    };
+    let lots = outcome
+        .created
+        .iter()
+        .filter(|id| {
+            doc.get(**id)
+                .is_some_and(|o| o.layer == crate::lot::LOTS_LAYER)
+        })
+        .count();
+    let which = rank.map_or(String::new(), |r| format!(" #{r}"));
+    let dropped = roles_before.map_or(0, |n| {
+        n - doc.subdivision_links.get(&source).map_or(n, |l| l.edge_roles.len())
+    });
+    Ok((
+        Command::SiteOptimizeApply {
+            rank,
+            source: Some(source),
+            params: Some(params),
+            ids: Some(outcome.created.clone()),
+        },
+        inverse,
+        ApplyOutcome {
+            message: format!(
+                "siteoptimize apply{which}: site plan with {lots} lots ({} objects){}",
+                outcome.created.len(),
+                dropped_roles_note(dropped)
+            ),
+            created: outcome.created,
         },
     ))
 }
@@ -13358,7 +13433,26 @@ fn apply_forward(
         } => exec_lot_generate_site(
             doc, targets, pattern, roadwidth, blockdepth, alleys, seed, road_ids, block_ids,
         ),
-        Command::SitePlan { targets, ids } => exec_site_plan(doc, targets, ids),
+        Command::SitePlan { targets, ids } => exec_site_plan(doc, targets, ids, None),
+        Command::SiteOptimize { targets, request } => {
+            let ids = resolve(doc, &targets)?;
+            let (_, result) = crate::site_optimize::optimize_doc(doc, &ids, &request)
+                .map_err(ExecError::Invalid)?;
+            Ok((
+                Command::SiteOptimize { targets, request },
+                Inverse::Rename(Vec::new()), // never logged
+                ApplyOutcome {
+                    message: result.to_markdown(),
+                    created: Vec::new(),
+                },
+            ))
+        }
+        Command::SiteOptimizeApply {
+            rank,
+            source,
+            params,
+            ids,
+        } => exec_site_optimize_apply(doc, rank, source, params, ids),
         Command::LotSetbacks { targets, front, side, streetside, rear, buildto, envelope, ids } => {
             exec_lot_setbacks(doc, targets, front, side, streetside, rear, buildto, envelope, ids)
         }
@@ -16158,6 +16252,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
         Command::SitePlan { .. } => "siteplan",
+        Command::SiteOptimize { .. } | Command::SiteOptimizeApply { .. } => "siteoptimize",
         Command::LotSetbacks { .. } => "lotsetbacks",
         Command::LotFrontage { .. } => "lotfrontage",
         Command::LotReport { .. } => "lotreport",

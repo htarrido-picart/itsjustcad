@@ -1697,6 +1697,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "edgerole" => parse_edgerole(&args),
         "lotfrontage" => parse_lotfrontage(&args),
         "lotreport" => parse_lotreport(&args),
+        "siteoptimize" => parse_siteoptimize(&args),
         "lotopenspace" => parse_lotopenspace(&args),
         "lotbuilding" => parse_lotbuilding(&args),
         "lotsettings" => {
@@ -3051,6 +3052,48 @@ fn parse_lotreport(args: &[&str]) -> Result<Command, ParseError> {
         sel
     };
     Ok(Command::LotReport { targets, compare: None })
+}
+
+/// `siteoptimize [sel] [objective=lots budget=200 seed=1 top=5 lock=a,b
+/// min_frontage=… …]` searches the site-plan params; `siteoptimize apply
+/// <rank>` bakes a candidate from the last result.
+fn parse_siteoptimize(args: &[&str]) -> Result<Command, ParseError> {
+    const USAGE: &str =
+        "[selector] [objective= budget= seed= top= lock= min_*/max_*=] · OR apply <rank>";
+    if let [first, rank] = args
+        && first.eq_ignore_ascii_case("apply")
+    {
+        let rank = rank
+            .parse::<usize>()
+            .map_err(|_| ParseError::BadNumber(rank.to_string()))?;
+        return Ok(Command::SiteOptimizeApply {
+            rank: Some(rank),
+            source: None,
+            params: None,
+            ids: None,
+        });
+    }
+    let (targets, rest) = match args.split_first() {
+        Some((first, _)) if !first.contains('=') => selector(args, "siteoptimize")?,
+        _ => (Selector::Selected, args),
+    };
+    let mut request = crate::site_optimize::OptimizeRequest::default();
+    for tok in rest {
+        let Some((k, v)) = tok.split_once('=') else {
+            return wrong("siteoptimize", USAGE, args);
+        };
+        if let Err(e) = request.set(&k.to_ascii_lowercase(), v) {
+            let mut err = wrong_err("siteoptimize", USAGE, args);
+            if let ParseError::WrongArgs { got, .. } = &mut err {
+                *got = e;
+            }
+            return Err(err);
+        }
+    }
+    Ok(Command::SiteOptimize {
+        targets,
+        request: Box::new(request),
+    })
 }
 
 /// `lotopenspace <sel> type=park|greenway|pond|treesave [area=]`

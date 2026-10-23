@@ -1301,6 +1301,88 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
     }
 }
 
+// ── site plan — the whole chain, off-document ───────────────────────────────
+
+/// The whole `siteplan` chain computed without touching a document: streets +
+/// street-tagged blocks, the blocks reserved as open space
+/// (`open_space_reserve_frac`), tagged lots on the remaining blocks with the
+/// link's edge role overrides applied, then setbacks + buildings. The
+/// `SitePlan` link bakes it; `siteoptimize` scores it without baking.
+#[derive(Debug)]
+pub struct SitePlanBake {
+    pub site: SiteBake,
+    /// Blocks kept out of subdivision as open space (`openspace:reserve`).
+    pub reserved: Vec<Polygon2d>,
+    /// The lots, with the street tags inherited from their block and the
+    /// overridden roles applied (`polygons` and `lots` are parallel).
+    pub lots: LotBake,
+    pub setbacks: Option<SetbackBake>,
+    pub buildings: Option<BuildingBake>,
+}
+
+/// Run the site-plan chain on `site`. Deterministic: the output depends only on
+/// the boundary, settings, street edits (`streetset`) and role overrides
+/// (`edgerole`). `edge_roles` are re-keyed to the regenerated edges, and the
+/// ones that match no edge are removed (see [`apply_edge_roles`]). A block
+/// that fails to subdivide (too small, …) and setbacks/buildings that fail are
+/// skipped, never aborting the plan.
+pub fn plan_site(
+    site: &Polygon2d,
+    z: f64,
+    settings: &SubdivisionSettings,
+    streets: &BTreeMap<u32, StreetEdit>,
+    edge_roles: &mut Vec<EdgeRoleOverride>,
+) -> Result<SitePlanBake, String> {
+    let bake = generate_site(site, z, settings, streets)?;
+    // Reserved blocks are picked among the blocks that bake (still baked as
+    // blocks, just never subdivided).
+    let reserved: Vec<Polygon2d> =
+        subdivision::reserve_among(site, &bake.blocks, settings.open_space_reserve_frac)
+            .reserved
+            .into_iter()
+            .map(|b| b.polygon)
+            .collect();
+    let mut lots = LotBake {
+        polygons: Vec::new(),
+        lots: Vec::new(),
+        z: bake.z,
+        with_street: 0,
+        slivers_merged: 0,
+        corners_widened: 0,
+        placeholder_note: None,
+        width_mix_error: None,
+    };
+    for b in bake.blocks.iter().filter(|b| !reserved.contains(&b.polygon)) {
+        if let Ok(lb) = subdivide_tagged_blocks(&[(b.clone(), bake.z)], settings) {
+            lots.with_street += lb.with_street;
+            lots.polygons.extend(lb.polygons);
+            lots.lots.extend(lb.lots);
+        }
+    }
+    apply_edge_roles(lots.lots.iter_mut(), edge_roles);
+    let lots_z: Vec<(Block, f64)> = lots.lots.iter().map(|l| (l.clone(), bake.z)).collect();
+    let setbacks = compute_setbacks(&lots_z, settings).ok();
+    let buildings = compute_buildings(&lots_z, settings).ok();
+    Ok(SitePlanBake {
+        site: bake,
+        reserved,
+        lots,
+        setbacks,
+        buildings,
+    })
+}
+
+/// The `openspace:reserve` bake for a plan's reserved blocks.
+pub fn reserve_bake(plan: &SitePlanBake) -> OpenSpaceBake {
+    OpenSpaceBake {
+        polygons: plan.reserved.clone(),
+        labels: vec!["openspace:reserve".to_string(); plan.reserved.len()],
+        z: plan.site.z,
+        summary: String::new(),
+        advisory: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

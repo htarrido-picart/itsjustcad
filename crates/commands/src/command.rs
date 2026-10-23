@@ -2367,6 +2367,29 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compare: Option<String>,
     },
+    /// Site plan auto-optimization (#145): search the `siteplan` params of the
+    /// selected site boundary for the best yield under hard constraints,
+    /// evaluating every candidate off-document. Prints a Markdown table of the
+    /// top candidates and the (score, open-space) Pareto front. Read-only query
+    /// — never logged; the session keeps the result for `siteoptimize apply`.
+    SiteOptimize {
+        targets: Selector,
+        request: Box<crate::site_optimize::OptimizeRequest>,
+    },
+    /// Bake one `siteoptimize` candidate as ONE `SitePlan` link (one undo
+    /// step), replacing the boundary's existing site plan if it has one.
+    /// `siteoptimize apply <rank>` fills `source` + `params` from the session's
+    /// last result before logging, so replay never re-runs the search.
+    SiteOptimizeApply {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rank: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ObjectId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     Undo,
     Redo,
     /// Rewrite history: replace the logged op at `step` (0-based) and rebuild
@@ -2548,6 +2571,7 @@ impl Command {
                 | Command::EnviroReport { .. }
                 | Command::LotFrontage { .. }
                 | Command::LotReport { .. }
+                | Command::SiteOptimize { .. }
                 | Command::CheckRulesList
                 | Command::CheckRulesLoad { .. }
                 | Command::RoomList

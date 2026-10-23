@@ -83,8 +83,22 @@ pub fn reserve_blocks(site: &Polygon2d, frac: f64, settings: &SubdivisionSetting
     if graph.is_empty() {
         return empty;
     }
-    let blocks: Vec<Block> = extract_blocks(site, &graph, settings);
-    if blocks.is_empty() {
+    reserve_among(site, &extract_blocks(site, &graph, settings), frac)
+}
+
+/// [`reserve_blocks`] over already-generated `blocks` (e.g. a site plan whose
+/// street widths were edited), so the reserve picks from the blocks that bake.
+pub fn reserve_among(site: &Polygon2d, blocks: &[Block], frac: f64) -> ReserveResult {
+    let site_area = site.area();
+    let frac = frac.clamp(0.0, 0.9);
+    let empty = ReserveResult {
+        reserved: Vec::new(),
+        developable: Vec::new(),
+        site_area,
+        reserved_area: 0.0,
+        requested_frac: frac,
+    };
+    if frac <= 0.0 || site_area <= 1e-6 || blocks.is_empty() {
         return empty;
     }
 

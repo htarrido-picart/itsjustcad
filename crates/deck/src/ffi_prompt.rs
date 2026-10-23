@@ -108,6 +108,9 @@ fn guidance_for(request: &str) -> String {
     if has(&[
         "lot",
         "lotreport",
+        "siteoptimize",
+        "optimize",
+        "maximize",
         "yield",
         "far",
         "subdivide",

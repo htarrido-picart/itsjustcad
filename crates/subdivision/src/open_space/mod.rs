@@ -30,7 +30,7 @@ pub mod tree_save;
 
 pub use greenway::greenway;
 pub use pocket_park::pocket_park;
-pub use reserve::{reserve_blocks, ReservedBlock};
+pub use reserve::{reserve_among, reserve_blocks, ReservedBlock};
 pub use retention_pond::retention_pond;
 pub use tree_save::tree_save;
 

@@ -75,7 +75,7 @@ pub use geometry::clip_bridge;
 pub use indexing::ConsistentIndexing;
 pub use geometry::oriented_box::{convex_hull, OrientedBox};
 pub use open_space::{
-    greenway, pocket_park, reserve_blocks, retention_pond, tree_save, OpenSpaceFeature,
+    greenway, pocket_park, reserve_among, reserve_blocks, retention_pond, tree_save, OpenSpaceFeature,
     ReservedBlock,
 };
 pub use geometry::polygon2d::Polygon2d;
