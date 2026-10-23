@@ -4602,6 +4602,126 @@ pub unsafe extern "C" fn ijc_save_json(h: *mut AppHandle) -> *mut c_char {
     })
 }
 
+// ── site plan auto-optimization (#145) ──────────────────────────────────────
+
+/// The object with short id `source` (any object; a site boundary need not
+/// carry a site plan yet).
+fn object_by_short_id(
+    doc: &itsjustcad_doc::Document,
+    source: &str,
+) -> Option<itsjustcad_doc::ObjectId> {
+    doc.objects()
+        .map(|o| o.id)
+        .find(|id| id.to_string() == source)
+}
+
+/// A C string argument as `&str`, or an error message naming it.
+unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
+    if p.is_null() {
+        return Err(format!("{name} is null"));
+    }
+    (unsafe { CStr::from_ptr(p) })
+        .to_str()
+        .map_err(|_| format!("{name} is not valid UTF-8"))
+}
+
+/// Search the `siteplan` params of the site boundary `source` (short id) for
+/// the best yield, evaluating every candidate off-document (nothing is baked,
+/// nothing logged). `request_json` is `{"objective":"lots|far_net|net_area|gfa|weighted",
+/// "weights":{…},"budget":200,"seed":1,"top":5,"lock":[…],"patterns":[…],
+/// "min_lot_area","min_lot_width","min_frontage","min_open","max_far","max_coverage"}`,
+/// every key optional (null / `{}` = defaults). Returns
+/// `{"candidates":[{"rank","score","params":{…},"yield":{YieldReport}}],"pareto":[ranks…],"evaluated":n,"feasible":n}`
+/// or `{"error":"…"}` (unknown source, bad request, or no feasible layout —
+/// the message names the binding constraint). Pass a candidate's `params` to
+/// [`ijc_site_optimize_apply`]. Runs synchronously (seconds for budget 200).
+/// Caller must [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `source` and
+/// `request_json` must be null or valid NUL-terminated C strings. The returned
+/// pointer must be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_site_optimize_json(
+    h: *mut AppHandle,
+    source: *const c_char,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let result = (|| {
+            let app = (unsafe { handle_ref(h) }).ok_or("invalid handle")?;
+            let source = unsafe { c_arg(source, "source") }?;
+            let request: itsjustcad_commands::site_optimize::OptimizeRequest =
+                match request_json.is_null() {
+                    true => Default::default(),
+                    false => serde_json::from_str(unsafe { c_arg(request_json, "request_json") }?)
+                        .map_err(|e| format!("bad request: {e}"))?,
+                };
+            let doc = &app.session.doc;
+            let id =
+                object_by_short_id(doc, source).ok_or_else(|| format!("no object '{source}'"))?;
+            itsjustcad_commands::site_optimize::optimize_doc(doc, &[id], &request)
+                .map(|(_, r)| r.to_json())
+        })();
+        into_c_string(
+            result
+                .unwrap_or_else(|e: String| serde_json::json!({ "error": e }))
+                .to_string(),
+        )
+    })
+}
+
+/// Bake one [`ijc_site_optimize_json`] candidate on the site boundary `source`
+/// (short id) as ONE associative `SitePlan` link — one undo step, replacing the
+/// boundary's current site plan if it has one. `candidate_params_json` is the
+/// candidate's `params` object (or the whole candidate, whose `params` is
+/// used). Returns run-result JSON like [`ijc_run_command_result`]:
+/// `{"ok","message","error","created":[short ids]}`. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `source` and
+/// `candidate_params_json` must be null or valid NUL-terminated C strings. The
+/// returned pointer must be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_site_optimize_apply(
+    h: *mut AppHandle,
+    source: *const c_char,
+    candidate_params_json: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |e: String| into_c_string(run_result_json(false, None, Some(&e), &[]));
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid handle".into());
+        };
+        let parsed = (|| {
+            let source = unsafe { c_arg(source, "source") }?;
+            let json: serde_json::Value = serde_json::from_str(unsafe {
+                c_arg(candidate_params_json, "candidate_params_json")
+            }?)
+            .map_err(|e| format!("bad params: {e}"))?;
+            let params = itsjustcad_commands::site_optimize::params_from_json(
+                json.get("params").unwrap_or(&json),
+            )?;
+            let id = object_by_short_id(&app.session.doc, source)
+                .ok_or_else(|| format!("no object '{source}'"))?;
+            Ok::<_, String>((id, params))
+        })();
+        match parsed {
+            Ok((id, params)) => into_c_string(run_cmd_json(
+                &mut app.session,
+                Command::SiteOptimizeApply {
+                    rank: None,
+                    source: Some(id),
+                    params: Some(params),
+                    ids: None,
+                },
+            )),
+            Err(e) => fail(e),
+        }
+    })
+}
+
 /// Parse a `feedback bug|idea | <field>: <value> | …` line (e.g. one the deck
 /// emitted) into flat draft JSON for the host's review sheet:
 /// `{"category":"bug","title":…,"steps":"one\nper\nline",…}`, keyed by the
@@ -5931,6 +6051,72 @@ mod headless_tests {
             assert!(ijc_open_json(h, json.as_ptr(), json.len()));
             assert_eq!(count(h), 1);
 
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn site_optimize_json_then_apply_is_one_undo_step() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = take(ijc_run_command_result(h, c("rect 0,0,0 200 150").as_ptr()));
+            let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+            let site = c(v["created"][0].as_str().unwrap());
+
+            let req = c(r#"{"objective":"lots","budget":12,"seed":1,"top":3}"#);
+            let out: serde_json::Value = serde_json::from_str(&take(ijc_site_optimize_json(
+                h,
+                site.as_ptr(),
+                req.as_ptr(),
+            )))
+            .unwrap();
+            assert_eq!(out["evaluated"], 12, "{out}");
+            let best = &out["candidates"][0];
+            assert_eq!(best["rank"], 1);
+            assert!(best["params"]["road_width"].is_number(), "{best}");
+            assert!(best["yield"]["lot_count"].as_u64().unwrap() > 0);
+            assert!(
+                out["pareto"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(1))
+            );
+            assert_eq!(count(h), 1, "the search bakes nothing");
+
+            let bad = c(r#"{"budget":6,"min_lot_area":1e9}"#);
+            let err = take(ijc_site_optimize_json(h, site.as_ptr(), bad.as_ptr()));
+            assert!(err.contains("binding constraint: min_lot_area"), "{err}");
+            let unknown = take(ijc_site_optimize_json(h, c("nope").as_ptr(), req.as_ptr()));
+            assert!(unknown.contains("\"error\""), "{unknown}");
+
+            let undo = ijc_undo_len(h);
+            let params = c(&best.to_string());
+            let r: serde_json::Value = serde_json::from_str(&take(ijc_site_optimize_apply(
+                h,
+                site.as_ptr(),
+                params.as_ptr(),
+            )))
+            .unwrap();
+            assert_eq!(r["ok"], true, "{r}");
+            assert_eq!(ijc_undo_len(h), undo + 1);
+            let app = handle_ref(h).unwrap();
+            let link = app.session.doc.subdivision_links.values().next().unwrap();
+            assert_eq!(link.kind, itsjustcad_doc::SubdivKind::SitePlan);
+            assert_eq!(
+                link.settings.road_width,
+                best["params"]["road_width"].as_f64().unwrap()
+            );
+            let lots = app
+                .session
+                .doc
+                .objects()
+                .filter(|o| o.layer == "lots")
+                .count() as u64;
+            assert_eq!(lots, best["yield"]["lot_count"].as_u64().unwrap());
+
+            assert!(ijc_run_command(h, c("undo").as_ptr()));
+            ijc_flush(h);
+            assert_eq!(count(h), 1, "undo restores the bare site");
             ijc_free(h);
         }
     }
