@@ -876,6 +876,10 @@ pub struct App {
     /// last change — committed once the gesture settles (mirrors `param_pending`
     /// but keyed on the subdivision source rather than a parametric object).
     subdiv_pending: Option<ParamPending>,
+    /// Subdivision inspector `Controls | Yield` segment (0 = Controls).
+    subdiv_segment: usize,
+    /// Yield of the inspected subdivision, cached by (source, doc generation).
+    subdiv_yield: Option<(itsjustcad_doc::ObjectId, u64, subdivision::YieldReport)>,
     /// Auto-recompute: per-source signature of the last-observed source block
     /// geometry. A change (after the first observation) fires a `lotrefresh` so
     /// non-frozen subdivisions track edits to their boundary block.
@@ -1560,6 +1564,8 @@ impl App {
             parametric_selected: None,
             param_pending: None,
             subdiv_pending: None,
+            subdiv_segment: 0,
+            subdiv_yield: None,
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
             subdiv_last_generation: 0,
@@ -8438,6 +8444,21 @@ impl App {
             ui.weak(short_id);
         });
 
+        // `Controls | Yield` for links that bake lots (a Site link has none).
+        if link.kind != itsjustcad_doc::SubdivKind::Site {
+            let roles = self.live_roles(ui.visuals().dark_mode);
+            let labels = [t("param.subdivision.controls"), t("param.subdivision.yield")];
+            if let Some(i) = crate::widgets::segmented_full(ui, &roles, &labels, self.subdiv_segment)
+            {
+                self.subdiv_segment = i;
+            }
+            ui.add_space(4.0);
+            if self.subdiv_segment == 1 {
+                self.subdivision_yield_table(ui, source, &link);
+                return;
+            }
+        }
+
         // Current values = the link's settings projected to the exposed map; the
         // live editing map is the pending edit if a gesture is in flight here.
         let current = subdiv_params::settings_to_params(&link.settings);
@@ -8509,11 +8530,114 @@ impl App {
                 }
             });
         });
-        ui.weak(format!(
-            "{} lot(s){}",
-            link.produced.len(),
-            if link.frozen { " · frozen" } else { "" }
-        ));
+    }
+
+    /// The `Yield` segment: the link's yield (source + produced objects, as
+    /// `ijc_subdivision_yield_json` reports it), recomputed only when the
+    /// document changes.
+    fn subdivision_yield_table(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: itsjustcad_doc::ObjectId,
+        link: &itsjustcad_doc::SubdivLink,
+    ) {
+        use crate::i18n::t;
+        let generation = self.session.doc.generation;
+        let fresh = matches!(&self.subdiv_yield, Some((id, g, _)) if *id == source && *g == generation);
+        if !fresh {
+            let mut ids = vec![source];
+            ids.extend(link.produced.iter().copied());
+            let report =
+                itsjustcad_commands::lot::yield_report(&self.session.doc, &ids, &link.settings);
+            self.subdiv_yield = Some((source, generation, report));
+        }
+        let Some((_, _, r)) = self.subdiv_yield.as_ref() else {
+            return;
+        };
+        if r.is_empty() {
+            ui.weak(t("param.subdivision.yield.empty"));
+            return;
+        }
+        // Baked objects per layer (roads / blocks / setbacks); zero rows hide.
+        let count = |layer: &str| {
+            link.produced
+                .iter()
+                .filter(|id| self.session.doc.get(**id).is_some_and(|o| o.layer == layer))
+                .count()
+        };
+        use itsjustcad_commands::lot::{BLOCKS_LAYER, ROADS_LAYER, SETBACKS_LAYER};
+        let n = |v: usize| v.to_string();
+        let m2 = |a: f64| format!("{a:.0}");
+        let pct = |f: f64| format!("{:.1}", f * 100.0);
+        let ratio = |v: Option<f64>| v.map_or("—".to_string(), |v| format!("{v:.2}"));
+        // (label, value, unit): values right-aligned, units in their own
+        // leading-aligned column so both line up.
+        let mut rows: Vec<(&str, String, &str)> = Vec::new();
+        for (key, layer) in [
+            ("param.subdivision.yield.roads", ROADS_LAYER),
+            ("param.subdivision.yield.blocks", BLOCKS_LAYER),
+        ] {
+            let c = count(layer);
+            if c > 0 {
+                rows.push((t(key), n(c), ""));
+            }
+        }
+        rows.extend([
+            (t("param.subdivision.yield.lots"), n(r.lot_count), ""),
+            (t("param.subdivision.yield.lot_area_avg"), m2(r.avg_lot_area), "m²"),
+            (
+                t("param.subdivision.yield.lot_area_range"),
+                format!("{:.0} – {:.0}", r.min_lot_area, r.max_lot_area),
+                "m²",
+            ),
+        ]);
+        if let Some(f) = &r.frontage {
+            rows.push((t("param.subdivision.yield.frontage_avg"), format!("{:.1}", f.avg), "m"));
+        }
+        let setbacks = count(SETBACKS_LAYER);
+        if setbacks > 0 {
+            rows.push((t("param.subdivision.yield.setbacks"), n(setbacks), ""));
+        }
+        rows.extend([
+            (t("param.subdivision.yield.gross"), m2(r.gross_site_area), "m²"),
+            (
+                t("param.subdivision.yield.open_space"),
+                m2(r.open_space_feature_area + r.reserved_block_area),
+                "m²",
+            ),
+            (t("param.subdivision.yield.open_space_ratio"), pct(r.open_space_ratio), "%"),
+            (t("param.subdivision.yield.net"), m2(r.net_developable_area), "m²"),
+            (t("param.subdivision.yield.buildings"), n(r.building_count), ""),
+            (t("param.subdivision.yield.gfa"), m2(r.total_gfa), "m²"),
+            (t("param.subdivision.yield.far"), format!("{} / {}", ratio(r.far_net), ratio(r.far_gross)), ""),
+            (
+                t("param.subdivision.yield.coverage"),
+                r.lot_coverage.map_or("—".to_string(), pct),
+                if r.lot_coverage.is_some() { "%" } else { "" },
+            ),
+        ]);
+        // Side padding so the table doesn't run edge to edge with the panel.
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::M as i8, 4))
+            .show(ui, |ui| {
+                egui::Grid::new(("subdiv_yield", source))
+                    .num_columns(3)
+                    .striped(true)
+                    .spacing([crate::theme::Spacing::S, 6.0])
+                    .show(ui, |ui| {
+                        for (label, value, unit) in rows {
+                            ui.label(label);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.monospace(value);
+                                },
+                            );
+                            ui.monospace(unit);
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     /// Commit a debounced subdivision params edit as one `lotsetparams` op.
