@@ -222,47 +222,153 @@ impl Metrics {
         }
     }
 
-    /// Absolute cells (lots, net area, GFA, FAR, open %) for the `Current` row.
-    pub(super) fn cells(&self) -> [String; 5] {
-        [
-            self.lots.to_string(),
-            format!("{:.0} m²", self.net_area),
-            format!("{:.0} m²", self.gfa),
-            self.far.map_or("—".into(), |f| format!("{f:.2}")),
-            format!("{:.1} %", self.open_pct),
-        ]
+    /// The value shown in `col` (`Score` is not a yield metric).
+    fn get(&self, col: Col) -> Option<f64> {
+        match col {
+            Col::Score => None,
+            Col::Lots => Some(self.lots as f64),
+            Col::Net => Some(self.net_area),
+            Col::Gfa => Some(self.gfa),
+            Col::Far => self.far,
+            Col::Open => Some(self.open_pct),
+        }
     }
 
-    /// `self − base` cells, in [`Metrics::cells`] order.
-    pub(super) fn delta_cells(&self, base: &Metrics) -> [String; 5] {
-        [
-            fmt_delta(self.lots as f64 - base.lots as f64, 0, ""),
-            fmt_delta(self.net_area - base.net_area, 0, "m²"),
-            fmt_delta(self.gfa - base.gfa, 0, "m²"),
-            match (self.far, base.far) {
-                (Some(a), Some(b)) => fmt_delta(a - b, 2, ""),
-                (a, _) => a.map_or("—".into(), |f| format!("{f:.2}")),
-            },
-            fmt_delta(self.open_pct - base.open_pct, 1, "%"),
-        ]
+    /// The `Current` row's cell for `col`.
+    pub(super) fn cell(&self, col: Col) -> String {
+        self.get(col).map_or(String::new(), |v| fmt_abs(col, v))
+    }
+
+    /// `self − base` for `col`; absolute when the base has no value.
+    pub(super) fn delta_cell(&self, base: &Metrics, col: Col) -> String {
+        match (self.get(col), base.get(col)) {
+            (Some(a), Some(b)) => fmt_delta(col, a - b),
+            (Some(a), None) => fmt_abs(col, a),
+            (None, _) => "—".into(),
+        }
+    }
+
+    /// Every metric, for a row's hover.
+    fn summary(&self) -> String {
+        Col::ALL[1..]
+            .iter()
+            .map(|c| format!("{} {}", t(c.label_key()), self.cell(*c)))
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 }
 
-/// A signed delta: `+12`, `−3.0 %` (true minus sign), `±0` when it rounds to
-/// zero at `decimals`.
-pub(super) fn fmt_delta(d: f64, decimals: usize, unit: &str) -> String {
-    let mag = format!("{:.*}", decimals, d.abs());
-    let sign = if mag.chars().all(|c| c == '0' || c == '.') {
-        "±"
+/// A results-table column (units live in the header label).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Col {
+    Score,
+    Lots,
+    Net,
+    Gfa,
+    Far,
+    Open,
+}
+
+impl Col {
+    const ALL: [Col; 6] = [Col::Score, Col::Lots, Col::Net, Col::Gfa, Col::Far, Col::Open];
+
+    fn label_key(self) -> &'static str {
+        match self {
+            Col::Score => "optimize.col.score",
+            Col::Lots => "param.subdivision.yield.lots",
+            Col::Net => "optimize.col.net",
+            Col::Gfa => "optimize.col.gfa",
+            Col::Far => "optimize.col.far",
+            Col::Open => "optimize.col.open",
+        }
+    }
+
+    /// `a` (≥ 0) as shown: areas compact (`950`, `12.3k`, `412k`, `2.95M`, `12.0M`),
+    /// scores as integers when they are.
+    fn magnitude(self, a: f64) -> String {
+        match self {
+            Col::Score if (a - a.round()).abs() < 1e-9 => format!("{a:.0}"),
+            Col::Score | Col::Far => format!("{a:.2}"),
+            Col::Lots => format!("{a:.0}"),
+            Col::Open => format!("{a:.1}"),
+            Col::Net | Col::Gfa => match a {
+                a if a < 10_000.0 => format!("{a:.0}"),
+                a if a < 100_000.0 => format!("{:.1}k", a / 1e3),
+                a if a < 999_500.0 => format!("{:.0}k", a / 1e3),
+                a if a < 9_995_000.0 => format!("{:.2}M", a / 1e6),
+                a => format!("{:.1}M", a / 1e6),
+            },
+        }
+    }
+}
+
+fn rounds_to_zero(s: &str) -> bool {
+    s.chars().all(|c| c == '0' || c == '.')
+}
+
+/// An absolute value: `0` when it rounds to zero (never `−0.0`).
+pub(super) fn fmt_abs(col: Col, v: f64) -> String {
+    let mag = col.magnitude(v.abs());
+    if rounds_to_zero(&mag) {
+        "0".into()
+    } else if v < 0.0 {
+        format!("−{mag}")
+    } else {
+        mag
+    }
+}
+
+/// A signed delta: `+12`, `−3.0` (true minus sign), `±0` when it rounds to
+/// zero.
+pub(super) fn fmt_delta(col: Col, d: f64) -> String {
+    let mag = col.magnitude(d.abs());
+    let sign = if rounds_to_zero(&mag) {
+        return "±0".into();
     } else if d > 0.0 {
         "+"
     } else {
         "−"
     };
-    if unit.is_empty() {
-        format!("{sign}{mag}")
-    } else {
-        format!("{sign}{mag} {unit}")
+    format!("{sign}{mag}")
+}
+
+/// The columns worth a place in a narrow panel: Score only when it is not
+/// one of the shown metrics (weighted), FAR when the search is about FAR, open
+/// space when it is constrained or varies.
+pub(super) fn columns(form: &OptimizeForm, rows: &[ResultRow]) -> Vec<Col> {
+    let on = |c: Constraint| {
+        Constraint::ALL
+            .iter()
+            .position(|x| *x == c)
+            .is_some_and(|i| form.constraints[i].0)
+    };
+    let weighted = form.objective == Objective::Weighted;
+    let weight = |k: &str| {
+        weighted && METRICS.iter().zip(form.weights).any(|((m, _), w)| *m == k && w != 0.0)
+    };
+    let mut cols = Vec::new();
+    if weighted {
+        cols.push(Col::Score);
+    }
+    cols.extend([Col::Lots, Col::Net, Col::Gfa]);
+    if form.objective == Objective::FarNet || on(Constraint::MaxFar) || weight("far") {
+        cols.push(Col::Far);
+    }
+    let open_varies = rows.iter().any(|r| r.metrics.open_pct.abs() >= 0.05);
+    if open_varies || on(Constraint::MinOpen) || weight("open") {
+        cols.push(Col::Open);
+    }
+    cols
+}
+
+/// The Pareto axis token (`OptimizeResult::pareto_axis`) as a metric getter
+/// and its label key.
+fn axis_of(axis: &str) -> (fn(&ResultRow) -> f64, &'static str) {
+    match axis {
+        "net_area" => (|r| r.metrics.net_area, "optimize.objective.net_area"),
+        "gfa" => (|r| r.metrics.gfa, "optimize.objective.gfa"),
+        "lots" => (|r| r.metrics.lots as f64, "optimize.objective.lots"),
+        _ => (|r| r.metrics.open_pct, "optimize.weight.open"),
     }
 }
 
@@ -289,12 +395,21 @@ pub(super) fn result_rows(r: &OptimizeResult) -> Vec<ResultRow> {
         .collect()
 }
 
-/// A finished search: rows, evaluated count, feasible count.
-type Finished = (Vec<ResultRow>, usize, usize);
+/// A finished search, ready to show.
+pub(super) struct Finished {
+    rows: Vec<ResultRow>,
+    evaluated: usize,
+    feasible: usize,
+    /// `OptimizeResult::pareto_axis`.
+    axis: &'static str,
+    cols: Vec<Col>,
+}
 
 /// A search running on a worker thread.
 pub(super) struct Job {
     started: Instant,
+    /// The form the search ran with (picks the shown columns).
+    form: OptimizeForm,
     rx: mpsc::Receiver<Result<OptimizeResult, String>>,
 }
 
@@ -309,11 +424,20 @@ pub(super) struct OptimizePanel {
     result: Option<(Duration, Result<Finished, String>)>,
 }
 
+impl OptimizeForm {
+    /// Defaults that keep the current plan's lot size: `min_lot_area` on, at
+    /// the plan's `lot_area_min` (maximising lots alone rewards slivers).
+    pub(super) fn seed_from_plan(&mut self, settings: &subdivision::SubdivisionSettings) {
+        self.constraints[0] = (true, settings.lot_area_min);
+    }
+}
+
 impl OptimizePanel {
-    fn open_for(&mut self, source: ObjectId) {
+    fn open_for(&mut self, source: ObjectId, settings: &subdivision::SubdivisionSettings) {
         if self.source != Some(source) {
             self.job = None;
             self.result = None;
+            self.form.seed_from_plan(settings);
         }
         self.source = Some(source);
     }
@@ -337,7 +461,7 @@ impl OptimizePanel {
             ctx.request_repaint();
         });
         self.result = None;
-        self.job = Some(Job { started: Instant::now(), rx });
+        self.job = Some(Job { started: Instant::now(), form: self.form.clone(), rx });
     }
 
     /// Collect a finished search, if any.
@@ -349,10 +473,23 @@ impl OptimizePanel {
             Err(mpsc::TryRecvError::Disconnected) => Err("siteoptimize: the search stopped".into()),
         };
         let elapsed = job.started.elapsed();
+        let finished = got.map(|r| {
+            let rows = result_rows(&r);
+            Finished {
+                cols: columns(&job.form, &rows),
+                rows,
+                evaluated: r.evaluated,
+                feasible: r.feasible,
+                axis: r.pareto_axis,
+            }
+        });
         self.job = None;
-        self.result = Some((elapsed, got.map(|r| (result_rows(&r), r.evaluated, r.feasible))));
+        self.result = Some((elapsed, finished));
     }
 }
+
+/// Grid spacing of the form and results: comfortable rows.
+const GRID_SPACING: egui::Vec2 = egui::vec2(crate::theme::Spacing::S, 6.0);
 
 impl App {
     /// The `Optimize` segment of a `SitePlan` link's inspector.
@@ -362,20 +499,25 @@ impl App {
         source: ObjectId,
         link: &itsjustcad_doc::SubdivLink,
     ) {
-        self.optimize.open_for(source);
+        self.optimize.open_for(source, &link.settings);
         self.optimize.poll();
-        self.optimize_form(ui, source);
-        ui.add_space(6.0);
-        self.optimize_run_row(ui, source);
-        ui.add_space(4.0);
         self.refresh_subdiv_yield(source, link);
         let base = self
             .subdiv_yield
             .as_ref()
             .map(|(_, _, r)| Metrics::from_report(r));
-        self.optimize_results(ui, source, base);
-        ui.add_space(4.0);
-        self.optimize_advanced(ui, source);
+        let side = crate::theme::Spacing::M as i8;
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(side, 4))
+            .show(ui, |ui| {
+                self.optimize_form(ui, source);
+                ui.add_space(crate::theme::Spacing::SM);
+                self.optimize_run_row(ui, source);
+                ui.add_space(crate::theme::Spacing::S);
+                self.optimize_results(ui, source, base);
+                ui.add_space(crate::theme::Spacing::S);
+                self.optimize_advanced(ui, source);
+            });
     }
 
     /// Objective (+ weights) and the constraint list.
@@ -385,7 +527,7 @@ impl App {
         ui.add_enabled_ui(!busy, |ui| {
             egui::Grid::new(("optimize_objective_grid", source))
                 .num_columns(2)
-                .spacing([crate::theme::Spacing::S, 4.0])
+                .spacing(GRID_SPACING)
                 .show(ui, |ui| {
                     ui.strong(t("optimize.objective"));
                     let current = OBJECTIVES
@@ -409,11 +551,11 @@ impl App {
                     }
                 });
 
-            ui.add_space(4.0);
+            ui.add_space(crate::theme::Spacing::S);
             ui.strong(t("optimize.constraints"));
             egui::Grid::new(("optimize_constraint_grid", source))
                 .num_columns(2)
-                .spacing([crate::theme::Spacing::S, 2.0])
+                .spacing(GRID_SPACING)
                 .show(ui, |ui| {
                     for (c, (on, v)) in Constraint::ALL.into_iter().zip(form.constraints.iter_mut())
                     {
@@ -457,7 +599,7 @@ impl App {
                     .color(ui.visuals().strong_text_color());
                 let run = egui::Button::new(text)
                     .fill(fill)
-                    .min_size(egui::vec2(ui.available_width(), 28.0));
+                    .min_size(egui::vec2(ui.available_width(), crate::theme::Spacing::HIT_TARGET));
                 if ui.add(run).clicked() {
                     let ctx = ui.ctx().clone();
                     self.optimize.start(&self.session.doc, source, &ctx);
@@ -467,20 +609,23 @@ impl App {
     }
 
     /// Results table (deltas vs `base`, the current plan), then the scatter.
+    /// Apply comes first so a narrow panel never clips it.
     fn optimize_results(&mut self, ui: &mut egui::Ui, source: ObjectId, base: Option<Metrics>) {
         let Some((elapsed, result)) = &self.optimize.result else {
             return;
         };
-        let (rows, evaluated, feasible) = match result {
-            Ok(r) => r,
+        let f = match result {
+            Ok(f) => f,
             Err(e) => {
                 ui.colored_label(ui.visuals().error_fg_color, e);
                 return;
             }
         };
         ui.weak(format!(
-            "{evaluated} {} · {feasible} {} · {:.1} s",
+            "{} {} · {} {} · {:.1} s",
+            f.evaluated,
             t("optimize.evaluated"),
+            f.feasible,
             t("optimize.feasible"),
             elapsed.as_secs_f64()
         ));
@@ -489,53 +634,56 @@ impl App {
             .id_salt(("optimize_results_scroll", source))
             .show(ui, |ui| {
                 egui::Grid::new(("optimize_results", source))
-                    .num_columns(8)
+                    .num_columns(f.cols.len() + 2)
                     .striped(true)
-                    .spacing([crate::theme::Spacing::S, 4.0])
+                    .spacing(GRID_SPACING)
                     .show(ui, |ui| {
-                        for k in [
-                            "optimize.col.rank",
-                            "optimize.col.score",
-                            "param.subdivision.yield.lots",
-                            "optimize.objective.net_area",
-                            "param.subdivision.yield.gfa",
-                            "optimize.col.far",
-                            "optimize.col.open",
-                        ] {
-                            ui.strong(t(k));
-                        }
                         ui.label("");
+                        ui.strong(t("optimize.col.rank"));
+                        for c in &f.cols {
+                            ui.strong(t(c.label_key()));
+                        }
                         ui.end_row();
                         if let Some(b) = &base {
+                            ui.label("");
                             ui.strong(t("optimize.current"));
-                            ui.label("");
-                            for c in b.cells() {
-                                ui.strong(c);
+                            for c in &f.cols {
+                                ui.strong(b.cell(*c));
                             }
-                            ui.label("");
                             ui.end_row();
                         }
-                        for row in rows {
-                            let rank = format!("{}{}", row.rank, if row.pareto { " ◆" } else { "" });
-                            ui.monospace(rank).on_hover_text(params_text(&row.params));
-                            ui.monospace(format!("{:.2}", row.score));
-                            let cells = match &base {
-                                Some(b) => row.metrics.delta_cells(b),
-                                None => row.metrics.cells(),
-                            };
-                            for c in cells {
-                                ui.monospace(c);
-                            }
-                            if ui.button(t("optimize.apply")).clicked() {
+                        for row in &f.rows {
+                            if ui
+                                .small_button("✔")
+                                .on_hover_text(t("optimize.apply"))
+                                .clicked()
+                            {
                                 apply = Some(row.clone());
+                            }
+                            let rank = format!("{}{}", row.rank, if row.pareto { " ◆" } else { "" });
+                            let hover = format!(
+                                "{} {}\n{}\n\n{}",
+                                t("optimize.col.score"),
+                                fmt_abs(Col::Score, row.score),
+                                row.metrics.summary(),
+                                params_text(&row.params)
+                            );
+                            ui.monospace(rank).on_hover_text(hover);
+                            for c in &f.cols {
+                                ui.monospace(match (c, &base) {
+                                    (Col::Score, _) => fmt_abs(Col::Score, row.score),
+                                    (_, Some(b)) => row.metrics.delta_cell(b, *c),
+                                    (_, None) => row.metrics.cell(*c),
+                                });
                             }
                             ui.end_row();
                         }
                     });
             });
-        ui.add_space(4.0);
-        ui.weak(t("optimize.pareto"));
-        pareto_plot(ui, rows);
+        ui.add_space(crate::theme::Spacing::S);
+        let (x_of, x_key) = axis_of(f.axis);
+        ui.weak(format!("{} {}", t("optimize.pareto"), t(x_key)));
+        pareto_plot(ui, &f.rows, x_of);
 
         if let Some(row) = apply {
             let out = self.session.run(Command::SiteOptimizeApply {
@@ -565,7 +713,7 @@ impl App {
                 ui.add_enabled_ui(!busy, |ui| {
                     egui::Grid::new(("optimize_advanced_grid", source))
                         .num_columns(2)
-                        .spacing([crate::theme::Spacing::S, 4.0])
+                        .spacing(GRID_SPACING)
                         .show(ui, |ui| {
                             ui.label(t("optimize.budget"));
                             ui.add(egui::DragValue::new(&mut form.budget).range(1..=5000));
@@ -575,7 +723,7 @@ impl App {
                             ui.end_row();
                         });
 
-                    ui.add_space(4.0);
+                    ui.add_space(crate::theme::Spacing::S);
                     ui.strong(t("optimize.locks"));
                     let fields = subdiv_params::subdivision_fields();
                     for name in SEARCHED {
@@ -593,7 +741,7 @@ impl App {
                         }
                     }
 
-                    ui.add_space(4.0);
+                    ui.add_space(crate::theme::Spacing::S);
                     ui.strong(t("optimize.patterns"));
                     ui.horizontal_wrapped(|ui| {
                         for p in street_patterns() {
@@ -620,11 +768,11 @@ fn params_text(params: &BTreeMap<String, String>) -> String {
         .join("\n")
 }
 
-/// Tiny scatter of score (y) vs open-space % (x); the Pareto front is drawn in
-/// the selection color and joined.
-fn pareto_plot(ui: &mut egui::Ui, rows: &[ResultRow]) {
+/// Scatter of score (y) vs the Pareto axis `x_of` (x); the front is drawn in
+/// the selection color, joined and labelled by rank.
+fn pareto_plot(ui: &mut egui::Ui, rows: &[ResultRow], x_of: fn(&ResultRow) -> f64) {
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width().min(260.0), 90.0),
+        egui::vec2(ui.available_width(), 96.0),
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect);
@@ -634,23 +782,23 @@ fn pareto_plot(ui: &mut egui::Ui, rows: &[ResultRow]) {
     if rows.is_empty() {
         return;
     }
-    let span = |f: fn(&ResultRow) -> f64| {
+    let span = |f: &dyn Fn(&ResultRow) -> f64| {
         let (lo, hi) = rows
             .iter()
             .map(f)
             .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
         (lo, (hi - lo).max(1e-9))
     };
-    let ((x0, dx), (y0, dy)) = (span(|r| r.metrics.open_pct), span(|r| r.score));
-    let inner = rect.shrink(8.0);
+    let ((x0, dx), (y0, dy)) = (span(&x_of), span(&|r| r.score));
+    let inner = rect.shrink(10.0);
     let at = |r: &ResultRow| {
         egui::pos2(
-            inner.left() + ((r.metrics.open_pct - x0) / dx) as f32 * inner.width(),
+            inner.left() + ((x_of(r) - x0) / dx) as f32 * inner.width(),
             inner.bottom() - ((r.score - y0) / dy) as f32 * inner.height(),
         )
     };
     let mut front: Vec<&ResultRow> = rows.iter().filter(|r| r.pareto).collect();
-    front.sort_by(|a, b| a.metrics.open_pct.total_cmp(&b.metrics.open_pct));
+    front.sort_by(|a, b| x_of(a).total_cmp(&x_of(b)));
     painter.add(egui::Shape::line(
         front.iter().map(|r| at(r)).collect(),
         egui::Stroke::new(1.0, accent),
@@ -759,21 +907,61 @@ mod tests {
     }
 
     #[test]
-    fn deltas_are_signed_and_rounded() {
-        assert_eq!(fmt_delta(12.0, 0, ""), "+12");
-        assert_eq!(fmt_delta(-3.04, 1, "%"), "−3.0 %");
-        assert_eq!(fmt_delta(0.004, 2, ""), "±0.00");
-        assert_eq!(fmt_delta(-0.4, 0, "m²"), "±0 m²");
-        let base = Metrics { lots: 40, net_area: 9000.0, gfa: 12000.0, far: Some(1.2), open_pct: 20.0 };
+    fn cells_are_signed_compact_and_never_negative_zero() {
+        assert_eq!(fmt_delta(Col::Lots, 12.0), "+12");
+        assert_eq!(fmt_delta(Col::Open, -3.04), "−3.0");
+        assert_eq!(fmt_delta(Col::Far, 0.004), "±0");
+        assert_eq!(fmt_delta(Col::Net, -0.4), "±0");
+        assert_eq!(fmt_delta(Col::Net, 412_345.0), "+412k");
+        assert_eq!(fmt_delta(Col::Gfa, -12_345.0), "−12.3k");
+        assert_eq!(fmt_abs(Col::Gfa, 2_947_725.0), "2.95M");
+        assert_eq!(fmt_abs(Col::Gfa, 12_000_000.0), "12.0M");
+        assert_eq!(fmt_abs(Col::Open, -0.0), "0", "signed zero");
+        assert_eq!(fmt_abs(Col::Open, -0.01), "0");
+        assert_eq!(fmt_abs(Col::Score, 16.0), "16", "integer score");
+        assert_eq!(fmt_abs(Col::Score, 1.234), "1.23");
+        let base = Metrics { lots: 40, net_area: 9000.0, gfa: 12000.0, far: Some(1.2), open_pct: -0.0 };
         let cand = Metrics { lots: 52, net_area: 8500.0, gfa: 12000.0, far: Some(1.35), open_pct: 17.0 };
-        assert_eq!(
-            cand.delta_cells(&base),
-            ["+12", "−500 m²", "±0 m²", "+0.15", "−3.0 %"].map(String::from)
-        );
-        assert_eq!(base.cells(), ["40", "9000 m²", "12000 m²", "1.20", "20.0 %"].map(String::from));
+        let deltas: Vec<String> = Col::ALL[1..].iter().map(|c| cand.delta_cell(&base, *c)).collect();
+        assert_eq!(deltas, ["+12", "−500", "±0", "+0.15", "+17.0"]);
+        let cells: Vec<String> = Col::ALL[1..].iter().map(|c| base.cell(*c)).collect();
+        assert_eq!(cells, ["40", "9000", "12.0k", "1.20", "0"]);
         let no_far = Metrics { far: None, ..base };
-        assert_eq!(cand.delta_cells(&no_far)[3], "1.35", "no baseline FAR → absolute");
-        assert_eq!(no_far.delta_cells(&cand)[3], "—");
+        assert_eq!(cand.delta_cell(&no_far, Col::Far), "1.35", "no baseline FAR → absolute");
+        assert_eq!(no_far.delta_cell(&cand, Col::Far), "—");
+    }
+
+    fn row(open_pct: f64) -> ResultRow {
+        ResultRow {
+            rank: 1,
+            score: 1.0,
+            metrics: Metrics { lots: 1, net_area: 1.0, gfa: 1.0, far: None, open_pct },
+            pareto: true,
+            params: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn narrow_table_columns() {
+        use Col::*;
+        let f = OptimizeForm::default();
+        assert_eq!(columns(&f, &[row(0.0)]), [Lots, Net, Gfa], "lots: score = lots column");
+        assert_eq!(columns(&f, &[row(0.0), row(4.0)]), [Lots, Net, Gfa, Open], "open varies");
+        let mut far = OptimizeForm { objective: Objective::FarNet, ..f.clone() };
+        assert_eq!(columns(&far, &[row(0.0)]), [Lots, Net, Gfa, Far]);
+        far.constraints[3].0 = true; // min open
+        assert_eq!(columns(&far, &[row(0.0)]), [Lots, Net, Gfa, Far, Open]);
+        let w = OptimizeForm { objective: Objective::Weighted, weights: [1.0, 0.0, 0.0, 0.0, 1.0], ..f };
+        assert_eq!(columns(&w, &[row(0.0)]), [Score, Lots, Net, Gfa, Open]);
+    }
+
+    #[test]
+    fn plan_seeds_min_lot_area() {
+        let mut f = OptimizeForm::default();
+        let s = subdivision::SubdivisionSettings { lot_area_min: 420.0, ..Default::default() };
+        f.seed_from_plan(&s);
+        assert_eq!(f.constraints[0], (true, 420.0));
+        assert_eq!(f.to_request().min_lot_area, Some(420.0));
     }
 
     #[test]

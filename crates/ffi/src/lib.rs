@@ -5148,7 +5148,7 @@ unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 /// "weights":{…},"budget":200,"seed":1,"top":5,"lock":[…],"patterns":[…],
 /// "min_lot_area","min_lot_width","min_frontage","min_open","max_far","max_coverage"}`,
 /// every key optional (null / `{}` = defaults). Returns
-/// `{"candidates":[{"rank","score","params":{…},"yield":{YieldReport}}],"pareto":[ranks…],"evaluated":n,"feasible":n}`
+/// `{"candidates":[{"rank","score","params":{…},"yield":{YieldReport}}],"pareto":[ranks…],"pareto_axis":"open"|"net_area"|"gfa"|"lots","evaluated":n,"feasible":n}`
 /// or `{"error":"…"}` (unknown source, bad request, or no feasible layout —
 /// the message names the binding constraint). Pass a candidate's `params` to
 /// [`ijc_site_optimize_apply`]. Runs synchronously (seconds for budget 200).

@@ -355,8 +355,11 @@ pub struct OptimizeResult {
     pub objective: Objective,
     /// The top-N ranked candidates plus any Pareto member ranked lower.
     pub candidates: Vec<Candidate>,
-    /// Ranks on the (score, open-space ratio) Pareto front.
+    /// Ranks on the (score, [`OptimizeResult::pareto_axis`]) Pareto front.
     pub pareto: Vec<usize>,
+    /// The front's second metric (`open`, `net_area`, `gfa` or `lots`): the
+    /// first that varies across candidates and is not the objective.
+    pub pareto_axis: &'static str,
     pub evaluated: usize,
     pub feasible: usize,
 }
@@ -570,13 +573,50 @@ struct Trial {
 
 impl Trial {
     /// GA selection key, smaller = better: feasible first, then fewer
-    /// violations, then a higher score.
-    fn fitness(&self) -> (usize, f64) {
+    /// violations, then a higher score, then the [`TIE_BREAK`] metrics.
+    fn fitness(&self) -> (usize, [f64; 4]) {
         match &self.eval {
-            Ok(e) => (e.violations.len(), -e.score),
-            Err(_) => (usize::MAX, 0.0),
+            Ok(e) => (e.violations.len(), sort_key(e)),
+            Err(_) => (usize::MAX, [0.0; 4]),
         }
     }
+}
+
+/// Metrics that order equal scores (higher first), so a lots objective prefers
+/// the layout with more net area, then more GFA, then more open space.
+const TIE_BREAK: [&str; 3] = ["net_area", "gfa", "open"];
+
+/// Ascending sort key (smaller = better): −score, then −[`TIE_BREAK`].
+fn sort_key(e: &Evaluation) -> [f64; 4] {
+    let m = |k| -metric(&e.report, k);
+    [-e.score, m(TIE_BREAK[0]), m(TIE_BREAK[1]), m(TIE_BREAK[2])]
+}
+
+fn cmp_keys(a: &[f64; 4], b: &[f64; 4]) -> std::cmp::Ordering {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| x.total_cmp(y))
+        .find(|o| o.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// The Pareto front's second axis: the first of these that is not the
+/// objective's own metric and varies across the candidates (open space is 0
+/// for every plan when nothing reserves it). Falls back to `open`.
+const PARETO_AXES: [&str; 4] = ["open", "net_area", "gfa", "lots"];
+
+fn pareto_axis(objective: Objective, reports: &[&YieldReport]) -> &'static str {
+    PARETO_AXES
+        .into_iter()
+        .filter(|k| *k != objective.token())
+        .find(|k| {
+            let (lo, hi) = reports
+                .iter()
+                .map(|r| metric(r, k))
+                .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+            hi - lo > 1e-6 * hi.abs().max(1.0)
+        })
+        .unwrap_or("open")
 }
 
 /// Search the site-plan params of `site` for the best feasible layouts.
@@ -633,7 +673,7 @@ pub fn optimize_with(
         let mut order: Vec<usize> = (0..trials.len()).collect();
         order.sort_by(|&a, &b| {
             let (fa, fb) = (trials[a].fitness(), trials[b].fitness());
-            fa.0.cmp(&fb.0).then(fa.1.total_cmp(&fb.1)).then(a.cmp(&b))
+            fa.0.cmp(&fb.0).then(cmp_keys(&fa.1, &fb.1)).then(a.cmp(&b))
         });
         let elite = &order[..mu.min(order.len())];
         let children: Vec<Vec<f64>> = (0..lambda.min(budget - trials.len()))
@@ -662,8 +702,9 @@ pub fn optimize_with(
     rank(trials, req)
 }
 
-/// Rank the feasible trials, drop layouts whose yield duplicates a better one,
-/// and mark the (score, open-space) Pareto front. With nothing feasible, name
+/// Rank the feasible trials (score, then [`TIE_BREAK`]), drop layouts whose
+/// yield duplicates a better one, and mark the (score, [`pareto_axis`]) Pareto
+/// front. With nothing feasible, name
 /// the constraint broken most often.
 fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, String> {
     let evaluated = trials.len();
@@ -720,15 +761,7 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
             .expect("feasible trials evaluated")
     };
     feasible.sort_by(|(ia, a), (ib, b)| {
-        let (a, b) = (eval(a), eval(b));
-        b.score
-            .total_cmp(&a.score)
-            .then(
-                b.report
-                    .open_space_ratio
-                    .total_cmp(&a.report.open_space_ratio),
-            )
-            .then(ia.cmp(ib))
+        cmp_keys(&sort_key(&eval(a)), &sort_key(&eval(b))).then(ia.cmp(ib))
     });
     let mut seen = std::collections::BTreeSet::new();
     let unique: Vec<Candidate> = feasible
@@ -751,13 +784,14 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
             eval,
         })
         .collect();
+    let axis = pareto_axis(
+        req.objective,
+        &unique.iter().map(|c| &c.eval.report).collect::<Vec<_>>(),
+    );
     let dominated = |c: &Candidate| {
         unique.iter().any(|o| {
             let (s, os) = (c.eval.score, o.eval.score);
-            let (p, op) = (
-                c.eval.report.open_space_ratio,
-                o.eval.report.open_space_ratio,
-            );
+            let (p, op) = (metric(&c.eval.report, axis), metric(&o.eval.report, axis));
             // A better-ranked tie also dominates, so the front lists one per point.
             os >= s && op >= p && (os > s || op > p || o.rank < c.rank)
         })
@@ -775,6 +809,7 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
         objective: req.objective,
         candidates,
         pareto,
+        pareto_axis: axis,
         evaluated,
         feasible: n_feasible,
     })
@@ -814,7 +849,8 @@ impl OptimizeResult {
         }
         let front: Vec<String> = self.pareto.iter().map(|r| format!("#{r}")).collect();
         s.push_str(&format!(
-            "\nPareto (score vs open space): {}. Bake one with `siteoptimize apply <rank>`.",
+            "\nPareto (score vs {}): {}. Bake one with `siteoptimize apply <rank>`.",
+            self.pareto_axis,
             front.join(", ")
         ));
         s
@@ -848,6 +884,7 @@ impl OptimizeResult {
         serde_json::json!({
             "candidates": candidates,
             "pareto": self.pareto,
+            "pareto_axis": self.pareto_axis,
             "evaluated": self.evaluated,
             "feasible": self.feasible,
         })
@@ -995,6 +1032,47 @@ mod tests {
         );
         assert!(r.candidates.iter().all(|c| c.eval.violations.is_empty()));
         assert!(r.pareto.contains(&1), "the best score is on the front");
+    }
+
+    /// Equal scores are ordered by net area, then GFA (a lots objective must
+    /// not hand back five indistinguishable 16-lot plans), and the Pareto
+    /// front uses an axis that varies: open space is 0 without a reserve, so
+    /// it falls back to net area.
+    #[test]
+    fn ties_break_on_net_area_and_pareto_axis_varies() {
+        let site = rect(200.0, 150.0);
+        let r = optimize(&site, &SubdivisionSettings::default(), &req(120)).unwrap();
+        for w in r.candidates.windows(2) {
+            let (a, b) = (&w[0].eval, &w[1].eval);
+            assert!(a.score >= b.score);
+            if a.score == b.score {
+                let key = |e: &Evaluation| (e.report.total_lot_area, e.report.total_gfa);
+                assert!(key(a) >= key(b), "#{} vs #{}", w[0].rank, w[1].rank);
+            }
+        }
+        assert!(r.candidates.iter().all(|c| c.eval.report.open_space_ratio.abs() < 1e-9));
+        assert_eq!(r.pareto_axis, "net_area");
+        assert!(r.pareto.len() > 1, "a varying axis gives a real front: {:?}", r.pareto);
+        assert!(r.to_markdown().contains("Pareto (score vs net_area)"));
+        assert_eq!(r.to_json()["pareto_axis"], "net_area");
+    }
+
+    #[test]
+    fn pareto_axis_skips_the_objective_and_flat_metrics() {
+        let y = |lots: usize, area: f64, open: f64| {
+            YieldReport::compute(&YieldInputs {
+                lot_areas: vec![area / lots as f64; lots],
+                gross_site_area: 1000.0,
+                reserved_block_areas: vec![open * 1000.0],
+                ..YieldInputs::default()
+            })
+        };
+        let (a, b) = (y(10, 100.0, 0.0), y(12, 90.0, 0.0));
+        assert_eq!(pareto_axis(Objective::Lots, &[&a, &b]), "net_area");
+        assert_eq!(pareto_axis(Objective::NetArea, &[&a, &b]), "lots");
+        let (c, d) = (y(10, 100.0, 0.1), y(12, 90.0, 0.2));
+        assert_eq!(pareto_axis(Objective::Lots, &[&c, &d]), "open");
+        assert_eq!(pareto_axis(Objective::Lots, &[&a]), "open", "nothing varies");
     }
 
     #[test]
