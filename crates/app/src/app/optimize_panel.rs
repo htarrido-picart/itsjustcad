@@ -3,8 +3,9 @@
 
 //! Site plan optimizer panel (#145, desktop host): the **Optimize** segment of
 //! a `SitePlan` link's subdivision inspector (`Controls | Yield | Optimize`).
-//! Objective and constraints on top, a full-width **Run**, then the results as
-//! deltas vs the current plan's yield, the Pareto scatter, and an **Advanced**
+//! Objective, constraints and the `value` objective's **Economics** (unit
+//! prices) on top, a full-width **Run**, then the results as deltas vs the
+//! current plan (scored like a candidate), the Pareto scatter, and an **Advanced**
 //! section (budget, seed, locks, street patterns). Run hands the boundary, the
 //! link's settings and its hand edits to a worker thread that calls
 //! [`site_optimize::optimize_with`], so frames keep painting; Cancel drops the
@@ -17,7 +18,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use itsjustcad_commands::site_optimize::{
-    self, Objective, OptimizeRequest, OptimizeResult, SEARCHED,
+    self, Economics, Ledger, Objective, OptimizeRequest, OptimizeResult, Quantities, SEARCHED,
 };
 use itsjustcad_commands::{subdiv_params, Command};
 use itsjustcad_doc::{ObjectId, SubdivKind};
@@ -27,6 +28,7 @@ use crate::i18n::t;
 
 /// The objectives offered, with their label keys.
 const OBJECTIVES: &[(Objective, &str)] = &[
+    (Objective::Value, "optimize.objective.value"),
     (Objective::Lots, "optimize.objective.lots"),
     (Objective::FarNet, "optimize.objective.far_net"),
     (Objective::NetArea, "optimize.objective.net_area"),
@@ -105,6 +107,8 @@ pub(super) struct OptimizeForm {
     pub locks: BTreeSet<String>,
     /// Allowed street patterns; all of them (or none) means unrestricted.
     pub patterns: BTreeSet<String>,
+    /// Unit prices of the `value` objective (and the Yield economics block).
+    pub economics: Economics,
 }
 
 impl Default for OptimizeForm {
@@ -118,6 +122,7 @@ impl Default for OptimizeForm {
             seed: d.seed,
             locks: BTreeSet::new(),
             patterns: street_patterns().into_iter().collect(),
+            economics: d.economics,
         }
     }
 }
@@ -137,6 +142,7 @@ impl OptimizeForm {
             objective: self.objective,
             budget: self.budget,
             seed: self.seed,
+            economics: self.economics,
             lock: SEARCHED
                 .iter()
                 .filter(|k| self.locks.contains(**k))
@@ -333,8 +339,9 @@ pub(super) fn fmt_delta(col: Col, d: f64) -> String {
 }
 
 /// The columns worth a place in a narrow panel: Score only when it is not
-/// one of the shown metrics (weighted), FAR when the search is about FAR, open
-/// space when it is constrained or varies.
+/// one of the shown metrics (weighted, or profit per m² for `value`, which
+/// then drops GFA), FAR when the search is about FAR, open space when it is
+/// constrained or varies.
 pub(super) fn columns(form: &OptimizeForm, rows: &[ResultRow]) -> Vec<Col> {
     let on = |c: Constraint| {
         Constraint::ALL
@@ -346,11 +353,15 @@ pub(super) fn columns(form: &OptimizeForm, rows: &[ResultRow]) -> Vec<Col> {
     let weight = |k: &str| {
         weighted && METRICS.iter().zip(form.weights).any(|((m, _), w)| *m == k && w != 0.0)
     };
+    let value = form.objective == Objective::Value;
     let mut cols = Vec::new();
-    if weighted {
+    if weighted || value {
         cols.push(Col::Score);
     }
-    cols.extend([Col::Lots, Col::Net, Col::Gfa]);
+    cols.extend([Col::Lots, Col::Net]);
+    if !value {
+        cols.push(Col::Gfa);
+    }
     if form.objective == Objective::FarNet || on(Constraint::MaxFar) || weight("far") {
         cols.push(Col::Far);
     }
@@ -380,6 +391,7 @@ pub(super) struct ResultRow {
     pub metrics: Metrics,
     pub pareto: bool,
     pub params: BTreeMap<String, String>,
+    pub ledger: Ledger,
 }
 
 pub(super) fn result_rows(r: &OptimizeResult) -> Vec<ResultRow> {
@@ -391,8 +403,56 @@ pub(super) fn result_rows(r: &OptimizeResult) -> Vec<ResultRow> {
             metrics: Metrics::from_report(&c.eval.report),
             pareto: r.pareto.contains(&c.rank),
             params: c.params.clone(),
+            ledger: c.eval.ledger,
         })
         .collect()
+}
+
+/// The current plan as a (rank 0) row, scored like the candidates.
+pub(super) fn current_row(r: &OptimizeResult) -> Option<ResultRow> {
+    r.current.as_ref().map(|e| ResultRow {
+        rank: 0,
+        score: e.score,
+        metrics: Metrics::from_report(&e.report),
+        pareto: false,
+        params: BTreeMap::new(),
+        ledger: e.ledger,
+    })
+}
+
+/// Money, compact like areas (`950`, `12.3k`, `94.1M`), never `−0`.
+pub(super) fn fmt_money(v: f64) -> String {
+    fmt_abs(Col::Net, v)
+}
+
+/// A ledger as (label key, value) lines: revenue, each cost (negative),
+/// profit, profit per m².
+pub(super) fn ledger_lines(l: &Ledger) -> [(&'static str, String); 7] {
+    [
+        ("optimize.econ.revenue", fmt_money(l.revenue)),
+        ("optimize.econ.roads", fmt_money(-l.roads)),
+        ("optimize.econ.utilities", fmt_money(-l.utilities)),
+        ("optimize.econ.lots", fmt_money(-l.lots)),
+        ("optimize.econ.open_space", fmt_money(-l.open_space)),
+        ("optimize.econ.profit", fmt_money(l.profit)),
+        ("optimize.objective.value", fmt_abs(Col::Far, l.value)),
+    ]
+}
+
+fn ledger_text(l: &Ledger) -> String {
+    ledger_lines(l)
+        .iter()
+        .map(|(k, v)| format!("{} {v}", t(k)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `s` without the minus of a value that rounds to zero (`-0`, `-0.0`).
+pub(super) fn unsigned_zero(s: String) -> String {
+    match s.strip_prefix('-') {
+        Some(rest) if rounds_to_zero(rest) => rest.to_string(),
+        _ => s,
+    }
 }
 
 /// A finished search, ready to show.
@@ -403,6 +463,11 @@ pub(super) struct Finished {
     /// `OptimizeResult::pareto_axis`.
     axis: &'static str,
     cols: Vec<Col>,
+    /// Score header (`Profit/m²` for `value`).
+    score_key: &'static str,
+    /// The current plan, scored like a candidate.
+    current: Option<ResultRow>,
+    beats_current: bool,
 }
 
 /// A search running on a worker thread.
@@ -422,6 +487,8 @@ pub(super) struct OptimizePanel {
     job: Option<Job>,
     /// Last finished search: (elapsed, rows + summary, or the error).
     result: Option<(Duration, Result<Finished, String>)>,
+    /// The Yield economics block's plan quantities, per (source, generation).
+    current_q: Option<(ObjectId, u64, Option<Quantities>)>,
 }
 
 impl OptimizeForm {
@@ -481,6 +548,13 @@ impl OptimizePanel {
                 evaluated: r.evaluated,
                 feasible: r.feasible,
                 axis: r.pareto_axis,
+                score_key: if job.form.objective == Objective::Value {
+                    "optimize.col.value"
+                } else {
+                    "optimize.col.score"
+                },
+                current: current_row(&r),
+                beats_current: r.beats_current(),
             }
         });
         self.job = None;
@@ -511,6 +585,8 @@ impl App {
             .inner_margin(egui::Margin::symmetric(side, 4))
             .show(ui, |ui| {
                 self.optimize_form(ui, source);
+                ui.add_space(crate::theme::Spacing::S);
+                self.optimize_economics(ui, source);
                 ui.add_space(crate::theme::Spacing::SM);
                 self.optimize_run_row(ui, source);
                 ui.add_space(crate::theme::Spacing::S);
@@ -629,6 +705,21 @@ impl App {
             t("optimize.feasible"),
             elapsed.as_secs_f64()
         ));
+        // Deltas are against the current plan as the search scored it; the
+        // document's yield stands in when it could not be planned.
+        let base = f.current.as_ref().map(|c| c.metrics).or(base);
+        let hover = |row: &ResultRow| {
+            format!(
+                "{} {}\n\n{}\n\n{}\n\n{}",
+                t(f.score_key),
+                fmt_abs(Col::Score, row.score),
+                ledger_text(&row.ledger),
+                row.metrics.summary(),
+                params_text(&row.params)
+            )
+            .trim_end()
+            .to_string()
+        };
         let mut apply = None;
         egui::ScrollArea::horizontal()
             .id_salt(("optimize_results_scroll", source))
@@ -641,14 +732,21 @@ impl App {
                         ui.label("");
                         ui.strong(t("optimize.col.rank"));
                         for c in &f.cols {
-                            ui.strong(t(c.label_key()));
+                            let key = if *c == Col::Score { f.score_key } else { c.label_key() };
+                            ui.strong(t(key));
                         }
                         ui.end_row();
                         if let Some(b) = &base {
                             ui.label("");
-                            ui.strong(t("optimize.current"));
+                            let label = ui.strong(t("optimize.current"));
+                            if let Some(cur) = &f.current {
+                                label.on_hover_text(hover(cur));
+                            }
                             for c in &f.cols {
-                                ui.strong(b.cell(*c));
+                                ui.strong(match (c, &f.current) {
+                                    (Col::Score, Some(cur)) => fmt_abs(Col::Score, cur.score),
+                                    _ => b.cell(*c),
+                                });
                             }
                             ui.end_row();
                         }
@@ -661,14 +759,7 @@ impl App {
                                 apply = Some(row.clone());
                             }
                             let rank = format!("{}{}", row.rank, if row.pareto { " ◆" } else { "" });
-                            let hover = format!(
-                                "{} {}\n{}\n\n{}",
-                                t("optimize.col.score"),
-                                fmt_abs(Col::Score, row.score),
-                                row.metrics.summary(),
-                                params_text(&row.params)
-                            );
-                            ui.monospace(rank).on_hover_text(hover);
+                            ui.monospace(rank).on_hover_text(hover(row));
                             for c in &f.cols {
                                 ui.monospace(match (c, &base) {
                                     (Col::Score, _) => fmt_abs(Col::Score, row.score),
@@ -680,6 +771,10 @@ impl App {
                         }
                     });
             });
+        if !f.beats_current {
+            ui.add_space(crate::theme::Spacing::XS);
+            ui.label(t("optimize.current_best"));
+        }
         ui.add_space(crate::theme::Spacing::S);
         let (x_of, x_key) = axis_of(f.axis);
         ui.weak(format!("{} {}", t("optimize.pareto"), t(x_key)));
@@ -700,6 +795,81 @@ impl App {
                 Err(e) => self.command_line.push_line(e.to_string()),
             }
         }
+    }
+
+    /// Unit prices: open by default when the objective is `value` (the header
+    /// id follows the objective, so switching to `value` opens it).
+    fn optimize_economics(&mut self, ui: &mut egui::Ui, source: ObjectId) {
+        let busy = self.optimize.job.is_some();
+        let form = &mut self.optimize.form;
+        let value = form.objective == Objective::Value;
+        egui::CollapsingHeader::new(t("optimize.economics"))
+            .id_salt(("optimize_economics", source, value))
+            .default_open(value)
+            .show(ui, |ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    let e = &mut form.economics;
+                    egui::Grid::new(("optimize_economics_grid", source))
+                        .num_columns(2)
+                        .spacing(GRID_SPACING)
+                        .show(ui, |ui| {
+                            for (key, v, speed) in [
+                                ("optimize.econ.price", &mut e.price, 1.0),
+                                ("optimize.econ.road_cost", &mut e.road_cost, 1.0),
+                                ("optimize.econ.utility_cost", &mut e.utility_cost, 10.0),
+                                ("optimize.econ.lot_cost", &mut e.lot_cost, 100.0),
+                                ("optimize.econ.open_cost", &mut e.open_cost, 1.0),
+                            ] {
+                                ui.label(t(key));
+                                ui.add(egui::DragValue::new(v).speed(speed).range(0.0..=f64::MAX));
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+    }
+
+    /// The Yield segment's `Economics` block for a site plan: the current
+    /// plan's ledger at the Optimize form's unit prices. The plan quantities
+    /// are measured once per document generation.
+    pub(super) fn yield_economics(&mut self, ui: &mut egui::Ui, source: ObjectId) {
+        let generation = self.session.doc.generation;
+        let fresh = matches!(&self.optimize.current_q, Some((id, g, _)) if *id == source && *g == generation);
+        if !fresh {
+            let doc = &self.session.doc;
+            let q = site_optimize::site_boundary(doc, &[source]).and_then(|(_, site)| {
+                let (base, edits) = site_optimize::base_plan(doc, source);
+                site_optimize::evaluate(&site, &base, &edits, &OptimizeRequest::default())
+                    .ok()
+                    .map(|e| e.quantities)
+            });
+            self.optimize.current_q = Some((source, generation, q));
+        }
+        let Some((_, _, Some(q))) = &self.optimize.current_q else {
+            return;
+        };
+        let ledger = self.optimize.form.economics.ledger(q);
+        ui.add_space(crate::theme::Spacing::S);
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::M as i8, 4))
+            .show(ui, |ui| {
+                ui.strong(t("optimize.economics"));
+                // Same shape as the yield table: label, right-aligned value, unit.
+                egui::Grid::new(("subdiv_yield_economics", source))
+                    .num_columns(3)
+                    .striped(true)
+                    .spacing(GRID_SPACING)
+                    .show(ui, |ui| {
+                        for (key, v) in ledger_lines(&ledger) {
+                            ui.label(t(key));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.monospace(v);
+                            });
+                            ui.monospace(if key == "optimize.objective.value" { "/m²" } else { "" });
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     /// Collapsed-by-default budget, seed, locked parameters, street patterns.
@@ -938,13 +1108,17 @@ mod tests {
             metrics: Metrics { lots: 1, net_area: 1.0, gfa: 1.0, far: None, open_pct },
             pareto: true,
             params: BTreeMap::new(),
+            ledger: Ledger::default(),
         }
     }
 
     #[test]
     fn narrow_table_columns() {
         use Col::*;
-        let f = OptimizeForm::default();
+        let value = OptimizeForm::default();
+        assert_eq!(value.objective, Objective::Value, "value is the default");
+        assert_eq!(columns(&value, &[row(0.0)]), [Score, Lots, Net], "profit/m², no GFA");
+        let f = OptimizeForm { objective: Objective::Lots, ..value };
         assert_eq!(columns(&f, &[row(0.0)]), [Lots, Net, Gfa], "lots: score = lots column");
         assert_eq!(columns(&f, &[row(0.0), row(4.0)]), [Lots, Net, Gfa, Open], "open varies");
         let mut far = OptimizeForm { objective: Objective::FarNet, ..f.clone() };
@@ -953,6 +1127,35 @@ mod tests {
         assert_eq!(columns(&far, &[row(0.0)]), [Lots, Net, Gfa, Far, Open]);
         let w = OptimizeForm { objective: Objective::Weighted, weights: [1.0, 0.0, 0.0, 0.0, 1.0], ..f };
         assert_eq!(columns(&w, &[row(0.0)]), [Score, Lots, Net, Gfa, Open]);
+    }
+
+    #[test]
+    fn ledger_lines_and_unsigned_zero() {
+        let l = Ledger {
+            revenue: 94_080_000.0,
+            roads: 1_234_000.0,
+            utilities: 1_036_800.0,
+            lots: 93_000.0,
+            open_space: 0.0,
+            profit: 91_716_200.0,
+            value: 115.844,
+        };
+        let v: Vec<String> = ledger_lines(&l).into_iter().map(|(_, v)| v).collect();
+        assert_eq!(v, ["94.1M", "−1.23M", "−1.04M", "−93.0k", "0", "91.7M", "115.84"]);
+        assert_eq!(unsigned_zero("-0".into()), "0");
+        assert_eq!(unsigned_zero("-0.0".into()), "0.0");
+        assert_eq!(unsigned_zero("-0.1".into()), "-0.1");
+        assert_eq!(unsigned_zero("12".into()), "12");
+    }
+
+    #[test]
+    fn form_economics_reach_the_request() {
+        let mut f = OptimizeForm::default();
+        f.economics.price = 10.0;
+        f.economics.lot_cost = 0.0;
+        let r = f.to_request();
+        assert_eq!(r.objective, Objective::Value);
+        assert_eq!(r.economics, Economics { price: 10.0, lot_cost: 0.0, ..Economics::default() });
     }
 
     #[test]

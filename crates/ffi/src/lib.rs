@@ -5144,11 +5144,14 @@ unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 
 /// Search the `siteplan` params of the site boundary `source` (short id) for
 /// the best yield, evaluating every candidate off-document (nothing is baked,
-/// nothing logged). `request_json` is `{"objective":"lots|far_net|net_area|gfa|weighted",
+/// nothing logged). `request_json` is `{"objective":"value|lots|far_net|net_area|gfa|weighted",
 /// "weights":{…},"budget":200,"seed":1,"top":5,"lock":[…],"patterns":[…],
-/// "min_lot_area","min_lot_width","min_frontage","min_open","max_far","max_coverage"}`,
+/// "min_lot_area","min_lot_width","min_frontage","min_open","max_far","max_coverage",
+/// "economics":{"price","road_cost","utility_cost","lot_cost","open_cost"}}`,
 /// every key optional (null / `{}` = defaults). Returns
-/// `{"candidates":[{"rank","score","params":{…},"yield":{YieldReport}}],"pareto":[ranks…],"pareto_axis":"open"|"net_area"|"gfa"|"lots","evaluated":n,"feasible":n}`
+/// `{"candidates":[{"rank","score","params":{…},"yield":{YieldReport},"ledger":{Ledger}}],"pareto":[ranks…],
+/// "pareto_axis":"open"|"net_area"|"gfa"|"lots","evaluated":n,"feasible":n,
+/// "current":{"score","yield","ledger","violations"}|null,"beats_current":bool}`
 /// or `{"error":"…"}` (unknown source, bad request, or no feasible layout —
 /// the message names the binding constraint). Pass a candidate's `params` to
 /// [`ijc_site_optimize_apply`]. Runs synchronously (seconds for budget 200).

@@ -13,6 +13,12 @@
 //! resampled. Every candidate is drawn from one seeded RNG before its batch is
 //! evaluated in parallel (rayon, ordered collect), so the result is the same
 //! for a given seed whatever the thread count.
+//!
+//! The default objective is `value`: profit per m² of gross site area, from a
+//! simple land-development ledger ([`Economics`] → [`Ledger`]): lot land sold
+//! at a price per m², minus road, utility (per m of lot frontage), per-lot and
+//! open-space costs. The current plan is scored too, so a search that finds
+//! nothing better says so.
 
 use std::collections::BTreeMap;
 
@@ -29,7 +35,9 @@ use crate::lot::{self, SitePlanBake};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Objective {
+    /// Profit per m² of gross site area ([`Ledger::value`]).
     #[default]
+    Value,
     Lots,
     FarNet,
     /// Σ lot area — the land actually sold as lots.
@@ -42,6 +50,7 @@ pub enum Objective {
 impl Objective {
     fn parse(s: &str) -> Option<Objective> {
         match s.to_ascii_lowercase().as_str() {
+            "value" | "profit" => Some(Objective::Value),
             "lots" => Some(Objective::Lots),
             "far" | "far_net" => Some(Objective::FarNet),
             "net_area" | "area" => Some(Objective::NetArea),
@@ -53,6 +62,7 @@ impl Objective {
 
     fn token(self) -> &'static str {
         match self {
+            Objective::Value => "value",
             Objective::Lots => "lots",
             Objective::FarNet => "far_net",
             Objective::NetArea => "net_area",
@@ -88,12 +98,114 @@ pub struct OptimizeRequest {
     pub max_far: Option<f64>,
     /// Lot coverage in [0, 1].
     pub max_coverage: Option<f64>,
+    /// Unit prices of the `value` objective.
+    pub economics: Economics,
+}
+
+/// Unit prices of the land-development ledger, in one (any) currency. The
+/// defaults are illustrative, not market data: raw serviced land sold at 120
+/// per m² of lot; roads 90 per m² (paving, curbs, drainage); utilities 600 per
+/// m of lot frontage (water, sewer, power along the street); 3000 per lot
+/// (survey, titling, connections); open space 15 per m² (landscaping).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Economics {
+    /// Sale price per m² of lot area.
+    pub price: f64,
+    /// Cost per m² of road (site area outside every block).
+    pub road_cost: f64,
+    /// Cost per m of lot frontage at the curb.
+    pub utility_cost: f64,
+    /// Fixed cost per lot.
+    pub lot_cost: f64,
+    /// Cost per m² of reserved open space.
+    pub open_cost: f64,
+}
+
+impl Default for Economics {
+    fn default() -> Self {
+        Economics {
+            price: 120.0,
+            road_cost: 90.0,
+            utility_cost: 600.0,
+            lot_cost: 3000.0,
+            open_cost: 15.0,
+        }
+    }
+}
+
+/// The physical quantities a ledger prices, measured on one site plan.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Quantities {
+    /// Gross site area, m².
+    pub gross_area: f64,
+    /// Area of every lot, m².
+    pub lot_areas: Vec<f64>,
+    /// Site area outside every block, m².
+    pub road_area: f64,
+    /// Σ lot frontage at the curb, m.
+    pub frontage: f64,
+    /// Reserved open-space area, m².
+    pub open_area: f64,
+}
+
+/// One plan's development ledger: revenue, each cost line, profit, and profit
+/// per m² of gross site area (`value`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Ledger {
+    pub revenue: f64,
+    pub roads: f64,
+    pub utilities: f64,
+    pub lots: f64,
+    pub open_space: f64,
+    pub profit: f64,
+    pub value: f64,
+}
+
+impl Economics {
+    /// Sale value of one lot. Area × price for now; the place a frontage /
+    /// depth or shape factor would go.
+    pub fn land_value(&self, lot_area: f64) -> f64 {
+        lot_area * self.price
+    }
+
+    pub fn ledger(&self, q: &Quantities) -> Ledger {
+        let revenue = q.lot_areas.iter().map(|a| self.land_value(*a)).sum::<f64>();
+        let roads = q.road_area * self.road_cost;
+        let utilities = q.frontage * self.utility_cost;
+        let lots = q.lot_areas.len() as f64 * self.lot_cost;
+        let open_space = q.open_area * self.open_cost;
+        let profit = revenue - roads - utilities - lots - open_space;
+        Ledger {
+            revenue,
+            roads,
+            utilities,
+            lots,
+            open_space,
+            profit,
+            value: if q.gross_area > 0.0 { profit / q.gross_area } else { 0.0 },
+        }
+    }
+
+    /// Set one `key=value` price (the command form); false if `key` is not one.
+    fn set(&mut self, key: &str, v: f64) -> bool {
+        let slot = match key {
+            "price" => &mut self.price,
+            "road_cost" => &mut self.road_cost,
+            "utility_cost" => &mut self.utility_cost,
+            "lot_cost" => &mut self.lot_cost,
+            "open_cost" => &mut self.open_cost,
+            _ => return false,
+        };
+        *slot = v;
+        true
+    }
 }
 
 impl Default for OptimizeRequest {
     fn default() -> Self {
         OptimizeRequest {
-            objective: Objective::Lots,
+            objective: Objective::Value,
             weights: BTreeMap::new(),
             budget: 200,
             seed: 1,
@@ -106,6 +218,7 @@ impl Default for OptimizeRequest {
             min_open: None,
             max_far: None,
             max_coverage: None,
+            economics: Economics::default(),
         }
     }
 }
@@ -141,7 +254,7 @@ impl OptimizeRequest {
         match key {
             "objective" => {
                 self.objective = Objective::parse(v).ok_or_else(|| {
-                    format!("objective= must be lots|far_net|net_area|gfa|weighted, got '{v}'")
+                    format!("objective= must be value|lots|far_net|net_area|gfa|weighted, got '{v}'")
                 })?;
             }
             "weights" => {
@@ -154,7 +267,7 @@ impl OptimizeRequest {
                         .map_err(|_| format!("weights: bad weight '{w}'"))?;
                     self.weights.insert(k.trim().to_string(), w);
                 }
-                if self.objective == Objective::Lots {
+                if self.objective == Objective::default() {
                     self.objective = Objective::Weighted;
                 }
             }
@@ -169,6 +282,7 @@ impl OptimizeRequest {
             "min_open" => self.min_open = Some(num()?),
             "max_far" => self.max_far = Some(num()?),
             "max_coverage" => self.max_coverage = Some(num()?),
+            k if self.economics.set(k, num()?) => {}
             _ => return Err(format!("siteoptimize: unknown option '{key}'")),
         }
         Ok(())
@@ -198,10 +312,10 @@ impl OptimizeRequest {
         Ok(())
     }
 
-    fn score(&self, r: &YieldReport) -> f64 {
+    fn score(&self, r: &YieldReport, l: &Ledger) -> f64 {
         match self.objective {
-            Objective::Weighted => self.weights.iter().map(|(k, w)| w * metric(r, k)).sum(),
-            o => metric(r, o.token()),
+            Objective::Weighted => self.weights.iter().map(|(k, w)| w * metric(r, l, k)).sum(),
+            o => metric(r, l, o.token()),
         }
     }
 }
@@ -211,10 +325,11 @@ fn ratio(v: f64) -> f64 {
     if v > 1.0 { v / 100.0 } else { v }
 }
 
-const METRICS: &[&str] = &["lots", "far", "net_area", "gfa", "open"];
+const METRICS: &[&str] = &["lots", "far", "net_area", "gfa", "open", "value"];
 
-fn metric(r: &YieldReport, key: &str) -> f64 {
+fn metric(r: &YieldReport, l: &Ledger, key: &str) -> f64 {
     match key {
+        "value" => l.value,
         "lots" => r.lot_count as f64,
         "far" | "far_net" => r.far_net.unwrap_or(0.0),
         "net_area" => r.total_lot_area,
@@ -231,6 +346,10 @@ pub struct Evaluation {
     /// Hard constraints this plan breaks (empty = feasible).
     pub violations: Vec<&'static str>,
     pub score: f64,
+    /// What the ledger prices.
+    pub quantities: Quantities,
+    /// The plan's ledger at the request's [`Economics`].
+    pub ledger: Ledger,
 }
 
 /// Lot fronts as the constraints read them, from the street-tagged lots (#143):
@@ -332,11 +451,22 @@ pub fn evaluate(
         ("street_access", fronts.with_street < report.lot_count),
     ];
     let violations = checks.iter().filter(|c| c.1).map(|c| c.0).collect();
-    let score = req.score(&report);
+    let block_area: f64 = plan.site.blocks.iter().map(|b| b.polygon.area()).sum();
+    let quantities = Quantities {
+        gross_area: site.area(),
+        lot_areas: plan.lots.polygons.iter().map(|p| p.area()).collect(),
+        road_area: (site.area() - block_area).max(0.0),
+        frontage: fronts.curb.iter().sum(),
+        open_area: report.reserved_block_area,
+    };
+    let ledger = req.economics.ledger(&quantities);
+    let score = req.score(&report, &ledger);
     Ok(Evaluation {
         report,
         violations,
         score,
+        quantities,
+        ledger,
     })
 }
 
@@ -362,6 +492,9 @@ pub struct OptimizeResult {
     pub pareto_axis: &'static str,
     pub evaluated: usize,
     pub feasible: usize,
+    /// The plan the search started from (the boundary's site plan, or the
+    /// sticky settings), scored the same way. `None` if it failed to plan.
+    pub current: Option<Evaluation>,
 }
 
 /// How one searched param maps the unit interval.
@@ -588,7 +721,7 @@ const TIE_BREAK: [&str; 3] = ["net_area", "gfa", "open"];
 
 /// Ascending sort key (smaller = better): −score, then −[`TIE_BREAK`].
 fn sort_key(e: &Evaluation) -> [f64; 4] {
-    let m = |k| -metric(&e.report, k);
+    let m = |k| -metric(&e.report, &e.ledger, k);
     [-e.score, m(TIE_BREAK[0]), m(TIE_BREAK[1]), m(TIE_BREAK[2])]
 }
 
@@ -605,14 +738,14 @@ fn cmp_keys(a: &[f64; 4], b: &[f64; 4]) -> std::cmp::Ordering {
 /// for every plan when nothing reserves it). Falls back to `open`.
 const PARETO_AXES: [&str; 4] = ["open", "net_area", "gfa", "lots"];
 
-fn pareto_axis(objective: Objective, reports: &[&YieldReport]) -> &'static str {
+fn pareto_axis(objective: Objective, evals: &[&Evaluation]) -> &'static str {
     PARETO_AXES
         .into_iter()
         .filter(|k| *k != objective.token())
         .find(|k| {
-            let (lo, hi) = reports
+            let (lo, hi) = evals
                 .iter()
-                .map(|r| metric(r, k))
+                .map(|e| metric(&e.report, &e.ledger, k))
                 .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
             hi - lo > 1e-6 * hi.abs().max(1.0)
         })
@@ -699,7 +832,8 @@ pub fn optimize_with(
         sigma *= 0.8;
     }
 
-    rank(trials, req)
+    let current = evaluate(site, base, edits, req).ok();
+    rank(trials, req).map(|r| OptimizeResult { current, ..r })
 }
 
 /// Rank the feasible trials (score, then [`TIE_BREAK`]), drop layouts whose
@@ -786,12 +920,15 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
         .collect();
     let axis = pareto_axis(
         req.objective,
-        &unique.iter().map(|c| &c.eval.report).collect::<Vec<_>>(),
+        &unique.iter().map(|c| &c.eval).collect::<Vec<_>>(),
     );
     let dominated = |c: &Candidate| {
         unique.iter().any(|o| {
             let (s, os) = (c.eval.score, o.eval.score);
-            let (p, op) = (metric(&c.eval.report, axis), metric(&o.eval.report, axis));
+            let (p, op) = (
+                metric(&c.eval.report, &c.eval.ledger, axis),
+                metric(&o.eval.report, &o.eval.ledger, axis),
+            );
             // A better-ranked tie also dominates, so the front lists one per point.
             os >= s && op >= p && (os > s || op > p || o.rank < c.rank)
         })
@@ -812,6 +949,7 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
         pareto_axis: axis,
         evaluated,
         feasible: n_feasible,
+        current: None,
     })
 }
 
@@ -819,6 +957,18 @@ impl OptimizeResult {
     /// The candidate with `rank`, if listed.
     pub fn get(&self, rank: usize) -> Option<&Candidate> {
         self.candidates.iter().find(|c| c.rank == rank)
+    }
+
+    /// Whether the best candidate scores above the current plan (or there is
+    /// no current plan to beat).
+    pub fn beats_current(&self) -> bool {
+        match (&self.current, self.candidates.first()) {
+            (Some(cur), Some(best)) => {
+                best.eval.score > cur.score + 1e-9 * cur.score.abs().max(1.0)
+            }
+            (None, best) => best.is_some(),
+            (_, None) => false,
+        }
     }
 
     /// A Markdown table of the candidates (the chat renders tables).
@@ -830,16 +980,23 @@ impl OptimizeResult {
             self.evaluated,
             self.feasible
         );
-        for c in &self.candidates {
-            let r = &c.eval.report;
-            let params: Vec<String> = SEARCHED
-                .iter()
-                .filter_map(|k| c.params.get(*k).map(|v| format!("{k}={v}")))
-                .collect();
+        let current = self.current.iter().map(|e| ("Current".to_string(), e, None));
+        let ranked = self
+            .candidates
+            .iter()
+            .map(|c| (c.rank.to_string(), &c.eval, Some(&c.params)));
+        for (rank, e, params) in current.chain(ranked) {
+            let r = &e.report;
+            let params: Vec<String> = params.map_or_else(Vec::new, |p| {
+                SEARCHED
+                    .iter()
+                    .filter_map(|k| p.get(*k).map(|v| format!("{k}={v}")))
+                    .collect()
+            });
             s.push_str(&format!(
                 "| {} | {:.2} | {} | {:.0} | {} | {:.1} | {} |\n",
-                c.rank,
-                c.eval.score,
+                rank,
+                e.score + 0.0,
                 r.lot_count,
                 r.total_lot_area,
                 r.far_net.map_or("—".into(), |f| format!("{:.2}", f + 0.0)),
@@ -853,10 +1010,15 @@ impl OptimizeResult {
             self.pareto_axis,
             front.join(", ")
         ));
+        if !self.beats_current() {
+            s.push_str("\nThe current plan is already the best found.");
+        }
         s
     }
 
-    /// `{"candidates":[{"rank","score","params":{…},"yield":{…}}],"pareto":[…],"evaluated","feasible"}`.
+    /// `{"candidates":[{"rank","score","params":{…},"yield":{…},"ledger":{…}}],"pareto":[…],
+    /// "pareto_axis","evaluated","feasible","current":{"score","yield","ledger","violations"}|null,
+    /// "beats_current"}`.
     /// Params are typed (numbers / enum tokens) per the subdivision schema.
     pub fn to_json(&self) -> serde_json::Value {
         let fields = crate::subdiv_params::subdivision_fields();
@@ -878,7 +1040,7 @@ impl OptimizeResult {
             .map(|c| {
                 let params: serde_json::Map<String, serde_json::Value> =
                     c.params.iter().map(|(k, v)| (k.clone(), typed(k, v))).collect();
-                serde_json::json!({ "rank": c.rank, "score": c.eval.score, "params": params, "yield": c.eval.report })
+                serde_json::json!({ "rank": c.rank, "score": c.eval.score, "params": params, "yield": c.eval.report, "ledger": c.eval.ledger })
             })
             .collect();
         serde_json::json!({
@@ -887,6 +1049,10 @@ impl OptimizeResult {
             "pareto_axis": self.pareto_axis,
             "evaluated": self.evaluated,
             "feasible": self.feasible,
+            "current": self.current.as_ref().map(|e| serde_json::json!({
+                "score": e.score, "yield": e.report, "ledger": e.ledger, "violations": e.violations,
+            })),
+            "beats_current": self.beats_current(),
         })
     }
 }
@@ -968,6 +1134,7 @@ mod tests {
     fn req(budget: usize) -> OptimizeRequest {
         OptimizeRequest {
             budget,
+            objective: Objective::Lots,
             ..OptimizeRequest::default()
         }
     }
@@ -1058,14 +1225,80 @@ mod tests {
     }
 
     #[test]
+    fn ledger_lines_add_up() {
+        let q = Quantities {
+            gross_area: 10_000.0,
+            lot_areas: vec![500.0, 500.0],
+            road_area: 1000.0,
+            frontage: 40.0,
+            open_area: 200.0,
+        };
+        let l = Economics::default().ledger(&q);
+        assert_eq!(
+            (l.revenue, l.roads, l.utilities, l.lots, l.open_space),
+            (120_000.0, 90_000.0, 24_000.0, 6000.0, 3000.0)
+        );
+        assert_eq!(l.profit, -3000.0);
+        assert!((l.value + 0.3).abs() < 1e-12);
+        assert_eq!(Economics::default().ledger(&Quantities::default()).value, 0.0);
+    }
+
+    /// `value` is the default objective; the current plan is scored like a
+    /// candidate; the command sets the unit prices.
+    #[test]
+    fn value_objective_scores_the_current_plan() {
+        let site = rect(200.0, 150.0);
+        let r = optimize(&site, &SubdivisionSettings::default(), &OptimizeRequest { budget: 24, ..OptimizeRequest::default() }).unwrap();
+        assert_eq!(r.objective, Objective::Value);
+        for c in &r.candidates {
+            let (l, q) = (&c.eval.ledger, &c.eval.quantities);
+            assert_eq!(c.eval.score, l.value);
+            assert_eq!(q.lot_areas.len(), c.eval.report.lot_count);
+            assert!(q.road_area > 0.0 && q.road_area < q.gross_area, "{q:?}");
+            assert!(q.frontage > 0.0);
+            assert!((l.profit - (l.revenue - l.roads - l.utilities - l.lots - l.open_space)).abs() < 1e-6);
+        }
+        let cur = r.current.as_ref().expect("the start plan is scored");
+        assert_eq!(cur.score, cur.ledger.value);
+        let j = r.to_json();
+        assert_eq!(j["current"]["score"], cur.score);
+        assert!(j["candidates"][0]["ledger"]["profit"].is_number());
+        assert_eq!(j["beats_current"], r.beats_current());
+        assert!(r.to_markdown().contains("| Current |"));
+
+        let mut worse = r.clone();
+        worse.current.as_mut().unwrap().score = f64::MAX;
+        assert!(!worse.beats_current());
+        assert!(worse.to_markdown().contains("already the best found"));
+
+        let crate::Command::SiteOptimize { request, .. } = parse(
+            "siteoptimize last price=50 road_cost=10 utility_cost=1 lot_cost=2 open_cost=3",
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(request.objective, Objective::Value);
+        assert_eq!(
+            request.economics,
+            Economics { price: 50.0, road_cost: 10.0, utility_cost: 1.0, lot_cost: 2.0, open_cost: 3.0 }
+        );
+        let r: OptimizeRequest = serde_json::from_str(r#"{"economics":{"price":80}}"#).unwrap();
+        assert_eq!(r.economics, Economics { price: 80.0, ..Economics::default() });
+    }
+
+    #[test]
     fn pareto_axis_skips_the_objective_and_flat_metrics() {
-        let y = |lots: usize, area: f64, open: f64| {
-            YieldReport::compute(&YieldInputs {
+        let y = |lots: usize, area: f64, open: f64| Evaluation {
+            report: YieldReport::compute(&YieldInputs {
                 lot_areas: vec![area / lots as f64; lots],
                 gross_site_area: 1000.0,
                 reserved_block_areas: vec![open * 1000.0],
                 ..YieldInputs::default()
-            })
+            }),
+            violations: Vec::new(),
+            score: 0.0,
+            quantities: Quantities::default(),
+            ledger: Ledger::default(),
         };
         let (a, b) = (y(10, 100.0, 0.0), y(12, 90.0, 0.0));
         assert_eq!(pareto_axis(Objective::Lots, &[&a, &b]), "net_area");

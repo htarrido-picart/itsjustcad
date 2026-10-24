@@ -8592,9 +8592,11 @@ impl App {
         };
         use itsjustcad_commands::lot::{BLOCKS_LAYER, ROADS_LAYER, SETBACKS_LAYER};
         let n = |v: usize| v.to_string();
-        let m2 = |a: f64| format!("{a:.0}");
-        let pct = |f: f64| format!("{:.1}", f * 100.0);
-        let ratio = |v: Option<f64>| v.map_or("—".to_string(), |v| format!("{v:.2}"));
+        // `unsigned_zero`: an empty open space reads `0`, never `−0`.
+        use optimize_panel::unsigned_zero as z;
+        let m2 = |a: f64| z(format!("{a:.0}"));
+        let pct = |f: f64| z(format!("{:.1}", f * 100.0));
+        let ratio = |v: Option<f64>| v.map_or("—".to_string(), |v| z(format!("{v:.2}")));
         // (label, value, unit): values right-aligned, units in their own
         // leading-aligned column so both line up.
         let mut rows: Vec<(&str, String, &str)> = Vec::new();
@@ -8663,6 +8665,9 @@ impl App {
                         }
                     });
             });
+        if link.kind == itsjustcad_doc::SubdivKind::SitePlan {
+            self.yield_economics(ui, source);
+        }
     }
 
     /// Commit a debounced subdivision params edit as one `lotsetparams` op.
