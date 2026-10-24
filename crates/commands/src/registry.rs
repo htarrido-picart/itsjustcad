@@ -962,7 +962,25 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "streetset",
             usage: "streetset [selector] [name=<text> class=arterial|collector|local|alley width=<m>]",
-            summary: "Name, classify or widen generated road(s) from a siteplan / lotgeneratesite (#143). The selected roads must come from one site plan. The values are stored on the plan as inputs, then the plan is re-derived: a new width re-cuts the blocks, so lots, setbacks and buildings follow, and a later lotrefresh keeps the edits. Lot and block edge tags reference the street by id. An empty name= clears it. Moving or reshaping a generated road by hand does not regenerate the plan: the plan is reported stale, and lotrefresh replaces the hand edit. One undo step. Example: streetset selected name=Main Street class=collector width=16",
+            summary: "Name, classify or widen generated road(s) from a siteplan / lotgeneratesite (#143). The selected roads must come from one site plan. The values are stored on the plan as inputs, then the plan is re-derived: a new width re-cuts the blocks, so lots, setbacks and buildings follow, and a later lotrefresh keeps the edits. Lot and block edge tags reference the street by id. An empty name= clears it. To move or reshape a street, use streetmove / streetnode (a gumball move or point edit of a road runs them); only a rotate or scale of a road marks the plan stale. One undo step. Example: streetset selected name=Main Street class=collector width=16",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "streetmove",
+            usage: "streetmove [selector] delta=x,y",
+            summary: "Move generated street(s) of a siteplan / lotgeneratesite by delta=x,y (#157); ends of other streets resting on them follow. The new centreline is stored on the plan as a per-street override and the plan regenerates around it: blocks, lots, setbacks and buildings. Later param changes (block_depth, seed, ...) keep the hand geometry; streetreset clears it. Rejected when a street would leave the site, cross another street without a shared node, or leave a block thinner than the minimum block depth (half the block depth). A gumball move of a generated road runs this. One undo step. Example: streetmove selected delta=0,10",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "streetnode",
+            usage: "streetnode [selector] <index> to=x,y | insert at=x,y | delete <index>",
+            summary: "Edit one centreline node of a generated street (#157). <index> to=x,y moves node <index> (a polyline point index of the road); every street sharing that node moves with it, and a street passing through it bends there. insert at=x,y adds a node at the nearest point of the street; delete <index> removes an interior node that is not a junction. The plan regenerates around the edited network and keeps the edit through later param changes; streetreset clears it. Rejected when a street would leave the site, two streets would cross without a node, or a block would get thinner than the minimum block depth. Dragging a point grip of a selected road runs this. One undo step. Example: streetnode selected 1 to=110,75 · streetnode selected insert at=100,40 · streetnode selected delete 1",
+            category: Category::Tools,
+        },
+        CommandSpec {
+            name: "streetreset",
+            usage: "streetreset [selector] | all",
+            summary: "Reset generated street(s) to the rule (#157): clear the hand-edited centreline and the streetset name / class / width, then regenerate the plan. all resets every street of the plan (select any of its objects, or the only site plan in the document). One undo step. Example: streetreset all",
             category: Category::Tools,
         },
         CommandSpec {

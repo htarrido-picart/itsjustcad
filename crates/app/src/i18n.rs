@@ -854,6 +854,9 @@ static EN: &[(&str, &str)] = &[
     ("focus.length", "Length"),
     ("focus.street_edited", "A road was edited by hand: the plan is stale"),
     ("focus.fronting_lots", "Fronting lots"),
+    ("focus.reset_street", "Reset street to rule"),
+    ("focus.reset_street.tooltip", "Clear the hand-edited centreline, name, class and width, then regenerate the plan"),
+    ("focus.street_drag_hint", "Drag the road's nodes or move it with the gumball: the plan regenerates around the street"),
 ];
 
 /// Spanish catalog (español). Architect / CAD terminology: capa = layer,
@@ -1444,6 +1447,9 @@ static ES: &[(&str, &str)] = &[
     ("focus.length", "Longitud"),
     ("focus.street_edited", "Una calle se editó a mano: el plan está desactualizado"),
     ("focus.fronting_lots", "Lotes con frente"),
+    ("focus.reset_street", "Restablecer calle a la regla"),
+    ("focus.reset_street.tooltip", "Borra el eje editado a mano, el nombre, la clase y el ancho, y regenera el plan"),
+    ("focus.street_drag_hint", "Arrastra los nodos de la calle o muévela con el gizmo: el plan se regenera alrededor"),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2013,6 +2019,9 @@ static PT: &[(&str, &str)] = &[
     ("focus.length", "Comprimento"),
     ("focus.street_edited", "Uma rua foi editada à mão: o plano está desatualizado"),
     ("focus.fronting_lots", "Lotes com frente"),
+    ("focus.reset_street", "Repor rua à regra"),
+    ("focus.reset_street.tooltip", "Limpa o eixo editado à mão, o nome, a classe e a largura, e regenera o plano"),
+    ("focus.street_drag_hint", "Arraste os nós da rua ou mova-a com o gizmo: o plano regenera-se à volta"),
 ];
 
 /// French (français). SEED — auto-translated, pending native review.
@@ -2574,6 +2583,9 @@ static FR: &[(&str, &str)] = &[
     ("focus.length", "Longueur"),
     ("focus.street_edited", "Une voie a été modifiée à la main : le plan est périmé"),
     ("focus.fronting_lots", "Lots en façade"),
+    ("focus.reset_street", "Rétablir la voie selon la règle"),
+    ("focus.reset_street.tooltip", "Efface l'axe modifié à la main, le nom, la classe et la largeur, puis régénère le plan"),
+    ("focus.street_drag_hint", "Faites glisser les nœuds de la voie ou déplacez-la avec le gizmo : le plan se régénère autour"),
 ];
 
 /// Italian (italiano). SEED — auto-translated, pending native review.
@@ -3135,6 +3147,9 @@ static IT: &[(&str, &str)] = &[
     ("focus.length", "Lunghezza"),
     ("focus.street_edited", "Una strada è stata modificata a mano: il piano non è aggiornato"),
     ("focus.fronting_lots", "Lotti con fronte"),
+    ("focus.reset_street", "Ripristina la strada alla regola"),
+    ("focus.reset_street.tooltip", "Cancella l'asse modificato a mano, il nome, la classe e la larghezza, poi rigenera il piano"),
+    ("focus.street_drag_hint", "Trascina i nodi della strada o spostala con il gizmo: il piano si rigenera attorno"),
 ];
 
 /// Romanian (română). SEED — auto-translated, pending native review.
@@ -3696,6 +3711,9 @@ static RO: &[(&str, &str)] = &[
     ("focus.length", "Lungime"),
     ("focus.street_edited", "Un drum a fost editat manual: planul este învechit"),
     ("focus.fronting_lots", "Loturi la front"),
+    ("focus.reset_street", "Resetează drumul la regulă"),
+    ("focus.reset_street.tooltip", "Șterge axul editat manual, numele, clasa și lățimea, apoi regenerează planul"),
+    ("focus.street_drag_hint", "Trage nodurile drumului sau mută-l cu gizmo-ul: planul se regenerează în jurul lui"),
 ];
 
 /// Catalan (català). SEED — auto-translated, pending native review.
@@ -4257,6 +4275,9 @@ static CA: &[(&str, &str)] = &[
     ("focus.length", "Longitud"),
     ("focus.street_edited", "Un carrer s'ha editat a mà: el pla està desactualitzat"),
     ("focus.fronting_lots", "Lots amb façana"),
+    ("focus.reset_street", "Restableix el carrer a la regla"),
+    ("focus.reset_street.tooltip", "Esborra l'eix editat a mà, el nom, la classe i l'amplada, i regenera el pla"),
+    ("focus.street_drag_hint", "Arrossega els nodes del carrer o mou-lo amb el gizmo: el pla es regenera al voltant"),
 ];
 
 /// Galician (galego). SEED — auto-translated, pending native review.
@@ -4818,6 +4839,9 @@ static GL: &[(&str, &str)] = &[
     ("focus.length", "Lonxitude"),
     ("focus.street_edited", "Unha rúa editouse á man: o plan está desactualizado"),
     ("focus.fronting_lots", "Lotes con fronte"),
+    ("focus.reset_street", "Restablecer rúa á regra"),
+    ("focus.reset_street.tooltip", "Borra o eixo editado á man, o nome, a clase e o ancho, e rexenera o plan"),
+    ("focus.street_drag_hint", "Arrastra os nodos da rúa ou móvea co gizmo: o plan rexenérase arredor"),
 ];
 
 #[cfg(test)]

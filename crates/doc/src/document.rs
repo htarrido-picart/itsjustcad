@@ -140,6 +140,18 @@ pub struct StreetEdit {
     pub class: Option<crate::StreetClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<f64>,
+    /// Hand-edited centreline (#157: `streetmove` / `streetnode`), plan XY.
+    /// Replaces the generator's centreline on every re-derive, so the street
+    /// stays where it was put when other parameters change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centerline: Option<Vec<glam::DVec2>>,
+}
+
+impl StreetEdit {
+    /// True when nothing is overridden (the record can be dropped).
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.class.is_none() && self.width.is_none() && self.centerline.is_none()
+    }
 }
 
 /// Which associative subdivision generator a `SubdivLink` drives. Serialized

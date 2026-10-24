@@ -3959,6 +3959,35 @@ impl App {
         }
     }
 
+    /// Run a gumball / point-edit commit. A move or node drag of a generated
+    /// road re-derives its site plan (#157), replacing the road ids, so the
+    /// edited streets are re-selected and their node grips stay up.
+    fn run_viewport_edit(&mut self, cmd: itsjustcad_commands::Command) {
+        use itsjustcad_commands::lot::{refocus, FocusAnchor};
+        let doc = &self.session.doc;
+        let anchors: Vec<FocusAnchor> = doc
+            .selection
+            .iter()
+            .filter_map(|id| {
+                Some(FocusAnchor::Street {
+                    source: doc.subdiv_source_of(*id)?,
+                    street_id: doc.get(*id)?.street.as_ref()?.id,
+                })
+            })
+            .collect();
+        match self.session.run(cmd) {
+            Ok(outcome) => {
+                self.command_line.push_line(outcome.message);
+                let doc = &self.session.doc;
+                if !anchors.is_empty() && doc.selection.iter().any(|id| doc.get(*id).is_none()) {
+                    let sel = anchors.iter().flat_map(|a| refocus(doc, a)).collect();
+                    self.session.doc.selection = sel;
+                }
+            }
+            Err(e) => self.command_line.push_line(format!("error: {e}")),
+        }
+    }
+
     fn pick(
         &mut self,
         view_proj: glam::Mat4,
@@ -4700,10 +4729,7 @@ impl App {
                         theme,
                     );
                     if let Some(cmd) = pe.command {
-                        match self.session.run(cmd) {
-                            Ok(outcome) => self.command_line.push_line(outcome.message),
-                            Err(e) => self.command_line.push_line(format!("error: {e}")),
-                        }
+                        self.run_viewport_edit(cmd);
                     }
                     consumed = pe.consumed;
                     // Gumball is a persistent Rhino-style toggle (default OFF):
@@ -4716,10 +4742,7 @@ impl App {
                                 .ui(ui, rect, &response, view_proj, &self.session.doc);
                         consumed = out.consumed;
                         if let Some(cmd) = out.command {
-                            match self.session.run(cmd) {
-                                Ok(outcome) => self.command_line.push_line(outcome.message),
-                                Err(e) => self.command_line.push_line(format!("error: {e}")),
-                            }
+                            self.run_viewport_edit(cmd);
                         }
                     }
                 }
@@ -8717,8 +8740,9 @@ impl App {
         for (source, n) in newly_stale_road_links(&self.session.doc, &mut self.subdiv_stale_roads) {
             self.command_line.push_line(format!(
                 "site plan {source} is stale: {n} generated road(s) edited by hand. Use \
-                 streetset to change a road's width/class/name, lotrefresh to regenerate \
-                 (replaces the hand edit), or lotfreeze to keep it."
+                 streetmove / streetnode to reshape a street (or move its road / drag its \
+                 nodes), streetset to change its width/class/name, lotrefresh to \
+                 regenerate (replaces the hand edit), or lotfreeze to keep it."
             ));
         }
         // Refresh bumps generation but does NOT change the source geometry, so
@@ -12899,8 +12923,9 @@ mod tests {
         assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
     }
 
-    /// A hand-moved generated road never triggers a refresh; it reports the
-    /// plan stale once, until the edit is gone.
+    /// A hand-rotated generated road never triggers a refresh; it reports the
+    /// plan stale once, until the edit is gone. (A move or point edit runs as
+    /// a street geometry edit and regenerates instead, #157.)
     #[test]
     fn edited_road_reports_stale_once_and_never_refreshes() {
         use itsjustcad_commands::{Command, Selector, Session};
@@ -12913,11 +12938,13 @@ mod tests {
         let (mut cache, mut seen) = (Default::default(), Default::default());
         assert!(subdivisions_to_refresh(&s.doc, &mut cache).is_empty());
         assert!(newly_stale_road_links(&s.doc, &mut seen).is_empty());
-        let mv = Command::Move {
+        let rot = Command::Rotate {
             targets: Selector::Ids { ids: vec![road] },
-            delta: glam::DVec3::X,
+            angle_deg: 2.0,
+            axis: glam::DVec3::Z,
+            center: None,
         };
-        s.run(mv).unwrap();
+        s.run(rot).unwrap();
         assert!(subdivisions_to_refresh(&s.doc, &mut cache).is_empty());
         assert_eq!(newly_stale_road_links(&s.doc, &mut seen), vec![(source, 1)]);
         assert!(

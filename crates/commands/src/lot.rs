@@ -19,6 +19,8 @@
 //! byte-identical lots (the subdivider is deterministic for a fixed seed).
 
 pub mod focus;
+pub mod streets;
+pub use streets::StreetOp;
 pub use focus::{
     Focus, FocusAnchor, LotView, StreetView, focus_anchor, focus_target, link_lots, lot_under,
     lot_view, plan_probe, refocus, street_view,
@@ -714,20 +716,16 @@ pub struct SiteBake {
 /// `settings`. Deterministic — output depends only on the site + settings (seed).
 /// Handles all seven patterns: the four rectilinear plus the three
 /// non-rectilinear radial/hexagonal/Voronoi generators. `edits` (a link's
-/// `streetset` overrides, keyed by street id) set widths before the blocks are
-/// cut, and names/classes on the baked roads.
+/// `streetset` / `streetmove` / `streetnode` overrides, keyed by street id) set
+/// widths and hand centrelines before the blocks are cut, and names/classes on
+/// the baked roads.
 pub fn generate_site(
     site: &Polygon2d,
     z: f64,
     settings: &SubdivisionSettings,
     edits: &BTreeMap<u32, StreetEdit>,
 ) -> Result<SiteBake, String> {
-    let mut graph = subdivision::generate_streets(site, settings);
-    for s in &mut graph.streets {
-        if let Some(w) = edits.get(&s.id).and_then(|e| e.width) {
-            s.width = w;
-        }
-    }
+    let graph = streets::edited_graph(site, settings, edits);
     if graph.is_empty() {
         return Err(
             "lotgeneratesite produced no roads (site too small for the given blockdepth?)".into(),
