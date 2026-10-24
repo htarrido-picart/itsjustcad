@@ -2830,6 +2830,7 @@ dependencies = [
  "itsjustcad-deck",
  "itsjustcad-doc",
  "itsjustcad-render",
+ "kernel-curve",
  "kernel-mesh",
  "pollster",
  "raw-window-handle",

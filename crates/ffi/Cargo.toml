@@ -14,6 +14,7 @@ itsjustcad-commands.workspace = true
 itsjustcad-deck.workspace = true
 itsjustcad-render.workspace = true
 kernel-mesh.workspace = true
+kernel-curve.workspace = true
 serde_json.workspace = true
 wgpu.workspace = true
 glam.workspace = true

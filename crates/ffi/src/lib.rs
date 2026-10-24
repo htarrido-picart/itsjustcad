@@ -4083,6 +4083,61 @@ pub unsafe extern "C" fn ijc_object_is_locked_generated(h: *mut AppHandle, id: *
     })
 }
 
+/// The editable points of curve `id` (short id or full uuid), for vertex
+/// handles (itsjustcad-ios#128): `{"id","kind":"polyline"|"nurbs","closed",
+/// "points":[[x,y,z]…],"generated"}`. `points` are a polyline's vertices or a
+/// NURBS curve's control points, in the index order `setpoint` takes.
+/// `generated` is true when a subdivision produced the object (a lot, block,
+/// setback or road), so the host can route it to the focus editors instead.
+/// Returns `null` for any other object (lines, arcs and ellipses are
+/// parametric and have no handles), an unknown id, or a null/invalid handle.
+/// Reflects queued commands only after the next [`ijc_render_frame`] /
+/// [`ijc_flush`]. Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `id` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_object_points_json(h: *mut AppHandle, id: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let null = || into_c_string(String::from("null"));
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return null();
+        };
+        let Some(id) = (unsafe { c_str(id) }) else {
+            return null();
+        };
+        let doc = &app.session.doc;
+        match object_by_id(doc, id).and_then(|oid| object_points_json(doc, oid)) {
+            Some(v) => into_c_string(v.to_string()),
+            None => null(),
+        }
+    })
+}
+
+/// The [`ijc_object_points_json`] object for `id`, or `None` when it has no
+/// editable points.
+fn object_points_json(doc: &itsjustcad_doc::Document, id: itsjustcad_doc::ObjectId) -> Option<serde_json::Value> {
+    use kernel_curve::Curve;
+    let obj = doc.get(id)?;
+    let itsjustcad_doc::Geometry::Curve(curve) = &obj.geometry else {
+        return None;
+    };
+    let (kind, points, closed) = match curve {
+        Curve::Polyline { points, closed } => ("polyline", points, *closed),
+        Curve::Nurbs { control, .. } => ("nurbs", control, false),
+        _ => return None,
+    };
+    let points: Vec<[f64; 3]> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
+    Some(serde_json::json!({
+        "id": obj.id.to_string(),
+        "kind": kind,
+        "closed": closed,
+        "points": points,
+        "generated": doc.subdiv_source_of(id).is_some(),
+    }))
+}
+
 /// The subdivision source with short id `source`, if it has a link.
 fn subdivision_source(doc: &itsjustcad_doc::Document, source: &str) -> Option<itsjustcad_doc::ObjectId> {
     doc.subdivision_links.keys().find(|id| id.to_string() == source).copied()
@@ -7458,6 +7513,49 @@ mod headless_tests {
             assert_eq!(r(ijc_street_json(h, std::ptr::null(), id)), null);
             assert_eq!(r(ijc_street_json(std::ptr::null_mut(), c(&source).as_ptr(), id)), null);
             assert_eq!(r(ijc_street_set(std::ptr::null_mut(), c(&source).as_ptr(), id, c(edit).as_ptr()))["ok"], false);
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn object_points_json_lists_vertices_and_control_points() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            let id = |line: &str| {
+                let out = r(ijc_run_command_result(h, c(line).as_ptr()));
+                assert_eq!(out["ok"], true, "{line}: {out}");
+                out["created"][0].as_str().unwrap().to_string()
+            };
+            let poly = id("polyline 0,0,0 10,0,0 10,5,2 closed");
+            let v = r(ijc_object_points_json(h, c(&poly).as_ptr()));
+            assert_eq!(v["kind"], "polyline");
+            assert_eq!(v["closed"], true);
+            assert_eq!(v["generated"], false);
+            assert_eq!(v["points"], serde_json::json!([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 5.0, 2.0]]));
+            let set = format!("setpoint id:{poly} 1 20,0,0");
+            assert_eq!(r(ijc_run_command_result(h, c(&set).as_ptr()))["ok"], true);
+            let v = r(ijc_object_points_json(h, c(&poly).as_ptr()));
+            assert_eq!(v["points"][1], serde_json::json!([20.0, 0.0, 0.0]));
+
+            let nurbs = id("curve 0,0,0 5,5,0 10,0,0 15,5,0");
+            let v = r(ijc_object_points_json(h, c(&nurbs).as_ptr()));
+            assert_eq!(v["kind"], "nurbs");
+            assert_eq!(v["points"].as_array().unwrap().len(), 4);
+
+            let null = serde_json::Value::Null;
+            let line = id("line 0,0,0 1,0,0");
+            assert_eq!(r(ijc_object_points_json(h, c(&line).as_ptr())), null);
+            assert_eq!(r(ijc_object_points_json(h, c("nope").as_ptr())), null);
+            assert_eq!(r(ijc_object_points_json(h, std::ptr::null())), null);
+            assert_eq!(r(ijc_object_points_json(std::ptr::null_mut(), c(&poly).as_ptr())), null);
+
+            id("rect 0,0,0 200 150");
+            assert_eq!(r(ijc_run_command_result(h, c("siteplan last").as_ptr()))["ok"], true);
+            let source = r(ijc_streets_json(h))[0]["source"].as_str().unwrap().to_string();
+            let road = r(ijc_street_json(h, c(&source).as_ptr(), 0))["objects"][0].as_str().unwrap().to_string();
+            let v = r(ijc_object_points_json(h, c(&road).as_ptr()));
+            assert_eq!(v["generated"], true, "{v}");
             ijc_free(h);
         }
     }
