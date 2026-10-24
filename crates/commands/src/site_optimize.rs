@@ -98,6 +98,18 @@ pub struct OptimizeRequest {
     pub max_far: Option<f64>,
     /// Lot coverage in [0, 1].
     pub max_coverage: Option<f64>,
+    /// Largest lot, m² (none by default; the desktop form seeds 3 × the
+    /// plan's `lot_area_min`).
+    pub max_lot_area: Option<f64>,
+    /// Largest lot depth : frontage, with depth = area / curb frontage (so the
+    /// ratio is area / frontage²). Default 3 — no strip lots.
+    pub max_depth_ratio: Option<f64>,
+    /// Share of lots in [0, 1] allowed above `max_depth_ratio`. Default 0:
+    /// every lot.
+    pub depth_ratio_share: f64,
+    /// Largest perimeter of a block that gets subdivided, m. Default 800 —
+    /// no super-blocks.
+    pub max_block_perimeter: Option<f64>,
     /// Unit prices of the `value` objective.
     pub economics: Economics,
 }
@@ -107,6 +119,12 @@ pub struct OptimizeRequest {
 /// per m² of lot; roads 90 per m² (paving, curbs, drainage); utilities 600 per
 /// m of lot frontage (water, sewer, power along the street); 3000 per lot
 /// (survey, titling, connections); open space 15 per m² (landscaping).
+///
+/// Lot value has diminishing returns on size: `price × ref × (area/ref)^γ`
+/// with `γ = size_exponent` (0.85), so a lot of the reference area (`ref_lot_area`,
+/// 0 = the plan's `lot_area_min`) sells at `price` per m² and bigger lots earn
+/// less per m². Lots deeper than 2.5 × their frontage lose up to 10 % of their
+/// value at 3 : 1 (a soft shape penalty under the hard `max_depth_ratio`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Economics {
@@ -120,6 +138,10 @@ pub struct Economics {
     pub lot_cost: f64,
     /// Cost per m² of reserved open space.
     pub open_cost: f64,
+    /// Exponent γ of lot value on lot area (1 = linear).
+    pub size_exponent: f64,
+    /// Lot area worth exactly `price` per m²; 0 = the plan's `lot_area_min`.
+    pub ref_lot_area: f64,
 }
 
 impl Default for Economics {
@@ -130,9 +152,17 @@ impl Default for Economics {
             utility_cost: 600.0,
             lot_cost: 3000.0,
             open_cost: 15.0,
+            size_exponent: 0.85,
+            ref_lot_area: 0.0,
         }
     }
 }
+
+/// Depth : frontage where the soft shape penalty starts, and the value lost
+/// per unit of ratio above it (10 % at 3 : 1), capped at [`SHAPE_PENALTY_MAX`].
+const SHAPE_SOFT_RATIO: f64 = 2.5;
+const SHAPE_PENALTY_SLOPE: f64 = 0.2;
+const SHAPE_PENALTY_MAX: f64 = 0.5;
 
 /// The physical quantities a ledger prices, measured on one site plan.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -147,6 +177,22 @@ pub struct Quantities {
     pub frontage: f64,
     /// Reserved open-space area, m².
     pub open_area: f64,
+    /// Depth : frontage of every lot (area / curb frontage²; infinite with
+    /// no frontage), parallel to `lot_areas`.
+    pub depth_ratios: Vec<f64>,
+    /// Largest perimeter of a subdivided (not reserved) block, m.
+    pub max_block_perimeter: f64,
+}
+
+impl Quantities {
+    /// The largest finite lot depth : frontage (0 with no lots).
+    pub fn max_depth_ratio(&self) -> f64 {
+        self.depth_ratios
+            .iter()
+            .copied()
+            .filter(|r| r.is_finite())
+            .fold(0.0, f64::max)
+    }
 }
 
 /// One plan's development ledger: revenue, each cost line, profit, and profit
@@ -163,14 +209,36 @@ pub struct Ledger {
 }
 
 impl Economics {
-    /// Sale value of one lot. Area × price for now; the place a frontage /
-    /// depth or shape factor would go.
-    pub fn land_value(&self, lot_area: f64) -> f64 {
-        lot_area * self.price
+    /// Sale value of one lot of `lot_area` m² and `depth_ratio` depth :
+    /// frontage: diminishing in size around the reference area, less the
+    /// soft shape penalty.
+    pub fn land_value(&self, lot_area: f64, depth_ratio: f64) -> f64 {
+        let size = if self.ref_lot_area > 0.0 && lot_area > 0.0 {
+            self.ref_lot_area * (lot_area / self.ref_lot_area).powf(self.size_exponent)
+        } else {
+            lot_area
+        };
+        let penalty = ((depth_ratio - SHAPE_SOFT_RATIO) * SHAPE_PENALTY_SLOPE)
+            .clamp(0.0, SHAPE_PENALTY_MAX);
+        self.price * size * (1.0 - penalty)
+    }
+
+    /// These prices with `ref_lot_area` resolved: 0 takes `lot_area_min`.
+    pub fn resolved(&self, lot_area_min: f64) -> Economics {
+        Economics {
+            ref_lot_area: if self.ref_lot_area > 0.0 { self.ref_lot_area } else { lot_area_min },
+            ..*self
+        }
     }
 
     pub fn ledger(&self, q: &Quantities) -> Ledger {
-        let revenue = q.lot_areas.iter().map(|a| self.land_value(*a)).sum::<f64>();
+        let ratio = |i: usize| q.depth_ratios.get(i).copied().unwrap_or(0.0);
+        let revenue = q
+            .lot_areas
+            .iter()
+            .enumerate()
+            .map(|(i, a)| self.land_value(*a, ratio(i)))
+            .sum::<f64>();
         let roads = q.road_area * self.road_cost;
         let utilities = q.frontage * self.utility_cost;
         let lots = q.lot_areas.len() as f64 * self.lot_cost;
@@ -195,6 +263,8 @@ impl Economics {
             "utility_cost" => &mut self.utility_cost,
             "lot_cost" => &mut self.lot_cost,
             "open_cost" => &mut self.open_cost,
+            "size_exponent" => &mut self.size_exponent,
+            "ref_lot_area" => &mut self.ref_lot_area,
             _ => return false,
         };
         *slot = v;
@@ -218,6 +288,10 @@ impl Default for OptimizeRequest {
             min_open: None,
             max_far: None,
             max_coverage: None,
+            max_lot_area: None,
+            max_depth_ratio: Some(3.0),
+            depth_ratio_share: 0.0,
+            max_block_perimeter: Some(800.0),
             economics: Economics::default(),
         }
     }
@@ -282,6 +356,16 @@ impl OptimizeRequest {
             "min_open" => self.min_open = Some(num()?),
             "max_far" => self.max_far = Some(num()?),
             "max_coverage" => self.max_coverage = Some(num()?),
+            // `off` lifts a default-on limit.
+            "max_lot_area" | "max_depth_ratio" | "max_block_perimeter" => {
+                let v = if v.eq_ignore_ascii_case("off") { None } else { Some(num()?) };
+                match key {
+                    "max_lot_area" => self.max_lot_area = v,
+                    "max_depth_ratio" => self.max_depth_ratio = v,
+                    _ => self.max_block_perimeter = v,
+                }
+            }
+            "depth_ratio_share" => self.depth_ratio_share = ratio(num()?),
             k if self.economics.set(k, num()?) => {}
             _ => return Err(format!("siteoptimize: unknown option '{key}'")),
         }
@@ -345,6 +429,9 @@ pub struct Evaluation {
     pub report: YieldReport,
     /// Hard constraints this plan breaks (empty = feasible).
     pub violations: Vec<&'static str>,
+    /// Σ of the broken checks' excess (shares of lots, relative overshoot);
+    /// 0 when feasible. Guides the search toward feasibility.
+    pub infeasibility: f64,
     pub score: f64,
     /// What the ledger prices.
     pub quantities: Quantities,
@@ -420,50 +507,65 @@ pub fn evaluate(
         building_gfas: gfas,
         building_footprints: footprints,
     });
-    let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+    let depth_ratios: Vec<f64> = plan
+        .lots
+        .polygons
+        .iter()
+        .zip(&fronts.curb)
+        .map(|(p, f)| if *f > 1e-6 { p.area() / (f * f) } else { f64::INFINITY })
+        .collect();
+    let max_block_perimeter = plan
+        .site
+        .blocks
+        .iter()
+        .filter(|b| !plan.reserved.contains(&b.polygon))
+        .map(|b| b.polygon.perimeter())
+        .fold(0.0, f64::max);
+    // Each check's excess (> 0 = broken): a share of lots for per-lot rules,
+    // else the relative overshoot. Their sum steers the search out of the
+    // infeasible region (a count of broken rules is too coarse for that).
+    let lot_areas: Vec<f64> = plan.lots.polygons.iter().map(|p| p.area()).collect();
+    let n = lot_areas.len().max(1) as f64;
+    let share = |v: &[f64], bad: &dyn Fn(f64) -> bool| v.iter().filter(|x| bad(**x)).count() as f64 / n;
+    let over = |v: f64, m: f64| (v - m) / m.abs().max(1e-9);
     let checks = [
+        ("min_lot_area", req.min_lot_area.map(|m| share(&lot_areas, &|a| a < m))),
+        ("min_lot_width", req.min_lot_width.map(|m| share(&fronts.curb, &|w| w < m))),
+        ("min_frontage", req.min_frontage.map(|m| share(&fronts.setback, &|w| w < m))),
+        ("min_open", req.min_open.map(|m| m - report.open_space_ratio)),
+        ("max_far", req.max_far.map(|m| over(report.far_net.unwrap_or(0.0), m))),
+        ("max_coverage", req.max_coverage.map(|m| over(report.lot_coverage.unwrap_or(0.0), m))),
+        ("max_lot_area", req.max_lot_area.map(|m| over(report.max_lot_area, m))),
         (
-            "min_lot_area",
-            req.min_lot_area.is_some_and(|m| report.min_lot_area < m),
+            "max_depth_ratio",
+            req.max_depth_ratio
+                .map(|m| share(&depth_ratios, &|r| r > m) - req.depth_ratio_share - 1e-9),
         ),
+        ("max_block_perimeter", req.max_block_perimeter.map(|m| over(max_block_perimeter, m))),
         (
-            "min_lot_width",
-            req.min_lot_width.is_some_and(|m| min(&fronts.curb) < m),
+            "street_access",
+            Some((report.lot_count - fronts.with_street.min(report.lot_count)) as f64 / n),
         ),
-        (
-            "min_frontage",
-            req.min_frontage.is_some_and(|m| min(&fronts.setback) < m),
-        ),
-        (
-            "min_open",
-            req.min_open.is_some_and(|m| report.open_space_ratio < m),
-        ),
-        (
-            "max_far",
-            req.max_far
-                .is_some_and(|m| report.far_net.unwrap_or(0.0) > m),
-        ),
-        (
-            "max_coverage",
-            req.max_coverage
-                .is_some_and(|m| report.lot_coverage.unwrap_or(0.0) > m),
-        ),
-        ("street_access", fronts.with_street < report.lot_count),
     ];
-    let violations = checks.iter().filter(|c| c.1).map(|c| c.0).collect();
+    let checks = checks.map(|(name, excess)| (name, excess.unwrap_or(0.0)));
+    let infeasibility = checks.iter().map(|c| c.1.max(0.0)).sum();
+    let violations = checks.iter().filter(|c| c.1 > 0.0).map(|c| c.0).collect();
     let block_area: f64 = plan.site.blocks.iter().map(|b| b.polygon.area()).sum();
     let quantities = Quantities {
         gross_area: site.area(),
-        lot_areas: plan.lots.polygons.iter().map(|p| p.area()).collect(),
+        lot_areas,
         road_area: (site.area() - block_area).max(0.0),
         frontage: fronts.curb.iter().sum(),
         open_area: report.reserved_block_area,
+        depth_ratios,
+        max_block_perimeter,
     };
     let ledger = req.economics.ledger(&quantities);
     let score = req.score(&report, &ledger);
     Ok(Evaluation {
         report,
         violations,
+        infeasibility,
         score,
         quantities,
         ledger,
@@ -560,9 +662,16 @@ fn dimensions(site: &Polygon2d, base: &SubdivisionSettings, req: &OptimizeReques
                     hi: 20.0,
                     step: 0.5,
                 },
+            // From 30 m up to half the site; a block perimeter cap bounds
+                // it too (an orthogonal block is up to ~2 depths a side, so
+                // perimeter ≈ 4–8 depths).
                 "block_depth" => Range::Float {
-                    lo: (short / 8.0).max(20.0),
-                    hi: (short / 2.0).max(40.0),
+                    lo: 30.0_f64.min(short / 4.0).max(10.0),
+                    hi: req
+                        .max_block_perimeter
+                        .map_or(f64::MAX, |p| p / 4.0)
+                        .min(short / 2.0)
+                        .max(40.0),
                     step: 1.0,
                 },
                 "method" => Range::Choice(choices("method")),
@@ -705,12 +814,12 @@ struct Trial {
 }
 
 impl Trial {
-    /// GA selection key, smaller = better: feasible first, then fewer
-    /// violations, then a higher score, then the [`TIE_BREAK`] metrics.
-    fn fitness(&self) -> (usize, [f64; 4]) {
+    /// GA selection key, smaller = better: less infeasible first (0 =
+    /// feasible), then a higher score, then the [`TIE_BREAK`] metrics.
+    fn fitness(&self) -> (f64, [f64; 4]) {
         match &self.eval {
-            Ok(e) => (e.violations.len(), sort_key(e)),
-            Err(_) => (usize::MAX, [0.0; 4]),
+            Ok(e) => (e.infeasibility, sort_key(e)),
+            Err(_) => (f64::INFINITY, [0.0; 4]),
         }
     }
 }
@@ -775,6 +884,7 @@ pub fn optimize_with(
         min_lot_width: Some(req.min_lot_width.unwrap_or(width_lo)),
         min_open: req.min_open.map(ratio),
         max_coverage: req.max_coverage.map(ratio),
+        economics: req.economics.resolved(base.lot_area_min),
         ..req.clone()
     };
     let dims = dimensions(site, base, req);
@@ -806,7 +916,7 @@ pub fn optimize_with(
         let mut order: Vec<usize> = (0..trials.len()).collect();
         order.sort_by(|&a, &b| {
             let (fa, fb) = (trials[a].fitness(), trials[b].fitness());
-            fa.0.cmp(&fb.0).then(cmp_keys(&fa.1, &fb.1)).then(a.cmp(&b))
+            fa.0.total_cmp(&fb.0).then(cmp_keys(&fa.1, &fb.1)).then(a.cmp(&b))
         });
         let elite = &order[..mu.min(order.len())];
         let children: Vec<Vec<f64>> = (0..lambda.min(budget - trials.len()))
@@ -876,6 +986,9 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
             "min_open" => req.min_open,
             "max_far" => req.max_far,
             "max_coverage" => req.max_coverage,
+            "max_lot_area" => req.max_lot_area,
+            "max_depth_ratio" => req.max_depth_ratio,
+            "max_block_perimeter" => req.max_block_perimeter,
             _ => None,
         };
         let what = limit.map_or("every lot fronts a street".to_string(), |v| {
@@ -1232,6 +1345,7 @@ mod tests {
             road_area: 1000.0,
             frontage: 40.0,
             open_area: 200.0,
+            ..Quantities::default()
         };
         let l = Economics::default().ledger(&q);
         assert_eq!(
@@ -1280,10 +1394,57 @@ mod tests {
         assert_eq!(request.objective, Objective::Value);
         assert_eq!(
             request.economics,
-            Economics { price: 50.0, road_cost: 10.0, utility_cost: 1.0, lot_cost: 2.0, open_cost: 3.0 }
+            Economics {
+                price: 50.0,
+                road_cost: 10.0,
+                utility_cost: 1.0,
+                lot_cost: 2.0,
+                open_cost: 3.0,
+                ..Economics::default()
+            }
         );
         let r: OptimizeRequest = serde_json::from_str(r#"{"economics":{"price":80}}"#).unwrap();
         assert_eq!(r.economics, Economics { price: 80.0, ..Economics::default() });
+    }
+
+    #[test]
+    fn lot_value_diminishes_with_size_and_penalises_strips() {
+        let e = Economics { ref_lot_area: 1000.0, ..Economics::default() };
+        assert_eq!(e.land_value(1000.0, 1.0), 120_000.0, "the reference lot sells at price");
+        let big = e.land_value(4000.0, 1.0);
+        assert!((big - 120.0 * 1000.0 * 4f64.powf(0.85)).abs() < 1e-6);
+        assert!(big / 4000.0 < 120.0, "bigger lots earn less per m²");
+        assert_eq!(e.land_value(1000.0, 2.5), 120_000.0, "no penalty up to 2.5 : 1");
+        assert!((e.land_value(1000.0, 3.0) - 108_000.0).abs() < 1e-6, "−10 % at 3 : 1");
+        let linear = Economics { size_exponent: 1.0, ..e };
+        assert_eq!(linear.land_value(4000.0, 1.0), 480_000.0);
+        assert_eq!(Economics::default().resolved(500.0).ref_lot_area, 500.0, "0 = the plan's");
+        assert_eq!(e.resolved(500.0).ref_lot_area, 1000.0);
+    }
+
+    /// No strip lots, no super-blocks by default; `off` lifts a limit.
+    #[test]
+    fn realistic_lot_and_block_limits_hold_by_default() {
+        let d = OptimizeRequest::default();
+        assert_eq!((d.max_depth_ratio, d.max_block_perimeter, d.depth_ratio_share), (Some(3.0), Some(800.0), 0.0));
+        let r = optimize(&rect(200.0, 150.0), &SubdivisionSettings::default(), &req(24)).unwrap();
+        for c in &r.candidates {
+            let q = &c.eval.quantities;
+            assert!(q.depth_ratios.iter().all(|x| *x <= 3.0), "#{} {:?}", c.rank, q.depth_ratios);
+            assert!(q.max_block_perimeter <= 800.0, "#{}", c.rank);
+            assert_eq!(c.eval.infeasibility, 0.0);
+        }
+        let crate::Command::SiteOptimize { request, .. } = parse(
+            "siteoptimize last max_depth_ratio=off max_block_perimeter=600 max_lot_area=9000 depth_ratio_share=5 size_exponent=0.9",
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(request.max_depth_ratio, None);
+        assert_eq!(request.max_block_perimeter, Some(600.0));
+        assert_eq!(request.max_lot_area, Some(9000.0));
+        assert_eq!(request.depth_ratio_share, 0.05);
+        assert_eq!(request.economics.size_exponent, 0.9);
     }
 
     #[test]
@@ -1296,6 +1457,7 @@ mod tests {
                 ..YieldInputs::default()
             }),
             violations: Vec::new(),
+            infeasibility: 0.0,
             score: 0.0,
             quantities: Quantities::default(),
             ledger: Ledger::default(),

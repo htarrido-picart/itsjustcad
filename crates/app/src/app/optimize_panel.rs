@@ -54,17 +54,28 @@ pub(super) enum Constraint {
     MinOpen,
     MaxFar,
     MaxCoverage,
+    MaxLotArea,
+    MaxDepthRatio,
+    MaxBlockPerimeter,
 }
 
 impl Constraint {
-    pub(super) const ALL: [Constraint; 6] = [
+    pub(super) const ALL: [Constraint; 9] = [
         Constraint::MinLotArea,
         Constraint::MinLotWidth,
         Constraint::MinFrontage,
         Constraint::MinOpen,
         Constraint::MaxFar,
         Constraint::MaxCoverage,
+        Constraint::MaxLotArea,
+        Constraint::MaxDepthRatio,
+        Constraint::MaxBlockPerimeter,
     ];
+
+    /// On out of the box (the core's defaults): no strip lots, no super-blocks.
+    fn default_on(self) -> bool {
+        matches!(self, Constraint::MaxDepthRatio | Constraint::MaxBlockPerimeter)
+    }
 
     fn label_key(self) -> &'static str {
         match self {
@@ -74,6 +85,9 @@ impl Constraint {
             Constraint::MinOpen => "optimize.min_open",
             Constraint::MaxFar => "optimize.max_far",
             Constraint::MaxCoverage => "optimize.max_coverage",
+            Constraint::MaxLotArea => "optimize.max_lot_area",
+            Constraint::MaxDepthRatio => "optimize.max_depth_ratio",
+            Constraint::MaxBlockPerimeter => "optimize.max_block_perimeter",
         }
     }
 
@@ -86,6 +100,9 @@ impl Constraint {
             Constraint::MinOpen => (15.0, 1.0, "%"),
             Constraint::MaxFar => (1.5, 0.05, ""),
             Constraint::MaxCoverage => (60.0, 1.0, "%"),
+            Constraint::MaxLotArea => (900.0, 10.0, "m²"),
+            Constraint::MaxDepthRatio => (3.0, 0.05, ": 1"),
+            Constraint::MaxBlockPerimeter => (800.0, 10.0, "m"),
         }
     }
 
@@ -101,7 +118,7 @@ pub(super) struct OptimizeForm {
     /// Weights per [`METRICS`] entry (used by `Weighted`; zero = omitted).
     pub weights: [f64; 5],
     /// Per [`Constraint::ALL`]: (enabled, value in form units).
-    pub constraints: [(bool, f64); 6],
+    pub constraints: [(bool, f64); 9],
     pub budget: usize,
     pub seed: u64,
     pub locks: BTreeSet<String>,
@@ -117,7 +134,7 @@ impl Default for OptimizeForm {
         OptimizeForm {
             objective: d.objective,
             weights: [1.0, 0.0, 0.0, 0.0, 0.0],
-            constraints: Constraint::ALL.map(|c| (false, c.widget().0)),
+            constraints: Constraint::ALL.map(|c| (c.default_on(), c.widget().0)),
             budget: d.budget,
             seed: d.seed,
             locks: BTreeSet::new(),
@@ -162,6 +179,9 @@ impl OptimizeForm {
         if !all.iter().all(|p| self.patterns.contains(p)) {
             req.patterns = all.into_iter().filter(|p| self.patterns.contains(p)).collect();
         }
+        // An unchecked box lifts the core's default-on limits too.
+        req.max_depth_ratio = None;
+        req.max_block_perimeter = None;
         for (c, (on, v)) in Constraint::ALL.into_iter().zip(self.constraints) {
             if !on {
                 continue;
@@ -174,6 +194,9 @@ impl OptimizeForm {
                 Constraint::MinOpen => req.min_open = v,
                 Constraint::MaxFar => req.max_far = v,
                 Constraint::MaxCoverage => req.max_coverage = v,
+                Constraint::MaxLotArea => req.max_lot_area = v,
+                Constraint::MaxDepthRatio => req.max_depth_ratio = v,
+                Constraint::MaxBlockPerimeter => req.max_block_perimeter = v,
             }
         }
         req
@@ -492,10 +515,13 @@ pub(super) struct OptimizePanel {
 }
 
 impl OptimizeForm {
-    /// Defaults that keep the current plan's lot size: `min_lot_area` on, at
-    /// the plan's `lot_area_min` (maximising lots alone rewards slivers).
+    /// Lot-size bounds from the current plan, on: at least half its
+    /// `lot_area_min` (a full `lot_area_min` floor leaves no feasible layout
+    /// once blocks are walkable — edge remnants fall below it) and at most
+    /// 3 × it (no super-lots).
     pub(super) fn seed_from_plan(&mut self, settings: &subdivision::SubdivisionSettings) {
-        self.constraints[0] = (true, settings.lot_area_min);
+        self.constraints[0] = (true, 0.5 * settings.lot_area_min);
+        self.constraints[6] = (true, 3.0 * settings.lot_area_min);
     }
 }
 
@@ -824,6 +850,15 @@ impl App {
                                 ui.add(egui::DragValue::new(v).speed(speed).range(0.0..=f64::MAX));
                                 ui.end_row();
                             }
+                            ui.label(t("optimize.econ.size_exponent"))
+                                .on_hover_text(t("optimize.econ.size_exponent.hint"));
+                            ui.add(
+                                egui::DragValue::new(&mut e.size_exponent)
+                                    .speed(0.01)
+                                    .range(0.5..=1.0)
+                                    .fixed_decimals(2),
+                            );
+                            ui.end_row();
                         });
                 });
             });
@@ -848,7 +883,13 @@ impl App {
         let Some((_, _, Some(q))) = &self.optimize.current_q else {
             return;
         };
-        let ledger = self.optimize.form.economics.ledger(q);
+        let lot_area_min = self
+            .session
+            .doc
+            .subdivision_links
+            .get(&source)
+            .map_or(0.0, |l| l.settings.lot_area_min);
+        let ledger = self.optimize.form.economics.resolved(lot_area_min).ledger(q);
         ui.add_space(crate::theme::Spacing::S);
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::M as i8, 4))
@@ -1163,8 +1204,15 @@ mod tests {
         let mut f = OptimizeForm::default();
         let s = subdivision::SubdivisionSettings { lot_area_min: 420.0, ..Default::default() };
         f.seed_from_plan(&s);
-        assert_eq!(f.constraints[0], (true, 420.0));
-        assert_eq!(f.to_request().min_lot_area, Some(420.0));
+        assert_eq!(f.constraints[0], (true, 210.0));
+        assert_eq!(f.constraints[6], (true, 1260.0));
+        let r = f.to_request();
+        assert_eq!((r.min_lot_area, r.max_lot_area), (Some(210.0), Some(1260.0)));
+        assert_eq!((r.max_depth_ratio, r.max_block_perimeter), (Some(3.0), Some(800.0)));
+        f.constraints[7].0 = false;
+        f.constraints[8].0 = false;
+        let r = f.to_request();
+        assert_eq!((r.max_depth_ratio, r.max_block_perimeter), (None, None), "unchecked lifts them");
     }
 
     #[test]

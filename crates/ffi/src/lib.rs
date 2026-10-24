@@ -5147,7 +5147,9 @@ unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 /// nothing logged). `request_json` is `{"objective":"value|lots|far_net|net_area|gfa|weighted",
 /// "weights":{…},"budget":200,"seed":1,"top":5,"lock":[…],"patterns":[…],
 /// "min_lot_area","min_lot_width","min_frontage","min_open","max_far","max_coverage",
-/// "economics":{"price","road_cost","utility_cost","lot_cost","open_cost"}}`,
+/// "max_lot_area","max_depth_ratio" (default 3),"depth_ratio_share" (default 0),
+/// "max_block_perimeter" (default 800),
+/// "economics":{"price","road_cost","utility_cost","lot_cost","open_cost","size_exponent","ref_lot_area"}}`,
 /// every key optional (null / `{}` = defaults). Returns
 /// `{"candidates":[{"rank","score","params":{…},"yield":{YieldReport},"ledger":{Ledger}}],"pareto":[ranks…],
 /// "pareto_axis":"open"|"net_area"|"gfa"|"lots","evaluated":n,"feasible":n,
