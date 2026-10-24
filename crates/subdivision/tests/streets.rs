@@ -310,10 +310,17 @@ fn hexagonal_interior_cells_are_proper_hexagons() {
     let mut s = base_settings(StreetPattern::Hexagonal);
     s.block_depth = depth;
     let g = generate_streets(&site, &s);
-    // Every street is a single hex edge of length ~r.
+    // Every street is a single hex edge: length ~r inside the site, shorter
+    // where it is clipped to the boundary (#166).
+    let on_edge = |p: DVec2| p.x.min(400.0 - p.x).min(p.y).min(300.0 - p.y) < 1e-6;
     for st in &g.streets {
-        let len = st.centerline[0].distance(st.centerline[1]);
-        assert!((len - r).abs() < 1e-6, "hex edge len {len} != {r}");
+        let (a, b) = (st.centerline[0], st.centerline[1]);
+        let len = a.distance(b);
+        if on_edge(a) || on_edge(b) {
+            assert!(len <= r + 1e-6, "clipped hex edge len {len} > {r}");
+        } else {
+            assert!((len - r).abs() < 1e-6, "hex edge len {len} != {r}");
+        }
     }
     let blocks = extract_blocks(&site, &g, &s);
     assert!(!blocks.is_empty(), "hex extraction produced no cells");
