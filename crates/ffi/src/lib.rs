@@ -5147,7 +5147,7 @@ unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 /// nothing logged). `request_json` is `{"objective":"value|lots|far_net|net_area|gfa|weighted",
 /// "weights":{…},"budget":400,"seed":1,"top":5,"lock":[…],"patterns":[…],
 /// "min_lot_area","min_lot_width","min_frontage","min_open","max_far","max_coverage",
-/// "max_lot_area","max_depth_ratio" (default 3),"lot_rule_share" (default 0.05, share of lots that may break the per-lot rules), "access_share" (default 0.02), "max_stories" (default 6), "min_park_access" (default 0.9), "min_daylight", "daylight_hours" (default 2), "location":{"lat_deg","lon_deg","tz_hours"},
+/// "max_lot_area","max_depth_ratio" (default 3),"lot_rule_share" (default 0.05, share of lots that may break the per-lot rules), "access_share" (default 0.02), "max_stories" (default 6), "min_park_access" (default 0.9), "min_daylight" (facade share), "daylight_hours" (default 2), "daylight_period" ("annual" default | "worst_month" | {"custom":{"month","day"}}), "max_overheat", "overheat_hours" (default 6), "location":{"lat_deg","lon_deg","tz_hours"},
 /// "max_block_perimeter" (default 800),
 /// "economics":{"price","road_cost","utility_cost","lot_cost","open_cost","size_exponent","ref_lot_area"}}`,
 /// every key optional (null / `{}` = defaults). Returns

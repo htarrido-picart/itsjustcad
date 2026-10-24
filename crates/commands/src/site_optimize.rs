@@ -25,12 +25,14 @@ use std::collections::BTreeMap;
 use itsjustcad_doc::{
     Document, EdgeRoleOverride, FieldKind, Geometry, LotOverride, ObjectId, StreetEdit,
 };
-use glam::{DVec2, DVec3};
+use glam::DVec2;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use subdivision::{FrontageAt, Polygon2d, SubdivisionSettings, YieldInputs, YieldReport};
 
 use crate::lot::{self, SitePlanBake};
+pub use crate::site_metrics::{DaylightOpts, DaylightPeriod, FacadeDaylight};
+use crate::site_metrics::facade_daylight;
 
 /// What to maximize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -123,11 +125,20 @@ pub struct OptimizeRequest {
     pub max_stories: Option<usize>,
     /// Least share of lots within `economics.park_distance` of a park.
     pub min_park_access: Option<f64>,
-    /// Least share of open ground with ≥ `daylight_hours` of sun on the
-    /// winter solstice (checked on the top candidates only; needs `location`).
+    /// Least share of facade area whose direct sun averages ≥ `daylight_hours`
+    /// a day over `daylight_period` (checked on the best candidates only;
+    /// needs `location`).
     pub min_daylight: Option<f64>,
-    /// Winter-solstice sun hours a daylight sample needs. Default 2.
+    /// Direct-sun hours a day a facade sample needs. Default 2.
     pub daylight_hours: f64,
+    /// The days the daylight analysis averages. Default: the whole year.
+    pub daylight_period: DaylightPeriod,
+    /// Most share of facade area with more than `overheat_hours` of direct
+    /// sun on the hottest month (hot / tropical sites). Off by default.
+    pub max_overheat: Option<f64>,
+    /// Sun hours on the hottest month above which a facade overheats.
+    /// Default 6.
+    pub overheat_hours: f64,
     /// Observer location for daylight (the document's, when unset).
     pub location: Option<Location>,
     /// Unit prices of the `value` objective.
@@ -242,9 +253,15 @@ pub struct Quantities {
     pub lot_near_park: Vec<bool>,
     /// Every building: GFA, storeys, near a park.
     pub buildings: Vec<BuiltQ>,
-    /// Share of open ground with ≥ the requested winter sun hours, when it
-    /// was measured.
+    /// Share of facade area with the requested direct-sun hours, when it was
+    /// measured.
     pub daylight: Option<f64>,
+    /// Share of storeys with at least one such facade sample.
+    pub daylight_floors: Option<f64>,
+    /// Share of facade area overheating on the hottest month, when asked.
+    pub overheat: Option<f64>,
+    /// Each lot's walk to the nearest park along the streets, m.
+    pub park_walk: Vec<f64>,
 }
 
 /// One building as the ledger prices it.
@@ -421,6 +438,9 @@ impl Default for OptimizeRequest {
             min_park_access: Some(DEFAULT_PARK_ACCESS),
             min_daylight: None,
             daylight_hours: 2.0,
+            daylight_period: DaylightPeriod::Annual,
+            max_overheat: None,
+            overheat_hours: 6.0,
             location: None,
             economics: Economics::default(),
         }
@@ -522,6 +542,24 @@ impl OptimizeRequest {
                 }
             }
             "daylight_hours" => self.daylight_hours = num()?,
+            "overheat_hours" => self.overheat_hours = num()?,
+            "max_overheat" => {
+                self.max_overheat = (!v.eq_ignore_ascii_case("off")).then(|| num().map(ratio)).transpose()?
+            }
+            // annual | worst | MM-DD
+            "daylight_period" => {
+                self.daylight_period = match v.to_ascii_lowercase().as_str() {
+                    "annual" | "year" => DaylightPeriod::Annual,
+                    "worst" | "worst_month" => DaylightPeriod::WorstMonth,
+                    d => {
+                        let (m, day) = d
+                            .split_once('-')
+                            .and_then(|(m, d)| Some((m.parse().ok()?, d.parse().ok()?)))
+                            .ok_or("daylight_period= takes annual | worst | MM-DD")?;
+                        DaylightPeriod::Custom { month: m, day }
+                    }
+                }
+            }
             "location" => {
                 let n: Vec<f64> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
                 let [lat, lon, rest @ ..] = n.as_slice() else {
@@ -573,7 +611,20 @@ impl OptimizeRequest {
     /// Whether daylight is part of this search (a constraint or a weight).
     pub fn wants_daylight(&self) -> bool {
         self.min_daylight.is_some()
-            || (self.objective == Objective::Weighted && self.weights.contains_key("daylight"))
+            || self.max_overheat.is_some()
+            || (self.objective == Objective::Weighted
+                && (self.weights.contains_key("daylight") || self.weights.contains_key("overheat")))
+    }
+
+    /// The facade daylight analysis this request asks for.
+    pub fn daylight_opts(&self) -> DaylightOpts {
+        let overheat = self.max_overheat.is_some()
+            || (self.objective == Objective::Weighted && self.weights.contains_key("overheat"));
+        DaylightOpts {
+            period: self.daylight_period,
+            hours: self.daylight_hours,
+            overheat_hours: overheat.then_some(self.overheat_hours),
+        }
     }
 }
 
@@ -582,12 +633,13 @@ fn ratio(v: f64) -> f64 {
     if v > 1.0 { v / 100.0 } else { v }
 }
 
-const METRICS: &[&str] = &["lots", "far", "net_area", "gfa", "open", "value", "park", "daylight"];
+const METRICS: &[&str] = &["lots", "far", "net_area", "gfa", "open", "value", "park", "daylight", "overheat"];
 
 fn metric(r: &YieldReport, l: &Ledger, q: &Quantities, key: &str) -> f64 {
     match key {
         "park" => q.park_access(),
         "daylight" => q.daylight.unwrap_or(0.0),
+        "overheat" => q.overheat.unwrap_or(0.0),
         "value" => l.value,
         "lots" => r.lot_count as f64,
         "far" | "far_net" => r.far_net.unwrap_or(0.0),
@@ -703,16 +755,19 @@ pub fn evaluate(
     let n = lot_areas.len().max(1) as f64;
     let share = |v: &[f64], bad: &dyn Fn(f64) -> bool| v.iter().filter(|x| bad(**x)).count() as f64 / n;
     let over = |v: f64, m: f64| (v - m) / m.abs().max(1e-9);
-    let parks = &plan.reserved;
-    let near = |p: DVec2| distance_to_polygons(p, parks) <= req.economics.park_distance;
-    let lot_near_park: Vec<bool> = plan.lots.polygons.iter().map(|l| near(l.centroid())).collect();
+    // Walking distance along the streets, from each lot's frontage.
+    let park_walk = crate::site_metrics::park_walk(&plan);
+    let lot_near_park: Vec<bool> =
+        park_walk.iter().map(|d| *d <= req.economics.park_distance).collect();
+    // A building earns its lot's park premium (the lot holding its centroid).
+    let lot_of = lot_locator(&plan.lots.polygons);
     let buildings: Vec<BuiltQ> = plan.buildings.as_ref().map_or_else(Vec::new, |b| {
         b.buildings
             .iter()
             .map(|b| BuiltQ {
                 gfa: b.gfa,
                 floors: b.floor_areas.len(),
-                near_park: near(b.footprint.centroid()),
+                near_park: lot_of(b.footprint.centroid()).is_some_and(|i| lot_near_park[i]),
             })
             .collect()
     });
@@ -724,6 +779,7 @@ pub fn evaluate(
     let tol = req.lot_rule_share + 1e-9;
     let checks = [
         ("min_park_access", req.min_park_access.map(|m| m - park_access)),
+        // Daylight / overheating are measured after the search (see `rank`).
         ("min_lot_area", req.min_lot_area.map(|m| share(&lot_areas, &|a| a < m) - tol)),
         ("min_lot_width", req.min_lot_width.map(|m| share(&fronts.curb, &|w| w < m) - tol)),
         ("min_frontage", req.min_frontage.map(|m| share(&fronts.setback, &|w| w < m) - tol)),
@@ -757,6 +813,9 @@ pub fn evaluate(
         lot_near_park,
         buildings,
         daylight: None,
+        daylight_floors: None,
+        overheat: None,
+        park_walk,
     };
     let ledger = req.economics.ledger(&quantities);
     let score = req.score(&report, &ledger, &quantities);
@@ -1163,12 +1222,13 @@ pub fn optimize_with(
                 .into())
         }
     };
+    let opts = req.daylight_opts();
     let day = |p: &BTreeMap<String, String>| {
         let loc = daylight?;
-        plan_daylight(site, &settings_with(base, p).ok()?, edits, &loc, req.daylight_hours)
+        plan_daylight(site, &settings_with(base, p).ok()?, edits, &loc, &opts)
     };
     if let (Some(loc), Some(c)) = (daylight, current.as_mut()) {
-        c.quantities.daylight = plan_daylight(site, base, edits, &loc, req.daylight_hours);
+        set_daylight(&mut c.quantities, plan_daylight(site, base, edits, &loc, &opts));
         c.score = req.score(&c.report, &c.ledger, &c.quantities);
     }
     rank(trials, req, daylight.map(|_| &day as DaylightOf)).map(|r| OptimizeResult { current, ..r })
@@ -1179,7 +1239,14 @@ pub fn optimize_with(
 /// front. With nothing feasible, name
 /// the constraint broken most often.
 /// Daylight of a candidate's params (re-plans it), for the top-K pass.
-type DaylightOf<'a> = &'a (dyn Fn(&BTreeMap<String, String>) -> Option<f64> + Sync);
+type DaylightOf<'a> = &'a (dyn Fn(&BTreeMap<String, String>) -> Option<FacadeDaylight> + Sync);
+
+/// Store a facade daylight measure on `q`.
+pub fn set_daylight(q: &mut Quantities, d: Option<FacadeDaylight>) {
+    q.daylight = d.map(|d| d.facade);
+    q.daylight_floors = d.map(|d| d.floors);
+    q.overheat = d.and_then(|d| d.overheat);
+}
 
 fn rank(
     trials: Vec<Trial>,
@@ -1226,6 +1293,7 @@ fn rank(
             "max_block_perimeter" => req.max_block_perimeter,
             "min_park_access" => req.min_park_access,
             "min_daylight" => req.min_daylight,
+            "max_overheat" => req.max_overheat,
             _ => None,
         };
         let what = limit.map_or("every lot fronts a street".to_string(), |v| {
@@ -1268,7 +1336,11 @@ fn rank(
     // (it trades against profit, so the very best often fail) or
     // DAYLIGHT_MAX_CHECKED were tried.
     if let Some(day) = daylight {
-        let limit = if req.min_daylight.is_some() { DAYLIGHT_MAX_CHECKED } else { DAYLIGHT_TOP_K };
+        let limit = if req.min_daylight.is_some() || req.max_overheat.is_some() {
+            DAYLIGHT_MAX_CHECKED
+        } else {
+            DAYLIGHT_TOP_K
+        };
         let mut checked: Vec<(BTreeMap<String, String>, Evaluation)> = Vec::new();
         let mut best = 0.0_f64;
         let mut rest = unique.into_iter();
@@ -1277,12 +1349,16 @@ fn rank(
             if batch.is_empty() {
                 break;
             }
-            let shares: Vec<Option<f64>> = batch.par_iter().map(|(p, _)| day(p)).collect();
+            let shares: Vec<Option<FacadeDaylight>> = batch.par_iter().map(|(p, _)| day(p)).collect();
             for ((p, mut e), d) in batch.into_iter().zip(shares) {
-                e.quantities.daylight = d;
+                set_daylight(&mut e.quantities, d);
+                let d = e.quantities.daylight;
                 best = best.max(d.unwrap_or(0.0));
                 if req.min_daylight.is_some_and(|m| d.unwrap_or(0.0) < m) {
                     e.violations.push("min_daylight");
+                }
+                if req.max_overheat.is_some_and(|m| e.quantities.overheat.unwrap_or(0.0) > m) {
+                    e.violations.push("max_overheat");
                 }
                 e.score = req.score(&e.report, &e.ledger, &e.quantities);
                 checked.push((p, e));
@@ -1295,7 +1371,8 @@ fn rank(
         if checked.is_empty() {
             return Err(format!(
                 "siteoptimize: none of the best {limit} layouts meets min_daylight={} \
-                 (best {:.0} % of open ground gets {} h of winter sun); lower it or the max stories",
+                 (best {:.0} % of facade area averages {} h of direct sun over the period); \
+                 lower it, the max stories or the max overheating",
                 req.min_daylight.unwrap_or(0.0),
                 best * 100.0,
                 req.daylight_hours
@@ -1527,93 +1604,13 @@ pub fn optimize_doc(
 
 // ── parks and daylight ──────────────────────────────────────────────────────
 
-/// Distance from `p` to the nearest of `polys` (0 inside one; infinite with
-/// none).
-fn distance_to_polygons(p: DVec2, polys: &[Polygon2d]) -> f64 {
-    polys
-        .iter()
-        .map(|g| {
-            if g.contains(p) {
-                return 0.0;
-            }
-            g.edges()
-                .map(|(a, b)| {
-                    let ab = b - a;
-                    let t = if ab.length_squared() > 0.0 {
-                        ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    p.distance(a + ab * t)
-                })
-                .fold(f64::INFINITY, f64::min)
-        })
-        .fold(f64::INFINITY, f64::min)
-}
-
-/// Daylight sample spacing (m) and how many top candidates it is measured on.
-pub const DAYLIGHT_SPACING: f64 = 10.0;
-pub const DAYLIGHT_TOP_K: usize = 10;
-pub const DAYLIGHT_MAX_CHECKED: usize = 60;
-
-/// Sun directions (unit, z up) every 30 min of the winter solstice at `loc`
-/// (Dec 21 north of the equator, Jun 21 south), sun above the horizon only.
-fn winter_sun(loc: &Location) -> Vec<DVec3> {
-    let (month, day) = if loc.lat_deg >= 0.0 { (12, 21) } else { (6, 21) };
-    (0..48)
-        .filter_map(|slot| {
-            let utc = (slot as f64 * 30.0 - loc.tz_hours * 60.0).rem_euclid(1440.0);
-            let p = itsjustcad_solar::solar_position(
-                2025,
-                month,
-                day,
-                (utc / 60.0) as u32,
-                (utc % 60.0) as u32,
-                loc.lat_deg,
-                loc.lon_deg,
-            );
-            (p.altitude_deg > 0.0).then(|| {
-                let d = itsjustcad_solar::sun_direction(p.azimuth_deg, p.altitude_deg);
-                DVec3::new(d[0] as f64, d[1] as f64, d[2] as f64)
-            })
-        })
-        .collect()
-}
-
-/// Where the ray `p + t·dir` (t > 0) first crosses `poly`'s boundary.
-fn ray_enter(p: DVec2, dir: DVec2, poly: &Polygon2d) -> Option<f64> {
-    let cross = |a: DVec2, b: DVec2| a.x * b.y - a.y * b.x;
-    poly.edges()
-        .filter_map(|(a, b)| {
-            let e = b - a;
-            let den = cross(dir, e);
-            if den.abs() < 1e-12 {
-                return None;
-            }
-            let t = cross(a - p, e) / den;
-            let u = cross(a - p, dir) / den;
-            (t > 1e-6 && (0.0..=1.0).contains(&u)).then_some(t)
-        })
-        .min_by(f64::total_cmp)
-}
-
-/// Share of the plan's open ground — lots outside building footprints, and
-/// parks — sampled every `spacing` m, that gets at least `hours` of sun on
-/// the winter solstice, shaded by the buildings as prisms of their height.
-pub fn daylight_share(plan: &SitePlanBake, loc: &Location, hours: f64, spacing: f64) -> f64 {
-    const CELL: f64 = 25.0;
-    let suns = winter_sun(loc);
-    let need = (hours / 0.5).ceil() as usize;
-    let blds: Vec<(&Polygon2d, f64)> = plan
-        .buildings
-        .iter()
-        .flat_map(|b| b.buildings.iter())
-        .map(|b| (&b.footprint, b.height))
-        .collect();
+/// Lookup of the lot polygon holding a point (a 50 m bucket grid).
+fn lot_locator(lots: &[Polygon2d]) -> impl Fn(DVec2) -> Option<usize> + '_ {
+    const CELL: f64 = 50.0;
     let key = |p: DVec2| ((p.x / CELL).floor() as i64, (p.y / CELL).floor() as i64);
     let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = Default::default();
-    for (i, (poly, _)) in blds.iter().enumerate() {
-        let (lo, hi) = poly.aabb();
+    for (i, l) in lots.iter().enumerate() {
+        let (lo, hi) = l.aabb();
         let (a, b) = (key(lo), key(hi));
         for x in a.0..=b.0 {
             for y in a.1..=b.1 {
@@ -1621,69 +1618,27 @@ pub fn daylight_share(plan: &SitePlanBake, loc: &Location, hours: f64, spacing: 
             }
         }
     }
-    let near = |a: DVec2, b: DVec2| {
-        let (lo, hi) = (key(a.min(b)), key(a.max(b)));
-        (lo.0..=hi.0)
-            .flat_map(move |x| (lo.1..=hi.1).map(move |y| (x, y)))
-            .filter_map(|c| grid.get(&c))
-            .flatten()
-            .copied()
-    };
-    let max_h = blds.iter().map(|b| b.1).fold(0.0, f64::max);
-    let mut samples = Vec::new();
-    for g in plan.lots.polygons.iter().chain(&plan.reserved) {
-        let (lo, hi) = g.aabb();
-        let (x0, y0) = ((lo.x / spacing).ceil() as i64, (lo.y / spacing).ceil() as i64);
-        let (x1, y1) = ((hi.x / spacing).floor() as i64, (hi.y / spacing).floor() as i64);
-        for ix in x0..=x1 {
-            for iy in y0..=y1 {
-                let p = DVec2::new(ix as f64 * spacing, iy as f64 * spacing);
-                if g.contains(p) && !near(p, p).any(|i| blds[i].0.contains(p)) {
-                    samples.push(p);
-                }
-            }
-        }
-    }
-    if samples.is_empty() || suns.is_empty() {
-        return if suns.is_empty() { 0.0 } else { 1.0 };
-    }
-    let lit = samples
-        .par_iter()
-        .filter(|p| {
-            let sunny = suns
-                .iter()
-                .filter(|d| {
-                    let h = DVec2::new(d.x, d.y);
-                    let len = h.length();
-                    if len < 1e-9 {
-                        return true;
-                    }
-                    let (dir, tan) = (h / len, d.z / len);
-                    let end = **p + dir * (max_h / tan.max(1e-6));
-                    !near(**p, end).any(|i| {
-                        let (poly, height) = blds[i];
-                        ray_enter(**p, dir, poly).is_some_and(|t| t * tan < height)
-                    })
-                })
-                .count();
-            sunny >= need
-        })
-        .count();
-    lit as f64 / samples.len() as f64
+    move |p| grid.get(&key(p))?.iter().copied().find(|i| lots[*i].contains(p))
 }
 
-/// Plan `settings` on `site` with the hand edits and measure its daylight.
+/// How many best candidates a daylight batch measures, and the most a
+/// daylight constraint may try.
+pub const DAYLIGHT_TOP_K: usize = 10;
+pub const DAYLIGHT_MAX_CHECKED: usize = 60;
+
+/// Plan `settings` on `site` with the hand edits and measure its facade
+/// daylight.
 pub fn plan_daylight(
     site: &Polygon2d,
     settings: &SubdivisionSettings,
     edits: &PlanEdits,
     loc: &Location,
-    hours: f64,
-) -> Option<f64> {
+    opts: &DaylightOpts,
+) -> Option<FacadeDaylight> {
     let mut roles = edits.edge_roles.clone();
     let mut heights = edits.lot_overrides.clone();
     let plan = lot::plan_site(site, 0.0, settings, &edits.streets, &mut roles, &mut heights).ok()?;
-    Some(daylight_share(&plan, loc, hours, DAYLIGHT_SPACING))
+    facade_daylight(&plan, settings.floor_height, loc, opts)
 }
 
 #[cfg(test)]
@@ -1945,24 +1900,49 @@ mod tests {
         assert!(f.iter().all(|n| (1..=5).contains(n)) && f.first() != f.last(), "{f:?}");
     }
 
+    /// Facade daylight at 40° N and in the tropics (5° N, about Bogotá): the
+    /// period is never a hemisphere assumption — the worst month is found
+    /// from the sun; taller buildings shade more; overheating is measured on
+    /// the hottest month; daylight constraints need a location.
     #[test]
-    fn daylight_counts_shaded_ground_and_needs_a_location() {
+    fn facade_daylight_by_latitude_and_period() {
+        use crate::site_metrics::{hottest_month, worst_month};
+        assert_eq!((worst_month(40.0), hottest_month(40.0)), (12, 6));
+        assert_eq!((worst_month(-40.0), hottest_month(-40.0)), (6, 12));
         let site = rect(200.0, 150.0);
         let s = SubdivisionSettings::walkable();
-        let (mut roles, mut pins) = (Vec::new(), Vec::new());
-        let plan = lot::plan_site(&site, 0.0, &s, &BTreeMap::new(), &mut roles, &mut pins).unwrap();
+        let plan = |s: &SubdivisionSettings| {
+            lot::plan_site(&site, 0.0, s, &BTreeMap::new(), &mut Vec::new(), &mut Vec::new()).unwrap()
+        };
+        let (low, tall) = (plan(&s), plan(&SubdivisionSettings { floors_min: 6, floors_max: 6, floors_cap: 0, ..s.clone() }));
         let madrid = Location { lat_deg: 40.4, lon_deg: -3.7, tz_hours: 1.0 };
-        // 5 h of December sun in Madrid (≈ 9 h of day) separates the heights.
-        let low = daylight_share(&plan, &madrid, 5.0, DAYLIGHT_SPACING);
-        let tall = SubdivisionSettings { floors_min: 6, floors_max: 6, floors_cap: 0, ..s.clone() };
-        let plan_tall = lot::plan_site(&site, 0.0, &tall, &BTreeMap::new(), &mut Vec::new(), &mut Vec::new()).unwrap();
-        let high = daylight_share(&plan_tall, &madrid, 5.0, DAYLIGHT_SPACING);
-        assert!((0.0..=1.0).contains(&low) && high < low, "taller shades more: {high} vs {low}");
+        let bogota = Location { lat_deg: 4.7, lon_deg: -74.1, tz_hours: -5.0 };
+        let opts = |period, hours| DaylightOpts { period, hours, overheat_hours: Some(6.0) };
+        let fd = |p: &SitePlanBake, loc: &Location, o: &DaylightOpts| facade_daylight(p, s.floor_height, loc, o).unwrap();
+        for loc in [madrid, bogota] {
+            let annual = fd(&low, &loc, &opts(DaylightPeriod::Annual, 2.0));
+            let worst = fd(&low, &loc, &opts(DaylightPeriod::WorstMonth, 2.0));
+            let high = fd(&tall, &loc, &opts(DaylightPeriod::Annual, 2.0));
+            eprintln!("lat {}: annual {annual:?} worst {worst:?} tall {high:?}", loc.lat_deg);
+            for v in [annual.facade, annual.floors, worst.facade, annual.overheat.unwrap()] {
+                assert!((0.0..=1.0).contains(&v));
+            }
+            assert!(annual.facade > 0.2, "a low neighbourhood is mostly daylit");
+            assert!(high.facade <= annual.facade, "taller shades more");
+            assert!(annual.floors >= annual.facade - 1e-9, "a storey needs one daylit sample");
+        }
         let req = OptimizeRequest { budget: 8, min_daylight: Some(0.1), ..OptimizeRequest::default() };
         let err = optimize(&site, &s, &req).unwrap_err();
         assert!(err.contains("needs a location"), "{err}");
         let r = optimize(&site, &s, &OptimizeRequest { location: Some(madrid), ..req }).unwrap();
         assert!(r.candidates.iter().all(|c| c.eval.quantities.daylight.is_some_and(|d| d >= 0.1)));
+        let crate::Command::SiteOptimize { request, .. } =
+            parse("siteoptimize last daylight_period=03-15 max_overheat=30 overheat_hours=5").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(request.daylight_period, DaylightPeriod::Custom { month: 3, day: 15 });
+        assert_eq!((request.max_overheat, request.overheat_hours), (Some(0.3), 5.0));
     }
 
     #[test]

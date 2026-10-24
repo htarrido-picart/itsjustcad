@@ -31,6 +31,7 @@ pub mod raster;
 mod registry;
 pub mod rhino3dm;
 pub mod saf;
+pub mod site_metrics;
 pub mod site_optimize;
 pub mod sketch;
 pub mod stairs;

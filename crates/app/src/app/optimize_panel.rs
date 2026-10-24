@@ -18,7 +18,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use itsjustcad_commands::site_optimize::{
-    self, Economics, Ledger, Objective, OptimizeRequest, OptimizeResult, Quantities, SEARCHED,
+    self, DaylightPeriod, Economics, Ledger, Objective, OptimizeRequest, OptimizeResult, Quantities,
+    SEARCHED,
 };
 use itsjustcad_commands::{subdiv_params, Command};
 use itsjustcad_doc::{ObjectId, SubdivKind};
@@ -60,10 +61,11 @@ pub(super) enum Constraint {
     MaxStories,
     MinParkAccess,
     MinDaylight,
+    MaxOverheat,
 }
 
 impl Constraint {
-    pub(super) const ALL: [Constraint; 12] = [
+    pub(super) const ALL: [Constraint; 13] = [
         Constraint::MinLotArea,
         Constraint::MinLotWidth,
         Constraint::MinFrontage,
@@ -76,6 +78,7 @@ impl Constraint {
         Constraint::MaxStories,
         Constraint::MinParkAccess,
         Constraint::MinDaylight,
+        Constraint::MaxOverheat,
     ];
 
     /// On out of the box (the core's defaults): no strip lots, no
@@ -105,6 +108,7 @@ impl Constraint {
             Constraint::MaxStories => "optimize.max_stories",
             Constraint::MinParkAccess => "optimize.min_park_access",
             Constraint::MinDaylight => "optimize.min_daylight",
+            Constraint::MaxOverheat => "optimize.max_overheat",
         }
     }
 
@@ -123,6 +127,7 @@ impl Constraint {
             Constraint::MaxStories => (6.0, 1.0, ""),
             Constraint::MinParkAccess => (90.0, 1.0, "%"),
             Constraint::MinDaylight => (50.0, 1.0, "%"),
+            Constraint::MaxOverheat => (30.0, 1.0, "%"),
         }
     }
 
@@ -133,6 +138,7 @@ impl Constraint {
                 | Constraint::MaxCoverage
                 | Constraint::MinParkAccess
                 | Constraint::MinDaylight
+                | Constraint::MaxOverheat
         )
     }
 }
@@ -144,7 +150,7 @@ pub(super) struct OptimizeForm {
     /// Weights per [`METRICS`] entry (used by `Weighted`; zero = omitted).
     pub weights: [f64; 5],
     /// Per [`Constraint::ALL`]: (enabled, value in form units).
-    pub constraints: [(bool, f64); 12],
+    pub constraints: [(bool, f64); 13],
     pub budget: usize,
     pub seed: u64,
     pub locks: BTreeSet<String>,
@@ -152,6 +158,10 @@ pub(super) struct OptimizeForm {
     pub patterns: BTreeSet<String>,
     /// Unit prices of the `value` objective (and the Yield economics block).
     pub economics: Economics,
+    /// Facade daylight: period, sun hours a day, overheating hours.
+    pub daylight_period: DaylightPeriod,
+    pub daylight_hours: f64,
+    pub overheat_hours: f64,
 }
 
 impl Default for OptimizeForm {
@@ -166,6 +176,9 @@ impl Default for OptimizeForm {
             locks: BTreeSet::new(),
             patterns: d.patterns.iter().cloned().collect(),
             economics: d.economics,
+            daylight_period: d.daylight_period,
+            daylight_hours: d.daylight_hours,
+            overheat_hours: d.overheat_hours,
         }
     }
 }
@@ -186,6 +199,9 @@ impl OptimizeForm {
             budget: self.budget,
             seed: self.seed,
             economics: self.economics,
+            daylight_period: self.daylight_period,
+            daylight_hours: self.daylight_hours,
+            overheat_hours: self.overheat_hours,
             lock: SEARCHED
                 .iter()
                 .filter(|k| self.locks.contains(**k))
@@ -230,6 +246,7 @@ impl OptimizeForm {
                 Constraint::MaxStories => req.max_stories = v.map(|n| n.round().max(1.0) as usize),
                 Constraint::MinParkAccess => req.min_park_access = v,
                 Constraint::MinDaylight => req.min_daylight = v,
+                Constraint::MaxOverheat => req.max_overheat = v,
             }
         }
         req
@@ -275,8 +292,10 @@ pub(super) struct Metrics {
     pub floors: Option<f64>,
     /// Lots within walking distance of a park, percent.
     pub park_pct: Option<f64>,
-    /// Open ground with the winter sun hours, percent (when measured).
+    /// Facade area with the daylight sun hours, percent (when measured).
     pub daylight_pct: Option<f64>,
+    /// Facade area overheating on the hottest month, percent (when asked).
+    pub overheat_pct: Option<f64>,
 }
 
 impl Metrics {
@@ -290,6 +309,7 @@ impl Metrics {
             floors: None,
             park_pct: None,
             daylight_pct: None,
+            overheat_pct: None,
         }
     }
 
@@ -300,6 +320,7 @@ impl Metrics {
             floors: f.get(f.len() / 2).map(|n| *n as f64),
             park_pct: Some(e.quantities.park_access() * 100.0),
             daylight_pct: e.quantities.daylight.map(|d| d * 100.0),
+            overheat_pct: e.quantities.overheat.map(|d| d * 100.0),
             ..Metrics::from_report(&e.report)
         }
     }
@@ -316,6 +337,7 @@ impl Metrics {
             Col::Floors => self.floors,
             Col::Park => self.park_pct,
             Col::Daylight => self.daylight_pct,
+            Col::Overheat => self.overheat_pct,
         }
     }
 
@@ -360,10 +382,11 @@ pub(super) enum Col {
     Floors,
     Park,
     Daylight,
+    Overheat,
 }
 
 impl Col {
-    const ALL: [Col; 9] = [
+    const ALL: [Col; 10] = [
         Col::Score,
         Col::Lots,
         Col::Net,
@@ -373,6 +396,7 @@ impl Col {
         Col::Floors,
         Col::Park,
         Col::Daylight,
+        Col::Overheat,
     ];
 
     fn label_key(self) -> &'static str {
@@ -386,6 +410,7 @@ impl Col {
             Col::Floors => "optimize.col.floors",
             Col::Park => "optimize.col.park",
             Col::Daylight => "optimize.col.daylight",
+            Col::Overheat => "optimize.col.overheat",
         }
     }
 
@@ -395,7 +420,7 @@ impl Col {
         match self {
             Col::Score if (a - a.round()).abs() < 1e-9 => format!("{a:.0}"),
             Col::Score | Col::Far => format!("{a:.2}"),
-            Col::Lots | Col::Floors | Col::Park | Col::Daylight => format!("{a:.0}"),
+            Col::Lots | Col::Floors | Col::Park | Col::Daylight | Col::Overheat => format!("{a:.0}"),
             Col::Open => format!("{a:.1}"),
             Col::Net | Col::Gfa => match a {
                 a if a < 10_000.0 => format!("{a:.0}"),
@@ -465,6 +490,9 @@ pub(super) fn columns(form: &OptimizeForm, rows: &[ResultRow]) -> Vec<Col> {
         cols.extend([Col::Lots, Col::Floors, Col::Park]);
         if on(Constraint::MinDaylight) || weight("daylight") {
             cols.push(Col::Daylight);
+        }
+        if on(Constraint::MaxOverheat) {
+            cols.push(Col::Overheat);
         }
         return cols;
     }
@@ -619,7 +647,7 @@ pub(super) struct OptimizePanel {
     /// Last finished search: (elapsed, rows + summary, or the error).
     result: Option<(Duration, Result<Finished, String>)>,
     /// The Yield economics block's plan quantities, per (source, generation).
-    current_q: Option<(ObjectId, u64, Option<Quantities>)>,
+    current_q: Option<(ObjectId, u64, site_optimize::DaylightOpts, Option<Quantities>)>,
 }
 
 impl OptimizeForm {
@@ -730,6 +758,7 @@ impl App {
                 self.optimize_form(ui, source);
                 ui.add_space(crate::theme::Spacing::S);
                 self.optimize_economics(ui, source);
+                self.optimize_daylight(ui, source);
                 ui.add_space(crate::theme::Spacing::SM);
                 self.optimize_run_row(ui, source);
                 ui.add_space(crate::theme::Spacing::S);
@@ -878,7 +907,18 @@ impl App {
                         ui.strong(t("optimize.col.rank"));
                         for c in &f.cols {
                             let key = if *c == Col::Score { f.score_key } else { c.label_key() };
-                            ui.strong(t(key));
+                            let head = ui.strong(t(key));
+                            // Short headers keep the table in the panel; the
+                            // hover names the metric in full.
+                            let full = match c {
+                                Col::Park => Some("optimize.yield.park"),
+                                Col::Daylight => Some("optimize.yield.daylight"),
+                                Col::Overheat => Some("optimize.yield.overheat"),
+                                _ => None,
+                            };
+                            if let Some(k) = full {
+                                head.on_hover_text(t(k));
+                            }
                         }
                         ui.end_row();
                         if let Some(b) = &base {
@@ -949,7 +989,7 @@ impl App {
         let busy = self.optimize.job.is_some();
         let no_location = self.session.doc.location.is_none();
         let form = &mut self.optimize.form;
-        let daylight_on = form.constraints[11].0;
+        let daylight_on = form.constraints[11].0 || form.constraints[12].0;
         if daylight_on && no_location {
             ui.colored_label(ui.visuals().warn_fg_color, t("optimize.daylight_needs_location"));
         }
@@ -1024,13 +1064,73 @@ impl App {
             });
     }
 
+    /// Facade daylight settings: the period (annual by default, the site's
+    /// worst month, or a date — never a hemisphere assumption), the daily sun
+    /// hours a facade needs, and the overheating threshold. Open when a
+    /// daylight constraint is on.
+    fn optimize_daylight(&mut self, ui: &mut egui::Ui, source: ObjectId) {
+        let busy = self.optimize.job.is_some();
+        let form = &mut self.optimize.form;
+        let on = form.constraints[11].0 || form.constraints[12].0;
+        egui::CollapsingHeader::new(t("optimize.daylight"))
+            .id_salt(("optimize_daylight", source, on))
+            .default_open(on)
+            .show(ui, |ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::Grid::new(("optimize_daylight_grid", source))
+                        .num_columns(2)
+                        .spacing(GRID_SPACING)
+                        .show(ui, |ui| {
+                            ui.label(t("optimize.daylight.period"));
+                            let custom = DaylightPeriod::Custom { month: 3, day: 21 };
+                            let label = |p: &DaylightPeriod| match p {
+                                DaylightPeriod::Annual => t("optimize.daylight.annual"),
+                                DaylightPeriod::WorstMonth => t("optimize.daylight.worst"),
+                                DaylightPeriod::Custom { .. } => t("optimize.daylight.custom"),
+                            };
+                            egui::ComboBox::from_id_salt(("optimize_daylight_period", source))
+                                .selected_text(label(&form.daylight_period))
+                                .show_ui(ui, |ui| {
+                                    for p in [DaylightPeriod::Annual, DaylightPeriod::WorstMonth, custom] {
+                                        let sel = std::mem::discriminant(&form.daylight_period)
+                                            == std::mem::discriminant(&p);
+                                        if ui.selectable_label(sel, label(&p)).clicked() && !sel {
+                                            form.daylight_period = p;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+                            if let DaylightPeriod::Custom { month, day } = &mut form.daylight_period {
+                                ui.label(t("optimize.daylight.date"));
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::DragValue::new(month).range(1..=12).prefix("M "));
+                                    ui.add(egui::DragValue::new(day).range(1..=28).prefix("D "));
+                                });
+                                ui.end_row();
+                            }
+                            ui.label(t("optimize.daylight.hours"));
+                            ui.add(egui::DragValue::new(&mut form.daylight_hours).speed(0.1).range(0.5..=12.0).suffix(" h"));
+                            ui.end_row();
+                            ui.label(t("optimize.daylight.overheat_hours"));
+                            ui.add(egui::DragValue::new(&mut form.overheat_hours).speed(0.1).range(1.0..=14.0).suffix(" h"));
+                            ui.end_row();
+                        });
+                });
+            });
+    }
+
     /// The Yield segment's `Economics` block for a site plan: the current
     /// plan's ledger at the Optimize form's unit prices, its storeys, park
     /// access and (with a location) winter daylight. Measured once per
     /// document generation.
     pub(super) fn yield_economics(&mut self, ui: &mut egui::Ui, source: ObjectId) {
         let generation = self.session.doc.generation;
-        let fresh = matches!(&self.optimize.current_q, Some((id, g, _)) if *id == source && *g == generation);
+        // The form's daylight settings; overheating always measured here.
+        let opts = site_optimize::DaylightOpts {
+            overheat_hours: Some(self.optimize.form.overheat_hours),
+            ..self.optimize.form.to_request().daylight_opts()
+        };
+        let fresh = matches!(&self.optimize.current_q, Some((id, g, o, _)) if *id == source && *g == generation && *o == opts);
         if !fresh {
             let doc = &self.session.doc;
             let q = site_optimize::site_boundary(doc, &[source]).and_then(|(_, site)| {
@@ -1038,14 +1138,16 @@ impl App {
                 let mut q = site_optimize::evaluate(&site, &base, &edits, &OptimizeRequest::default())
                     .ok()?
                     .quantities;
-                q.daylight = doc.location.map(location).and_then(|loc| {
-                    site_optimize::plan_daylight(&site, &base, &edits, &loc, OptimizeRequest::default().daylight_hours)
-                });
+                let d = doc
+                    .location
+                    .map(location)
+                    .and_then(|loc| site_optimize::plan_daylight(&site, &base, &edits, &loc, &opts));
+                site_optimize::set_daylight(&mut q, d);
                 Some(q)
             });
-            self.optimize.current_q = Some((source, generation, q));
+            self.optimize.current_q = Some((source, generation, opts, q));
         }
-        let Some((_, _, Some(q))) = &self.optimize.current_q else {
+        let Some((_, _, _, Some(q))) = &self.optimize.current_q else {
             return;
         };
         let lot_area_min = self
@@ -1063,6 +1165,12 @@ impl App {
         lines.push(("optimize.yield.park", fmt_abs(Col::Park, q.park_access() * 100.0), "%"));
         if let Some(d) = q.daylight {
             lines.push(("optimize.yield.daylight", fmt_abs(Col::Daylight, d * 100.0), "%"));
+        }
+        if let Some(d) = q.daylight_floors {
+            lines.push(("optimize.yield.daylight_floors", fmt_abs(Col::Daylight, d * 100.0), "%"));
+        }
+        if let Some(d) = q.overheat {
+            lines.push(("optimize.yield.overheat", fmt_abs(Col::Overheat, d * 100.0), "%"));
         }
         let floors = q.floors_sorted();
         ui.add_space(crate::theme::Spacing::S);
@@ -1338,6 +1446,7 @@ mod tests {
                 floors: None,
                 park_pct: None,
                 daylight_pct: None,
+                overheat_pct: None,
             },
             pareto: true,
             params: BTreeMap::new(),
@@ -1355,6 +1464,8 @@ mod tests {
         let mut sunny = value.clone();
         sunny.constraints[11].0 = true;
         assert_eq!(columns(&sunny, &[row(0.0)]), [Score, Lots, Floors, Park, Daylight]);
+        sunny.constraints[12].0 = true;
+        assert_eq!(columns(&sunny, &[row(0.0)]), [Score, Lots, Floors, Park, Daylight, Overheat]);
         let mut f = OptimizeForm { objective: Objective::Lots, ..value };
         f.constraints[3].0 = false; // min open (on by default)
         assert_eq!(columns(&f, &[row(0.0)]), [Lots, Net, Gfa], "lots: score = lots column");
@@ -1409,9 +1520,13 @@ mod tests {
             f.constraints[i].0 = false;
         }
         f.constraints[11] = (true, 40.0);
+        f.constraints[12] = (true, 25.0);
+        f.daylight_period = DaylightPeriod::WorstMonth;
         let r = f.to_request();
         assert_eq!((r.min_open, r.max_stories, r.min_park_access), (None, None, None));
-        assert_eq!(r.min_daylight, Some(0.4));
+        assert_eq!((r.min_daylight, r.max_overheat), (Some(0.4), Some(0.25)));
+        assert_eq!(r.daylight_period, DaylightPeriod::WorstMonth);
+        assert_eq!(r.daylight_opts().overheat_hours, Some(6.0));
     }
 
     #[test]
