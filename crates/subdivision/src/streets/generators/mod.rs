@@ -39,6 +39,113 @@ pub mod voronoi;
 use crate::geometry::polygon2d::Polygon2d;
 use crate::settings::{StreetPattern, SubdivisionSettings};
 use crate::streets::street_graph::StreetGraph;
+use glam::DVec2;
+
+/// A clipped piece shorter than this (metres) is a crumb, not a road: dropped.
+const MIN_PIECE_M: f64 = 1e-3;
+/// A point this close to the site boundary (metres) counts as on it.
+const ON_BOUNDARY_EPS: f64 = 1e-9;
+
+fn on_boundary(site: &Polygon2d, p: DVec2) -> bool {
+    site.edges().any(|(a, b)| {
+        let ab = b - a;
+        let l2 = ab.length_squared();
+        let t = if l2 > 0.0 { ((p - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+        p.distance(a + ab * t) <= ON_BOUNDARY_EPS
+    })
+}
+
+/// Parameters `t ∈ (0, 1)` where segment `a`→`b` meets the site boundary.
+fn boundary_hits(site: &Polygon2d, a: DVec2, b: DVec2) -> Vec<f64> {
+    let d = b - a;
+    let mut ts = Vec::new();
+    for (c, e) in site.edges() {
+        let f = e - c;
+        let den = d.perp_dot(f);
+        if den.abs() < 1e-15 {
+            // Parallel: if collinear, the edge endpoints bound an overlap.
+            if (c - a).perp_dot(d).abs() < 1e-9 * d.length().max(1.0) {
+                let l2 = d.length_squared();
+                ts.extend([c, e].map(|q| (q - a).dot(d) / l2));
+            }
+            continue;
+        }
+        let t = (c - a).perp_dot(f) / den;
+        let u = (c - a).perp_dot(d) / den;
+        if (-1e-12..=1.0 + 1e-12).contains(&u) {
+            ts.push(t);
+        }
+    }
+    ts.retain(|t| *t > 1e-12 && *t < 1.0 - 1e-12);
+    ts
+}
+
+/// Clip an open (or closed) polyline to the — possibly concave — site: the
+/// pieces of it inside the site or on its boundary, in order. Each piece that
+/// leaves the site ends exactly on the boundary; pieces shorter than
+/// [`MIN_PIECE_M`] are dropped. A polyline wholly inside comes back unchanged.
+pub(crate) fn clip_polyline_to_site(site: &Polygon2d, pts: &[DVec2]) -> Vec<Vec<DVec2>> {
+    let mut runs: Vec<Vec<DVec2>> = Vec::new();
+    let mut cur: Vec<DVec2> = Vec::new();
+    let flush = |cur: &mut Vec<DVec2>, runs: &mut Vec<Vec<DVec2>>| {
+        if cur.len() >= 2 && crate::geometry::polyline::PolylineTools::arc_length(cur) >= MIN_PIECE_M {
+            runs.push(std::mem::take(cur));
+        }
+        cur.clear();
+    };
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a.distance_squared(b) < 1e-24 {
+            continue;
+        }
+        let mut ts = boundary_hits(site, a, b);
+        ts.extend([0.0, 1.0]);
+        ts.sort_by(f64::total_cmp);
+        ts.dedup_by(|x, y| (*x - *y).abs() < 1e-12);
+        for iv in ts.windows(2) {
+            let mid = a.lerp(b, 0.5 * (iv[0] + iv[1]));
+            if !(site.contains(mid) || on_boundary(site, mid)) {
+                flush(&mut cur, &mut runs);
+                continue;
+            }
+            let (p0, p1) = (a.lerp(b, iv[0]), a.lerp(b, iv[1]));
+            if cur.is_empty() {
+                cur.push(p0);
+            }
+            // Extend along the same segment instead of adding a collinear point.
+            if iv[0] > 0.0 && cur.len() >= 2 {
+                cur.pop();
+            }
+            cur.push(p1);
+        }
+    }
+    flush(&mut cur, &mut runs);
+    // A closed loop cut open: rejoin the piece through its start vertex.
+    let closed = pts.len() >= 3 && pts[0].distance(pts[pts.len() - 1]) < 1e-9;
+    if closed
+        && runs.len() >= 2
+        && runs[0][0] == pts[0]
+        && runs.last().and_then(|r| r.last()) == pts.last()
+    {
+        let first = runs.remove(0);
+        runs.last_mut().unwrap().extend_from_slice(&first[1..]);
+    }
+    runs
+}
+
+/// Clip every street of `graph` to `site` (#166): generators that lay a
+/// lattice / diagram over the site bbox (hexagonal, Voronoi) or step off a
+/// concave site (cul-de-sac stubs) would otherwise leave centerlines outside.
+/// Streets keep their width + tier; ids are reassigned in order.
+pub(crate) fn clip_to_site(site: &Polygon2d, graph: StreetGraph) -> StreetGraph {
+    let mut out = StreetGraph::new();
+    for s in graph.streets {
+        for piece in clip_polyline_to_site(site, &s.centerline) {
+            out.add(piece, s.width, s.tier);
+        }
+    }
+    out
+}
 
 /// A deterministic splitmix64 stream shared by the generators.
 pub(crate) struct SplitMix64 {
@@ -119,7 +226,7 @@ pub fn effective_road_width(settings: &SubdivisionSettings) -> f64 {
 /// generators (radial / hexagonal / Voronoi). All seven produce a `StreetGraph`
 /// fed to the same `block_extractor`.
 pub fn generate(site: &Polygon2d, settings: &SubdivisionSettings) -> StreetGraph {
-    match settings.street_pattern {
+    let graph = match settings.street_pattern {
         StreetPattern::Orthogonal => orthogonal::generate(site, settings),
         StreetPattern::Skewed => skewed::generate(site, settings),
         StreetPattern::Organic => organic::generate(site, settings),
@@ -128,7 +235,8 @@ pub fn generate(site: &Polygon2d, settings: &SubdivisionSettings) -> StreetGraph
         StreetPattern::Radial => radial::generate(site, settings),
         StreetPattern::Hexagonal => hexagonal::generate(site, settings),
         StreetPattern::Voronoi => voronoi::generate(site, settings),
-    }
+    };
+    clip_to_site(site, graph)
 }
 
 #[cfg(test)]
