@@ -437,6 +437,9 @@ pub struct SubdivisionSettings {
     /// Random floors per lot: upper bound. 0 = off (every lot gets
     /// `floor_count`).
     pub floors_max: usize,
+    /// Storey cap on every drawn floor count (`floor_count`, the random range
+    /// and each mix class are clamped to it); per-lot pins are not. 0 = off.
+    pub floors_cap: usize,
     /// Seed of the per-lot height draw. 0 = follow `seed`. Change it to
     /// reshuffle heights without changing the layout.
     pub height_seed: u64,
@@ -505,6 +508,7 @@ impl Default for SubdivisionSettings {
             roof_pitch: 30.0,
             floors_min: 0,
             floors_max: 0,
+            floors_cap: 0,
             height_seed: 0,
             height_mix: None,
             height_falloff: HeightFalloff::None,
@@ -533,6 +537,35 @@ impl SubdivisionSettings {
     /// `irregularity` clamped to `[0, cap]` (cap widened by `loose`).
     pub fn clamped_irregularity(&self) -> f64 {
         self.irregularity.clamp(0.0, self.irregularity_cap())
+    }
+
+    /// A walkable residential neighbourhood (a preset, `lotsettings
+    /// preset=walkable`; not the struct `Default`, so documents that never set
+    /// lot settings replay unchanged). Lots 400–800 m², at least 12 m wide
+    /// and about 30 m deep; an orthogonal (connected, dead-end-free) grid of
+    /// 12 m local streets with a 60 m block depth, so blocks are about
+    /// 60–120 m a side (faces within 60–200 m, perimeter well under 800 m);
+    /// 10 % of the blocks reserved as parks; 2–5 storeys, capped at 6.
+    pub fn walkable() -> SubdivisionSettings {
+        SubdivisionSettings {
+            lot_area_min: 400.0,
+            lot_area_max: 800.0,
+            lot_width_min: 12.0,
+            lot_depth_target: 30.0,
+            lot_depth_tolerance: 8.0,
+            street_pattern: StreetPattern::Orthogonal,
+            road_width: 12.0,
+            block_depth: 60.0,
+            open_space_reserve_frac: 0.10,
+            setback_front: 3.0,
+            setback_side: 1.5,
+            setback_rear: 3.0,
+            floor_count: 3,
+            floors_min: 2,
+            floors_max: 5,
+            floors_cap: 6,
+            ..SubdivisionSettings::default()
+        }
     }
 
     /// A fully-metric **euro_latam** settings object. Every value is a
