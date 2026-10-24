@@ -6168,6 +6168,116 @@ fn exec_street_set(
     ))
 }
 
+/// `streetmove` / `streetnode` / `streetreset` (#157): edit the centreline of
+/// the targeted generated street(s), store the result as per-street overrides
+/// on their site link, validate the edited network, then re-derive the link.
+/// One undo step (`LotRefreshed`).
+fn exec_street_geometry(
+    doc: &mut Document,
+    targets: Selector,
+    op: crate::lot::StreetOp,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    use crate::lot::{streets, StreetOp};
+    let verb = op.verb();
+    let err = |m: &str| ExecError::Invalid(format!("{verb}: {m}"));
+    let pick = "select generated roads (from siteplan or lotgeneratesite)";
+    let objs = resolve(doc, &targets)?;
+    let reset_all = matches!(op, StreetOp::Reset { all: true });
+    let mut source = None;
+    let mut street_ids = Vec::new();
+    for id in &objs {
+        // `streetreset all` takes any object of the plan, or its boundary.
+        let src = doc.subdiv_source_of(*id).or_else(|| {
+            (reset_all && doc.subdivision_links.contains_key(id)).then_some(*id)
+        });
+        let street = doc.get(*id).and_then(|o| o.street.as_ref()).map(|s| s.id);
+        let Some(src) = src.filter(|_| reset_all || street.is_some()) else {
+            if reset_all {
+                continue;
+            }
+            return Err(err(pick));
+        };
+        if source.is_some_and(|s| s != src) {
+            return Err(err(if reset_all {
+                "the selection spans several site plans; select one"
+            } else {
+                "the selected roads come from different site plans"
+            }));
+        }
+        source = Some(src);
+        street_ids.extend(street);
+    }
+    let Some(source) = source else {
+        return Err(err(pick));
+    };
+    let link = doc.subdivision_links[&source].clone();
+    if link.frozen {
+        return Err(err("this result is frozen — unfreeze to recompute"));
+    }
+    if !matches!(
+        link.kind,
+        itsjustcad_doc::SubdivKind::Site | itsjustcad_doc::SubdivKind::SitePlan
+    ) {
+        return Err(err(pick));
+    }
+    street_ids.sort_unstable();
+    street_ids.dedup();
+
+    let prev_link = Box::new(link.clone());
+    let mut new_link = link;
+    let summary;
+    if let StreetOp::Reset { all } = op {
+        let before = new_link.streets.len();
+        if all {
+            new_link.streets.clear();
+        } else {
+            new_link.streets.retain(|id, _| !street_ids.contains(id));
+        }
+        let n = before - new_link.streets.len();
+        if n == 0 {
+            return Err(err("no street overrides to reset"));
+        }
+        summary = format!("{n} street(s) reset to the rule");
+    } else {
+        let site = streets::site_polygon(doc, source)
+            .ok_or_else(|| err("could not read the site boundary"))?;
+        let before = streets::edited_graph(&site, &new_link.settings, &new_link.streets);
+        let changed = streets::apply_op(&before, &street_ids, &op).map_err(|m| err(&m))?;
+        for (id, pts) in &changed {
+            new_link.streets.entry(*id).or_default().centerline = Some(pts.clone());
+        }
+        let after = streets::edited_graph(&site, &new_link.settings, &new_link.streets);
+        let changed_ids = changed.keys().copied().collect();
+        streets::validate(&site, &new_link.settings, &before, &after, &changed_ids)
+            .map_err(|m| err(&m))?;
+        summary = format!("{} street(s) edited", changed.len());
+    }
+    let (new_ids, restored, dropped) = rederive_link(doc, source, new_link, ids, verb)?;
+    let message = format!(
+        "{verb}: {summary}; {} object(s) recomputed{}",
+        new_ids.len(),
+        dropped_roles_note(dropped)
+    );
+    Ok((
+        Command::StreetGeometry {
+            targets: Selector::Ids { ids: objs },
+            op,
+            ids: Some(new_ids.clone()),
+        },
+        Inverse::LotRefreshed {
+            source,
+            created: new_ids.clone(),
+            restored,
+            prev_link,
+        },
+        ApplyOutcome {
+            created: new_ids,
+            message,
+        },
+    ))
+}
+
 /// `edgerole` (#143 phase 5): override (or with `role: None` clear) the setback
 /// role of curve edge `edge` of one lot. A lot of a Lots/SitePlan link stores
 /// the override on the link and re-derives it (one `LotRefreshed` undo step);
@@ -10857,6 +10967,13 @@ fn apply_forward(
                 )));
             };
             let curve = curve_of(doc, tid, "setpoint")?.clone();
+            // A node of a generated road of a live site plan (#157).
+            if matches!(curve, Curve::Polyline { .. })
+                && crate::lot::streets::live_roads_source(doc, &[tid]).is_some()
+            {
+                let op = crate::lot::StreetOp::Node { index: index as usize, to: position.truncate() };
+                return exec_street_geometry(doc, Selector::Ids { ids: vec![tid] }, op, None);
+            }
             let mut new = curve.clone();
             let i = index as usize;
             match &mut new {
@@ -11607,6 +11724,12 @@ fn apply_forward(
         }
         Command::Move { targets, delta } => {
             let ids = resolve(doc, &targets)?;
+            // A generated road of a live site plan moves as a street (#157):
+            // the plan regenerates around it instead of going stale.
+            if delta.truncate().length() > 1e-9 && crate::lot::streets::live_roads_source(doc, &ids).is_some() {
+                let op = crate::lot::StreetOp::Move { delta: delta.truncate() };
+                return exec_street_geometry(doc, Selector::Ids { ids }, op, None);
+            }
             for id in &ids {
                 doc.get_mut(*id).expect("resolved").geometry.translate(delta);
             }
@@ -13808,6 +13931,7 @@ fn apply_forward(
         Command::StreetSet { targets, name, class, width, ids } => {
             exec_street_set(doc, targets, name, class, width, ids)
         }
+        Command::StreetGeometry { targets, op, ids } => exec_street_geometry(doc, targets, op, ids),
         Command::EdgeRole { targets, edge, role, ids } => {
             exec_edge_role(doc, targets, edge, role, ids)
         }
@@ -16642,6 +16766,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotSetParams { .. } => "lotsetparams",
         Command::LotFreeze { .. } => "lotfreeze",
         Command::StreetSet { .. } => "streetset",
+        Command::StreetGeometry { op, .. } => op.verb(),
         Command::EdgeRole { .. } => "edgerole",
         Command::LotHeight { .. } => "lotheight",
         Command::LotSet { .. } => "lotset",
@@ -27766,8 +27891,9 @@ mod tests {
         assert_eq!(polys(&s, crate::lot::LOTS_LAYER), lots0);
     }
 
-    /// Moving a generated road does not regenerate: it reads as edited (the
-    /// plan is stale), undo clears it, and `lotrefresh` replaces the edit.
+    /// Rotating a generated road does not regenerate: it reads as edited (the
+    /// plan is stale), undo clears it, and `lotrefresh` replaces the edit. (A
+    /// move or point edit runs as a street geometry edit instead, #157.)
     #[test]
     fn hand_edited_road_marks_plan_stale() {
         let mut s = Session::default();
@@ -27777,19 +27903,17 @@ mod tests {
         let stale =
             |s: &Session| crate::lot::edited_roads(&s.doc, &s.doc.subdivision_links[&source]);
         let road = street_roads(&s.doc)[0].0;
-        s.run(Command::Move {
+        let rotate = || Command::Rotate {
             targets: Selector::Ids { ids: vec![road] },
-            delta: DVec3::new(5.0, 0.0, 0.0),
-        })
-        .unwrap();
+            angle_deg: 2.0,
+            axis: DVec3::Z,
+            center: None,
+        };
+        s.run(rotate()).unwrap();
         assert_eq!(stale(&s), 1);
         run(&mut s, "undo");
         assert_eq!(stale(&s), 0);
-        s.run(Command::Move {
-            targets: Selector::Ids { ids: vec![road] },
-            delta: DVec3::new(5.0, 0.0, 0.0),
-        })
-        .unwrap();
+        s.run(rotate()).unwrap();
         let out = s.run(Command::LotRefresh { source, ids: None }).unwrap();
         assert!(
             out.message
@@ -27810,6 +27934,214 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("select generated roads"));
+    }
+
+    // ── #157 editable street centrelines ───────────────────────────────────
+
+    /// A 200×150 grid site plan (block_depth 40: seven streets meeting at
+    /// T-junctions), its boundary id.
+    fn grid_plan(block_depth: &str) -> (Session, ObjectId) {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 150");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "siteplan last");
+        s.run(Command::LotSetParams {
+            source,
+            params: [("block_depth".to_string(), block_depth.to_string())].into(),
+            ids: None,
+        })
+        .unwrap();
+        (s, source)
+    }
+
+    /// The road object of street `id` and its plan-XY centreline.
+    fn road_of(doc: &Document, id: u32) -> (ObjectId, Vec<glam::DVec2>) {
+        let o = doc
+            .objects()
+            .find(|o| o.street.as_ref().is_some_and(|s| s.id == id))
+            .expect("street road");
+        let Geometry::Curve(Curve::Polyline { points, .. }) = &o.geometry else {
+            panic!("road is a polyline")
+        };
+        (o.id, points.iter().map(|p| p.truncate()).collect())
+    }
+
+    /// The objects and links: what undo must restore exactly.
+    fn plan_state(s: &Session) -> String {
+        serde_json::to_string(&(s.doc.objects().collect::<Vec<_>>(), &s.doc.subdivision_links))
+            .unwrap()
+    }
+
+    /// Per-layer sorted geometry of the plan, independent of object ids.
+    fn plan_geometry(s: &Session) -> Vec<(String, String)> {
+        let mut v: Vec<_> = s
+            .doc
+            .objects()
+            .map(|o| (o.layer.clone(), serde_json::to_string(&o.geometry).unwrap()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn xy(x: f64, y: f64) -> glam::DVec2 {
+        glam::DVec2::new(x, y)
+    }
+
+    #[test]
+    fn street_geometry_commands_parse() {
+        use crate::lot::StreetOp;
+        let p = |l: &str| crate::parse::parse(l).unwrap();
+        let geo = |targets, op| Command::StreetGeometry { targets, op, ids: None };
+        assert_eq!(
+            p("streetmove delta=0,10"),
+            geo(Selector::Selected, StreetOp::Move { delta: xy(0.0, 10.0) })
+        );
+        assert_eq!(
+            p("streetnode #ab12 1 to=110,75"),
+            geo(Selector::Named { name: "ab12".into() }, StreetOp::Node { index: 1, to: xy(110.0, 75.0) })
+        );
+        assert_eq!(
+            p("streetnode 2 to=1,2"),
+            geo(Selector::Selected, StreetOp::Node { index: 2, to: xy(1.0, 2.0) })
+        );
+        assert_eq!(
+            p("streetnode insert at=100,40"),
+            geo(Selector::Selected, StreetOp::Insert { at: xy(100.0, 40.0) })
+        );
+        assert_eq!(
+            p("streetnode sel delete 1"),
+            geo(Selector::Selected, StreetOp::Delete { index: 1 })
+        );
+        assert_eq!(p("streetreset all"), geo(Selector::All, StreetOp::Reset { all: true }));
+        assert_eq!(p("streetreset"), geo(Selector::Selected, StreetOp::Reset { all: false }));
+        for bad in ["streetmove", "streetmove delta=x", "streetnode 1", "streetnode insert", "streetreset last bogus"] {
+            assert!(crate::parse::parse(bad).is_err(), "{bad}");
+        }
+        // Old street edits (no centreline) still load.
+        let e: itsjustcad_doc::StreetEdit = serde_json::from_str(r#"{"width":16.0}"#).unwrap();
+        assert!(e.centerline.is_none() && !e.is_empty());
+    }
+
+    /// Acceptance (#157): dragging one interior node 10 m regenerates the plan
+    /// around it in one undo step; undo restores it exactly; a block_depth
+    /// change keeps the edited street; replay reproduces it; `streetreset all`
+    /// equals a fresh plan.
+    #[test]
+    fn dragging_a_street_node_regenerates_the_plan_in_one_undo_step() {
+        let (mut s, source) = grid_plan("40");
+        let before = plan_state(&s);
+        let geometry0 = plan_geometry(&s);
+        let (road, line) = road_of(&s.doc, 1);
+        assert_eq!(line, vec![xy(0.0, 75.0), xy(100.0, 75.0)], "street 1 ends at the T");
+        let log0 = s.save_log().len();
+
+        // The point-edit drag of node 1 (the interior T at 100,75) by 10 m.
+        let out = s
+            .run(Command::SetPoint {
+                target: Selector::Ids { ids: vec![road] },
+                index: 1,
+                position: DVec3::new(110.0, 75.0, 0.0),
+            })
+            .unwrap();
+        assert!(out.message.starts_with("streetnode: 3 street(s) edited"), "{}", out.message);
+        let log = s.save_log();
+        assert_eq!(log.len(), log0 + 1, "one logged op");
+        assert!(matches!(&log[log0], Command::StreetGeometry { op: crate::lot::StreetOp::Node { index: 1, .. }, .. }));
+        assert_eq!(road_of(&s.doc, 1).1, vec![xy(0.0, 75.0), xy(110.0, 75.0)]);
+        assert_eq!(road_of(&s.doc, 4).1[0], xy(110.0, 75.0), "the street across follows");
+        assert_eq!(road_of(&s.doc, 0).1, vec![xy(100.0, 0.0), xy(110.0, 75.0), xy(100.0, 150.0)], "the through street bends");
+        let link = &s.doc.subdivision_links[&source];
+        assert!(link.streets[&1].centerline.is_some());
+        let geometry1 = plan_geometry(&s);
+        assert_ne!(geometry1, geometry0, "blocks and lots regenerated");
+        assert!(geometry1.iter().any(|(l, _)| l == crate::lot::LOTS_LAYER));
+        let street = crate::lot::street_view(&s.doc, source, 1).unwrap();
+        assert!(street.geometry_overridden && !street.edited, "an override, not a stale edit");
+
+        run(&mut s, "undo");
+        assert_eq!(plan_state(&s), before, "undo restores the plan exactly");
+        run(&mut s, "redo");
+        assert_eq!(plan_geometry(&s), geometry1);
+
+        // A block_depth change keeps the edited street and regenerates the rest.
+        s.run(Command::LotSetParams {
+            source,
+            params: [("block_depth".to_string(), "45".to_string())].into(),
+            ids: None,
+        })
+        .unwrap();
+        assert_eq!(road_of(&s.doc, 1).1, vec![xy(0.0, 75.0), xy(110.0, 75.0)], "kept");
+        assert_eq!(s.doc.subdivision_links[&source].settings.block_depth, 45.0);
+
+        // Replay of the saved op log reproduces the edited plan.
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&s.doc.objects().collect::<Vec<_>>()).unwrap(),
+            serde_json::to_string(&replayed.doc.objects().collect::<Vec<_>>()).unwrap(),
+            "byte for byte"
+        );
+
+        // streetreset all == a fresh siteplan with the same params.
+        let out = run(&mut s, "streetreset all");
+        assert!(out.message.contains("3 street(s) reset"), "{}", out.message);
+        assert!(s.doc.subdivision_links[&source].streets.is_empty());
+        let (fresh, _) = grid_plan("45");
+        assert_eq!(plan_geometry(&s), plan_geometry(&fresh));
+        assert!(s.run(crate::parse::parse("streetreset all").unwrap()).is_err(), "nothing left");
+    }
+
+    #[test]
+    fn street_edits_that_break_the_network_are_rejected() {
+        let (mut s, _) = grid_plan("40");
+        let state = plan_state(&s);
+        let (road1, _) = road_of(&s.doc, 1);
+        let (road2, _) = road_of(&s.doc, 2);
+        let fail = |s: &mut Session, line: String| {
+            s.run(crate::parse::parse(&line).unwrap()).unwrap_err().to_string()
+        };
+        let e = fail(&mut s, format!("streetnode id:{road1} 0 to=-10,75"));
+        assert!(e.contains("street 1 would leave the site: node 0 at (-10.00, 75.00)"), "{e}");
+        let e = fail(&mut s, format!("streetnode id:{road1} 1 to=100,60"));
+        assert!(e.contains("would cross without a shared node"), "{e}");
+        let e = fail(&mut s, format!("streetmove id:{road2} delta=-40,0"));
+        assert!(e.contains("thinner than the minimum block depth (20.0 m)"), "{e}");
+        let e = fail(&mut s, format!("streetnode id:{road1} delete 0"));
+        assert!(e.contains("not an interior node"), "{e}");
+        assert_eq!(plan_state(&s), state, "nothing changed");
+    }
+
+    /// A gumball move of a generated road moves the street (the ends resting
+    /// on it follow); insert + delete of a node round-trips the geometry.
+    #[test]
+    fn moving_a_road_moves_the_street_and_nodes_insert_and_delete() {
+        let (mut s, source) = grid_plan("40");
+        let (road1, _) = road_of(&s.doc, 1);
+        s.run(Command::Move {
+            targets: Selector::Ids { ids: vec![road1] },
+            delta: DVec3::new(0.0, 10.0, 0.0),
+        })
+        .unwrap();
+        assert!(matches!(s.save_log().last(), Some(Command::StreetGeometry { op: crate::lot::StreetOp::Move { .. }, .. })));
+        assert_eq!(road_of(&s.doc, 1).1, vec![xy(0.0, 85.0), xy(100.0, 85.0)]);
+        assert_eq!(road_of(&s.doc, 2).1[0], xy(50.0, 85.0), "a street ending on it follows");
+        assert_eq!(crate::lot::edited_roads(&s.doc, &s.doc.subdivision_links[&source]), 0, "not stale");
+
+        let (road3, line3) = road_of(&s.doc, 3);
+        run(&mut s, &format!("streetnode id:{road3} insert at=52,40"));
+        assert_eq!(road_of(&s.doc, 3).1, vec![line3[0], xy(50.0, 40.0), line3[1]]);
+        let (road3, _) = road_of(&s.doc, 3);
+        run(&mut s, &format!("streetnode id:{road3} delete 1"));
+        assert_eq!(road_of(&s.doc, 3).1, line3);
+
+        // A frozen plan keeps the plain (stale) move.
+        s.doc.subdivision_links.get_mut(&source).unwrap().frozen = true;
+        let (road1, _) = road_of(&s.doc, 1);
+        s.run(Command::Move {
+            targets: Selector::Ids { ids: vec![road1] },
+            delta: DVec3::new(0.0, 1.0, 0.0),
+        })
+        .unwrap();
+        assert!(matches!(s.save_log().last(), Some(Command::Move { .. })));
     }
 
     /// The one lot carrying a hand-set edge role, with its tags.

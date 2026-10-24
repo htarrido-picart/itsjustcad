@@ -3833,11 +3833,11 @@ fn lot_view_value(
 }
 
 /// One generated street (#159): `{"source","id","name"?,"class","width",
-/// "length","edited","overridden":{"name","class","width"},"objects":[…],
+/// "length","edited","overridden":{"name","class","width","geometry"},"objects":[…],
 /// "lots":[…]}`. `source` (short id or uuid of the site boundary) and
 /// `street_id` identify it as in [`ijc_streets_json`]; `length` is the total
-/// centreline length (m); `overridden` flags the `streetset` edits stored on
-/// the plan; `objects` its road curves; `lots` the lots with an edge fronting
+/// centreline length (m); `overridden` flags the `streetset` edits and the
+/// hand-edited centreline (`geometry`, #157) stored on the plan; `objects` its road curves; `lots` the lots with an edge fronting
 /// it (short ids). Returns `null` for an unknown street or a null/invalid
 /// handle. Free with [`ijc_string_free`].
 ///
@@ -3878,6 +3878,7 @@ pub unsafe extern "C" fn ijc_street_json(
                 "name": v.name_overridden,
                 "class": v.class_overridden,
                 "width": v.width_overridden,
+                "geometry": v.geometry_overridden,
             },
             "objects": ids(&v.roads),
             "lots": ids(&v.lots),
@@ -3886,6 +3887,102 @@ pub unsafe extern "C" fn ijc_street_json(
             out["name"] = name.into();
         }
         into_c_string(out.to_string())
+    })
+}
+
+/// The street graph of site plan `source` (#157): `{"source","nodes":[{"id",
+/// "at":[x,y],"streets":[…],"boundary"}],"edges":[{"street","object","from",
+/// "to","points":[[x,y]…],"width","class","name"?,"overridden":{"geometry",
+/// "name","class","width"}}]}`. Nodes are street ends and junctions (an end on
+/// another street's side joins it; `boundary` = on the site boundary); an
+/// edge's `points` are the node indices `ijc_street_edit` takes. Returns
+/// `null` when `source` is not a site plan or for a null/invalid handle. Free
+/// with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `source` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_street_graph_json(
+    h: *mut AppHandle,
+    source: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let null = || into_c_string(String::from("null"));
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return null();
+        };
+        let Some(source) = (unsafe { c_str(source) }) else {
+            return null();
+        };
+        let doc = &app.session.doc;
+        match object_by_id(doc, source)
+            .and_then(|s| itsjustcad_commands::lot::streets::street_graph_json(doc, s))
+        {
+            Some(v) => into_c_string(v.to_string()),
+            None => null(),
+        }
+    })
+}
+
+/// Edit the centreline of a generated street of site `source` (#157). `json`
+/// is `{"op":"move","street":id,"delta":[x,y]}`, `{"op":"node","street":id,
+/// "index":i,"to":[x,y]}`, `{"op":"insert","street":id,"at":[x,y]}`,
+/// `{"op":"delete","street":id,"index":i}` or `{"op":"reset","street":id}` /
+/// `{"op":"reset","all":true}`. Runs `streetmove` / `streetnode` /
+/// `streetreset` as one undoable op that re-derives the plan; an edit that
+/// leaves the site, crosses a street without a node or thins a block below
+/// the minimum depth fails with the reason. Returns run-result JSON (as
+/// [`ijc_run_command_result`]). Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `source` and `json` must be null or
+/// valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_street_edit(
+    h: *mut AppHandle,
+    source: *const c_char,
+    json: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        use itsjustcad_commands::lot::StreetOp;
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        let (Some(source), Some(json)) = (unsafe { c_str(source) }, unsafe { c_str(json) }) else {
+            return fail("source or json is null or not valid UTF-8");
+        };
+        let Ok(serde_json::Value::Object(mut edit)) = serde_json::from_str::<serde_json::Value>(json)
+        else {
+            return fail("json must be an object");
+        };
+        let street = edit.remove("street");
+        let op: StreetOp = match serde_json::from_value(serde_json::Value::Object(edit)) {
+            Ok(op) => op,
+            Err(e) => return fail(&format!("bad street edit: {e}")),
+        };
+        apply_pending(app);
+        let doc = &app.session.doc;
+        let Some(source) = object_by_id(doc, source) else {
+            return fail("no such site");
+        };
+        let targets = match (street.as_ref().map(|v| v.as_u64()), &op) {
+            (Some(Some(id)), _) => match itsjustcad_commands::lot::street_view(doc, source, id as u32) {
+                Some(v) => v.roads,
+                None => return fail("no such street"),
+            },
+            (None, StreetOp::Reset { all: true }) => vec![source],
+            (None, _) => return fail("street (a street id) is required"),
+            (Some(_), _) => return fail("street must be a street id"),
+        };
+        let cmd = Command::StreetGeometry {
+            targets: Selector::Ids { ids: targets },
+            op,
+            ids: None,
+        };
+        into_c_string(run_cmd_json(&mut app.session, cmd))
     })
 }
 
@@ -7326,7 +7423,7 @@ mod headless_tests {
             assert_eq!(v["objects"], streets[0]["objects"]);
             assert!(v["length"].as_f64().unwrap() > 0.0, "{v}");
             assert!(!v["lots"].as_array().unwrap().is_empty(), "fronting lots: {v}");
-            assert_eq!(v["overridden"], serde_json::json!({ "name": false, "class": false, "width": false }));
+            assert_eq!(v["overridden"], serde_json::json!({ "name": false, "class": false, "width": false, "geometry": false }));
             // Every listed lot really fronts the street.
             for lot in v["lots"].as_array().unwrap() {
                 let tags = r(ijc_edge_tags_json(h, c(lot.as_str().unwrap()).as_ptr()));
@@ -7342,7 +7439,7 @@ mod headless_tests {
             assert_eq!(v["name"], "Main Street");
             assert_eq!(v["class"], "arterial");
             assert_eq!(v["width"], 20.0);
-            assert_eq!(v["overridden"], serde_json::json!({ "name": true, "class": true, "width": true }));
+            assert_eq!(v["overridden"], serde_json::json!({ "name": true, "class": true, "width": true, "geometry": false }));
             assert_eq!(r(ijc_run_command_result(h, c("undo").as_ptr()))["ok"], true);
             let v = r(ijc_street_json(h, c(&source).as_ptr(), id));
             assert!(v.get("name").is_none(), "undone: {v}");
@@ -7356,6 +7453,59 @@ mod headless_tests {
             assert_eq!(r(ijc_street_json(h, std::ptr::null(), id)), null);
             assert_eq!(r(ijc_street_json(std::ptr::null_mut(), c(&source).as_ptr(), id)), null);
             assert_eq!(r(ijc_street_set(std::ptr::null_mut(), c(&source).as_ptr(), id, c(edit).as_ptr()))["ok"], false);
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn street_graph_json_and_street_edit_one_undo() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 200 150", "siteplan last"] {
+                assert_eq!(r(ijc_run_command_result(h, c(line).as_ptr()))["ok"], true);
+            }
+            let source = r(ijc_streets_json(h))[0]["source"].as_str().unwrap().to_string();
+            let set = r#"{"op":"node","street":0,"index":1,"to":[100,140]}"#;
+            let g = r(ijc_street_graph_json(h, c(&source).as_ptr()));
+            let edges = g["edges"].as_array().unwrap();
+            assert!(!edges.is_empty(), "{g}");
+            assert_eq!(edges[0]["overridden"]["geometry"], false);
+            let nodes = g["nodes"].as_array().unwrap();
+            assert!(nodes.iter().all(|n| n["boundary"] == true), "single street ends on the boundary: {g}");
+
+            let before = ijc_undo_cursor(h);
+            let insert = r#"{"op":"insert","street":0,"at":[103,75]}"#;
+            let out = r(ijc_street_edit(h, c(&source).as_ptr(), c(insert).as_ptr()));
+            assert_eq!(out["ok"], true, "{out}");
+            assert_eq!(ijc_undo_cursor(h), before + 1, "one undo step");
+            let out = r(ijc_street_edit(h, c(&source).as_ptr(), c(set).as_ptr()));
+            assert_eq!(out["ok"], true, "{out}");
+            let g = r(ijc_street_graph_json(h, c(&source).as_ptr()));
+            assert_eq!(g["edges"][0]["points"][1], serde_json::json!([100.0, 140.0]));
+            assert_eq!(g["edges"][0]["overridden"]["geometry"], true);
+            let v = r(ijc_street_json(h, c(&source).as_ptr(), 0));
+            assert_eq!(v["overridden"]["geometry"], true, "{v}");
+
+            let out_of_site = r#"{"op":"node","street":0,"index":1,"to":[100,200]}"#;
+            let out = r(ijc_street_edit(h, c(&source).as_ptr(), c(out_of_site).as_ptr()));
+            assert_eq!(out["ok"], false);
+            assert!(out.to_string().contains("would leave the site"), "{out}");
+
+            let reset = r#"{"op":"reset","all":true}"#;
+            assert_eq!(r(ijc_street_edit(h, c(&source).as_ptr(), c(reset).as_ptr()))["ok"], true);
+            let g = r(ijc_street_graph_json(h, c(&source).as_ptr()));
+            assert_eq!(g["edges"][0]["overridden"]["geometry"], false);
+            assert_eq!(g["edges"][0]["points"].as_array().unwrap().len(), 2);
+
+            for bad in [r#"{"op":"fly","street":0}"#, r#"{"op":"move","delta":[1,0]}"#, r#"{"op":"move","street":99,"delta":[1,0]}"#, "[1]"] {
+                assert_eq!(r(ijc_street_edit(h, c(&source).as_ptr(), c(bad).as_ptr()))["ok"], false, "{bad}");
+            }
+            let null = serde_json::Value::Null;
+            assert_eq!(r(ijc_street_graph_json(h, c("nope").as_ptr())), null);
+            assert_eq!(r(ijc_street_graph_json(h, std::ptr::null())), null);
+            assert_eq!(r(ijc_street_graph_json(std::ptr::null_mut(), c(&source).as_ptr())), null);
+            assert_eq!(r(ijc_street_edit(std::ptr::null_mut(), c(&source).as_ptr(), c(reset).as_ptr()))["ok"], false);
             ijc_free(h);
         }
     }

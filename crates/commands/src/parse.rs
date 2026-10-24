@@ -1695,6 +1695,9 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "lotloading" => parse_lotloading(&args),
         "lotsetbacks" => parse_lotsetbacks(&args),
         "streetset" => parse_streetset(&args),
+        "streetmove" => parse_streetmove(&args),
+        "streetnode" => parse_streetnode(&args),
+        "streetreset" => parse_streetreset(&args),
         "edgerole" => parse_edgerole(&args),
         "lotheight" => parse_lotheight(&args),
         "lotset" => parse_lotset(&args),
@@ -2907,6 +2910,85 @@ fn parse_streetset(args: &[&str]) -> Result<Command, ParseError> {
         width,
         ids: None,
     })
+}
+
+/// The leading road selector of a street edit (`streetmove` / `streetnode`),
+/// defaulting to the selection when the first token is a keyword, a number or
+/// a `key=value`.
+fn street_targets<'a>(
+    args: &'a [&'a str],
+    command: &'static str,
+) -> Result<(Selector, &'a [&'a str]), ParseError> {
+    match args.split_first() {
+        Some((first, _))
+            if !first.contains('=')
+                && first.parse::<usize>().is_err()
+                && !matches!(first.to_lowercase().as_str(), "insert" | "delete") =>
+        {
+            selector(args, command)
+        }
+        _ => Ok((Selector::Selected, args)),
+    }
+}
+
+fn street_geometry(targets: Selector, op: crate::lot::StreetOp) -> Command {
+    Command::StreetGeometry { targets, op, ids: None }
+}
+
+/// `streetmove [selector] delta=x,y` (#157).
+fn parse_streetmove(args: &[&str]) -> Result<Command, ParseError> {
+    let (targets, rest) = street_targets(args, "streetmove")?;
+    match rest {
+        [d] if d.to_lowercase().starts_with("delta=") => {
+            let delta = point(&d[6..])?.truncate();
+            Ok(street_geometry(targets, crate::lot::StreetOp::Move { delta }))
+        }
+        _ => wrong("streetmove", "delta=x,y", args),
+    }
+}
+
+/// `streetnode [selector] <index> to=x,y | insert at=x,y | delete <index>` (#157).
+fn parse_streetnode(args: &[&str]) -> Result<Command, ParseError> {
+    use crate::lot::StreetOp;
+    const WANT: &str = "<index> to=x,y | insert at=x,y | delete <index>";
+    let (targets, rest) = street_targets(args, "streetnode")?;
+    let index = |s: &str| s.parse::<usize>().map_err(|_| ParseError::BadNumber(s.to_string()));
+    let value = |tok: &str, key: &str| {
+        tok.split_once('=')
+            .filter(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.to_string())
+    };
+    let op = match rest {
+        [kw, at] if kw.eq_ignore_ascii_case("insert") => match value(at, "at") {
+            Some(v) => StreetOp::Insert { at: point(&v)?.truncate() },
+            None => return wrong("streetnode", WANT, args),
+        },
+        [kw, i] if kw.eq_ignore_ascii_case("delete") => StreetOp::Delete { index: index(i)? },
+        [i, to] => match value(to, "to") {
+            Some(v) => StreetOp::Node { index: index(i)?, to: point(&v)?.truncate() },
+            None => return wrong("streetnode", WANT, args),
+        },
+        _ => return wrong("streetnode", WANT, args),
+    };
+    Ok(street_geometry(targets, op))
+}
+
+/// `streetreset [selector] | all` (#157): `all` resets every street of the
+/// plan (select any object of it, or the only site plan in the document).
+fn parse_streetreset(args: &[&str]) -> Result<Command, ParseError> {
+    use crate::lot::StreetOp;
+    match args {
+        [] => Ok(street_geometry(Selector::Selected, StreetOp::Reset { all: false })),
+        ["all"] => Ok(street_geometry(Selector::All, StreetOp::Reset { all: true })),
+        _ => {
+            let (targets, rest) = selector(args, "streetreset")?;
+            match rest {
+                [] => Ok(street_geometry(targets, StreetOp::Reset { all: false })),
+                ["all"] => Ok(street_geometry(targets, StreetOp::Reset { all: true })),
+                _ => wrong("streetreset", "<selector> | all", args),
+            }
+        }
+    }
 }
 
 /// `edgerole [selector] edge=<index> role=front|street_side|side|rear|auto`.

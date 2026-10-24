@@ -626,8 +626,31 @@ impl App {
 
                     ui.label(t("focus.length"));
                     ui.monospace(format!("{:.1} m", v.length));
+                    override_mark(ui, v.geometry_overridden);
                     ui.end_row();
                 });
+
+            // #157: drag the road's node grips (or gumball-move it) to reshape
+            // the street; the plan regenerates around it.
+            ui.label(RichText::new(t("focus.street_drag_hint")).small().weak());
+            ui.add_space(4.0);
+            let overridden = v.name_overridden
+                || v.class_overridden
+                || v.width_overridden
+                || v.geometry_overridden;
+            if ui
+                .add_enabled(overridden, egui::Button::new(t("focus.reset_street")))
+                .on_hover_text(t("focus.reset_street.tooltip"))
+                .clicked()
+            {
+                edit = Some(Command::StreetGeometry {
+                    targets: Selector::Ids {
+                        ids: v.roads.clone(),
+                    },
+                    op: lot::StreetOp::Reset { all: false },
+                    ids: None,
+                });
+            }
         });
         if v.edited {
             ui.colored_label(ui.visuals().warn_fg_color, t("focus.street_edited"));

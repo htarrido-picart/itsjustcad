@@ -92,7 +92,7 @@ pub(crate) const MIN_SPACING_M: f64 = 0.5;
 /// positive, else a fallback of ~2× the lot depth target (or a multiple of the
 /// min lot width when no depth target is set). Clamped to [`MIN_SPACING_M`] so a
 /// tiny denominator can never generate an unbounded number of roads.
-pub(crate) fn effective_block_depth(settings: &SubdivisionSettings) -> f64 {
+pub fn effective_block_depth(settings: &SubdivisionSettings) -> f64 {
     let d = if settings.block_depth > 0.0 {
         settings.block_depth
     } else if settings.lot_depth_target > 0.0 {
@@ -106,7 +106,7 @@ pub(crate) fn effective_block_depth(settings: &SubdivisionSettings) -> f64 {
 
 /// The effective road ROW width: the verb-supplied value if positive, else a
 /// sane residential default. Never returns ≤ 0.
-pub(crate) fn effective_road_width(settings: &SubdivisionSettings) -> f64 {
+pub fn effective_road_width(settings: &SubdivisionSettings) -> f64 {
     if settings.road_width > 0.0 {
         settings.road_width
     } else {

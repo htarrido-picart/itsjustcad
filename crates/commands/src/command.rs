@@ -2168,6 +2168,21 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Edit the centreline of generated street(s) (#157): `streetmove`,
+    /// `streetnode` (move / insert / delete a node) or `streetreset`. The new
+    /// centrelines are stored on the site link as per-street overrides and the
+    /// link is re-derived, so blocks, lots, setbacks and buildings regenerate
+    /// around the edited network and later param changes keep the hand
+    /// geometry. A move or point edit of a generated road of a live plan runs
+    /// as this op. `targets` is written back as the resolved road ids and
+    /// `ids` as the re-derived children, so replay is byte-identical. Logged;
+    /// one undo step (`LotRefreshed`).
+    StreetGeometry {
+        targets: Selector,
+        op: crate::lot::StreetOp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// Override the setback role of edge `edge` (curve edge `i` runs from
     /// point `i` to `i + 1`) of one lot (#143 phase 5); `role: None` (`auto`)
     /// clears the override. On a lot of a Lots/SitePlan link the override is

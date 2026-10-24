@@ -319,6 +319,8 @@ pub struct StreetView {
     pub name_overridden: bool,
     pub class_overridden: bool,
     pub width_overridden: bool,
+    /// Hand-edited centreline (`streetmove` / `streetnode`, #157).
+    pub geometry_overridden: bool,
     /// Its road objects.
     pub roads: Vec<ObjectId>,
     /// Lots with an edge tagged as fronting this street.
@@ -370,6 +372,7 @@ pub fn street_view(doc: &Document, source: ObjectId, street_id: u32) -> Option<S
         name_overridden: edit.is_some_and(|e| e.name.is_some()),
         class_overridden: edit.is_some_and(|e| e.class.is_some()),
         width_overridden: edit.is_some_and(|e| e.width.is_some()),
+        geometry_overridden: edit.is_some_and(|e| e.centerline.is_some()),
         roads: roads.iter().map(|o| o.id).collect(),
         lots,
     })

@@ -60,8 +60,15 @@ pub fn street_ribbon(street: &Street) -> Option<Polygon2d> {
         }
         let t = t.normalize();
         let n = DVec2::new(-t.y, t.x); // left normal
-        left.push(c[i] + n * half);
-        right.push(c[i] - n * half);
+        // Miter a bend so both sides stay `half` from each segment (a hand-bent
+        // centreline, #157): scale by 1/cos(θ/2), capped for sharp turns.
+        let miter = if prev.length_squared() > 1e-18 && next.length_squared() > 1e-18 {
+            half / t.dot(next.normalize()).max(0.25)
+        } else {
+            half
+        };
+        left.push(c[i] + n * miter);
+        right.push(c[i] - n * miter);
     }
     if left.len() < 2 {
         return None;
