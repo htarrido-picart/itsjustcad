@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Site plan optimizer panel (#145, desktop host). An **Optimize** button in
-//! the subdivision inspector of a `SitePlan` link opens an inline form
-//! (objective, constraints, budget, seed, locks, street patterns). Run hands
-//! the boundary, the link's settings and its hand edits to a worker thread
-//! that calls [`site_optimize::optimize_with`], so frames keep painting; Cancel
-//! drops the receiver (the search finishes and its result is discarded). Each
-//! result row's **Apply** runs `siteoptimize apply` with the candidate's
-//! params: one logged op, one undo step.
+//! Site plan optimizer panel (#145, desktop host): the **Optimize** segment of
+//! a `SitePlan` link's subdivision inspector (`Controls | Yield | Optimize`).
+//! Objective and constraints on top, a full-width **Run**, then the results as
+//! deltas vs the current plan's yield, the Pareto scatter, and an **Advanced**
+//! section (budget, seed, locks, street patterns). Run hands the boundary, the
+//! link's settings and its hand edits to a worker thread that calls
+//! [`site_optimize::optimize_with`], so frames keep painting; Cancel drops the
+//! receiver (the search finishes and its result is discarded). Each result
+//! row's **Apply** runs `siteoptimize apply` with the candidate's params (one
+//! logged op, one undo step), then the inspector switches to `Yield`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
@@ -18,7 +20,7 @@ use itsjustcad_commands::site_optimize::{
     self, Objective, OptimizeRequest, OptimizeResult, SEARCHED,
 };
 use itsjustcad_commands::{subdiv_params, Command};
-use itsjustcad_doc::ObjectId;
+use itsjustcad_doc::{ObjectId, SubdivKind};
 
 use super::App;
 use crate::i18n::t;
@@ -172,11 +174,34 @@ impl OptimizeForm {
     }
 }
 
-/// One result-table row.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct ResultRow {
-    pub rank: usize,
-    pub score: f64,
+/// Subdivision inspector segment indices (see [`segment_keys`]).
+pub(super) const SEG_YIELD: usize = 1;
+pub(super) const SEG_OPTIMIZE: usize = 2;
+
+/// The subdivision inspector's segment label keys for a link kind: a Site link
+/// bakes no lots (no segments), a Lots link has `Controls | Yield`, a site plan
+/// adds `Optimize`.
+pub(super) fn segment_keys(kind: SubdivKind) -> &'static [&'static str] {
+    const ALL: &[&str] = &[
+        "param.subdivision.controls",
+        "param.subdivision.yield",
+        "param.subdivision.optimize",
+    ];
+    match kind {
+        SubdivKind::Site => &[],
+        SubdivKind::Lots => &ALL[..2],
+        SubdivKind::SitePlan => ALL,
+    }
+}
+
+/// `seg` clamped to `n` segments (the index is shared across links).
+pub(super) fn clamp_segment(seg: usize, n: usize) -> usize {
+    seg.min(n.saturating_sub(1))
+}
+
+/// The yield metrics the results table compares.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Metrics {
     pub lots: usize,
     /// Σ lot area, m².
     pub net_area: f64,
@@ -184,6 +209,69 @@ pub(super) struct ResultRow {
     pub far: Option<f64>,
     /// Open-space ratio, percent.
     pub open_pct: f64,
+}
+
+impl Metrics {
+    pub(super) fn from_report(y: &subdivision::YieldReport) -> Self {
+        Metrics {
+            lots: y.lot_count,
+            net_area: y.total_lot_area,
+            gfa: y.total_gfa,
+            far: y.far_net,
+            open_pct: y.open_space_ratio * 100.0,
+        }
+    }
+
+    /// Absolute cells (lots, net area, GFA, FAR, open %) for the `Current` row.
+    pub(super) fn cells(&self) -> [String; 5] {
+        [
+            self.lots.to_string(),
+            format!("{:.0} m²", self.net_area),
+            format!("{:.0} m²", self.gfa),
+            self.far.map_or("—".into(), |f| format!("{f:.2}")),
+            format!("{:.1} %", self.open_pct),
+        ]
+    }
+
+    /// `self − base` cells, in [`Metrics::cells`] order.
+    pub(super) fn delta_cells(&self, base: &Metrics) -> [String; 5] {
+        [
+            fmt_delta(self.lots as f64 - base.lots as f64, 0, ""),
+            fmt_delta(self.net_area - base.net_area, 0, "m²"),
+            fmt_delta(self.gfa - base.gfa, 0, "m²"),
+            match (self.far, base.far) {
+                (Some(a), Some(b)) => fmt_delta(a - b, 2, ""),
+                (a, _) => a.map_or("—".into(), |f| format!("{f:.2}")),
+            },
+            fmt_delta(self.open_pct - base.open_pct, 1, "%"),
+        ]
+    }
+}
+
+/// A signed delta: `+12`, `−3.0 %` (true minus sign), `±0` when it rounds to
+/// zero at `decimals`.
+pub(super) fn fmt_delta(d: f64, decimals: usize, unit: &str) -> String {
+    let mag = format!("{:.*}", decimals, d.abs());
+    let sign = if mag.chars().all(|c| c == '0' || c == '.') {
+        "±"
+    } else if d > 0.0 {
+        "+"
+    } else {
+        "−"
+    };
+    if unit.is_empty() {
+        format!("{sign}{mag}")
+    } else {
+        format!("{sign}{mag} {unit}")
+    }
+}
+
+/// One result-table row.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ResultRow {
+    pub rank: usize,
+    pub score: f64,
+    pub metrics: Metrics,
     pub pareto: bool,
     pub params: BTreeMap<String, String>,
 }
@@ -191,19 +279,12 @@ pub(super) struct ResultRow {
 pub(super) fn result_rows(r: &OptimizeResult) -> Vec<ResultRow> {
     r.candidates
         .iter()
-        .map(|c| {
-            let y = &c.eval.report;
-            ResultRow {
-                rank: c.rank,
-                score: c.eval.score,
-                lots: y.lot_count,
-                net_area: y.total_lot_area,
-                gfa: y.total_gfa,
-                far: y.far_net,
-                open_pct: y.open_space_ratio * 100.0,
-                pareto: r.pareto.contains(&c.rank),
-                params: c.params.clone(),
-            }
+        .map(|c| ResultRow {
+            rank: c.rank,
+            score: c.eval.score,
+            metrics: Metrics::from_report(&c.eval.report),
+            pareto: r.pareto.contains(&c.rank),
+            params: c.params.clone(),
         })
         .collect()
 }
@@ -274,43 +355,39 @@ impl OptimizePanel {
 }
 
 impl App {
-    /// The Optimize button + inline panel of a `SitePlan` link's inspector.
-    pub(super) fn optimize_section(&mut self, ui: &mut egui::Ui, source: ObjectId) {
-        let open = self.optimize.source == Some(source);
-        ui.add_space(4.0);
-        if ui
-            .selectable_label(open, t("param.subdivision.optimize"))
-            .clicked()
-        {
-            if open {
-                self.optimize.source = None;
-                self.optimize.job = None;
-            } else {
-                self.optimize.open_for(source);
-            }
-        }
-        if self.optimize.source != Some(source) {
-            return;
-        }
+    /// The `Optimize` segment of a `SitePlan` link's inspector.
+    pub(super) fn optimize_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: ObjectId,
+        link: &itsjustcad_doc::SubdivLink,
+    ) {
+        self.optimize.open_for(source);
         self.optimize.poll();
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.strong(t("optimize.title"));
-            self.optimize_form(ui, source);
-            ui.separator();
-            self.optimize_run_row(ui, source);
-            self.optimize_results(ui, source);
-        });
+        self.optimize_form(ui, source);
+        ui.add_space(6.0);
+        self.optimize_run_row(ui, source);
+        ui.add_space(4.0);
+        self.refresh_subdiv_yield(source, link);
+        let base = self
+            .subdiv_yield
+            .as_ref()
+            .map(|(_, _, r)| Metrics::from_report(r));
+        self.optimize_results(ui, source, base);
+        ui.add_space(4.0);
+        self.optimize_advanced(ui, source);
     }
 
+    /// Objective (+ weights) and the constraint list.
     fn optimize_form(&mut self, ui: &mut egui::Ui, source: ObjectId) {
         let busy = self.optimize.job.is_some();
         let form = &mut self.optimize.form;
         ui.add_enabled_ui(!busy, |ui| {
-            egui::Grid::new(("optimize_form", source))
+            egui::Grid::new(("optimize_objective_grid", source))
                 .num_columns(2)
                 .spacing([crate::theme::Spacing::S, 4.0])
                 .show(ui, |ui| {
-                    ui.label(t("optimize.objective"));
+                    ui.strong(t("optimize.objective"));
                     let current = OBJECTIVES
                         .iter()
                         .find(|(o, _)| *o == form.objective)
@@ -330,105 +407,67 @@ impl App {
                             ui.end_row();
                         }
                     }
-                    ui.label(t("optimize.budget"));
-                    ui.add(egui::DragValue::new(&mut form.budget).range(1..=5000));
-                    ui.end_row();
-                    ui.label(t("optimize.seed"));
-                    ui.add(egui::DragValue::new(&mut form.seed));
-                    ui.end_row();
                 });
 
-            egui::CollapsingHeader::new(t("optimize.constraints"))
-                .id_salt(("optimize_constraints", source))
-                .default_open(true)
+            ui.add_space(4.0);
+            ui.strong(t("optimize.constraints"));
+            egui::Grid::new(("optimize_constraint_grid", source))
+                .num_columns(2)
+                .spacing([crate::theme::Spacing::S, 2.0])
                 .show(ui, |ui| {
-                    egui::Grid::new(("optimize_constraint_grid", source))
-                        .num_columns(2)
-                        .show(ui, |ui| {
-                            for (c, (on, v)) in
-                                Constraint::ALL.into_iter().zip(form.constraints.iter_mut())
-                            {
-                                ui.checkbox(on, t(c.label_key()));
-                                let (_, step, unit) = c.widget();
-                                ui.add_enabled(
-                                    *on,
-                                    egui::DragValue::new(v)
-                                        .speed(step)
-                                        .range(0.0..=f64::MAX)
-                                        .suffix(if unit.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" {unit}")
-                                        }),
-                                );
-                                ui.end_row();
-                            }
-                        });
-                });
-
-            egui::CollapsingHeader::new(t("optimize.locks"))
-                .id_salt(("optimize_locks", source))
-                .show(ui, |ui| {
-                    let fields = subdiv_params::subdivision_fields();
-                    for name in SEARCHED {
-                        let label = fields
-                            .iter()
-                            .find(|f| f.name == *name)
-                            .map_or(*name, |f| t(f.label_key));
-                        let mut on = form.locks.contains(*name);
-                        if ui.checkbox(&mut on, label).changed() {
-                            if on {
-                                form.locks.insert(name.to_string());
-                            } else {
-                                form.locks.remove(*name);
-                            }
-                        }
-                    }
-                });
-
-            egui::CollapsingHeader::new(t("optimize.patterns"))
-                .id_salt(("optimize_patterns", source))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for p in street_patterns() {
-                            let mut on = form.patterns.contains(&p);
-                            if ui.checkbox(&mut on, &p).changed() {
-                                if on {
-                                    form.patterns.insert(p);
+                    for (c, (on, v)) in Constraint::ALL.into_iter().zip(form.constraints.iter_mut())
+                    {
+                        ui.checkbox(on, t(c.label_key()));
+                        let (_, step, unit) = c.widget();
+                        ui.add_enabled(
+                            *on,
+                            egui::DragValue::new(v)
+                                .speed(step)
+                                .range(0.0..=f64::MAX)
+                                .suffix(if unit.is_empty() {
+                                    String::new()
                                 } else {
-                                    form.patterns.remove(&p);
-                                }
-                            }
-                        }
-                    });
+                                    format!(" {unit}")
+                                }),
+                        );
+                        ui.end_row();
+                    }
                 });
         });
     }
 
+    /// Full-width Run, or spinner + elapsed + Cancel while a search runs.
     fn optimize_run_row(&mut self, ui: &mut egui::Ui, source: ObjectId) {
-        ui.horizontal(|ui| match &self.optimize.job {
+        match &self.optimize.job {
             Some(job) => {
-                ui.spinner();
-                ui.label(format!(
-                    "{} {:.1} s",
-                    t("optimize.running"),
-                    job.started.elapsed().as_secs_f64()
-                ));
-                if ui.button(t("optimize.cancel")).clicked() {
-                    self.optimize.job = None;
-                }
+                let elapsed = job.started.elapsed().as_secs_f64();
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("{} {elapsed:.1} s", t("optimize.running")));
+                    if ui.button(t("optimize.cancel")).clicked() {
+                        self.optimize.job = None;
+                    }
+                });
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
             None => {
-                if ui.button(t("optimize.run")).clicked() {
+                let fill = ui.visuals().selection.bg_fill;
+                let text = egui::RichText::new(t("optimize.run"))
+                    .strong()
+                    .color(ui.visuals().strong_text_color());
+                let run = egui::Button::new(text)
+                    .fill(fill)
+                    .min_size(egui::vec2(ui.available_width(), 28.0));
+                if ui.add(run).clicked() {
                     let ctx = ui.ctx().clone();
                     self.optimize.start(&self.session.doc, source, &ctx);
                 }
             }
-        });
+        }
     }
 
-    fn optimize_results(&mut self, ui: &mut egui::Ui, source: ObjectId) {
+    /// Results table (deltas vs `base`, the current plan), then the scatter.
+    fn optimize_results(&mut self, ui: &mut egui::Ui, source: ObjectId, base: Option<Metrics>) {
         let Some((elapsed, result)) = &self.optimize.result else {
             return;
         };
@@ -467,15 +506,26 @@ impl App {
                         }
                         ui.label("");
                         ui.end_row();
+                        if let Some(b) = &base {
+                            ui.strong(t("optimize.current"));
+                            ui.label("");
+                            for c in b.cells() {
+                                ui.strong(c);
+                            }
+                            ui.label("");
+                            ui.end_row();
+                        }
                         for row in rows {
                             let rank = format!("{}{}", row.rank, if row.pareto { " ◆" } else { "" });
                             ui.monospace(rank).on_hover_text(params_text(&row.params));
                             ui.monospace(format!("{:.2}", row.score));
-                            ui.monospace(row.lots.to_string());
-                            ui.monospace(format!("{:.0}", row.net_area));
-                            ui.monospace(format!("{:.0}", row.gfa));
-                            ui.monospace(row.far.map_or("—".into(), |f| format!("{f:.2}")));
-                            ui.monospace(format!("{:.1}", row.open_pct));
+                            let cells = match &base {
+                                Some(b) => row.metrics.delta_cells(b),
+                                None => row.metrics.cells(),
+                            };
+                            for c in cells {
+                                ui.monospace(c);
+                            }
                             if ui.button(t("optimize.apply")).clicked() {
                                 apply = Some(row.clone());
                             }
@@ -495,10 +545,70 @@ impl App {
                 ids: None,
             });
             match out {
-                Ok(o) => self.command_line.push_line(o.message),
+                Ok(o) => {
+                    self.command_line.push_line(o.message);
+                    self.subdiv_segment = SEG_YIELD;
+                }
                 Err(e) => self.command_line.push_line(e.to_string()),
             }
         }
+    }
+
+    /// Collapsed-by-default budget, seed, locked parameters, street patterns.
+    fn optimize_advanced(&mut self, ui: &mut egui::Ui, source: ObjectId) {
+        let busy = self.optimize.job.is_some();
+        let form = &mut self.optimize.form;
+        egui::CollapsingHeader::new(t("optimize.advanced"))
+            .id_salt(("optimize_advanced", source))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::Grid::new(("optimize_advanced_grid", source))
+                        .num_columns(2)
+                        .spacing([crate::theme::Spacing::S, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(t("optimize.budget"));
+                            ui.add(egui::DragValue::new(&mut form.budget).range(1..=5000));
+                            ui.end_row();
+                            ui.label(t("optimize.seed"));
+                            ui.add(egui::DragValue::new(&mut form.seed));
+                            ui.end_row();
+                        });
+
+                    ui.add_space(4.0);
+                    ui.strong(t("optimize.locks"));
+                    let fields = subdiv_params::subdivision_fields();
+                    for name in SEARCHED {
+                        let label = fields
+                            .iter()
+                            .find(|f| f.name == *name)
+                            .map_or(*name, |f| t(f.label_key));
+                        let mut on = form.locks.contains(*name);
+                        if ui.checkbox(&mut on, label).changed() {
+                            if on {
+                                form.locks.insert(name.to_string());
+                            } else {
+                                form.locks.remove(*name);
+                            }
+                        }
+                    }
+
+                    ui.add_space(4.0);
+                    ui.strong(t("optimize.patterns"));
+                    ui.horizontal_wrapped(|ui| {
+                        for p in street_patterns() {
+                            let mut on = form.patterns.contains(&p);
+                            if ui.checkbox(&mut on, &p).changed() {
+                                if on {
+                                    form.patterns.insert(p);
+                                } else {
+                                    form.patterns.remove(&p);
+                                }
+                            }
+                        }
+                    });
+                });
+            });
     }
 }
 
@@ -531,16 +641,16 @@ fn pareto_plot(ui: &mut egui::Ui, rows: &[ResultRow]) {
             .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
         (lo, (hi - lo).max(1e-9))
     };
-    let ((x0, dx), (y0, dy)) = (span(|r| r.open_pct), span(|r| r.score));
+    let ((x0, dx), (y0, dy)) = (span(|r| r.metrics.open_pct), span(|r| r.score));
     let inner = rect.shrink(8.0);
     let at = |r: &ResultRow| {
         egui::pos2(
-            inner.left() + ((r.open_pct - x0) / dx) as f32 * inner.width(),
+            inner.left() + ((r.metrics.open_pct - x0) / dx) as f32 * inner.width(),
             inner.bottom() - ((r.score - y0) / dy) as f32 * inner.height(),
         )
     };
     let mut front: Vec<&ResultRow> = rows.iter().filter(|r| r.pareto).collect();
-    front.sort_by(|a, b| a.open_pct.total_cmp(&b.open_pct));
+    front.sort_by(|a, b| a.metrics.open_pct.total_cmp(&b.metrics.open_pct));
     painter.add(egui::Shape::line(
         front.iter().map(|r| at(r)).collect(),
         egui::Stroke::new(1.0, accent),
@@ -625,8 +735,8 @@ mod tests {
         let rows = result_rows(&r);
         assert_eq!(rows.len(), r.candidates.len());
         for (row, c) in rows.iter().zip(&r.candidates) {
-            assert_eq!((row.rank, row.lots), (c.rank, c.eval.report.lot_count));
-            assert_eq!(row.open_pct, c.eval.report.open_space_ratio * 100.0);
+            assert_eq!(row.rank, c.rank);
+            assert_eq!(row.metrics, Metrics::from_report(&c.eval.report));
             assert_eq!(row.pareto, r.pareto.contains(&c.rank));
             assert_eq!(row.params, c.params);
         }
@@ -646,5 +756,36 @@ mod tests {
         f.constraints[0] = (true, 1e9);
         let err = site_optimize::optimize(&site, &Default::default(), &f.to_request()).unwrap_err();
         assert!(err.contains("binding constraint: min_lot_area"), "{err}");
+    }
+
+    #[test]
+    fn deltas_are_signed_and_rounded() {
+        assert_eq!(fmt_delta(12.0, 0, ""), "+12");
+        assert_eq!(fmt_delta(-3.04, 1, "%"), "−3.0 %");
+        assert_eq!(fmt_delta(0.004, 2, ""), "±0.00");
+        assert_eq!(fmt_delta(-0.4, 0, "m²"), "±0 m²");
+        let base = Metrics { lots: 40, net_area: 9000.0, gfa: 12000.0, far: Some(1.2), open_pct: 20.0 };
+        let cand = Metrics { lots: 52, net_area: 8500.0, gfa: 12000.0, far: Some(1.35), open_pct: 17.0 };
+        assert_eq!(
+            cand.delta_cells(&base),
+            ["+12", "−500 m²", "±0 m²", "+0.15", "−3.0 %"].map(String::from)
+        );
+        assert_eq!(base.cells(), ["40", "9000 m²", "12000 m²", "1.20", "20.0 %"].map(String::from));
+        let no_far = Metrics { far: None, ..base };
+        assert_eq!(cand.delta_cells(&no_far)[3], "1.35", "no baseline FAR → absolute");
+        assert_eq!(no_far.delta_cells(&cand)[3], "—");
+    }
+
+    #[test]
+    fn segments_per_kind_and_clamp() {
+        assert!(segment_keys(SubdivKind::Site).is_empty());
+        assert_eq!(segment_keys(SubdivKind::Lots).len(), 2);
+        assert_eq!(segment_keys(SubdivKind::SitePlan)[SEG_OPTIMIZE], "param.subdivision.optimize");
+        assert_eq!(segment_keys(SubdivKind::Lots)[SEG_YIELD], "param.subdivision.yield");
+        // Optimize selected on a site plan, then a Lots link is inspected.
+        assert_eq!(clamp_segment(SEG_OPTIMIZE, 2), SEG_YIELD);
+        assert_eq!(clamp_segment(SEG_OPTIMIZE, 3), SEG_OPTIMIZE);
+        assert_eq!(clamp_segment(0, 2), 0);
+        assert_eq!(clamp_segment(5, 0), 0);
     }
 }

@@ -8448,18 +8448,29 @@ impl App {
             ui.weak(short_id);
         });
 
-        // `Controls | Yield` for links that bake lots (a Site link has none).
-        if link.kind != itsjustcad_doc::SubdivKind::Site {
+        // `Controls | Yield` for links that bake lots, plus `Optimize` for a
+        // site plan (a Site link has none). The index is shared across links,
+        // so clamp it to this link's segment count.
+        let keys = optimize_panel::segment_keys(link.kind);
+        if !keys.is_empty() {
+            self.subdiv_segment = optimize_panel::clamp_segment(self.subdiv_segment, keys.len());
             let roles = self.live_roles(ui.visuals().dark_mode);
-            let labels = [t("param.subdivision.controls"), t("param.subdivision.yield")];
+            let labels: Vec<&str> = keys.iter().map(|k| t(k)).collect();
             if let Some(i) = crate::widgets::segmented_full(ui, &roles, &labels, self.subdiv_segment)
             {
                 self.subdiv_segment = i;
             }
             ui.add_space(4.0);
-            if self.subdiv_segment == 1 {
-                self.subdivision_yield_table(ui, source, &link);
-                return;
+            match self.subdiv_segment {
+                optimize_panel::SEG_YIELD => {
+                    self.subdivision_yield_table(ui, source, &link);
+                    return;
+                }
+                optimize_panel::SEG_OPTIMIZE => {
+                    self.optimize_panel(ui, source, &link);
+                    return;
+                }
+                _ => {}
             }
         }
 
@@ -8534,8 +8545,23 @@ impl App {
                 }
             });
         });
-        if link.kind == itsjustcad_doc::SubdivKind::SitePlan {
-            self.optimize_section(ui, source);
+    }
+
+    /// Recompute `subdiv_yield` (the link's source + produced objects) unless
+    /// it is fresh for this source and document generation.
+    fn refresh_subdiv_yield(
+        &mut self,
+        source: itsjustcad_doc::ObjectId,
+        link: &itsjustcad_doc::SubdivLink,
+    ) {
+        let generation = self.session.doc.generation;
+        let fresh = matches!(&self.subdiv_yield, Some((id, g, _)) if *id == source && *g == generation);
+        if !fresh {
+            let mut ids = vec![source];
+            ids.extend(link.produced.iter().copied());
+            let report =
+                itsjustcad_commands::lot::yield_report(&self.session.doc, &ids, &link.settings);
+            self.subdiv_yield = Some((source, generation, report));
         }
     }
 
@@ -8549,15 +8575,7 @@ impl App {
         link: &itsjustcad_doc::SubdivLink,
     ) {
         use crate::i18n::t;
-        let generation = self.session.doc.generation;
-        let fresh = matches!(&self.subdiv_yield, Some((id, g, _)) if *id == source && *g == generation);
-        if !fresh {
-            let mut ids = vec![source];
-            ids.extend(link.produced.iter().copied());
-            let report =
-                itsjustcad_commands::lot::yield_report(&self.session.doc, &ids, &link.settings);
-            self.subdiv_yield = Some((source, generation, report));
-        }
+        self.refresh_subdiv_yield(source, link);
         let Some((_, _, r)) = self.subdiv_yield.as_ref() else {
             return;
         };
