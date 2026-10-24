@@ -2,6 +2,7 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 mod focus_inspector;
+mod optimize_panel;
 
 use itsjustcad_commands::Session;
 use itsjustcad_render::{
@@ -885,6 +886,8 @@ pub struct App {
     /// The lot/street focus whose "Site plan ›" breadcrumb was clicked: while
     /// the focus is unchanged the subdivision inspector shows instead (#159).
     focus_site_override: Option<itsjustcad_commands::lot::Focus>,
+    /// Site plan optimizer form / running search / results (#145).
+    optimize: optimize_panel::OptimizePanel,
     /// Auto-recompute: per-source signature of the last-observed source block
     /// geometry. A change (after the first observation) fires a `lotrefresh` so
     /// non-frozen subdivisions track edits to their boundary block.
@@ -1572,6 +1575,7 @@ impl App {
             subdiv_segment: 0,
             subdiv_yield: None,
             focus_site_override: None,
+            optimize: Default::default(),
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
             subdiv_last_generation: 0,
@@ -8530,6 +8534,9 @@ impl App {
                 }
             });
         });
+        if link.kind == itsjustcad_doc::SubdivKind::SitePlan {
+            self.optimize_section(ui, source);
+        }
     }
 
     /// The `Yield` segment: the link's yield (source + produced objects, as

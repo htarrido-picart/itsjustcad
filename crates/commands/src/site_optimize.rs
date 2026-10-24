@@ -1244,6 +1244,69 @@ mod tests {
         assert!(!s.doc.layers.contains_key(lot::OPENSPACE_LAYER));
     }
 
+    /// #160: a `lotset` override is scored by the search, survives apply when
+    /// its lot did not move, and is dropped (and reported) when it did; undo
+    /// brings it back.
+    #[test]
+    fn apply_keeps_matching_lot_overrides_and_reports_dropped() {
+        use crate::Command;
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 150");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "siteplan last");
+        let lot = s
+            .doc
+            .objects()
+            .find(|o| o.layer == lot::LOTS_LAYER)
+            .unwrap()
+            .id;
+        run(&mut s, &format!("lotset id:{lot} floors=9"));
+        let before = s.doc.subdivision_links[&source].lot_overrides.clone();
+        assert_eq!(before.len(), 1);
+
+        // Only the typology is searched, so the lots stay put.
+        run(
+            &mut s,
+            &format!(
+                "siteoptimize id:{source} budget=4 objective=gfa lock=seed,street_pattern,\
+                 road_width,block_depth,method,lot_area_min,lot_area_max,lot_width_min,\
+                 open_space_reserve_frac"
+            ),
+        );
+        let chosen = s.last_site_optimize.as_ref().unwrap().1.get(1).unwrap().clone();
+        let site = site_boundary(&s.doc, &[source]).unwrap().1;
+        let settings =
+            settings_with(&s.doc.subdivision_links[&source].settings, &chosen.params).unwrap();
+        let bare = evaluate(&site, &settings, &PlanEdits::default(), &OptimizeRequest::default())
+            .unwrap();
+        assert!(
+            chosen.eval.report.total_gfa > bare.report.total_gfa,
+            "the pinned floors are scored"
+        );
+        let out = run(&mut s, "siteoptimize apply 1");
+        assert!(!out.message.contains("dropped"), "{}", out.message);
+        assert_eq!(s.doc.subdivision_links[&source].lot_overrides, before, "override kept");
+
+        // A candidate that moves every lot drops the pin and says so.
+        let area = s.doc.subdivision_links[&source].settings.lot_area_min * 10.0;
+        let out = s
+            .run(Command::SiteOptimizeApply {
+                rank: None,
+                source: Some(source),
+                params: Some(BTreeMap::from([("lot_area_min".into(), area.to_string())])),
+                ids: None,
+            })
+            .unwrap();
+        assert!(
+            out.message.contains("1 lot override(s) no longer match"),
+            "{}",
+            out.message
+        );
+        assert!(s.doc.subdivision_links[&source].lot_overrides.is_empty());
+        run(&mut s, "undo");
+        assert_eq!(s.doc.subdivision_links[&source].lot_overrides, before, "undo restores it");
+    }
+
     #[test]
     fn apply_without_a_search_errors() {
         let mut s = Session::default();
