@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use itsjustcad_doc::{
     Document, EdgeRoleOverride, FieldKind, Geometry, LotOverride, ObjectId, StreetEdit,
 };
+use glam::{DVec2, DVec3};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use subdivision::{FrontageAt, Polygon2d, SubdivisionSettings, YieldInputs, YieldReport};
@@ -80,7 +81,8 @@ pub struct OptimizeRequest {
     pub objective: Objective,
     /// Metric weights for [`Objective::Weighted`].
     pub weights: BTreeMap<String, f64>,
-    /// Number of site plans evaluated.
+    /// Number of site plans evaluated (default 400: on a ~80 ha walkable
+    /// site, seeds then agree within ~1 % in ~7 s).
     pub budget: usize,
     /// Search seed (not the layout `seed` param, which is searched).
     pub seed: u64,
@@ -104,14 +106,40 @@ pub struct OptimizeRequest {
     /// Largest lot depth : frontage, with depth = area / curb frontage (so the
     /// ratio is area / frontage²). Default 3 — no strip lots.
     pub max_depth_ratio: Option<f64>,
-    /// Share of lots in [0, 1] allowed above `max_depth_ratio`. Default 0:
-    /// every lot.
-    pub depth_ratio_share: f64,
+    /// Share of lots in [0, 1] allowed to break the per-lot rules (min lot
+    /// area / width / frontage, max depth : frontage). Default 5 %: an
+    /// irregular site always leaves a few odd remnant lots at its edges, and
+    /// a strict rule then rejects every walkable layout.
+    #[serde(alias = "depth_ratio_share")]
+    pub lot_rule_share: f64,
+    /// Share of lots allowed without a street edge (interior remnants).
+    /// Default 2 %.
+    pub access_share: f64,
     /// Largest perimeter of a block that gets subdivided, m. Default 800 —
     /// no super-blocks.
     pub max_block_perimeter: Option<f64>,
+    /// Storey cap: the search draws heights within it (`floors_cap`).
+    /// Default 6.
+    pub max_stories: Option<usize>,
+    /// Least share of lots within `economics.park_distance` of a park.
+    pub min_park_access: Option<f64>,
+    /// Least share of open ground with ≥ `daylight_hours` of sun on the
+    /// winter solstice (checked on the top candidates only; needs `location`).
+    pub min_daylight: Option<f64>,
+    /// Winter-solstice sun hours a daylight sample needs. Default 2.
+    pub daylight_hours: f64,
+    /// Observer location for daylight (the document's, when unset).
+    pub location: Option<Location>,
     /// Unit prices of the `value` objective.
     pub economics: Economics,
+}
+
+/// Where the sun is computed for daylight.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Location {
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub tz_hours: f64,
 }
 
 /// Unit prices of the land-development ledger, in one (any) currency. The
@@ -119,6 +147,10 @@ pub struct OptimizeRequest {
 /// per m² of lot; roads 90 per m² (paving, curbs, drainage); utilities 600 per
 /// m of lot frontage (water, sewer, power along the street); 3000 per lot
 /// (survey, titling, connections); open space 15 per m² (landscaping).
+/// Developing (the default) instead buys the site at `price` per m² gross,
+/// sells floor area at 2000 per m² and builds it at 1200 per m² plus 10 % per
+/// storey above the first; lots and buildings within 400 m of a park sell
+/// 10 % higher.
 ///
 /// Lot value has diminishing returns on size: `price × ref × (area/ref)^γ`
 /// with `γ = size_exponent` (0.85), so a lot of the reference area (`ref_lot_area`,
@@ -142,6 +174,23 @@ pub struct Economics {
     pub size_exponent: f64,
     /// Lot area worth exactly `price` per m²; 0 = the plan's `lot_area_min`.
     pub ref_lot_area: f64,
+    /// Develop and sell built floor area (true, the default) instead of
+    /// selling serviced lots. Developing buys the site at `price` per m² of
+    /// gross site area, builds every building at `build_cost` and sells its
+    /// GFA at `sale_price`.
+    pub develop: bool,
+    /// Sale price per m² of built floor area (GFA).
+    pub sale_price: f64,
+    /// Construction cost per m² of GFA for a one-storey building.
+    pub build_cost: f64,
+    /// Construction cost rise per storey above the first, as a fraction
+    /// (structure, lifts, fire safety): a 5-storey building costs
+    /// `build_cost × (1 + 4 × height_cost)` per m².
+    pub height_cost: f64,
+    /// Price uplift for lots / buildings within `park_distance` of a park.
+    pub park_premium: f64,
+    /// Walking distance to a park that earns the premium, m (straight line).
+    pub park_distance: f64,
 }
 
 impl Default for Economics {
@@ -154,6 +203,12 @@ impl Default for Economics {
             open_cost: 15.0,
             size_exponent: 0.85,
             ref_lot_area: 0.0,
+            develop: true,
+            sale_price: 2000.0,
+            build_cost: 1200.0,
+            height_cost: 0.10,
+            park_premium: 0.10,
+            park_distance: 400.0,
         }
     }
 }
@@ -182,9 +237,40 @@ pub struct Quantities {
     pub depth_ratios: Vec<f64>,
     /// Largest perimeter of a subdivided (not reserved) block, m.
     pub max_block_perimeter: f64,
+    /// Whether each lot (centroid) is within `park_distance` of a park,
+    /// parallel to `lot_areas`.
+    pub lot_near_park: Vec<bool>,
+    /// Every building: GFA, storeys, near a park.
+    pub buildings: Vec<BuiltQ>,
+    /// Share of open ground with ≥ the requested winter sun hours, when it
+    /// was measured.
+    pub daylight: Option<f64>,
+}
+
+/// One building as the ledger prices it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuiltQ {
+    pub gfa: f64,
+    pub floors: usize,
+    pub near_park: bool,
 }
 
 impl Quantities {
+    /// Share of lots within walking distance of a park (1 with no lots).
+    pub fn park_access(&self) -> f64 {
+        if self.lot_near_park.is_empty() {
+            return 1.0;
+        }
+        self.lot_near_park.iter().filter(|n| **n).count() as f64 / self.lot_near_park.len() as f64
+    }
+
+    /// Building storeys, sorted ascending.
+    pub fn floors_sorted(&self) -> Vec<usize> {
+        let mut f: Vec<usize> = self.buildings.iter().map(|b| b.floors).collect();
+        f.sort_unstable();
+        f
+    }
+
     /// The largest finite lot depth : frontage (0 with no lots).
     pub fn max_depth_ratio(&self) -> f64 {
         self.depth_ratios
@@ -199,7 +285,12 @@ impl Quantities {
 /// per m² of gross site area (`value`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Ledger {
+    /// Lot sales, or floor-area sales when developing.
     pub revenue: f64,
+    /// Site acquisition (developing only).
+    pub land: f64,
+    /// Construction (developing only).
+    pub construction: f64,
     pub roads: f64,
     pub utilities: f64,
     pub lots: f64,
@@ -233,19 +324,43 @@ impl Economics {
 
     pub fn ledger(&self, q: &Quantities) -> Ledger {
         let ratio = |i: usize| q.depth_ratios.get(i).copied().unwrap_or(0.0);
-        let revenue = q
-            .lot_areas
-            .iter()
-            .enumerate()
-            .map(|(i, a)| self.land_value(*a, ratio(i)))
-            .sum::<f64>();
+        let uplift = |near: bool| if near { 1.0 + self.park_premium } else { 1.0 };
+        let (revenue, land, construction) = if self.develop {
+            let sales = q
+                .buildings
+                .iter()
+                .map(|b| b.gfa * self.sale_price * uplift(b.near_park))
+                .sum::<f64>();
+            let build = q
+                .buildings
+                .iter()
+                .map(|b| {
+                    let above = b.floors.saturating_sub(1) as f64;
+                    b.gfa * self.build_cost * (1.0 + self.height_cost * above)
+                })
+                .sum::<f64>();
+            (sales, q.gross_area * self.price, build)
+        } else {
+            let sales = q
+                .lot_areas
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let near = q.lot_near_park.get(i).copied().unwrap_or(false);
+                    self.land_value(*a, ratio(i)) * uplift(near)
+                })
+                .sum::<f64>();
+            (sales, 0.0, 0.0)
+        };
         let roads = q.road_area * self.road_cost;
         let utilities = q.frontage * self.utility_cost;
         let lots = q.lot_areas.len() as f64 * self.lot_cost;
         let open_space = q.open_area * self.open_cost;
-        let profit = revenue - roads - utilities - lots - open_space;
+        let profit = revenue - land - construction - roads - utilities - lots - open_space;
         Ledger {
             revenue,
+            land,
+            construction,
             roads,
             utilities,
             lots,
@@ -265,6 +380,15 @@ impl Economics {
             "open_cost" => &mut self.open_cost,
             "size_exponent" => &mut self.size_exponent,
             "ref_lot_area" => &mut self.ref_lot_area,
+            "sale_price" => &mut self.sale_price,
+            "build_cost" => &mut self.build_cost,
+            "height_cost" => &mut self.height_cost,
+            "park_premium" => &mut self.park_premium,
+            "park_distance" => &mut self.park_distance,
+            "develop" => {
+                self.develop = v != 0.0;
+                return true;
+            }
             _ => return false,
         };
         *slot = v;
@@ -277,21 +401,27 @@ impl Default for OptimizeRequest {
         OptimizeRequest {
             objective: Objective::Value,
             weights: BTreeMap::new(),
-            budget: 200,
+            budget: 400,
             seed: 1,
             top: 5,
             lock: Vec::new(),
-            patterns: Vec::new(),
+            patterns: WALKABLE_PATTERNS.iter().map(|p| p.to_string()).collect(),
             min_lot_area: None,
             min_lot_width: None,
             min_frontage: None,
-            min_open: None,
+            min_open: Some(0.10),
             max_far: None,
             max_coverage: None,
             max_lot_area: None,
             max_depth_ratio: Some(3.0),
-            depth_ratio_share: 0.0,
+            lot_rule_share: 0.05,
+            access_share: 0.02,
             max_block_perimeter: Some(800.0),
+            max_stories: Some(6),
+            min_park_access: Some(DEFAULT_PARK_ACCESS),
+            min_daylight: None,
+            daylight_hours: 2.0,
+            location: None,
             economics: Economics::default(),
         }
     }
@@ -299,6 +429,14 @@ impl Default for OptimizeRequest {
 
 /// The params searched by default, in decode order (`lot_area_max` is a ratio
 /// of `lot_area_min`, so it follows it).
+/// The street patterns searched by default: connected networks without
+/// cul-de-sacs (`culdesac`), spoke-and-ring (`radial`, also ~1 s a plan on a
+/// large site) or meandering super-blocks (`organic`).
+pub const WALKABLE_PATTERNS: &[&str] = &["orthogonal", "skewed", "hexagonal", "voronoi"];
+
+/// Default least share of lots within walking distance of a park.
+pub const DEFAULT_PARK_ACCESS: f64 = 0.9;
+
 pub const SEARCHED: &[&str] = &[
     "seed",
     "street_pattern",
@@ -310,6 +448,14 @@ pub const SEARCHED: &[&str] = &[
     "lot_width_min",
     "typology",
     "open_space_reserve_frac",
+    "floors_min",
+    "floors_max",
+    "height_mix_low",
+    "height_mix_mid",
+    "height_mix_tower",
+    "height_falloff",
+    "falloff_strength",
+    "height_seed",
 ];
 
 impl OptimizeRequest {
@@ -353,7 +499,6 @@ impl OptimizeRequest {
             "min_lot_area" => self.min_lot_area = Some(num()?),
             "min_lot_width" => self.min_lot_width = Some(num()?),
             "min_frontage" => self.min_frontage = Some(num()?),
-            "min_open" => self.min_open = Some(num()?),
             "max_far" => self.max_far = Some(num()?),
             "max_coverage" => self.max_coverage = Some(num()?),
             // `off` lifts a default-on limit.
@@ -365,7 +510,29 @@ impl OptimizeRequest {
                     _ => self.max_block_perimeter = v,
                 }
             }
-            "depth_ratio_share" => self.depth_ratio_share = ratio(num()?),
+            "lot_rule_share" | "depth_ratio_share" => self.lot_rule_share = ratio(num()?),
+            "access_share" => self.access_share = ratio(num()?),
+            "max_stories" | "min_park_access" | "min_daylight" | "min_open" => {
+                let off = v.eq_ignore_ascii_case("off");
+                match key {
+                    "max_stories" => self.max_stories = (!off).then(|| num().map(|n| n as usize)).transpose()?,
+                    "min_park_access" => self.min_park_access = (!off).then(|| num().map(ratio)).transpose()?,
+                    "min_open" => self.min_open = (!off).then(num).transpose()?,
+                    _ => self.min_daylight = (!off).then(|| num().map(ratio)).transpose()?,
+                }
+            }
+            "daylight_hours" => self.daylight_hours = num()?,
+            "location" => {
+                let n: Vec<f64> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                let [lat, lon, rest @ ..] = n.as_slice() else {
+                    return Err("location= takes lat,lon[,tz]".into());
+                };
+                self.location = Some(Location {
+                    lat_deg: *lat,
+                    lon_deg: *lon,
+                    tz_hours: rest.first().copied().unwrap_or((lon / 15.0).round()),
+                });
+            }
             k if self.economics.set(k, num()?) => {}
             _ => return Err(format!("siteoptimize: unknown option '{key}'")),
         }
@@ -396,11 +563,17 @@ impl OptimizeRequest {
         Ok(())
     }
 
-    fn score(&self, r: &YieldReport, l: &Ledger) -> f64 {
+    fn score(&self, r: &YieldReport, l: &Ledger, q: &Quantities) -> f64 {
         match self.objective {
-            Objective::Weighted => self.weights.iter().map(|(k, w)| w * metric(r, l, k)).sum(),
-            o => metric(r, l, o.token()),
+            Objective::Weighted => self.weights.iter().map(|(k, w)| w * metric(r, l, q, k)).sum(),
+            o => metric(r, l, q, o.token()),
         }
+    }
+
+    /// Whether daylight is part of this search (a constraint or a weight).
+    pub fn wants_daylight(&self) -> bool {
+        self.min_daylight.is_some()
+            || (self.objective == Objective::Weighted && self.weights.contains_key("daylight"))
     }
 }
 
@@ -409,10 +582,12 @@ fn ratio(v: f64) -> f64 {
     if v > 1.0 { v / 100.0 } else { v }
 }
 
-const METRICS: &[&str] = &["lots", "far", "net_area", "gfa", "open", "value"];
+const METRICS: &[&str] = &["lots", "far", "net_area", "gfa", "open", "value", "park", "daylight"];
 
-fn metric(r: &YieldReport, l: &Ledger, key: &str) -> f64 {
+fn metric(r: &YieldReport, l: &Ledger, q: &Quantities, key: &str) -> f64 {
     match key {
+        "park" => q.park_access(),
+        "daylight" => q.daylight.unwrap_or(0.0),
         "value" => l.value,
         "lots" => r.lot_count as f64,
         "far" | "far_net" => r.far_net.unwrap_or(0.0),
@@ -528,10 +703,30 @@ pub fn evaluate(
     let n = lot_areas.len().max(1) as f64;
     let share = |v: &[f64], bad: &dyn Fn(f64) -> bool| v.iter().filter(|x| bad(**x)).count() as f64 / n;
     let over = |v: f64, m: f64| (v - m) / m.abs().max(1e-9);
+    let parks = &plan.reserved;
+    let near = |p: DVec2| distance_to_polygons(p, parks) <= req.economics.park_distance;
+    let lot_near_park: Vec<bool> = plan.lots.polygons.iter().map(|l| near(l.centroid())).collect();
+    let buildings: Vec<BuiltQ> = plan.buildings.as_ref().map_or_else(Vec::new, |b| {
+        b.buildings
+            .iter()
+            .map(|b| BuiltQ {
+                gfa: b.gfa,
+                floors: b.floor_areas.len(),
+                near_park: near(b.footprint.centroid()),
+            })
+            .collect()
+    });
+    let park_access = if lot_near_park.is_empty() {
+        1.0
+    } else {
+        lot_near_park.iter().filter(|n| **n).count() as f64 / lot_near_park.len() as f64
+    };
+    let tol = req.lot_rule_share + 1e-9;
     let checks = [
-        ("min_lot_area", req.min_lot_area.map(|m| share(&lot_areas, &|a| a < m))),
-        ("min_lot_width", req.min_lot_width.map(|m| share(&fronts.curb, &|w| w < m))),
-        ("min_frontage", req.min_frontage.map(|m| share(&fronts.setback, &|w| w < m))),
+        ("min_park_access", req.min_park_access.map(|m| m - park_access)),
+        ("min_lot_area", req.min_lot_area.map(|m| share(&lot_areas, &|a| a < m) - tol)),
+        ("min_lot_width", req.min_lot_width.map(|m| share(&fronts.curb, &|w| w < m) - tol)),
+        ("min_frontage", req.min_frontage.map(|m| share(&fronts.setback, &|w| w < m) - tol)),
         ("min_open", req.min_open.map(|m| m - report.open_space_ratio)),
         ("max_far", req.max_far.map(|m| over(report.far_net.unwrap_or(0.0), m))),
         ("max_coverage", req.max_coverage.map(|m| over(report.lot_coverage.unwrap_or(0.0), m))),
@@ -539,12 +734,12 @@ pub fn evaluate(
         (
             "max_depth_ratio",
             req.max_depth_ratio
-                .map(|m| share(&depth_ratios, &|r| r > m) - req.depth_ratio_share - 1e-9),
+                .map(|m| share(&depth_ratios, &|r| r > m) - req.lot_rule_share - 1e-9),
         ),
         ("max_block_perimeter", req.max_block_perimeter.map(|m| over(max_block_perimeter, m))),
         (
             "street_access",
-            Some((report.lot_count - fronts.with_street.min(report.lot_count)) as f64 / n),
+            Some((report.lot_count - fronts.with_street.min(report.lot_count)) as f64 / n - req.access_share - 1e-9),
         ),
     ];
     let checks = checks.map(|(name, excess)| (name, excess.unwrap_or(0.0)));
@@ -559,9 +754,12 @@ pub fn evaluate(
         open_area: report.reserved_block_area,
         depth_ratios,
         max_block_perimeter,
+        lot_near_park,
+        buildings,
+        daylight: None,
     };
     let ledger = req.economics.ledger(&quantities);
-    let score = req.score(&report, &ledger);
+    let score = req.score(&report, &ledger, &quantities);
     Ok(Evaluation {
         report,
         violations,
@@ -662,18 +860,20 @@ fn dimensions(site: &Polygon2d, base: &SubdivisionSettings, req: &OptimizeReques
                     hi: 20.0,
                     step: 0.5,
                 },
-            // From 30 m up to half the site; a block perimeter cap bounds
-                // it too (an orthogonal block is up to ~2 depths a side, so
-                // perimeter ≈ 4–8 depths).
-                "block_depth" => Range::Float {
-                    lo: 30.0_f64.min(short / 4.0).max(10.0),
-                    hi: req
-                        .max_block_perimeter
-                        .map_or(f64::MAX, |p| p / 4.0)
-                        .min(short / 2.0)
-                        .max(40.0),
-                    step: 1.0,
-                },
+            // Walkable blocks: an orthogonal block is up to ~2 depths a
+            // side, so block faces of 60–200 m (and a perimeter within the
+            // cap, ≈ 8 depths at most) need a depth of ~30–100 m. From 45 m
+            // (smaller ones mostly add road and slow the hex / Voronoi
+            // generators down) up to perimeter / 8, or half the site.
+            "block_depth" => Range::Float {
+                lo: 45.0_f64.min(short / 4.0).max(10.0),
+                hi: req
+                    .max_block_perimeter
+                    .map_or(short / 2.0, |p| p / 8.0)
+                    .min(short / 2.0)
+                    .max(50.0),
+                step: 1.0,
+            },
                 "method" => Range::Choice(choices("method")),
                 "lot_area_min" => Range::Float {
                     lo: area_lo,
@@ -688,11 +888,21 @@ fn dimensions(site: &Polygon2d, base: &SubdivisionSettings, req: &OptimizeReques
                 },
                 "typology" => Range::Choice(choices("typology")),
                 // Open space only costs yield: search it just above the floor.
-                "open_space_reserve_frac" if open > 0.0 => Range::Float {
+            "open_space_reserve_frac" if open > 0.0 => Range::Float {
                     lo: open,
                     hi: (open + 0.15).min(0.9),
                     step: 0.01,
                 },
+                // CityEngine-style heights (#156), drawn within the storey cap
+                // (`floors_cap` clamps every class range too).
+                "floors_min" | "floors_max" => Range::Int {
+                    lo: 1,
+                    hi: req.max_stories.unwrap_or(12).max(1) as i64,
+                },
+                "height_mix_low" | "height_mix_mid" | "height_mix_tower" => Range::Int { lo: 0, hi: 3 },
+                "height_falloff" => Range::Choice(vec!["none".into(), "center".into(), "street".into()]),
+                "falloff_strength" => Range::Float { lo: 0.0, hi: 1.0, step: 0.05 },
+                "height_seed" => Range::Int { lo: 1, hi: 9999 },
                 _ => return None,
             };
             Some(Dim { name, range })
@@ -830,7 +1040,7 @@ const TIE_BREAK: [&str; 3] = ["net_area", "gfa", "open"];
 
 /// Ascending sort key (smaller = better): −score, then −[`TIE_BREAK`].
 fn sort_key(e: &Evaluation) -> [f64; 4] {
-    let m = |k| -metric(&e.report, &e.ledger, k);
+    let m = |k| -metric(&e.report, &e.ledger, &e.quantities, k);
     [-e.score, m(TIE_BREAK[0]), m(TIE_BREAK[1]), m(TIE_BREAK[2])]
 }
 
@@ -854,7 +1064,7 @@ fn pareto_axis(objective: Objective, evals: &[&Evaluation]) -> &'static str {
         .find(|k| {
             let (lo, hi) = evals
                 .iter()
-                .map(|e| metric(&e.report, &e.ledger, k))
+                .map(|e| metric(&e.report, &e.ledger, &e.quantities, k))
                 .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
             hi - lo > 1e-6 * hi.abs().max(1.0)
         })
@@ -896,7 +1106,8 @@ pub fn optimize_with(
         genomes
             .into_par_iter()
             .map(|genome| {
-                let params = decode(&dims, &genome, base);
+                let mut params = decode(&dims, &genome, base);
+                params.insert("floors_cap".into(), req.max_stories.unwrap_or(0).to_string());
                 let eval =
                     settings_with(base, &params).and_then(|s| evaluate(site, &s, edits, req));
                 Trial {
@@ -942,15 +1153,39 @@ pub fn optimize_with(
         sigma *= 0.8;
     }
 
-    let current = evaluate(site, base, edits, req).ok();
-    rank(trials, req).map(|r| OptimizeResult { current, ..r })
+    let mut current = evaluate(site, base, edits, req).ok();
+    let daylight = match (req.wants_daylight(), req.location) {
+        (false, _) => None,
+        (true, Some(loc)) => Some(loc),
+        (true, None) => {
+            return Err("siteoptimize: daylight needs a location — set one with \
+                        `location <lat> <lon>` (or `sun …`) first"
+                .into())
+        }
+    };
+    let day = |p: &BTreeMap<String, String>| {
+        let loc = daylight?;
+        plan_daylight(site, &settings_with(base, p).ok()?, edits, &loc, req.daylight_hours)
+    };
+    if let (Some(loc), Some(c)) = (daylight, current.as_mut()) {
+        c.quantities.daylight = plan_daylight(site, base, edits, &loc, req.daylight_hours);
+        c.score = req.score(&c.report, &c.ledger, &c.quantities);
+    }
+    rank(trials, req, daylight.map(|_| &day as DaylightOf)).map(|r| OptimizeResult { current, ..r })
 }
 
 /// Rank the feasible trials (score, then [`TIE_BREAK`]), drop layouts whose
 /// yield duplicates a better one, and mark the (score, [`pareto_axis`]) Pareto
 /// front. With nothing feasible, name
 /// the constraint broken most often.
-fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, String> {
+/// Daylight of a candidate's params (re-plans it), for the top-K pass.
+type DaylightOf<'a> = &'a (dyn Fn(&BTreeMap<String, String>) -> Option<f64> + Sync);
+
+fn rank(
+    trials: Vec<Trial>,
+    req: &OptimizeRequest,
+    daylight: Option<DaylightOf>,
+) -> Result<OptimizeResult, String> {
     let evaluated = trials.len();
     let mut feasible: Vec<(usize, Trial)> = Vec::new();
     let mut broken: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -989,6 +1224,8 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
             "max_lot_area" => req.max_lot_area,
             "max_depth_ratio" => req.max_depth_ratio,
             "max_block_perimeter" => req.max_block_perimeter,
+            "min_park_access" => req.min_park_access,
+            "min_daylight" => req.min_daylight,
             _ => None,
         };
         let what = limit.map_or("every lot fronts a street".to_string(), |v| {
@@ -1011,7 +1248,7 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
         cmp_keys(&sort_key(&eval(a)), &sort_key(&eval(b))).then(ia.cmp(ib))
     });
     let mut seen = std::collections::BTreeSet::new();
-    let unique: Vec<Candidate> = feasible
+    let mut unique: Vec<(BTreeMap<String, String>, Evaluation)> = feasible
         .into_iter()
         .filter_map(|(_, t)| {
             let e = eval(&t);
@@ -1024,6 +1261,51 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
             );
             seen.insert(key).then_some((t.params, e))
         })
+        .collect();
+    // Daylight is costly (a re-plan and a ray-cast grid), so it is measured
+    // on the best candidates only, in batches of DAYLIGHT_TOP_K in rank order:
+    // as a weight, on one batch; as a constraint, until `top` layouts pass
+    // (it trades against profit, so the very best often fail) or
+    // DAYLIGHT_MAX_CHECKED were tried.
+    if let Some(day) = daylight {
+        let limit = if req.min_daylight.is_some() { DAYLIGHT_MAX_CHECKED } else { DAYLIGHT_TOP_K };
+        let mut checked: Vec<(BTreeMap<String, String>, Evaluation)> = Vec::new();
+        let mut best = 0.0_f64;
+        let mut rest = unique.into_iter();
+        while checked.len() < limit {
+            let batch: Vec<_> = rest.by_ref().take(DAYLIGHT_TOP_K).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let shares: Vec<Option<f64>> = batch.par_iter().map(|(p, _)| day(p)).collect();
+            for ((p, mut e), d) in batch.into_iter().zip(shares) {
+                e.quantities.daylight = d;
+                best = best.max(d.unwrap_or(0.0));
+                if req.min_daylight.is_some_and(|m| d.unwrap_or(0.0) < m) {
+                    e.violations.push("min_daylight");
+                }
+                e.score = req.score(&e.report, &e.ledger, &e.quantities);
+                checked.push((p, e));
+            }
+            if checked.iter().filter(|(_, e)| e.violations.is_empty()).count() >= req.top.max(1) {
+                break;
+            }
+        }
+        checked.retain(|(_, e)| e.violations.is_empty());
+        if checked.is_empty() {
+            return Err(format!(
+                "siteoptimize: none of the best {limit} layouts meets min_daylight={} \
+                 (best {:.0} % of open ground gets {} h of winter sun); lower it or the max stories",
+                req.min_daylight.unwrap_or(0.0),
+                best * 100.0,
+                req.daylight_hours
+            ));
+        }
+        checked.sort_by(|a, b| cmp_keys(&sort_key(&a.1), &sort_key(&b.1)));
+        unique = checked;
+    }
+    let unique: Vec<Candidate> = unique
+        .into_iter()
         .enumerate()
         .map(|(i, (params, eval))| Candidate {
             rank: i + 1,
@@ -1039,8 +1321,8 @@ fn rank(trials: Vec<Trial>, req: &OptimizeRequest) -> Result<OptimizeResult, Str
         unique.iter().any(|o| {
             let (s, os) = (c.eval.score, o.eval.score);
             let (p, op) = (
-                metric(&c.eval.report, &c.eval.ledger, axis),
-                metric(&o.eval.report, &o.eval.ledger, axis),
+                metric(&c.eval.report, &c.eval.ledger, &c.eval.quantities, axis),
+                metric(&o.eval.report, &o.eval.ledger, &o.eval.quantities, axis),
             );
             // A better-ranked tie also dominates, so the front lists one per point.
             os >= s && op >= p && (os > s || op > p || o.rank < c.rank)
@@ -1153,7 +1435,11 @@ impl OptimizeResult {
             .map(|c| {
                 let params: serde_json::Map<String, serde_json::Value> =
                     c.params.iter().map(|(k, v)| (k.clone(), typed(k, v))).collect();
-                serde_json::json!({ "rank": c.rank, "score": c.eval.score, "params": params, "yield": c.eval.report, "ledger": c.eval.ledger })
+                serde_json::json!({
+                    "rank": c.rank, "score": c.eval.score, "params": params, "yield": c.eval.report,
+                    "ledger": c.eval.ledger, "park_access": c.eval.quantities.park_access(),
+                    "floors": c.eval.quantities.floors_sorted(), "daylight": c.eval.quantities.daylight,
+                })
             })
             .collect();
         serde_json::json!({
@@ -1164,6 +1450,8 @@ impl OptimizeResult {
             "feasible": self.feasible,
             "current": self.current.as_ref().map(|e| serde_json::json!({
                 "score": e.score, "yield": e.report, "ledger": e.ledger, "violations": e.violations,
+                "park_access": e.quantities.park_access(), "floors": e.quantities.floors_sorted(),
+                "daylight": e.quantities.daylight,
             })),
             "beats_current": self.beats_current(),
         })
@@ -1226,7 +1514,176 @@ pub fn optimize_doc(
     let (source, site) = site_boundary(doc, ids)
         .ok_or("siteoptimize needs a closed site boundary curve (draw or select one first)")?;
     let (base, edits) = base_plan(doc, source);
+    let req = &OptimizeRequest {
+        location: req.location.or(doc.location.map(|l| Location {
+            lat_deg: l.lat_deg,
+            lon_deg: l.lon_deg,
+            tz_hours: l.tz_hours,
+        })),
+        ..req.clone()
+    };
     Ok((source, optimize_with(&site, &base, &edits, req)?))
+}
+
+// ── parks and daylight ──────────────────────────────────────────────────────
+
+/// Distance from `p` to the nearest of `polys` (0 inside one; infinite with
+/// none).
+fn distance_to_polygons(p: DVec2, polys: &[Polygon2d]) -> f64 {
+    polys
+        .iter()
+        .map(|g| {
+            if g.contains(p) {
+                return 0.0;
+            }
+            g.edges()
+                .map(|(a, b)| {
+                    let ab = b - a;
+                    let t = if ab.length_squared() > 0.0 {
+                        ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    p.distance(a + ab * t)
+                })
+                .fold(f64::INFINITY, f64::min)
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Daylight sample spacing (m) and how many top candidates it is measured on.
+pub const DAYLIGHT_SPACING: f64 = 10.0;
+pub const DAYLIGHT_TOP_K: usize = 10;
+pub const DAYLIGHT_MAX_CHECKED: usize = 60;
+
+/// Sun directions (unit, z up) every 30 min of the winter solstice at `loc`
+/// (Dec 21 north of the equator, Jun 21 south), sun above the horizon only.
+fn winter_sun(loc: &Location) -> Vec<DVec3> {
+    let (month, day) = if loc.lat_deg >= 0.0 { (12, 21) } else { (6, 21) };
+    (0..48)
+        .filter_map(|slot| {
+            let utc = (slot as f64 * 30.0 - loc.tz_hours * 60.0).rem_euclid(1440.0);
+            let p = itsjustcad_solar::solar_position(
+                2025,
+                month,
+                day,
+                (utc / 60.0) as u32,
+                (utc % 60.0) as u32,
+                loc.lat_deg,
+                loc.lon_deg,
+            );
+            (p.altitude_deg > 0.0).then(|| {
+                let d = itsjustcad_solar::sun_direction(p.azimuth_deg, p.altitude_deg);
+                DVec3::new(d[0] as f64, d[1] as f64, d[2] as f64)
+            })
+        })
+        .collect()
+}
+
+/// Where the ray `p + t·dir` (t > 0) first crosses `poly`'s boundary.
+fn ray_enter(p: DVec2, dir: DVec2, poly: &Polygon2d) -> Option<f64> {
+    let cross = |a: DVec2, b: DVec2| a.x * b.y - a.y * b.x;
+    poly.edges()
+        .filter_map(|(a, b)| {
+            let e = b - a;
+            let den = cross(dir, e);
+            if den.abs() < 1e-12 {
+                return None;
+            }
+            let t = cross(a - p, e) / den;
+            let u = cross(a - p, dir) / den;
+            (t > 1e-6 && (0.0..=1.0).contains(&u)).then_some(t)
+        })
+        .min_by(f64::total_cmp)
+}
+
+/// Share of the plan's open ground — lots outside building footprints, and
+/// parks — sampled every `spacing` m, that gets at least `hours` of sun on
+/// the winter solstice, shaded by the buildings as prisms of their height.
+pub fn daylight_share(plan: &SitePlanBake, loc: &Location, hours: f64, spacing: f64) -> f64 {
+    const CELL: f64 = 25.0;
+    let suns = winter_sun(loc);
+    let need = (hours / 0.5).ceil() as usize;
+    let blds: Vec<(&Polygon2d, f64)> = plan
+        .buildings
+        .iter()
+        .flat_map(|b| b.buildings.iter())
+        .map(|b| (&b.footprint, b.height))
+        .collect();
+    let key = |p: DVec2| ((p.x / CELL).floor() as i64, (p.y / CELL).floor() as i64);
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = Default::default();
+    for (i, (poly, _)) in blds.iter().enumerate() {
+        let (lo, hi) = poly.aabb();
+        let (a, b) = (key(lo), key(hi));
+        for x in a.0..=b.0 {
+            for y in a.1..=b.1 {
+                grid.entry((x, y)).or_default().push(i);
+            }
+        }
+    }
+    let near = |a: DVec2, b: DVec2| {
+        let (lo, hi) = (key(a.min(b)), key(a.max(b)));
+        (lo.0..=hi.0)
+            .flat_map(move |x| (lo.1..=hi.1).map(move |y| (x, y)))
+            .filter_map(|c| grid.get(&c))
+            .flatten()
+            .copied()
+    };
+    let max_h = blds.iter().map(|b| b.1).fold(0.0, f64::max);
+    let mut samples = Vec::new();
+    for g in plan.lots.polygons.iter().chain(&plan.reserved) {
+        let (lo, hi) = g.aabb();
+        let (x0, y0) = ((lo.x / spacing).ceil() as i64, (lo.y / spacing).ceil() as i64);
+        let (x1, y1) = ((hi.x / spacing).floor() as i64, (hi.y / spacing).floor() as i64);
+        for ix in x0..=x1 {
+            for iy in y0..=y1 {
+                let p = DVec2::new(ix as f64 * spacing, iy as f64 * spacing);
+                if g.contains(p) && !near(p, p).any(|i| blds[i].0.contains(p)) {
+                    samples.push(p);
+                }
+            }
+        }
+    }
+    if samples.is_empty() || suns.is_empty() {
+        return if suns.is_empty() { 0.0 } else { 1.0 };
+    }
+    let lit = samples
+        .par_iter()
+        .filter(|p| {
+            let sunny = suns
+                .iter()
+                .filter(|d| {
+                    let h = DVec2::new(d.x, d.y);
+                    let len = h.length();
+                    if len < 1e-9 {
+                        return true;
+                    }
+                    let (dir, tan) = (h / len, d.z / len);
+                    let end = **p + dir * (max_h / tan.max(1e-6));
+                    !near(**p, end).any(|i| {
+                        let (poly, height) = blds[i];
+                        ray_enter(**p, dir, poly).is_some_and(|t| t * tan < height)
+                    })
+                })
+                .count();
+            sunny >= need
+        })
+        .count();
+    lit as f64 / samples.len() as f64
+}
+
+/// Plan `settings` on `site` with the hand edits and measure its daylight.
+pub fn plan_daylight(
+    site: &Polygon2d,
+    settings: &SubdivisionSettings,
+    edits: &PlanEdits,
+    loc: &Location,
+    hours: f64,
+) -> Option<f64> {
+    let mut roles = edits.edge_roles.clone();
+    let mut heights = edits.lot_overrides.clone();
+    let plan = lot::plan_site(site, 0.0, settings, &edits.streets, &mut roles, &mut heights).ok()?;
+    Some(daylight_share(&plan, loc, hours, DAYLIGHT_SPACING))
 }
 
 #[cfg(test)]
@@ -1321,7 +1778,9 @@ mod tests {
     #[test]
     fn ties_break_on_net_area_and_pareto_axis_varies() {
         let site = rect(200.0, 150.0);
-        let r = optimize(&site, &SubdivisionSettings::default(), &req(120)).unwrap();
+        // No green space (it would make open space vary): flat open space.
+        let flat = OptimizeRequest { min_open: None, min_park_access: None, ..req(120) };
+        let r = optimize(&site, &SubdivisionSettings::default(), &flat).unwrap();
         for w in r.candidates.windows(2) {
             let (a, b) = (&w[0].eval, &w[1].eval);
             assert!(a.score >= b.score);
@@ -1347,13 +1806,30 @@ mod tests {
             open_area: 200.0,
             ..Quantities::default()
         };
-        let l = Economics::default().ledger(&q);
+        // Selling serviced lots.
+        let sell = Economics { develop: false, ..Economics::default() };
+        let l = sell.ledger(&q);
         assert_eq!(
-            (l.revenue, l.roads, l.utilities, l.lots, l.open_space),
-            (120_000.0, 90_000.0, 24_000.0, 6000.0, 3000.0)
+            (l.revenue, l.land, l.construction, l.roads, l.utilities, l.lots, l.open_space),
+            (120_000.0, 0.0, 0.0, 90_000.0, 24_000.0, 6000.0, 3000.0)
         );
         assert_eq!(l.profit, -3000.0);
         assert!((l.value + 0.3).abs() < 1e-12);
+        // A park within walking distance lifts that lot's price.
+        let near = Quantities { lot_near_park: vec![true, false], ..q.clone() };
+        assert_eq!(sell.ledger(&near).revenue, 60_000.0 * 1.1 + 60_000.0);
+        // Developing: buy the site, build, sell floor area.
+        let built = Quantities {
+            buildings: vec![
+                BuiltQ { gfa: 1000.0, floors: 1, near_park: false },
+                BuiltQ { gfa: 2000.0, floors: 3, near_park: true },
+            ],
+            ..q.clone()
+        };
+        let l = Economics::default().ledger(&built);
+        assert_eq!(l.land, 10_000.0 * 120.0, "site acquisition");
+        assert!((l.revenue - (1000.0 * 2000.0 + 2000.0 * 2000.0 * 1.1)).abs() < 1e-6);
+        assert!((l.construction - (1000.0 * 1200.0 + 2000.0 * 1200.0 * 1.2)).abs() < 1e-6, "+10 %/storey");
         assert_eq!(Economics::default().ledger(&Quantities::default()).value, 0.0);
     }
 
@@ -1370,7 +1846,8 @@ mod tests {
             assert_eq!(q.lot_areas.len(), c.eval.report.lot_count);
             assert!(q.road_area > 0.0 && q.road_area < q.gross_area, "{q:?}");
             assert!(q.frontage > 0.0);
-            assert!((l.profit - (l.revenue - l.roads - l.utilities - l.lots - l.open_space)).abs() < 1e-6);
+            let costs = l.land + l.construction + l.roads + l.utilities + l.lots + l.open_space;
+            assert!((l.profit - (l.revenue - costs)).abs() < 1e-6);
         }
         let cur = r.current.as_ref().expect("the start plan is scored");
         assert_eq!(cur.score, cur.ledger.value);
@@ -1426,16 +1903,17 @@ mod tests {
     #[test]
     fn realistic_lot_and_block_limits_hold_by_default() {
         let d = OptimizeRequest::default();
-        assert_eq!((d.max_depth_ratio, d.max_block_perimeter, d.depth_ratio_share), (Some(3.0), Some(800.0), 0.0));
+        assert_eq!((d.max_depth_ratio, d.max_block_perimeter, d.lot_rule_share), (Some(3.0), Some(800.0), 0.05));
         let r = optimize(&rect(200.0, 150.0), &SubdivisionSettings::default(), &req(24)).unwrap();
         for c in &r.candidates {
             let q = &c.eval.quantities;
-            assert!(q.depth_ratios.iter().all(|x| *x <= 3.0), "#{} {:?}", c.rank, q.depth_ratios);
+            let deep = q.depth_ratios.iter().filter(|x| **x > 3.0).count() as f64;
+            assert!(deep <= 0.05 * q.depth_ratios.len() as f64, "#{} {:?}", c.rank, q.depth_ratios);
             assert!(q.max_block_perimeter <= 800.0, "#{}", c.rank);
             assert_eq!(c.eval.infeasibility, 0.0);
         }
         let crate::Command::SiteOptimize { request, .. } = parse(
-            "siteoptimize last max_depth_ratio=off max_block_perimeter=600 max_lot_area=9000 depth_ratio_share=5 size_exponent=0.9",
+            "siteoptimize last max_depth_ratio=off max_block_perimeter=600 max_lot_area=9000 lot_rule_share=5 size_exponent=0.9",
         )
         .unwrap() else {
             panic!()
@@ -1443,8 +1921,48 @@ mod tests {
         assert_eq!(request.max_depth_ratio, None);
         assert_eq!(request.max_block_perimeter, Some(600.0));
         assert_eq!(request.max_lot_area, Some(9000.0));
-        assert_eq!(request.depth_ratio_share, 0.05);
+        assert_eq!(request.lot_rule_share, 0.05);
         assert_eq!(request.economics.size_exponent, 0.9);
+    }
+
+    /// `lotsettings preset=walkable` loads the walkable neighbourhood (later
+    /// keys refine it); a walkable site plan meets the optimizer's default
+    /// walkability limits, heights stay within the cap and vary.
+    #[test]
+    fn walkable_preset_plans_a_walkable_neighbourhood() {
+        let mut s = Session::default();
+        run(&mut s, "lotsettings preset=walkable floors_cap=5");
+        let want = SubdivisionSettings { floors_cap: 5, ..SubdivisionSettings::walkable() };
+        assert_eq!(s.doc.subdivision_settings, want);
+        let site = rect(400.0, 300.0);
+        let e = evaluate(&site, &want, &PlanEdits::default(), &OptimizeRequest::default()).unwrap();
+        let q = &e.quantities;
+        let avg = e.report.avg_lot_area;
+        assert!((300.0..=900.0).contains(&avg), "residential lots: {avg}");
+        assert!(q.max_block_perimeter <= 800.0, "{}", q.max_block_perimeter);
+        assert!(e.report.open_space_ratio >= 0.05, "parks reserved");
+        let f = q.floors_sorted();
+        assert!(f.iter().all(|n| (1..=5).contains(n)) && f.first() != f.last(), "{f:?}");
+    }
+
+    #[test]
+    fn daylight_counts_shaded_ground_and_needs_a_location() {
+        let site = rect(200.0, 150.0);
+        let s = SubdivisionSettings::walkable();
+        let (mut roles, mut pins) = (Vec::new(), Vec::new());
+        let plan = lot::plan_site(&site, 0.0, &s, &BTreeMap::new(), &mut roles, &mut pins).unwrap();
+        let madrid = Location { lat_deg: 40.4, lon_deg: -3.7, tz_hours: 1.0 };
+        // 5 h of December sun in Madrid (≈ 9 h of day) separates the heights.
+        let low = daylight_share(&plan, &madrid, 5.0, DAYLIGHT_SPACING);
+        let tall = SubdivisionSettings { floors_min: 6, floors_max: 6, floors_cap: 0, ..s.clone() };
+        let plan_tall = lot::plan_site(&site, 0.0, &tall, &BTreeMap::new(), &mut Vec::new(), &mut Vec::new()).unwrap();
+        let high = daylight_share(&plan_tall, &madrid, 5.0, DAYLIGHT_SPACING);
+        assert!((0.0..=1.0).contains(&low) && high < low, "taller shades more: {high} vs {low}");
+        let req = OptimizeRequest { budget: 8, min_daylight: Some(0.1), ..OptimizeRequest::default() };
+        let err = optimize(&site, &s, &req).unwrap_err();
+        assert!(err.contains("needs a location"), "{err}");
+        let r = optimize(&site, &s, &OptimizeRequest { location: Some(madrid), ..req }).unwrap();
+        assert!(r.candidates.iter().all(|c| c.eval.quantities.daylight.is_some_and(|d| d >= 0.1)));
     }
 
     #[test]
@@ -1737,13 +2255,14 @@ mod tests {
         let before = s.doc.subdivision_links[&source].lot_overrides.clone();
         assert_eq!(before.len(), 1);
 
-        // Only the typology is searched, so the lots stay put.
+        // Only the typology and heights are searched, so the lots stay put
+        // (no parks: the green-space defaults are lifted).
         run(
             &mut s,
             &format!(
                 "siteoptimize id:{source} budget=4 objective=gfa lock=seed,street_pattern,\
                  road_width,block_depth,method,lot_area_min,lot_area_max,lot_width_min,\
-                 open_space_reserve_frac"
+                 open_space_reserve_frac min_open=off min_park_access=off"
             ),
         );
         let chosen = s.last_site_optimize.as_ref().unwrap().1.get(1).unwrap().clone();

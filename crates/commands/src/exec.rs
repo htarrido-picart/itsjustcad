@@ -6796,6 +6796,20 @@ fn exec_lot_settings(
             // Height variation.
             "floors_min" | "floorsmin" => s.floors_min = num()?.max(0.0) as usize,
             "floors_max" | "floorsmax" => s.floors_max = num()?.max(0.0) as usize,
+            "floors_cap" | "max_stories" => s.floors_cap = num()?.max(0.0) as usize,
+            // A whole-settings preset; later keys in the same call refine it.
+            "preset" => {
+                *s = match v.to_lowercase().as_str() {
+                    "walkable" => subdivision::SubdivisionSettings::walkable(),
+                    "euro_latam" | "eurolatam" => subdivision::SubdivisionSettings::euro_latam(),
+                    "default" => subdivision::SubdivisionSettings::default(),
+                    _ => {
+                        return Err(ExecError::Invalid(format!(
+                            "unknown preset '{v}' (try walkable | euro_latam | default)"
+                        )))
+                    }
+                }
+            }
             "floors_range" | "floorrange" => {
                 let (a, b) = v.split_once('-').unwrap_or((v, v));
                 let n = |t: &str| {

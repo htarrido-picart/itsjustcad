@@ -115,8 +115,9 @@ fn closeness(lots: &[&Block], centroids: &[DVec2], s: &SubdivisionSettings) -> O
 /// The floor count of each lot (parallel to `lots`). Deterministic; with no
 /// variation option on, every lot gets `floor_count`.
 pub fn lot_floor_counts(lots: &[&Block], s: &SubdivisionSettings) -> Vec<usize> {
+    let cap = |n: usize| if s.floors_cap > 0 { n.min(s.floors_cap) } else { n };
     if !varies_heights(s) {
-        return vec![s.floor_count; lots.len()];
+        return vec![cap(s.floor_count); lots.len()];
     }
     let seed = height_seed(s);
     let centroids: Vec<DVec2> = lots.iter().map(|l| l.polygon.centroid()).collect();
@@ -149,6 +150,8 @@ pub fn lot_floor_counts(lots: &[&Block], s: &SubdivisionSettings) -> Vec<usize> 
             } else {
                 (1, s.floor_count.max(1))
             };
+            let hi = cap(hi);
+            let lo = lo.min(hi);
             let u = draw(seed, *c, 2);
             let p = match &near {
                 Some(near) => (1.0 - strength) * u + strength * near[i],
@@ -284,5 +287,17 @@ mod tests {
         assert_eq!(HeightMix::parse(&m.to_string()).unwrap(), m);
         assert!(HeightMix::parse("podium:10").is_err());
         assert!(HeightMix::parse("low:0").is_err());
+    }
+
+    #[test]
+    fn floors_cap_clamps_every_draw_and_keeps_variety() {
+        let b = lots(40);
+        let mix = HeightMix::parse("low:1,mid:1,tower:1").unwrap();
+        let s = SubdivisionSettings { height_mix: Some(mix), floors_cap: 6, ..Default::default() };
+        let c = counts(&b, &s);
+        assert!(c.iter().all(|f| (1..=6).contains(f)), "{c:?}");
+        assert!(c.iter().any(|f| *f <= 3) && c.contains(&6), "still varied: {c:?}");
+        let flat = SubdivisionSettings { floor_count: 9, floors_cap: 6, ..Default::default() };
+        assert!(counts(&b, &flat).iter().all(|f| *f == 6));
     }
 }

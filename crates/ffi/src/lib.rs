@@ -5145,9 +5145,9 @@ unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 /// Search the `siteplan` params of the site boundary `source` (short id) for
 /// the best yield, evaluating every candidate off-document (nothing is baked,
 /// nothing logged). `request_json` is `{"objective":"value|lots|far_net|net_area|gfa|weighted",
-/// "weights":{…},"budget":200,"seed":1,"top":5,"lock":[…],"patterns":[…],
+/// "weights":{…},"budget":400,"seed":1,"top":5,"lock":[…],"patterns":[…],
 /// "min_lot_area","min_lot_width","min_frontage","min_open","max_far","max_coverage",
-/// "max_lot_area","max_depth_ratio" (default 3),"depth_ratio_share" (default 0),
+/// "max_lot_area","max_depth_ratio" (default 3),"lot_rule_share" (default 0.05, share of lots that may break the per-lot rules), "access_share" (default 0.02), "max_stories" (default 6), "min_park_access" (default 0.9), "min_daylight", "daylight_hours" (default 2), "location":{"lat_deg","lon_deg","tz_hours"},
 /// "max_block_perimeter" (default 800),
 /// "economics":{"price","road_cost","utility_cost","lot_cost","open_cost","size_exponent","ref_lot_area"}}`,
 /// every key optional (null / `{}` = defaults). Returns
@@ -5156,7 +5156,7 @@ unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 /// "current":{"score","yield","ledger","violations"}|null,"beats_current":bool}`
 /// or `{"error":"…"}` (unknown source, bad request, or no feasible layout —
 /// the message names the binding constraint). Pass a candidate's `params` to
-/// [`ijc_site_optimize_apply`]. Runs synchronously (seconds for budget 200).
+/// [`ijc_site_optimize_apply`]. Runs synchronously (seconds for budget 400).
 /// Caller must [`ijc_string_free`] the result.
 ///
 /// # Safety

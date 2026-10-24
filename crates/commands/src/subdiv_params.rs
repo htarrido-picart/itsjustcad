@@ -600,6 +600,15 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             Widget::Numeric,
         ),
         ParamField::int(
+            "floors_cap",
+            "param.subdivision.floors_cap",
+            0,
+            0,
+            200,
+            1,
+            Widget::Numeric,
+        ),
+        ParamField::int(
             "height_mix_low",
             "param.subdivision.height_mix_low",
             0,
@@ -732,6 +741,7 @@ const FIELD_GROUPS: &[(&str, &[&str])] = &[
             "roof_pitch",
             "floors_min",
             "floors_max",
+            "floors_cap",
             "height_mix_low",
             "height_mix_mid",
             "height_mix_tower",
@@ -898,6 +908,7 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     // Height variation
     m.insert("floors_min".into(), ParamValue::Int(s.floors_min as i64));
     m.insert("floors_max".into(), ParamValue::Int(s.floors_max as i64));
+    m.insert("floors_cap".into(), ParamValue::Int(s.floors_cap as i64));
     for ((_, key), w) in MIX_CLASSES.iter().zip(mix_weights(s.height_mix.as_ref())) {
         m.insert((*key).into(), ParamValue::Int(w));
     }
@@ -1086,6 +1097,9 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     }
     if let Some(v) = p.get("floors_max").and_then(|v| v.as_i64()) {
         s.floors_max = v.max(0) as usize;
+    }
+    if let Some(v) = p.get("floors_cap").and_then(|v| v.as_i64()) {
+        s.floors_cap = v.max(0) as usize;
     }
     // The mix is rebuilt only when a weight changed, so a custom mix set with
     // `lotsettings height_mix=…` survives an unrelated edit.

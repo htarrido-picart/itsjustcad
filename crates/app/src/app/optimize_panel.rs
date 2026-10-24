@@ -57,10 +57,13 @@ pub(super) enum Constraint {
     MaxLotArea,
     MaxDepthRatio,
     MaxBlockPerimeter,
+    MaxStories,
+    MinParkAccess,
+    MinDaylight,
 }
 
 impl Constraint {
-    pub(super) const ALL: [Constraint; 9] = [
+    pub(super) const ALL: [Constraint; 12] = [
         Constraint::MinLotArea,
         Constraint::MinLotWidth,
         Constraint::MinFrontage,
@@ -70,11 +73,22 @@ impl Constraint {
         Constraint::MaxLotArea,
         Constraint::MaxDepthRatio,
         Constraint::MaxBlockPerimeter,
+        Constraint::MaxStories,
+        Constraint::MinParkAccess,
+        Constraint::MinDaylight,
     ];
 
-    /// On out of the box (the core's defaults): no strip lots, no super-blocks.
+    /// On out of the box (the core's defaults): no strip lots, no
+    /// super-blocks, 10 % green space with a park near most lots, ≤ 6 storeys.
     fn default_on(self) -> bool {
-        matches!(self, Constraint::MaxDepthRatio | Constraint::MaxBlockPerimeter)
+        matches!(
+            self,
+            Constraint::MaxDepthRatio
+                | Constraint::MaxBlockPerimeter
+                | Constraint::MinOpen
+                | Constraint::MaxStories
+                | Constraint::MinParkAccess
+        )
     }
 
     fn label_key(self) -> &'static str {
@@ -88,6 +102,9 @@ impl Constraint {
             Constraint::MaxLotArea => "optimize.max_lot_area",
             Constraint::MaxDepthRatio => "optimize.max_depth_ratio",
             Constraint::MaxBlockPerimeter => "optimize.max_block_perimeter",
+            Constraint::MaxStories => "optimize.max_stories",
+            Constraint::MinParkAccess => "optimize.min_park_access",
+            Constraint::MinDaylight => "optimize.min_daylight",
         }
     }
 
@@ -97,17 +114,26 @@ impl Constraint {
             Constraint::MinLotArea => (300.0, 10.0, "m²"),
             Constraint::MinLotWidth => (10.0, 0.5, "m"),
             Constraint::MinFrontage => (8.0, 0.5, "m"),
-            Constraint::MinOpen => (15.0, 1.0, "%"),
+            Constraint::MinOpen => (10.0, 1.0, "%"),
             Constraint::MaxFar => (1.5, 0.05, ""),
             Constraint::MaxCoverage => (60.0, 1.0, "%"),
             Constraint::MaxLotArea => (900.0, 10.0, "m²"),
             Constraint::MaxDepthRatio => (3.0, 0.05, ": 1"),
             Constraint::MaxBlockPerimeter => (800.0, 10.0, "m"),
+            Constraint::MaxStories => (6.0, 1.0, ""),
+            Constraint::MinParkAccess => (90.0, 1.0, "%"),
+            Constraint::MinDaylight => (50.0, 1.0, "%"),
         }
     }
 
     fn is_percent(self) -> bool {
-        matches!(self, Constraint::MinOpen | Constraint::MaxCoverage)
+        matches!(
+            self,
+            Constraint::MinOpen
+                | Constraint::MaxCoverage
+                | Constraint::MinParkAccess
+                | Constraint::MinDaylight
+        )
     }
 }
 
@@ -118,7 +144,7 @@ pub(super) struct OptimizeForm {
     /// Weights per [`METRICS`] entry (used by `Weighted`; zero = omitted).
     pub weights: [f64; 5],
     /// Per [`Constraint::ALL`]: (enabled, value in form units).
-    pub constraints: [(bool, f64); 9],
+    pub constraints: [(bool, f64); 12],
     pub budget: usize,
     pub seed: u64,
     pub locks: BTreeSet<String>,
@@ -138,7 +164,7 @@ impl Default for OptimizeForm {
             budget: d.budget,
             seed: d.seed,
             locks: BTreeSet::new(),
-            patterns: street_patterns().into_iter().collect(),
+            patterns: d.patterns.iter().cloned().collect(),
             economics: d.economics,
         }
     }
@@ -175,13 +201,17 @@ impl OptimizeForm {
                 .map(|((k, _), w)| (k.to_string(), w))
                 .collect();
         }
-        let all = street_patterns();
-        if !all.iter().all(|p| self.patterns.contains(p)) {
-            req.patterns = all.into_iter().filter(|p| self.patterns.contains(p)).collect();
-        }
+        // The checked patterns, in schema order (none checked = all).
+        req.patterns = street_patterns()
+            .into_iter()
+            .filter(|p| self.patterns.contains(p))
+            .collect();
         // An unchecked box lifts the core's default-on limits too.
         req.max_depth_ratio = None;
         req.max_block_perimeter = None;
+        req.min_open = None;
+        req.max_stories = None;
+        req.min_park_access = None;
         for (c, (on, v)) in Constraint::ALL.into_iter().zip(self.constraints) {
             if !on {
                 continue;
@@ -197,6 +227,9 @@ impl OptimizeForm {
                 Constraint::MaxLotArea => req.max_lot_area = v,
                 Constraint::MaxDepthRatio => req.max_depth_ratio = v,
                 Constraint::MaxBlockPerimeter => req.max_block_perimeter = v,
+                Constraint::MaxStories => req.max_stories = v.map(|n| n.round().max(1.0) as usize),
+                Constraint::MinParkAccess => req.min_park_access = v,
+                Constraint::MinDaylight => req.min_daylight = v,
             }
         }
         req
@@ -238,6 +271,12 @@ pub(super) struct Metrics {
     pub far: Option<f64>,
     /// Open-space ratio, percent.
     pub open_pct: f64,
+    /// Median building storeys.
+    pub floors: Option<f64>,
+    /// Lots within walking distance of a park, percent.
+    pub park_pct: Option<f64>,
+    /// Open ground with the winter sun hours, percent (when measured).
+    pub daylight_pct: Option<f64>,
 }
 
 impl Metrics {
@@ -248,6 +287,20 @@ impl Metrics {
             gfa: y.total_gfa,
             far: y.far_net,
             open_pct: y.open_space_ratio * 100.0,
+            floors: None,
+            park_pct: None,
+            daylight_pct: None,
+        }
+    }
+
+    /// The report plus what only an optimizer evaluation measures.
+    pub(super) fn from_eval(e: &site_optimize::Evaluation) -> Self {
+        let f = e.quantities.floors_sorted();
+        Metrics {
+            floors: f.get(f.len() / 2).map(|n| *n as f64),
+            park_pct: Some(e.quantities.park_access() * 100.0),
+            daylight_pct: e.quantities.daylight.map(|d| d * 100.0),
+            ..Metrics::from_report(&e.report)
         }
     }
 
@@ -260,6 +313,9 @@ impl Metrics {
             Col::Gfa => Some(self.gfa),
             Col::Far => self.far,
             Col::Open => Some(self.open_pct),
+            Col::Floors => self.floors,
+            Col::Park => self.park_pct,
+            Col::Daylight => self.daylight_pct,
         }
     }
 
@@ -270,6 +326,9 @@ impl Metrics {
 
     /// `self − base` for `col`; absolute when the base has no value.
     pub(super) fn delta_cell(&self, base: &Metrics, col: Col) -> String {
+        if col == Col::Floors {
+            return self.cell(col);
+        }
         match (self.get(col), base.get(col)) {
             (Some(a), Some(b)) => fmt_delta(col, a - b),
             (Some(a), None) => fmt_abs(col, a),
@@ -281,6 +340,7 @@ impl Metrics {
     fn summary(&self) -> String {
         Col::ALL[1..]
             .iter()
+            .filter(|c| self.get(**c).is_some())
             .map(|c| format!("{} {}", t(c.label_key()), self.cell(*c)))
             .collect::<Vec<_>>()
             .join(" · ")
@@ -296,10 +356,24 @@ pub(super) enum Col {
     Gfa,
     Far,
     Open,
+    /// Median storeys (absolute, not a delta).
+    Floors,
+    Park,
+    Daylight,
 }
 
 impl Col {
-    const ALL: [Col; 6] = [Col::Score, Col::Lots, Col::Net, Col::Gfa, Col::Far, Col::Open];
+    const ALL: [Col; 9] = [
+        Col::Score,
+        Col::Lots,
+        Col::Net,
+        Col::Gfa,
+        Col::Far,
+        Col::Open,
+        Col::Floors,
+        Col::Park,
+        Col::Daylight,
+    ];
 
     fn label_key(self) -> &'static str {
         match self {
@@ -309,6 +383,9 @@ impl Col {
             Col::Gfa => "optimize.col.gfa",
             Col::Far => "optimize.col.far",
             Col::Open => "optimize.col.open",
+            Col::Floors => "optimize.col.floors",
+            Col::Park => "optimize.col.park",
+            Col::Daylight => "optimize.col.daylight",
         }
     }
 
@@ -318,14 +395,15 @@ impl Col {
         match self {
             Col::Score if (a - a.round()).abs() < 1e-9 => format!("{a:.0}"),
             Col::Score | Col::Far => format!("{a:.2}"),
-            Col::Lots => format!("{a:.0}"),
+            Col::Lots | Col::Floors | Col::Park | Col::Daylight => format!("{a:.0}"),
             Col::Open => format!("{a:.1}"),
             Col::Net | Col::Gfa => match a {
                 a if a < 10_000.0 => format!("{a:.0}"),
                 a if a < 100_000.0 => format!("{:.1}k", a / 1e3),
                 a if a < 999_500.0 => format!("{:.0}k", a / 1e3),
                 a if a < 9_995_000.0 => format!("{:.2}M", a / 1e6),
-                a => format!("{:.1}M", a / 1e6),
+                a if a < 999_500_000.0 => format!("{:.1}M", a / 1e6),
+                a => format!("{:.2}B", a / 1e9),
             },
         }
     }
@@ -381,10 +459,16 @@ pub(super) fn columns(form: &OptimizeForm, rows: &[ResultRow]) -> Vec<Col> {
     if weighted || value {
         cols.push(Col::Score);
     }
-    cols.extend([Col::Lots, Col::Net]);
-    if !value {
-        cols.push(Col::Gfa);
+    if value {
+        // Profit comes from built floor area: storeys and park access are
+        // what tell the layouts apart (areas are in the hover).
+        cols.extend([Col::Lots, Col::Floors, Col::Park]);
+        if on(Constraint::MinDaylight) || weight("daylight") {
+            cols.push(Col::Daylight);
+        }
+        return cols;
     }
+    cols.extend([Col::Lots, Col::Net, Col::Gfa]);
     if form.objective == Objective::FarNet || on(Constraint::MaxFar) || weight("far") {
         cols.push(Col::Far);
     }
@@ -415,6 +499,8 @@ pub(super) struct ResultRow {
     pub pareto: bool,
     pub params: BTreeMap<String, String>,
     pub ledger: Ledger,
+    /// Building storeys, sorted.
+    pub floors: Vec<usize>,
 }
 
 pub(super) fn result_rows(r: &OptimizeResult) -> Vec<ResultRow> {
@@ -423,10 +509,11 @@ pub(super) fn result_rows(r: &OptimizeResult) -> Vec<ResultRow> {
         .map(|c| ResultRow {
             rank: c.rank,
             score: c.eval.score,
-            metrics: Metrics::from_report(&c.eval.report),
+            metrics: Metrics::from_eval(&c.eval),
             pareto: r.pareto.contains(&c.rank),
             params: c.params.clone(),
             ledger: c.eval.ledger,
+            floors: c.eval.quantities.floors_sorted(),
         })
         .collect()
 }
@@ -436,10 +523,11 @@ pub(super) fn current_row(r: &OptimizeResult) -> Option<ResultRow> {
     r.current.as_ref().map(|e| ResultRow {
         rank: 0,
         score: e.score,
-        metrics: Metrics::from_report(&e.report),
+        metrics: Metrics::from_eval(e),
         pareto: false,
         params: BTreeMap::new(),
         ledger: e.ledger,
+        floors: e.quantities.floors_sorted(),
     })
 }
 
@@ -450,16 +538,36 @@ pub(super) fn fmt_money(v: f64) -> String {
 
 /// A ledger as (label key, value) lines: revenue, each cost (negative),
 /// profit, profit per m².
-pub(super) fn ledger_lines(l: &Ledger) -> [(&'static str, String); 7] {
-    [
-        ("optimize.econ.revenue", fmt_money(l.revenue)),
+pub(super) fn ledger_lines(l: &Ledger) -> Vec<(&'static str, String)> {
+    let mut lines = vec![("optimize.econ.revenue", fmt_money(l.revenue))];
+    // Site purchase and construction only exist when developing.
+    if l.land != 0.0 || l.construction != 0.0 {
+        lines.push(("optimize.econ.land", fmt_money(-l.land)));
+        lines.push(("optimize.econ.construction", fmt_money(-l.construction)));
+    }
+    lines.extend([
         ("optimize.econ.roads", fmt_money(-l.roads)),
         ("optimize.econ.utilities", fmt_money(-l.utilities)),
         ("optimize.econ.lots", fmt_money(-l.lots)),
         ("optimize.econ.open_space", fmt_money(-l.open_space)),
         ("optimize.econ.profit", fmt_money(l.profit)),
         ("optimize.objective.value", fmt_abs(Col::Far, l.value)),
-    ]
+    ]);
+    lines
+}
+
+/// Storeys as `min / median / max` plus a histogram, e.g.
+/// `1 / 4 / 6 · 1:49 2:99 … 6:456`.
+pub(super) fn floors_text(floors: &[usize]) -> String {
+    let (Some(lo), Some(hi)) = (floors.first(), floors.last()) else {
+        return "—".into();
+    };
+    let mut hist = BTreeMap::<usize, usize>::new();
+    for f in floors {
+        *hist.entry(*f).or_default() += 1;
+    }
+    let hist: Vec<String> = hist.iter().map(|(f, n)| format!("{f}:{n}")).collect();
+    format!("{lo} / {} / {hi} · {}", floors[floors.len() / 2], hist.join(" "))
 }
 
 fn ledger_text(l: &Ledger) -> String {
@@ -515,12 +623,13 @@ pub(super) struct OptimizePanel {
 }
 
 impl OptimizeForm {
-    /// Lot-size bounds from the current plan, on: at least half its
+    /// Lot-size bounds from the current plan, on: its `lot_width_min`, at least half its
     /// `lot_area_min` (a full `lot_area_min` floor leaves no feasible layout
     /// once blocks are walkable — edge remnants fall below it) and at most
     /// 3 × it (no super-lots).
     pub(super) fn seed_from_plan(&mut self, settings: &subdivision::SubdivisionSettings) {
         self.constraints[0] = (true, 0.5 * settings.lot_area_min);
+        self.constraints[1] = (true, settings.lot_width_min);
         self.constraints[6] = (true, 3.0 * settings.lot_area_min);
     }
 }
@@ -537,7 +646,10 @@ impl OptimizePanel {
 
     /// Start a search off the UI thread; repaints `ctx` when done.
     fn start(&mut self, doc: &itsjustcad_doc::Document, source: ObjectId, ctx: &egui::Context) {
-        let req = self.form.to_request();
+        let req = OptimizeRequest {
+            location: doc.location.map(location),
+            ..self.form.to_request()
+        };
         let Some((_, site)) = site_optimize::site_boundary(doc, &[source]) else {
             self.result = Some((
                 Duration::ZERO,
@@ -586,6 +698,11 @@ impl OptimizePanel {
         self.job = None;
         self.result = Some((elapsed, finished));
     }
+}
+
+/// The document's location as the optimizer takes it.
+fn location(l: itsjustcad_doc::GeoLocation) -> site_optimize::Location {
+    site_optimize::Location { lat_deg: l.lat_deg, lon_deg: l.lon_deg, tz_hours: l.tz_hours }
 }
 
 /// Grid spacing of the form and results: comfortable rows.
@@ -736,11 +853,13 @@ impl App {
         let base = f.current.as_ref().map(|c| c.metrics).or(base);
         let hover = |row: &ResultRow| {
             format!(
-                "{} {}\n\n{}\n\n{}\n\n{}",
+                "{} {}\n\n{}\n\n{}\n{} {}\n\n{}",
                 t(f.score_key),
                 fmt_abs(Col::Score, row.score),
                 ledger_text(&row.ledger),
                 row.metrics.summary(),
+                t("optimize.yield.floors"),
+                floors_text(&row.floors),
                 params_text(&row.params)
             )
             .trim_end()
@@ -824,10 +943,16 @@ impl App {
     }
 
     /// Unit prices: open by default when the objective is `value` (the header
-    /// id follows the objective, so switching to `value` opens it).
+    /// id follows the objective, so switching to `value` opens it). Develop
+    /// (the default) prices built floor area; otherwise serviced lots.
     fn optimize_economics(&mut self, ui: &mut egui::Ui, source: ObjectId) {
         let busy = self.optimize.job.is_some();
+        let no_location = self.session.doc.location.is_none();
         let form = &mut self.optimize.form;
+        let daylight_on = form.constraints[11].0;
+        if daylight_on && no_location {
+            ui.colored_label(ui.visuals().warn_fg_color, t("optimize.daylight_needs_location"));
+        }
         let value = form.objective == Objective::Value;
         egui::CollapsingHeader::new(t("optimize.economics"))
             .id_salt(("optimize_economics", source, value))
@@ -835,38 +960,74 @@ impl App {
             .show(ui, |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
                     let e = &mut form.economics;
+                    ui.checkbox(&mut e.develop, t("optimize.econ.develop"));
                     egui::Grid::new(("optimize_economics_grid", source))
                         .num_columns(2)
                         .spacing(GRID_SPACING)
                         .show(ui, |ui| {
-                            for (key, v, speed) in [
-                                ("optimize.econ.price", &mut e.price, 1.0),
-                                ("optimize.econ.road_cost", &mut e.road_cost, 1.0),
-                                ("optimize.econ.utility_cost", &mut e.utility_cost, 10.0),
-                                ("optimize.econ.lot_cost", &mut e.lot_cost, 100.0),
-                                ("optimize.econ.open_cost", &mut e.open_cost, 1.0),
-                            ] {
+                            let price_key = if e.develop {
+                                "optimize.econ.site_price"
+                            } else {
+                                "optimize.econ.price"
+                            };
+                            let mut rows: Vec<(&str, &mut f64, f64, &str)> =
+                                vec![(price_key, &mut e.price, 1.0, "")];
+                            if e.develop {
+                                rows.push(("optimize.econ.sale_price", &mut e.sale_price, 10.0, ""));
+                                rows.push(("optimize.econ.build_cost", &mut e.build_cost, 10.0, ""));
+                            }
+                            rows.extend([
+                                ("optimize.econ.road_cost", &mut e.road_cost, 1.0, ""),
+                                ("optimize.econ.utility_cost", &mut e.utility_cost, 10.0, ""),
+                                ("optimize.econ.lot_cost", &mut e.lot_cost, 100.0, ""),
+                                ("optimize.econ.open_cost", &mut e.open_cost, 1.0, ""),
+                                ("optimize.econ.park_distance", &mut e.park_distance, 10.0, " m"),
+                            ]);
+                            for (key, v, speed, suffix) in rows {
                                 ui.label(t(key));
-                                ui.add(egui::DragValue::new(v).speed(speed).range(0.0..=f64::MAX));
+                                ui.add(
+                                    egui::DragValue::new(v)
+                                        .speed(speed)
+                                        .range(0.0..=f64::MAX)
+                                        .suffix(suffix),
+                                );
                                 ui.end_row();
                             }
-                            ui.label(t("optimize.econ.size_exponent"))
-                                .on_hover_text(t("optimize.econ.size_exponent.hint"));
-                            ui.add(
-                                egui::DragValue::new(&mut e.size_exponent)
-                                    .speed(0.01)
-                                    .range(0.5..=1.0)
-                                    .fixed_decimals(2),
-                            );
-                            ui.end_row();
+                            // Percentages, edited as percent.
+                            let pct = |ui: &mut egui::Ui, key: &str, v: &mut f64| {
+                                let mut p = *v * 100.0;
+                                ui.label(t(key));
+                                if ui
+                                    .add(egui::DragValue::new(&mut p).speed(0.5).range(0.0..=100.0).suffix(" %"))
+                                    .changed()
+                                {
+                                    *v = p / 100.0;
+                                }
+                                ui.end_row();
+                            };
+                            pct(ui, "optimize.econ.park_premium", &mut e.park_premium);
+                            if e.develop {
+                                pct(ui, "optimize.econ.height_cost", &mut e.height_cost);
+                            } else {
+                                ui.label(t("optimize.econ.size_exponent"))
+                                    .on_hover_text(t("optimize.econ.size_exponent.hint"));
+                                ui.add(
+                                    egui::DragValue::new(&mut e.size_exponent)
+                                        .speed(0.01)
+                                        .range(0.5..=1.0)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+                            }
                         });
                 });
             });
     }
 
     /// The Yield segment's `Economics` block for a site plan: the current
-    /// plan's ledger at the Optimize form's unit prices. The plan quantities
-    /// are measured once per document generation.
+    /// plan's ledger at the Optimize form's unit prices, its storeys, park
+    /// access and (with a location) winter daylight. Measured once per
+    /// document generation.
     pub(super) fn yield_economics(&mut self, ui: &mut egui::Ui, source: ObjectId) {
         let generation = self.session.doc.generation;
         let fresh = matches!(&self.optimize.current_q, Some((id, g, _)) if *id == source && *g == generation);
@@ -874,9 +1035,13 @@ impl App {
             let doc = &self.session.doc;
             let q = site_optimize::site_boundary(doc, &[source]).and_then(|(_, site)| {
                 let (base, edits) = site_optimize::base_plan(doc, source);
-                site_optimize::evaluate(&site, &base, &edits, &OptimizeRequest::default())
-                    .ok()
-                    .map(|e| e.quantities)
+                let mut q = site_optimize::evaluate(&site, &base, &edits, &OptimizeRequest::default())
+                    .ok()?
+                    .quantities;
+                q.daylight = doc.location.map(location).and_then(|loc| {
+                    site_optimize::plan_daylight(&site, &base, &edits, &loc, OptimizeRequest::default().daylight_hours)
+                });
+                Some(q)
             });
             self.optimize.current_q = Some((source, generation, q));
         }
@@ -890,6 +1055,16 @@ impl App {
             .get(&source)
             .map_or(0.0, |l| l.settings.lot_area_min);
         let ledger = self.optimize.form.economics.resolved(lot_area_min).ledger(q);
+        let mut lines: Vec<(&str, String, &str)> =
+            ledger_lines(&ledger).into_iter().map(|(k, v)| (k, v, "")).collect();
+        if let Some(last) = lines.last_mut() {
+            last.2 = "/m²";
+        }
+        lines.push(("optimize.yield.park", fmt_abs(Col::Park, q.park_access() * 100.0), "%"));
+        if let Some(d) = q.daylight {
+            lines.push(("optimize.yield.daylight", fmt_abs(Col::Daylight, d * 100.0), "%"));
+        }
+        let floors = q.floors_sorted();
         ui.add_space(crate::theme::Spacing::S);
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::M as i8, 4))
@@ -901,15 +1076,17 @@ impl App {
                     .striped(true)
                     .spacing(GRID_SPACING)
                     .show(ui, |ui| {
-                        for (key, v) in ledger_lines(&ledger) {
+                        for (key, v, unit) in lines {
                             ui.label(t(key));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.monospace(v);
                             });
-                            ui.monospace(if key == "optimize.objective.value" { "/m²" } else { "" });
+                            ui.monospace(unit);
                             ui.end_row();
                         }
                     });
+                ui.add_space(crate::theme::Spacing::XS);
+                ui.label(format!("{} {}", t("optimize.yield.floors"), floors_text(&floors)));
             });
     }
 
@@ -1051,7 +1228,7 @@ mod tests {
         f.constraints[3] = (true, 15.0); // min open, percent
         f.constraints[5] = (false, 50.0); // max coverage, off
         f.locks.extend(["typology".to_string(), "seed".to_string()]);
-        f.patterns.retain(|p| p == "orthogonal" || p == "radial");
+        f.patterns = ["radial", "orthogonal"].map(String::from).into();
         let r = f.to_request();
         assert_eq!(r.objective, Objective::Weighted);
         assert_eq!(
@@ -1095,7 +1272,7 @@ mod tests {
         assert_eq!(rows.len(), r.candidates.len());
         for (row, c) in rows.iter().zip(&r.candidates) {
             assert_eq!(row.rank, c.rank);
-            assert_eq!(row.metrics, Metrics::from_report(&c.eval.report));
+            assert_eq!(row.metrics, Metrics::from_eval(&c.eval));
             assert_eq!(row.pareto, r.pareto.contains(&c.rank));
             assert_eq!(row.params, c.params);
         }
@@ -1127,15 +1304,21 @@ mod tests {
         assert_eq!(fmt_delta(Col::Gfa, -12_345.0), "−12.3k");
         assert_eq!(fmt_abs(Col::Gfa, 2_947_725.0), "2.95M");
         assert_eq!(fmt_abs(Col::Gfa, 12_000_000.0), "12.0M");
+        assert_eq!(fmt_money(2_311_900_000.0), "2.31B");
         assert_eq!(fmt_abs(Col::Open, -0.0), "0", "signed zero");
         assert_eq!(fmt_abs(Col::Open, -0.01), "0");
         assert_eq!(fmt_abs(Col::Score, 16.0), "16", "integer score");
         assert_eq!(fmt_abs(Col::Score, 1.234), "1.23");
-        let base = Metrics { lots: 40, net_area: 9000.0, gfa: 12000.0, far: Some(1.2), open_pct: -0.0 };
-        let cand = Metrics { lots: 52, net_area: 8500.0, gfa: 12000.0, far: Some(1.35), open_pct: 17.0 };
-        let deltas: Vec<String> = Col::ALL[1..].iter().map(|c| cand.delta_cell(&base, *c)).collect();
+        let none = Metrics::from_report(&subdivision::YieldReport::compute(&Default::default()));
+        let base = Metrics { lots: 40, net_area: 9000.0, gfa: 12000.0, far: Some(1.2), open_pct: -0.0, ..none };
+        let cand = Metrics { lots: 52, net_area: 8500.0, gfa: 12000.0, far: Some(1.35), open_pct: 17.0, ..none };
+        let deltas: Vec<String> = Col::ALL[1..6].iter().map(|c| cand.delta_cell(&base, *c)).collect();
         assert_eq!(deltas, ["+12", "−500", "±0", "+0.15", "+17.0"]);
-        let cells: Vec<String> = Col::ALL[1..].iter().map(|c| base.cell(*c)).collect();
+        let cells: Vec<String> = Col::ALL[1..6].iter().map(|c| base.cell(*c)).collect();
+        let tall = Metrics { floors: Some(4.0), park_pct: Some(98.0), ..cand };
+        let low = Metrics { floors: Some(2.0), park_pct: Some(90.0), ..base };
+        assert_eq!(tall.delta_cell(&low, Col::Floors), "4", "storeys are absolute");
+        assert_eq!(tall.delta_cell(&low, Col::Park), "+8");
         assert_eq!(cells, ["40", "9000", "12.0k", "1.20", "0"]);
         let no_far = Metrics { far: None, ..base };
         assert_eq!(cand.delta_cell(&no_far, Col::Far), "1.35", "no baseline FAR → absolute");
@@ -1146,10 +1329,20 @@ mod tests {
         ResultRow {
             rank: 1,
             score: 1.0,
-            metrics: Metrics { lots: 1, net_area: 1.0, gfa: 1.0, far: None, open_pct },
+            metrics: Metrics {
+                lots: 1,
+                net_area: 1.0,
+                gfa: 1.0,
+                far: None,
+                open_pct,
+                floors: None,
+                park_pct: None,
+                daylight_pct: None,
+            },
             pareto: true,
             params: BTreeMap::new(),
             ledger: Ledger::default(),
+            floors: Vec::new(),
         }
     }
 
@@ -1158,8 +1351,12 @@ mod tests {
         use Col::*;
         let value = OptimizeForm::default();
         assert_eq!(value.objective, Objective::Value, "value is the default");
-        assert_eq!(columns(&value, &[row(0.0)]), [Score, Lots, Net], "profit/m², no GFA");
-        let f = OptimizeForm { objective: Objective::Lots, ..value };
+        assert_eq!(columns(&value, &[row(0.0)]), [Score, Lots, Floors, Park], "profit/m², storeys, parks");
+        let mut sunny = value.clone();
+        sunny.constraints[11].0 = true;
+        assert_eq!(columns(&sunny, &[row(0.0)]), [Score, Lots, Floors, Park, Daylight]);
+        let mut f = OptimizeForm { objective: Objective::Lots, ..value };
+        f.constraints[3].0 = false; // min open (on by default)
         assert_eq!(columns(&f, &[row(0.0)]), [Lots, Net, Gfa], "lots: score = lots column");
         assert_eq!(columns(&f, &[row(0.0), row(4.0)]), [Lots, Net, Gfa, Open], "open varies");
         let mut far = OptimizeForm { objective: Objective::FarNet, ..f.clone() };
@@ -1180,6 +1377,7 @@ mod tests {
             open_space: 0.0,
             profit: 91_716_200.0,
             value: 115.844,
+            ..Ledger::default()
         };
         let v: Vec<String> = ledger_lines(&l).into_iter().map(|(_, v)| v).collect();
         assert_eq!(v, ["94.1M", "−1.23M", "−1.04M", "−93.0k", "0", "91.7M", "115.84"]);
@@ -1187,6 +1385,33 @@ mod tests {
         assert_eq!(unsigned_zero("-0.0".into()), "0.0");
         assert_eq!(unsigned_zero("-0.1".into()), "-0.1");
         assert_eq!(unsigned_zero("12".into()), "12");
+    }
+
+    #[test]
+    fn floors_text_summarises_the_skyline() {
+        assert_eq!(floors_text(&[1, 2, 2, 4, 6]), "1 / 2 / 6 · 1:1 2:2 4:1 6:1");
+        assert_eq!(floors_text(&[]), "—");
+        let built = Ledger { revenue: 10.0, land: 2.0, construction: 5.0, ..Ledger::default() };
+        let keys: Vec<&str> = ledger_lines(&built).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(&keys[..3], ["optimize.econ.revenue", "optimize.econ.land", "optimize.econ.construction"]);
+    }
+
+    /// Green space, storeys and walkable patterns are on out of the box;
+    /// unchecking lifts them; daylight is opt-in.
+    #[test]
+    fn walkable_form_defaults_and_toggles() {
+        let mut f = OptimizeForm::default();
+        let r = f.to_request();
+        assert_eq!((r.min_open, r.max_stories, r.min_park_access), (Some(0.10), Some(6), Some(0.9)));
+        assert_eq!(r.min_daylight, None);
+        assert_eq!(r.patterns, ["orthogonal", "skewed", "hexagonal", "voronoi"]);
+        for i in [3, 9, 10] {
+            f.constraints[i].0 = false;
+        }
+        f.constraints[11] = (true, 40.0);
+        let r = f.to_request();
+        assert_eq!((r.min_open, r.max_stories, r.min_park_access), (None, None, None));
+        assert_eq!(r.min_daylight, Some(0.4));
     }
 
     #[test]
@@ -1206,6 +1431,7 @@ mod tests {
         f.seed_from_plan(&s);
         assert_eq!(f.constraints[0], (true, 210.0));
         assert_eq!(f.constraints[6], (true, 1260.0));
+        assert_eq!(f.constraints[1], (true, s.lot_width_min));
         let r = f.to_request();
         assert_eq!((r.min_lot_area, r.max_lot_area), (Some(210.0), Some(1260.0)));
         assert_eq!((r.max_depth_ratio, r.max_block_perimeter), (Some(3.0), Some(800.0)));
