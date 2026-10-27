@@ -283,6 +283,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Curve,
         },
         CommandSpec {
+            name: "insertpoint",
+            usage: "insertpoint <curve selector> <index> <x,y,z>",
+            summary: "Insert a vertex/control point into a polyline or NURBS curve at index (0..=count). NURBS knots are regenerated clamped-uniform. Example: insertpoint last 1 4,5,0",
+            category: Category::Curve,
+        },
+        CommandSpec {
+            name: "deletepoint",
+            usage: "deletepoint <curve selector> <index>",
+            summary: "Delete one vertex/control point of a polyline or NURBS curve. Keeps 2 points (3 closed) or degree+1 control points. Example: deletepoint last 2",
+            category: Category::Curve,
+        },
+        CommandSpec {
             name: "insertknot",
             usage: "insertknot <curve selector> <t 0..1>",
             summary: "Insert a knot into a NURBS curve at parameter t — shape unchanged, one control point added for finer local editing. Example: insertknot last 0.5",

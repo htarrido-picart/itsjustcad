@@ -9647,6 +9647,106 @@ fn curve_of<'a>(doc: &'a Document, id: ObjectId, verb: &str) -> Result<&'a Curve
     }
 }
 
+/// `insertpoint` (`position` is `Some`) or `deletepoint` on one polyline or
+/// NURBS curve. Polylines keep at least 2 points (3 when closed). NURBS keep
+/// their degree and need `degree + 1` control points; the new point gets
+/// weight 1 and the knot vector is regenerated clamped-uniform, so a curve
+/// with non-uniform knots may shift slightly away from the edit. A live road
+/// centreline routes to the street editor: insert at the nearest point on the
+/// street (the index is ignored), delete an interior node.
+fn exec_vertex_edit(
+    doc: &mut Document,
+    target: Selector,
+    index: u32,
+    position: Option<DVec3>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let verb = if position.is_some() { "insertpoint" } else { "deletepoint" };
+    let ids = resolve(doc, &target)?;
+    let [tid] = ids[..] else {
+        return Err(ExecError::Invalid(format!(
+            "{verb} target matched {} objects, expected exactly 1",
+            ids.len()
+        )));
+    };
+    let mut new = curve_of(doc, tid, verb)?.clone();
+    let i = index as usize;
+    if matches!(new, Curve::Polyline { .. })
+        && crate::lot::streets::live_roads_source(doc, &[tid]).is_some()
+    {
+        let op = match position {
+            Some(p) => crate::lot::StreetOp::Insert { at: p.truncate() },
+            None => crate::lot::StreetOp::Delete { index: i },
+        };
+        return exec_street_geometry(doc, Selector::Ids { ids: vec![tid] }, op, None);
+    }
+    let range = |n: usize, what: &str| {
+        let hi = if position.is_some() { n } else { n.saturating_sub(1) };
+        ExecError::Invalid(format!("{verb} index {i} out of range (0..={hi} for {n} {what})"))
+    };
+    match &mut new {
+        Curve::Polyline { points, closed } => {
+            let n = points.len();
+            match position {
+                Some(p) if i <= n => points.insert(i, p),
+                None if i < n => {
+                    let min = if *closed { 3 } else { 2 };
+                    if n <= min {
+                        return Err(ExecError::Invalid(format!(
+                            "deletepoint would leave a {} polyline with {} points (needs {min})",
+                            if *closed { "closed" } else { "open" },
+                            n - 1
+                        )));
+                    }
+                    points.remove(i);
+                }
+                _ => return Err(range(n, "points")),
+            }
+        }
+        Curve::Nurbs { control, weights, knots, degree } => {
+            let n = control.len();
+            match position {
+                Some(p) if i <= n => {
+                    control.insert(i, p);
+                    weights.insert(i, 1.0);
+                }
+                None if i < n => {
+                    if n <= *degree + 1 {
+                        return Err(ExecError::Invalid(format!(
+                            "deletepoint would leave a degree-{degree} curve with {} control points (needs {})",
+                            n - 1,
+                            *degree + 1
+                        )));
+                    }
+                    control.remove(i);
+                    weights.remove(i);
+                }
+                _ => return Err(range(n, "control points")),
+            }
+            *knots = kernel_curve::clamped_uniform_knots(control.len(), *degree);
+        }
+        _ => {
+            return Err(ExecError::Invalid(format!(
+                "{verb} works on NURBS and polyline curves only"
+            )))
+        }
+    }
+    let obj = doc.get_mut(tid).expect("resolved");
+    let snapshot = obj.geometry.clone();
+    obj.geometry = Geometry::Curve(new);
+    let (cmd, message) = match position {
+        Some(p) => (
+            Command::InsertPoint { target, index, position: p },
+            format!("insertpoint {tid} [{i}] = {p}"),
+        ),
+        None => (Command::DeletePoint { target, index }, format!("deletepoint {tid} [{i}]")),
+    };
+    Ok((
+        cmd,
+        Inverse::SetGeometry(vec![(tid, snapshot)]),
+        ApplyOutcome { created: Vec::new(), message },
+    ))
+}
+
 /// Per-instance baked-block key for a dynamic-block instance. Deterministic in
 /// the instance id so undo/redo/replay recreate the exact same key.
 fn param_bake_key(source: &str, id: ObjectId) -> String {
@@ -11169,6 +11269,10 @@ fn apply_forward(
                 },
             ))
         }
+        Command::InsertPoint { target, index, position } => {
+            exec_vertex_edit(doc, target, index, Some(position))
+        }
+        Command::DeletePoint { target, index } => exec_vertex_edit(doc, target, index, None),
         Command::InsertKnot { target, t } => {
             let ids = resolve(doc, &target)?;
             let [tid] = ids[..] else {
@@ -16826,6 +16930,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::InterpCurve { .. } => "interpcurve",
         Command::Helix { .. } => "helix",
         Command::SetPoint { .. } => "setpoint",
+        Command::InsertPoint { .. } => "insertpoint",
+        Command::DeletePoint { .. } => "deletepoint",
         Command::InsertKnot { .. } => "insertknot",
         Command::CurvatureGraph { .. } => "curvature",
         Command::Rebuild { .. } => "rebuild",
@@ -24369,6 +24475,79 @@ mod tests {
         run(&mut s, "polyline 0,0 5,0 5,5");
         let err = s.run(parse("setpoint last 9 1,1,0").unwrap()).unwrap_err();
         assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn insertpoint_deletepoint_polyline_undo_replay() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0 5,0 5,5");
+        let before = curve_of_last(&s);
+        run(&mut s, "insertpoint last 1 2,0,0");
+        run(&mut s, "insertpoint last 4 0,5,0");
+        let Curve::Polyline { points, .. } = curve_of_last(&s) else { panic!() };
+        let xy: Vec<_> = points.iter().map(|p| (p.x, p.y)).collect();
+        assert_eq!(xy, [(0.0, 0.0), (2.0, 0.0), (5.0, 0.0), (5.0, 5.0), (0.0, 5.0)]);
+        run(&mut s, "deletepoint last 0");
+        let Curve::Polyline { points, .. } = curve_of_last(&s) else { panic!() };
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[0], DVec3::new(2.0, 0.0, 0.0));
+
+        let json = crate::io::to_json(&s);
+        assert!(json.contains("insert_point") && json.contains("delete_point"), "logged");
+        let loaded = crate::io::from_json(&json).unwrap();
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable");
+
+        for _ in 0..3 {
+            s.run(Command::Undo).unwrap();
+        }
+        assert_eq!(curve_of_last(&s), before);
+    }
+
+    #[test]
+    fn deletepoint_refuses_degenerate_polylines() {
+        let mut s = Session::default();
+        run(&mut s, "polyline 0,0 5,0");
+        let err = s.run(parse("deletepoint last 0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("needs 2"), "{err}");
+        run(&mut s, "polyline 0,0 5,0 5,5 closed");
+        let err = s.run(parse("deletepoint last 1").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("needs 3"), "{err}");
+        let err = s.run(parse("deletepoint last 3").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+        let err = s.run(parse("insertpoint last 4 1,1,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+        run(&mut s, "line 0,0 1,0");
+        let err = s.run(parse("deletepoint last 0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("NURBS and polyline"), "{err}");
+    }
+
+    #[test]
+    fn insertpoint_deletepoint_nurbs_keep_valid_knots() {
+        let mut s = Session::default();
+        run(&mut s, "curve 0,0 2,4 6,4 8,0");
+        let Curve::Nurbs { degree, control, .. } = curve_of_last(&s) else { panic!() };
+        let n0 = control.len();
+        let valid = |c: &Curve| {
+            let Curve::Nurbs { control, weights, knots, degree } = c else { panic!() };
+            assert_eq!(weights.len(), control.len());
+            assert_eq!(knots, &kernel_curve::clamped_uniform_knots(control.len(), *degree));
+            control.len()
+        };
+        run(&mut s, "insertpoint last 2 4,6,0");
+        let c = curve_of_last(&s);
+        assert_eq!(valid(&c), n0 + 1);
+        let Curve::Nurbs { control, .. } = &c else { panic!() };
+        assert_eq!(control[2], DVec3::new(4.0, 6.0, 0.0));
+        run(&mut s, "deletepoint last 0");
+        let c = curve_of_last(&s);
+        assert_eq!(valid(&c), n0);
+        let Curve::Nurbs { control, .. } = &c else { panic!() };
+        assert_eq!(control[1], DVec3::new(4.0, 6.0, 0.0));
+        while valid(&curve_of_last(&s)) > degree + 1 {
+            run(&mut s, "deletepoint last 0");
+        }
+        let err = s.run(parse("deletepoint last 0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("control points (needs"), "{err}");
     }
 
     #[test]
