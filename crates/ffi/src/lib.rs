@@ -39,6 +39,7 @@ mod boxsel;
 pub mod cameras;
 pub mod replay;
 pub mod selection;
+pub mod snap;
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -262,6 +263,8 @@ pub struct AppHandle {
     /// Other cameras (#165 multi-pane) wait in `cams` until activated.
     camera: OrbitCamera,
     cams: cameras::Cameras,
+    /// Grid step [`snap::ijc_osnap`] rounds to (model units).
+    grid_spacing: f64,
     /// Last size passed to [`ijc_resize`] on a headless handle (which has no
     /// drawable), for [`ijc_camera_state_json`] / [`ijc_screen_to_world`].
     /// `None` until set; unused on a GPU handle.
@@ -790,6 +793,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         session: Session::default(),
         camera: OrbitCamera::default(),
         cams: cameras::Cameras::default(),
+        grid_spacing: snap::DEFAULT_GRID,
         viewport: None,
         last_gen: None,
         theme: Theme::Dark,

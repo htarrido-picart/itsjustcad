@@ -23,6 +23,7 @@ pub mod io;
 pub mod landscape;
 pub mod las;
 pub mod lot;
+pub mod osnap;
 pub mod mesh_export;
 pub mod mesh_import;
 mod parse;

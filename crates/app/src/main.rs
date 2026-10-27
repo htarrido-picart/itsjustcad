@@ -33,7 +33,7 @@ mod menu;
 mod model_catalog;
 #[cfg(not(target_os = "linux"))]
 mod native_menu;
-mod osnap;
+use itsjustcad_commands::osnap;
 mod palette;
 mod param_editor;
 mod point_edit;
