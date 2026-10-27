@@ -356,7 +356,7 @@ fn assemble_lineperp(args: &[Input]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guided::{GuidedTool, StartResult, StepResult};
+    use crate::{GuidedTool, StartResult, StepResult};
     use glam::DVec3;
 
     // --- pure assembler round-trips ---

@@ -7,13 +7,34 @@
 //! parser already accepts. Guided runs flow through the identical substrate as
 //! typed or LLM commands (op-logged, undoable, replay-stable).
 //!
-//! This mirrors [`crate::draw_tool`] (the step machine for *creation* verbs) but
-//! generalizes the step to a heterogeneous list driven by a per-verb script.
-//! Pure logic lives here and is unit-tested; egui/rendering/snap timing stay in
-//! `app.rs`, which drives this the same way it drives `draw_tool`.
+//! This mirrors the desktop's `draw_tool` (the step machine for *creation*
+//! verbs) but generalizes the step to a heterogeneous list driven by a per-verb
+//! script. Pure logic lives here and is unit-tested, with no UI dependency, so
+//! the desktop app and the FFI (iOS/Mac) share one engine; egui/rendering/snap
+//! timing stay in the desktop's `app.rs`, the touch UI in the iOS app.
 
-pub(crate) use crate::draw_tool::{fmt, num};
 use glam::DVec3;
+
+/// Millimeter rounding for emitted command strings — points arrive already
+/// resolved (osnap hit or grid snap), this only strips float noise.
+pub fn num(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
+}
+
+/// A point as a command-line coordinate: `x,y` when z is ~0, else `x,y,z`.
+pub fn fmt(p: DVec3) -> String {
+    if p.z.abs() < 1e-9 {
+        format!("{},{}", num(p.x), num(p.y))
+    } else {
+        format!("{},{},{}", num(p.x), num(p.y), num(p.z))
+    }
+}
+
+/// Characters a typed precise-input buffer accepts (digits and coordinate
+/// punctuation: `.` `,` `@` `-` `+`).
+pub fn accepts_char(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '.' | ',' | '@' | '-' | '+')
+}
 
 // Per-group verb-script modules. Each owns one file and exposes a `SCRIPTS`
 // slice folded into `lookup`. `offset` is the locked reference example.
@@ -160,7 +181,7 @@ pub enum StartResult {
     NotGuided,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct GuidedTool {
     script: Option<&'static VerbScript>,
     /// Inputs seeded before any step (e.g. the pre-selection selector).
@@ -180,9 +201,11 @@ pub struct GuidedTool {
     /// branch is committed; then it supplies every step after the branch slot.
     branch: Option<&'static [Step]>,
     /// World points captured by `capture_point` [`Step::SelectObject`] picks, in
-    /// pick order. Appended (as [`Input::Point`]) after `seed ++ done` when the
-    /// flow completes, so the assembler can read them (fillet's `at` clause).
-    captured: Vec<DVec3>,
+    /// pick order, each tagged with the `done` index of the pick that captured
+    /// it (so [`GuidedTool::back`] can drop it). Appended (as [`Input::Point`])
+    /// after `seed ++ done` when the flow completes, so the assembler can read
+    /// them (fillet's `at` clause).
+    captured: Vec<(usize, DVec3)>,
 }
 
 impl GuidedTool {
@@ -386,7 +409,7 @@ impl GuidedTool {
         };
         self.done.push(Input::Objects(format!("#{short_id}")));
         if capture && let Some(p) = point {
-            self.captured.push(p);
+            self.captured.push((self.done.len() - 1, p));
         }
         self.input.clear();
         self.maybe_finish()
@@ -518,7 +541,7 @@ impl GuidedTool {
             Some(Step::Text { .. }) => c.is_alphanumeric() || c == '_' || c == '-',
             // Object picks are click-only — nothing to type into a buffer.
             Some(Step::SelectObject { .. } | Step::SelectObjects { .. }) => false,
-            _ => crate::precise::accepts_char(c),
+            _ => accepts_char(c),
         };
         if ok {
             self.input.push(c);
@@ -735,6 +758,89 @@ impl GuidedTool {
         if strip.len() >= 2 { vec![strip] } else { Vec::new() }
     }
 
+    /// The current step (branch-aware), for hosts that render their own
+    /// per-kind control (the iOS guided bar). `None` when idle.
+    pub fn current(&self) -> Option<&'static Step> {
+        self.current_step()
+    }
+
+    /// Zero-based index of the current step (steps committed so far).
+    pub fn step_index(&self) -> usize {
+        self.done.len()
+    }
+
+    /// Total steps when known (`None` while a branch arm is still unchosen).
+    pub fn step_count(&self) -> Option<usize> {
+        self.steps_total()
+    }
+
+    /// Objects (`#`-prefixed tokens) collected so far on an in-progress
+    /// [`Step::SelectObjects`] step.
+    pub fn selected_objects(&self) -> &[String] {
+        &self.selected
+    }
+
+    /// True when [`Self::back`] has something to undo.
+    pub fn can_back(&self) -> bool {
+        self.active() && (!self.done.is_empty() || !self.list.is_empty() || !self.selected.is_empty())
+    }
+
+    /// Step back once: an in-progress point list / object set loses its last
+    /// item first; otherwise the last committed step is re-opened (dropping a
+    /// chosen branch arm or a captured pick point with it). Returns false when
+    /// nothing was undone (first step, nothing collected). The desktop has no
+    /// Back; touch hosts use it for the guided bar's Back button.
+    pub fn back(&mut self) -> bool {
+        if !self.active() {
+            return false;
+        }
+        self.input.clear();
+        if self.list.pop().is_some() || self.selected.pop().is_some() {
+            return true;
+        }
+        if self.done.pop().is_none() {
+            return false;
+        }
+        let n = self.done.len();
+        self.captured.retain(|&(i, _)| i < n);
+        if self.branch_index() == Some(n) {
+            self.branch = None;
+        }
+        true
+    }
+
+    /// The command this flow would emit if the current step were answered with
+    /// `cursor` (a point step) or `pending` (a typed Number/Integer/Keyword
+    /// value; `None`/empty takes the default) and every later step took its
+    /// default. `None` when that is not possible — a later step has no default
+    /// (a point, an object, a number without default) or the input is invalid.
+    /// Pure (the tool is not changed): hosts run the result in a scratch
+    /// document to preview the outcome before commit.
+    pub fn hypothetical_command(&self, cursor: Option<DVec3>, pending: Option<&str>) -> Option<String> {
+        let mut t = self.clone();
+        let mut r = match t.current_step()? {
+            Step::PickPoint { .. } | Step::Vector { .. } => t.on_click(cursor?),
+            Step::Number { .. } | Step::Integer { .. } | Step::Keyword { .. } | Step::Branch { .. } => {
+                t.commit_typed(pending.unwrap_or(""))
+            }
+            _ => return None,
+        };
+        loop {
+            match r {
+                StepResult::Emit(cmd) => return Some(cmd),
+                StepResult::Error(_) => return None,
+                StepResult::NeedMore => {}
+            }
+            r = match t.current_step()? {
+                Step::Number { default: Some(_), .. }
+                | Step::Integer { default: Some(_), .. }
+                | Step::Keyword { .. }
+                | Step::Branch { .. } => t.commit_typed(""),
+                _ => return None,
+            };
+        }
+    }
+
     /// Total steps to collect before the flow completes, branch-aware. Without a
     /// branch it's just `base.len()`. With a branch: once an arm is chosen, it's
     /// `bi + 1` (base steps up to and including the branch's own Key slot) plus
@@ -761,7 +867,7 @@ impl GuidedTool {
         // Captured pick points (from `capture_point` SelectObject steps) ride at
         // the tail so assemblers that want them (fillet's `at` clause) can read
         // them via `captured_points`; assemblers that don't simply ignore them.
-        args.extend(self.captured.iter().copied().map(Input::Point));
+        args.extend(self.captured.iter().map(|&(_, p)| Input::Point(p)));
         let result = match (script.assemble)(&args) {
             Ok(cmd) => StepResult::Emit(cmd),
             Err(e) => StepResult::Error(e),
@@ -785,6 +891,16 @@ fn all_scripts() -> impl Iterator<Item = &'static VerbScript> {
         .chain(boolean::SCRIPTS)
         .chain(organize::SCRIPTS)
         .chain(structure::SCRIPTS)
+}
+
+/// True when `verb` (exactly, no args) has a guided script.
+pub fn is_guided_verb(verb: &str) -> bool {
+    lookup(verb.trim()).is_some()
+}
+
+/// Every guided verb name, in registry order.
+pub fn guided_verbs() -> impl Iterator<Item = &'static str> {
+    all_scripts().map(|s| s.verb)
 }
 
 /// Verb-script registry lookup. `None` → not a guided verb (fall through to the
@@ -1470,6 +1586,100 @@ mod tests {
         t.push_list_point(DVec3::ZERO);
         t.push_list_point(DVec3::new(1.0, 1.0, 0.0));
         assert!(t.preview(Some(cursor)).is_empty(), "no rubber-band when connect is false");
+    }
+
+    #[test]
+    fn back_reopens_the_previous_step_and_drops_captured_points() {
+        let mut t = GuidedTool::default();
+        assert!(!t.back(), "idle tool has nothing to undo");
+        t.try_start("fillet", None);
+        assert!(!t.can_back(), "first step, nothing collected");
+        assert!(!t.back());
+        t.commit_object_at("aaaa1111", Some(DVec3::new(1.0, 0.0, 0.0)));
+        assert!(t.can_back());
+        assert!(t.back(), "re-opens the first pick");
+        assert_eq!(t.step_index(), 0);
+        // The dropped pick's captured point must not leak into the command.
+        t.commit_object_at("aaaa1111", Some(DVec3::new(2.0, 0.0, 0.0)));
+        t.commit_object_at("bbbb2222", Some(DVec3::new(0.0, 3.0, 0.0)));
+        t.commit_typed("0.5");
+        t.commit_typed("");
+        assert_eq!(
+            t.commit_typed(""),
+            StepResult::Emit("fillet #aaaa1111 #bbbb2222 0.5 at 2,0 0,3 trim yes join no".into())
+        );
+    }
+
+    #[test]
+    fn back_pops_list_items_then_reopens_a_branch() {
+        let mut t = GuidedTool { script: Some(&BRANCH_TEST), ..Default::default() };
+        t.commit_typed("3");
+        t.commit_typed("beta");
+        assert_eq!(t.prompt().unwrap(), "B1:");
+        assert!(t.back(), "re-opens the branch choice");
+        assert_eq!(t.prompt().unwrap(), "Mode <alpha>:");
+        assert_eq!(t.step_count(), None, "arm unchosen again");
+        t.commit_typed("alpha");
+        assert_eq!(t.commit_typed("7"), StepResult::Emit("br 3 alpha 7".into()));
+
+        let mut t = GuidedTool { script: Some(&TXT_LIST_TEST), ..Default::default() };
+        t.push_input('n');
+        t.commit_text();
+        t.push_list_point(DVec3::ZERO);
+        assert!(t.back(), "pops the list point first");
+        assert_eq!(t.list_len(), 0);
+        assert!(t.current_wants_point_list(), "still on the list step");
+        assert!(t.back(), "then re-opens the name step");
+        assert!(t.current_wants_text());
+    }
+
+    #[test]
+    fn hypothetical_command_fills_cursor_and_defaults_without_mutating() {
+        let mut t = GuidedTool::default();
+        t.try_start("offset", Some("sel"));
+        // Distance step: the side point has no default → no result yet.
+        assert_eq!(t.hypothetical_command(Some(DVec3::X), Some("5")), None);
+        t.commit_typed("5");
+        // Side step: the cursor is the side point.
+        assert_eq!(
+            t.hypothetical_command(Some(DVec3::new(3.0, 0.0, 0.0)), None),
+            Some("offset sel 5 3,0".into())
+        );
+        assert_eq!(t.hypothetical_command(None, None), None, "no cursor, no point");
+        assert_eq!(t.step_index(), 1, "the tool itself did not advance");
+
+        let mut t = GuidedTool::default();
+        t.try_start("fillet", None);
+        t.commit_object_at("aaaa1111", Some(DVec3::new(2.0, 0.0, 0.0)));
+        assert_eq!(t.hypothetical_command(None, None), None, "second pick unknown");
+        t.commit_object_at("bbbb2222", Some(DVec3::new(0.0, 3.0, 0.0)));
+        // Radius step: a pending typed value, then Trim/Join defaults.
+        assert_eq!(
+            t.hypothetical_command(None, Some("0.25")),
+            Some("fillet #aaaa1111 #bbbb2222 0.25 at 2,0 0,3 trim yes join no".into())
+        );
+        assert_eq!(t.hypothetical_command(None, Some("abc")), None, "invalid pending");
+
+        let mut t = GuidedTool::default();
+        t.try_start("array", Some("sel"));
+        t.commit_typed("3");
+        t.commit_typed("");
+        // X spacing pending; Y spacing has no default → nothing yet.
+        assert_eq!(t.hypothetical_command(None, Some("2")), None);
+        t.commit_typed("2");
+        assert_eq!(
+            t.hypothetical_command(None, Some("4")),
+            Some("array sel 3,2,1 2,4,0".into())
+        );
+    }
+
+    #[test]
+    fn guided_verb_registry_queries() {
+        assert!(is_guided_verb("offset"));
+        assert!(is_guided_verb(" fillet "));
+        assert!(!is_guided_verb("offset sel 1"));
+        assert!(!is_guided_verb("sphere"));
+        assert_eq!(guided_verbs().count(), all_scripts().count());
     }
 
     #[test]

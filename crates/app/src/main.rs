@@ -18,7 +18,6 @@ mod feedback_sheet;
 mod draw_tool;
 mod dyntabs;
 mod filewatch;
-mod guided;
 mod gumball;
 mod hardware;
 mod headless;

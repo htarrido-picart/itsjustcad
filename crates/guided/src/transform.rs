@@ -239,7 +239,7 @@ pub static SCRIPTS: &[VerbScript] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guided::{GuidedTool, Input, StartResult, StepResult};
+    use crate::{GuidedTool, Input, StartResult, StepResult};
     use glam::DVec3;
 
     // ── assembler unit tests ─────────────────────────────────────────────────

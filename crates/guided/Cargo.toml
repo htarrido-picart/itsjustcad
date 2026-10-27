@@ -1,0 +1,13 @@
+[package]
+name = "itsjustcad-guided"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Guided command engine: per-verb step scripts that assemble canonical command strings (shared by the desktop app and the FFI)"
+
+[dependencies]
+glam.workspace = true
+
+[dev-dependencies]
+# Test-only: keeps the structure section catalog in step with the kernel.
+kernel-mesh.workspace = true

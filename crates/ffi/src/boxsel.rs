@@ -44,7 +44,7 @@ impl Rect {
 }
 
 /// World → screen pixels in a `w`×`h` drawable; None behind the camera.
-fn project(vp: Mat4, w: f32, h: f32, world: DVec3) -> Option<Vec2> {
+pub(crate) fn project(vp: Mat4, w: f32, h: f32, world: DVec3) -> Option<Vec2> {
     let clip = vp * Vec4::new(world.x as f32, world.y as f32, world.z as f32, 1.0);
     if clip.w.is_nan() || clip.w <= 0.0 {
         return None;
