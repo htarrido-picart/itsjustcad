@@ -1,0 +1,15 @@
+{
+  "_meta": {
+    "description": "Hand-written test fixture shaped like the SendCutSend catalog feed. Values are invented.",
+    "schema_version": "1.0",
+    "source_data_generated_at": "2026-01-02T03:04:05"
+  },
+  "materials": [
+    {"sku": "FIX-AL-125", "name": "5052 Test Aluminum", "category": "Aluminum", "thickness": "0.125", "out_of_stock": false, "cutting_process": "Fiber Laser", "min_part_size": "0.5x0.25", "max_part_size": "40 x 20", "available_services": ["bending", "anodizing"], "new_field": [1, 2, 3]},
+    {"sku": "FIX-AL7-125", "name": "7075 Test Aluminum", "category": "Aluminum", "thickness": "0.125", "out_of_stock": false, "cutting_process": "Fiber Laser", "min_part_size": "1.0x1.0", "max_part_size": "30 x 20"},
+    {"sku": "FIX-AL-063", "name": "5052 Test Aluminum", "category": "Aluminum", "thickness": "0.063", "out_of_stock": true, "cutting_process": "Fiber Laser", "min_part_size": "0.375x0.25"},
+    {"sku": "FIX-ST-250", "name": "Mild Test Steel", "category": "Steel", "thickness": "0.250", "cutting_process": "Fiber Laser", "max_part_size": "44 x 24"}
+  ],
+  "hardware": [],
+  "finish_options": []
+}

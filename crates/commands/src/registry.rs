@@ -822,6 +822,18 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "cutcheck",
+            usage: "cutcheck [sel] [units=mm|in] thickness=<t> [material=<sku or words>] [layers=a,b]",
+            summary: "Fabrication preflight for laser/waterjet/router parts (SendCutSend) over exactly what `export <f>.dxf profile=cut` would write: open contours, duplicate/overlapping paths, self-intersections and crossings, holes/slots below the minimum hole size, bridges/webs below the minimum bridge, holes too close to the part edge, part bounding box outside the min/max part size, text that is not outlined, dimensions/hatches/meshes in the export set, and islands inside holes. Limits: material=<SKU> (or words, nearest to thickness=, e.g. 'material=aluminum thickness=3') reads SendCutSend's specs/catalog JSON from ~/.config/itsjustcad/sendcutsend/; without it, the rule of thumb (holes, bridges, hole-to-edge ≥ 50% of thickness; part 0.5\"x0.5\" to 44\"x24\"). The report names its source and data date and every fallback. Prints a Markdown table; markers land on the 'compliance' layer; `report cutcheck` repeats it. Example: rect 0,0,0 0.05 0.03 then cutcheck thickness=3",
+            category: Category::Analyze,
+        },
+        CommandSpec {
+            name: "cutmaterials",
+            usage: "cutmaterials [filter words]",
+            summary: "List SendCutSend materials (SKU, thickness, process, part and feature minimums in inches) from the local cache ~/.config/itsjustcad/sendcutsend/ (sendcutsend-specs.json + sendcutsend-catalog.json, downloaded by the host — the core never fetches). Words filter on SKU/name/category/process. Example: cutmaterials aluminum",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "codecheck",
             usage: "codecheck <pack-name (e.g. demo, or one loaded via `checkrules load <path>`; `checkrules list` to see them)> [story]",
             summary: "Evaluate a compliance-check pack (declarative JSON rules) against the model: ramp/path slope, door clear width, stair risers, headroom, route clear width, turning circles, counts per story, guard drops. Verdicts land in `report codecheck` (rule id, pass/fail/warn, measured vs required, object ids); failures get colored markers on the 'compliance' layer. The embedded 'demo' pack is always available; load more with `checkrules load`. ADVISORY pre-check only, never a code review — verify with a licensed professional / AHJ. Example: codecheck demo · codecheck demo L1",

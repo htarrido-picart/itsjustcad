@@ -1647,6 +1647,33 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Fabrication preflight over the cut-profile contour set (see
+    /// [`crate::cutcheck`]). `thickness` is in `units`. `limits` is `None`
+    /// when typed; the session resolves it (SendCutSend cache for `material`,
+    /// else the rule of thumb), resolves `targets` to ids, and embeds both in
+    /// the logged op so replay never reads disk or the live selection.
+    /// Markers land on the 'compliance' layer; `ids` are written back.
+    CutCheck {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        targets: Option<Selector>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        layers: Vec<String>,
+        #[serde(default)]
+        units: crate::cut::CutUnit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thickness: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        material: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limits: Option<Box<crate::cutcheck::CutLimits>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
+    /// List SendCutSend materials from the local cache (query, never logged).
+    CutMaterials {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<String>,
+    },
     /// List the loaded check packs (query, never logged).
     CheckRulesList,
     /// Load a check-pack JSON file into the session's pack table (fs read;
@@ -2699,6 +2726,7 @@ impl Command {
                 | Command::SiteOptimize { .. }
                 | Command::CheckRulesList
                 | Command::CheckRulesLoad { .. }
+                | Command::CutMaterials { .. }
                 | Command::RoomList
                 | Command::StoryList
                 | Command::BlocksList

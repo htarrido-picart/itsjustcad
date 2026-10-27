@@ -765,6 +765,29 @@ impl Session {
                 self.run(Command::CodeCheck { pack, story, rules: Some(rules), ids })
             }
             Command::CheckRulesList => Ok(self.checkrules_list()),
+            Command::CutCheck { targets, layers, units, thickness, material, limits: None, ids } => {
+                let limits = crate::cutcheck::resolve_limits(
+                    units,
+                    thickness,
+                    material.as_deref(),
+                    crate::scs::default_dir().as_deref(),
+                )
+                .map_err(ExecError::Invalid)?;
+                let targets = match targets {
+                    Some(t) => Some(Selector::Ids { ids: resolve(&self.doc, &t)? }),
+                    None => None,
+                };
+                self.run(Command::CutCheck {
+                    targets,
+                    layers,
+                    units,
+                    thickness,
+                    material,
+                    limits: Some(Box::new(limits)),
+                    ids,
+                })
+            }
+            Command::CutMaterials { filter } => cutmaterials(filter.as_deref()),
             Command::SiteOptimize { targets, request } => {
                 let ids = resolve(&self.doc, &targets)?;
                 let (source, result) =
@@ -5150,6 +5173,11 @@ fn format_analysis_report(r: &AnalysisReport) -> String {
 /// so the deck can critique with citations; the advisory disclaimer rides in
 /// the header (it is part of the report's context) — every rendering carries it.
 fn format_compliance_report(r: &itsjustcad_doc::ComplianceReport) -> String {
+    if r.pack == crate::cutcheck::PACK {
+        // Part-scale report: locations in the cut unit, as a table.
+        let unit = r.rules.first().and_then(|o| crate::cut::CutUnit::parse(&o.unit));
+        return crate::cutcheck::markdown(r, unit.unwrap_or_default());
+    }
     let mut out = format!("codecheck {}: {}\n", r.pack, r.context);
     for o in &r.rules {
         let code = if o.code_ref.is_empty() {
@@ -5187,6 +5215,144 @@ fn format_compliance_report(r: &itsjustcad_doc::ComplianceReport) -> String {
     out
 }
 
+/// Draw one severity-colored circle per marker on the 'compliance' layer
+/// (radius `r`, lifted `dz`), reusing `ids` when replaying. Returns the
+/// marker ids and the layers created (for the undo inverse).
+fn place_markers(
+    doc: &mut Document,
+    markers: &[crate::checkengine::Marker],
+    ids: Option<Vec<ObjectId>>,
+    label: &str,
+    r: f64,
+    dz: f64,
+) -> (Vec<ObjectId>, Vec<String>) {
+    use crate::checkengine::COMPLIANCE_LAYER;
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == markers.len() => ids,
+        _ => (0..markers.len()).map(|_| ObjectId::new()).collect(),
+    };
+    let mut layers_created = Vec::new();
+    if !markers.is_empty() && !doc.layers.contains_key(COMPLIANCE_LAYER) {
+        doc.layers
+            .insert(COMPLIANCE_LAYER.to_string(), LayerStyle::default());
+        layers_created.push(COMPLIANCE_LAYER.to_string());
+    }
+    for ((at, severity), id) in markers.iter().zip(&new_ids) {
+        let circle: Vec<DVec3> = (0..12)
+            .map(|k| {
+                let a = k as f64 / 12.0 * std::f64::consts::TAU;
+                *at + DVec3::new(r * a.cos(), r * a.sin(), dz)
+            })
+            .collect();
+        doc.insert(SceneObject {
+            visible: true,
+            id: *id,
+            name: Some(format!("{label} {}", severity.label())),
+            layer: COMPLIANCE_LAYER.to_string(),
+            color: Some(severity.marker_color()),
+            material: None,
+            lineweight_mm: None,
+            edge_tags: None,
+            street: None,
+            geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
+        });
+    }
+    (new_ids, layers_created)
+}
+
+/// `cutcheck` — run the fabrication preflight over the cut-profile contour
+/// set, draw markers and store the report under `cutcheck` (see
+/// [`crate::cutcheck`]). `limits` and resolved `targets` were embedded by
+/// `Session::run`.
+#[allow(clippy::too_many_arguments)]
+fn exec_cutcheck(
+    doc: &mut Document,
+    targets: Option<Selector>,
+    layers: Vec<String>,
+    units: crate::cut::CutUnit,
+    thickness: Option<f64>,
+    material: Option<String>,
+    limits: Option<Box<crate::cutcheck::CutLimits>>,
+    ids: Option<Vec<ObjectId>>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    use crate::checkengine::COMPLIANCE_LAYER;
+    let limits = limits.ok_or_else(|| {
+        ExecError::Invalid("cutcheck op carries no limits (hand-edited file?)".into())
+    })?;
+    let scope_ids = targets.as_ref().map(|t| resolve(doc, t)).transpose()?;
+    let objs = crate::cut::scope(doc, &layers, scope_ids.as_deref());
+    let g = crate::cut::build(doc, &objs, units);
+    if g.contours.is_empty() && g.skipped.is_empty() {
+        return Err(ExecError::Invalid("cutcheck: nothing in scope to check".into()));
+    }
+    let context = crate::cutcheck::context(units, &limits);
+    let (report, markers) = crate::cutcheck::evaluate(&g, &limits, context);
+    // Marker size follows the part, not the 0.25 m building scale.
+    let (lo, hi) = g.contours.iter().map(|c| c.bbox()).fold(
+        (glam::DVec2::splat(f64::INFINITY), glam::DVec2::splat(f64::NEG_INFINITY)),
+        |(l, h), (a, b)| (l.min(a), h.max(b)),
+    );
+    let diag = if lo.is_finite() { lo.distance(hi) / units.per_meter() } else { 0.05 };
+    let r = (diag * 0.02).clamp(0.0005, 0.25);
+    let (new_ids, layers_created) = place_markers(doc, &markers, ids, "cutcheck", r, 0.0);
+    let mut message = crate::cutcheck::markdown(&report, units);
+    if !markers.is_empty() {
+        message.push_str(&format!(
+            "{} marker(s) on '{COMPLIANCE_LAYER}' — `report cutcheck` repeats this table\n",
+            markers.len()
+        ));
+    }
+    doc.compliance_reports.insert(crate::cutcheck::PACK.to_string(), report);
+    doc.generation += 1;
+    Ok((
+        Command::CutCheck {
+            targets,
+            layers,
+            units,
+            thickness,
+            material,
+            limits: Some(limits),
+            ids: Some(new_ids.clone()),
+        },
+        Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
+        ApplyOutcome { message, created: new_ids },
+    ))
+}
+
+/// `cutmaterials [filter]` — list SendCutSend materials from the local cache.
+fn cutmaterials(filter: Option<&str>) -> Result<ApplyOutcome, ExecError> {
+    let dir = crate::scs::default_dir()
+        .ok_or_else(|| ExecError::Invalid("no config directory".into()))?;
+    let data = crate::scs::load(&dir).map_err(ExecError::Invalid)?;
+    let hits = data.filter(filter.unwrap_or(""));
+    let mut out = format!(
+        "SendCutSend materials (data {}, {}): {} match(es){}\n\n| SKU | material | thickness | process | part min / max (in) | hole / bridge / edge min (in) |\n|---|---|---|---|---|---|\n",
+        data.date.as_deref().unwrap_or("of unknown date"),
+        dir.display(),
+        hits.len(),
+        if hits.len() > 60 { " — first 60 shown, narrow the filter" } else { "" },
+    );
+    let n = |v: Option<f64>| v.map_or("—".to_string(), |x| format!("{x}"));
+    let sz = |v: Option<(f64, f64)>| v.map_or("—".to_string(), |(a, b)| format!("{a}x{b}"));
+    for m in hits.iter().take(60) {
+        out.push_str(&format!(
+            "| {} | {}{} | {} | {} | {} / {} | {} / {} / {} |\n",
+            m.sku,
+            m.name,
+            if m.out_of_stock { " (out of stock)" } else { "" },
+            m.thickness.map_or("—".to_string(), |t| format!("{t} in ({:.2} mm)", t * 25.4)),
+            m.process.as_deref().unwrap_or("—"),
+            sz(m.min_part),
+            sz(m.max_part),
+            n(m.min_hole),
+            n(m.min_bridge),
+            n(m.min_hole_to_edge),
+        ));
+    }
+    out.push_str("\nUse `cutcheck material=<SKU>` (or words + thickness=, e.g. `material=aluminum thickness=3`).");
+    Ok(ApplyOutcome { message: out, created: Vec::new() })
+}
+
 /// `codecheck <pack> [story]` — evaluate the rules embedded in the op against
 /// the document, draw severity-colored failure markers on the 'compliance'
 /// layer (analysis-layer precedent: undo removes them, replay recreates them
@@ -5221,37 +5387,7 @@ fn exec_codecheck(
             .map_err(ExecError::Invalid)?;
 
     // Failure markers: a small circle per violation, colored by severity.
-    let new_ids: Vec<ObjectId> = match ids {
-        Some(ids) if ids.len() == markers.len() => ids,
-        _ => (0..markers.len()).map(|_| ObjectId::new()).collect(),
-    };
-    let mut layers_created = Vec::new();
-    if !markers.is_empty() && !doc.layers.contains_key(COMPLIANCE_LAYER) {
-        doc.layers
-            .insert(COMPLIANCE_LAYER.to_string(), LayerStyle::default());
-        layers_created.push(COMPLIANCE_LAYER.to_string());
-    }
-    const MARKER_R: f64 = 0.25;
-    for ((at, severity), id) in markers.iter().zip(&new_ids) {
-        let circle: Vec<DVec3> = (0..12)
-            .map(|k| {
-                let a = k as f64 / 12.0 * std::f64::consts::TAU;
-                *at + DVec3::new(MARKER_R * a.cos(), MARKER_R * a.sin(), 0.05)
-            })
-            .collect();
-        doc.insert(SceneObject {
-            visible: true,
-            id: *id,
-            name: Some(format!("codecheck {}", severity.label())),
-            layer: COMPLIANCE_LAYER.to_string(),
-            color: Some(severity.marker_color()),
-            material: None,
-            lineweight_mm: None,
-            edge_tags: None,
-            street: None,
-            geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
-        });
-    }
+    let (new_ids, layers_created) = place_markers(doc, &markers, ids, "codecheck", 0.25, 0.05);
 
     let count = |verdict: &str| report.rules.iter().filter(|r| r.verdict == verdict).count();
     let (pass, fail, warn, info) = (count("pass"), count("fail"), count("warn"), count("info"));
@@ -14014,6 +14150,12 @@ fn apply_forward(
         Command::CodeCheck { pack, story, rules, ids } => {
             exec_codecheck(doc, pack, story, rules, ids)
         }
+        Command::CutCheck { targets, layers, units, thickness, material, limits, ids } => {
+            exec_cutcheck(doc, targets, layers, units, thickness, material, limits, ids)
+        }
+        Command::CutMaterials { .. } => Err(ExecError::Invalid(
+            "cutmaterials is session-level; this is a bug".into(),
+        )),
         // Handled in Session::run (they touch session state, not the doc) and
         // never logged, so apply_forward/replay cannot legitimately see them.
         Command::CheckRulesList | Command::CheckRulesLoad { .. } => Err(ExecError::Invalid(
@@ -16824,6 +16966,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::EnviroReport { .. } => "report",
         Command::CodeCheck { .. } => "codecheck",
         Command::CheckRulesList | Command::CheckRulesLoad { .. } => "checkrules",
+        Command::CutCheck { .. } => "cutcheck",
+        Command::CutMaterials { .. } => "cutmaterials",
         Command::SheetTable { .. } => "sheettable",
         Command::SheetDim { .. } => "sheetdim",
         Command::SheetText { .. } => "sheettext",

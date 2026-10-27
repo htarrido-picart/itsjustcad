@@ -126,10 +126,11 @@ pub enum Contour {
         r: f64,
         src: usize,
     },
+    /// `src[i]` is the source index of `segs[i]`.
     Path {
         segs: Vec<Seg2>,
         closed: bool,
-        srcs: Vec<usize>,
+        src: Vec<usize>,
     },
 }
 
@@ -141,11 +142,20 @@ impl Contour {
         }
     }
 
-    /// Source indices (into [`CutGeometry::sources`]) this contour came from.
+    /// Distinct source indices (into [`CutGeometry::sources`]) this contour
+    /// came from, in first-use order.
     pub fn srcs(&self) -> Vec<usize> {
         match self {
             Contour::Circle { src, .. } => vec![*src],
-            Contour::Path { srcs, .. } => srcs.clone(),
+            Contour::Path { src, .. } => {
+                let mut out: Vec<usize> = Vec::new();
+                for s in src {
+                    if !out.contains(s) {
+                        out.push(*s);
+                    }
+                }
+                out
+            }
         }
     }
 
@@ -594,17 +604,8 @@ fn join(pieces: &[(Seg2, usize)], tol: f64) -> Vec<Contour> {
             }
         }
         let closed = closes(&chain);
-        let mut srcs: Vec<usize> = Vec::new();
-        for (_, s) in &chain {
-            if !srcs.contains(s) {
-                srcs.push(*s);
-            }
-        }
-        out.push(Contour::Path {
-            segs: chain.into_iter().map(|(s, _)| s).collect(),
-            closed,
-            srcs,
-        });
+        let (segs, src) = chain.into_iter().unzip();
+        out.push(Contour::Path { segs, closed, src });
     }
     out
 }
@@ -908,6 +909,27 @@ pub fn parse_export_opts(args: &[&str]) -> Result<Option<CutOpts>, String> {
     }
     opts.targets = parse_selector(&rest)?;
     Ok(Some(opts))
+}
+
+/// A length in `units`, optionally suffixed `mm` or `in` (`3`, `3mm`,
+/// `0.125in`); a suffix in the other unit is converted.
+pub fn parse_len(v: &str, units: CutUnit) -> Result<f64, String> {
+    let t = v.trim().to_ascii_lowercase();
+    let (num, from) = if let Some(n) = t.strip_suffix("mm") {
+        (n, CutUnit::Mm)
+    } else if let Some(n) = t.strip_suffix("in").or_else(|| t.strip_suffix('"')) {
+        (n, CutUnit::In)
+    } else {
+        (t.as_str(), units)
+    };
+    let x: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{v}' is not a length (e.g. 3, 3mm, 0.125in)"))?;
+    if !(x.is_finite() && x > 0.0) {
+        return Err(format!("'{v}' must be a positive length"));
+    }
+    Ok(x / from.per_meter() * units.per_meter())
 }
 
 /// Optional selector tokens (`sel`, `all`, `last [n]`, `name:<n>`, `id:<n>`).
