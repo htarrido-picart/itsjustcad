@@ -16,7 +16,7 @@
 
 use glam::DVec3;
 use kernel_curve::Curve;
-use itsjustcad_doc::{Document, Geometry};
+use itsjustcad_doc::{Document, Geometry, ObjectId};
 
 /// Screen-space pick radius in logical pixels.
 pub const SNAP_RADIUS_PX: f32 = 10.0;
@@ -225,14 +225,44 @@ pub fn candidates_filtered(
     last: Option<DVec3>,
     keep: impl Fn(kernel_mesh::Aabb) -> bool,
 ) -> Vec<(DVec3, SnapKind)> {
+    candidates_tagged(doc, settings, last, keep)
+        .into_iter()
+        .map(|c| (c.point, c.kind))
+        .collect()
+}
+
+/// A snap candidate with the object(s) it comes from: one object, or the two
+/// curves of an intersection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Candidate {
+    pub point: DVec3,
+    pub kind: SnapKind,
+    pub objects: [Option<ObjectId>; 2],
+}
+
+/// [`candidates_filtered`], keeping which object each candidate belongs to.
+pub fn candidates_tagged(
+    doc: &Document,
+    settings: &SnapSettings,
+    last: Option<DVec3>,
+    keep: impl Fn(kernel_mesh::Aabb) -> bool,
+) -> Vec<Candidate> {
     let mut out = Vec::new();
+    let mut tagged = Vec::new();
     if !settings.master {
-        return out; // master off ⇒ no object snapping at all
+        return tagged; // master off ⇒ no object snapping at all
     }
+    let tag = |out: &mut Vec<(DVec3, SnapKind)>, tagged: &mut Vec<Candidate>, objects| {
+        tagged.extend(out.drain(..).map(|(point, kind)| Candidate {
+            point,
+            kind,
+            objects,
+        }));
+    };
 
     // First pass: per-object candidates + gather nearby curves for the pairwise
     // intersection pass.
-    let mut curves: Vec<Curve> = Vec::new();
+    let mut curves: Vec<(ObjectId, Curve)> = Vec::new();
     for obj in doc.objects() {
         if !obj.visible || !doc.layer_visible(&obj.layer) {
             continue; // invisible geometry must not attract the cursor
@@ -243,7 +273,7 @@ pub fn candidates_filtered(
         match &obj.geometry {
             Geometry::Curve(c) => {
                 curve_candidates(c, settings, last, &mut out);
-                curves.push(c.clone());
+                curves.push((obj.id, c.clone()));
             }
             Geometry::Mesh(m)
             | Geometry::Frame { mesh: m, .. }
@@ -276,6 +306,7 @@ pub fn candidates_filtered(
             }
             Geometry::Points { .. } => {}
         }
+        tag(&mut out, &mut tagged, [Some(obj.id), None]);
     }
 
     // Second pass: intersections between nearby curves (line×line / segment
@@ -283,12 +314,17 @@ pub fn candidates_filtered(
     if settings.is_on(SnapKind::Intersection) {
         for i in 0..curves.len() {
             for j in (i + 1)..curves.len() {
-                curve_intersections(&curves[i], &curves[j], &mut out);
+                curve_intersections(&curves[i].1, &curves[j].1, &mut out);
+                tag(
+                    &mut out,
+                    &mut tagged,
+                    [Some(curves[i].0), Some(curves[j].0)],
+                );
             }
         }
     }
 
-    out
+    tagged
 }
 
 /// Per-curve significant points (end/mid/center/quadrant/perp/tan/nearest).
@@ -618,13 +654,24 @@ pub fn segment_intersection(p0: DVec3, p1: DVec3, q0: DVec3, q1: DVec3) -> Optio
 /// nearest). Candidates whose kind is not enabled in `settings` are ignored.
 pub fn resolve(
     candidates: &[(DVec3, SnapKind)],
-    cursor: egui::Pos2,
+    cursor: glam::Vec2,
     radius_px: f32,
     settings: &SnapSettings,
-    project: impl Fn(DVec3) -> Option<egui::Pos2>,
+    project: impl Fn(DVec3) -> Option<glam::Vec2>,
 ) -> Option<(DVec3, SnapKind)> {
-    let mut best: Option<(f32, u8, DVec3, SnapKind)> = None;
-    for (p, kind) in candidates {
+    resolve_index(candidates, cursor, radius_px, settings, project).map(|i| candidates[i])
+}
+
+/// [`resolve`], returning the index of the winning candidate.
+pub fn resolve_index(
+    candidates: &[(DVec3, SnapKind)],
+    cursor: glam::Vec2,
+    radius_px: f32,
+    settings: &SnapSettings,
+    project: impl Fn(DVec3) -> Option<glam::Vec2>,
+) -> Option<usize> {
+    let mut best: Option<(f32, u8, usize)> = None;
+    for (i, (p, kind)) in candidates.iter().enumerate() {
         if !settings.active(*kind) {
             continue;
         }
@@ -637,13 +684,13 @@ pub fn resolve(
         let better = match best {
             None => true,
             // Prefer smaller distance; on a near-tie prefer higher priority.
-            Some((bd, bp, _, _)) => d < bd - 0.5 || ((d - bd).abs() <= 0.5 && prio < bp),
+            Some((bd, bp, _)) => d < bd - 0.5 || ((d - bd).abs() <= 0.5 && prio < bp),
         };
         if better {
-            best = Some((d, prio, *p, *kind));
+            best = Some((d, prio, i));
         }
     }
-    best.map(|(_, _, p, k)| (p, k))
+    best.map(|(_, _, i)| i)
 }
 
 #[cfg(test)]
@@ -688,8 +735,8 @@ mod tests {
     }
 
     /// Identity-ish projection: world xy -> screen xy (z ignored).
-    fn flat(p: DVec3) -> Option<egui::Pos2> {
-        Some(egui::pos2(p.x as f32, p.y as f32))
+    fn flat(p: DVec3) -> Option<glam::Vec2> {
+        Some(glam::Vec2::new(p.x as f32, p.y as f32))
     }
 
     fn all_on() -> SnapSettings {
@@ -1010,20 +1057,20 @@ mod tests {
             (DVec3::new(100.0, 100.0, 0.0), SnapKind::Mid),
             (DVec3::new(100.0, 100.0, 0.0), SnapKind::End),
         ];
-        let hit = resolve(&cands, egui::pos2(100.0, 100.0), 10.0, &all_on(), flat).unwrap();
+        let hit = resolve(&cands, glam::Vec2::new(100.0, 100.0), 10.0, &all_on(), flat).unwrap();
         assert_eq!(hit.1, SnapKind::End);
         // Nearer candidate wins over priority when clearly closer.
         let cands = vec![
             (DVec3::new(100.0, 100.0, 0.0), SnapKind::End),
             (DVec3::new(104.0, 100.0, 0.0), SnapKind::Nearest),
         ];
-        let hit = resolve(&cands, egui::pos2(103.0, 100.0), 10.0, &all_on(), flat).unwrap();
+        let hit = resolve(&cands, glam::Vec2::new(103.0, 100.0), 10.0, &all_on(), flat).unwrap();
         assert_eq!(hit.1, SnapKind::Nearest);
         // Disabling End means a lone End candidate does not resolve.
         let mut s = all_on();
         s.set(SnapKind::End, false);
         let cands = vec![(DVec3::new(100.0, 100.0, 0.0), SnapKind::End)];
-        assert!(resolve(&cands, egui::pos2(100.0, 100.0), 10.0, &s, flat).is_none());
+        assert!(resolve(&cands, glam::Vec2::new(100.0, 100.0), 10.0, &s, flat).is_none());
     }
 
     #[test]

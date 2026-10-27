@@ -6445,10 +6445,10 @@ impl App {
             );
             crate::osnap::resolve(
                 &cands,
-                pos,
+                glam::Vec2::new(pos.x, pos.y),
                 crate::osnap::SNAP_RADIUS_PX,
                 &snap_settings,
-                |w| project(view_proj, rect, w),
+                |w| project(view_proj, rect, w).map(|p| glam::Vec2::new(p.x, p.y)),
             )
         });
         // Grid fallback only when the grid toggle is on; otherwise the raw
