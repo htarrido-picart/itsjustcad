@@ -1235,6 +1235,19 @@ pub enum Command {
         #[serde(default)]
         tz_hours: f64,
     },
+    /// Set (or clear) the site climate from an EPW weather file (#170): facade
+    /// daylight and overheating (`siteoptimize`, the Yield economics) then use
+    /// its sunshine hours (direct normal ≥ 120 W/m²) and its hottest month
+    /// (dry-bulb) instead of clear-sky sun hours and the longest day. Sets the
+    /// document location from the EPW when it has none.
+    Climate {
+        /// EPW path (reference only once `data` is embedded); `None` clears.
+        path: Option<String>,
+        /// The parsed climate, embedded on first exec so replay never needs
+        /// the EPW file again.
+        #[serde(default)]
+        data: Option<itsjustcad_doc::Climate>,
+    },
     /// Ground shadow study: for each time step across a day, project every mesh
     /// silhouette onto the ground (`z=0`) along the sun direction and emit the
     /// projected convex hull as a closed polygon on a per-time `shadows-HH:MM`

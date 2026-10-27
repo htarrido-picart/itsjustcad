@@ -798,6 +798,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "climate",
+            usage: "climate <path.epw> | climate off",
+            summary: "Set the site climate from an EPW (EnergyPlus weather) file you supply — no download. Facade daylight and overheating (siteoptimize min_daylight / max_overheat, the Yield economics) then count sunshine hours (hours with direct-normal irradiance ≥ 120 W/m², per month and hour, from the file's hourly DNI; diffuse horizontal is stored too) and use the file's hottest month (mean dry-bulb) instead of clear-sky sun hours and the longest day; reports name which source they used. Sets the location from the EPW when the document has none. Logged with the parsed climate embedded, so files replay without the EPW; one undo step. off clears it (clear-sky again). Example: climate /data/guayaquil.epw",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "shadowstudy",
             usage: "shadowstudy <YYYY-MM-DD> <from-HH:MM> <to-HH:MM> <step-min>",
             summary: "Cast ground shadows of every mesh onto z=0 for each time step across a day, one closed polygon (projected convex hull per object) per stamp on 'shadows-HH:MM' layers. Needs a location (sun/location/EPW). Example: shadowstudy 2024-06-21 09:00 15:00 120",

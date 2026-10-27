@@ -174,6 +174,8 @@ pub(super) struct OptimizeForm {
     pub daylight_period: DaylightPeriod,
     pub daylight_hours: f64,
     pub overheat_hours: f64,
+    /// Use the document's climate file for daylight (when it has one).
+    pub use_climate: bool,
     /// Unit-size rule: average dwelling m² and net-to-gross efficiency
     /// (a fraction), seeded from the plan; sent as overrides when changed.
     pub dwelling_area: f64,
@@ -199,6 +201,7 @@ impl Default for OptimizeForm {
             daylight_period: d.daylight_period,
             daylight_hours: d.daylight_hours,
             overheat_hours: d.overheat_hours,
+            use_climate: d.use_climate,
             dwelling_area: rule.0,
             dwelling_efficiency: rule.1,
             plan_rule: rule,
@@ -225,6 +228,7 @@ impl OptimizeForm {
             daylight_period: self.daylight_period,
             daylight_hours: self.daylight_hours,
             overheat_hours: self.overheat_hours,
+            use_climate: self.use_climate,
             lock: SEARCHED
                 .iter()
                 .filter(|k| self.locks.contains(**k))
@@ -550,6 +554,12 @@ pub(super) fn columns(form: &OptimizeForm, rows: &[ResultRow]) -> Vec<Col> {
         if on(Constraint::MaxOverheat) {
             cols.push(Col::Overheat);
         }
+        // A narrow panel holds five: lots, then park access, go to the hover.
+        for drop in [Col::Lots, Col::Park] {
+            if cols.len() > 5 {
+                cols.retain(|c| *c != drop);
+            }
+        }
         return cols;
     }
     cols.extend([Col::Lots, Col::Dwellings]);
@@ -689,6 +699,8 @@ pub(super) struct Finished {
     /// The current plan, scored like a candidate.
     current: Option<ResultRow>,
     beats_current: bool,
+    /// How daylight was measured (when it was).
+    daylight: Option<site_optimize::DaylightInfo>,
 }
 
 /// A search running on a worker thread.
@@ -887,8 +899,26 @@ impl Finished {
             },
             current: current_row(r),
             beats_current: r.beats_current(),
+            daylight: r.daylight.clone(),
         }
     }
+}
+
+/// A climate as the panel names it: `city (file)`.
+fn climate_name(c: &itsjustcad_doc::Climate) -> String {
+    format!("{} ({})", c.city, c.source)
+}
+
+/// Where daylight's sun hours came from, and the overheating month.
+pub(super) fn daylight_source_text(climate: Option<&str>, overheat_month: Option<u32>) -> String {
+    let mut s = match climate {
+        Some(c) => format!("{} {c}", t("optimize.daylight.source_climate")),
+        None => t("optimize.daylight.source_clear").to_string(),
+    };
+    if let Some(m) = overheat_month {
+        s.push_str(&format!(" · {} {m}", t("optimize.daylight.overheat_month")));
+    }
+    s
 }
 
 /// The document's location as the optimizer takes it.
@@ -1170,6 +1200,10 @@ impl App {
         let (x_of, x_key) = axis_of(f.axis);
         ui.weak(format!("{} {}", t("optimize.pareto"), t(x_key)));
         pareto_plot(ui, &f.rows, x_of);
+        if let Some(d) = &f.daylight {
+            ui.add_space(crate::theme::Spacing::XS);
+            ui.weak(daylight_source_text(d.climate.as_deref(), d.overheat_month));
+        }
 
         if let Some(row) = apply {
             let out = self.session.run(Command::SiteOptimizeApply {
@@ -1276,6 +1310,7 @@ impl App {
     /// daylight constraint is on.
     fn optimize_daylight(&mut self, ui: &mut egui::Ui, source: ObjectId) {
         let busy = self.optimize.job.is_some();
+        let climate = self.session.doc.climate.as_ref().map(climate_name);
         let form = &mut self.optimize.form;
         let on = form.constraints[11].0 || form.constraints[12].0;
         egui::CollapsingHeader::new(t("optimize.daylight"))
@@ -1283,6 +1318,21 @@ impl App {
             .default_open(on)
             .show(ui, |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
+                    // The sun hours' source: the site's climate file, or
+                    // clear-sky geometry.
+                    match &climate {
+                        Some(name) => {
+                            ui.checkbox(
+                                &mut form.use_climate,
+                                format!("{} {name}", t("optimize.daylight.use_climate")),
+                            )
+                            .on_hover_text(t("optimize.daylight.climate_hint"));
+                        }
+                        None => {
+                            ui.weak(t("optimize.daylight.no_climate"));
+                        }
+                    }
+                    ui.add_space(crate::theme::Spacing::XS);
                     egui::Grid::new(("optimize_daylight_grid", source))
                         .num_columns(2)
                         .spacing(GRID_SPACING)
@@ -1332,9 +1382,17 @@ impl App {
     pub(super) fn yield_economics(&mut self, ui: &mut egui::Ui, source: ObjectId) {
         let generation = self.session.doc.generation;
         // The form's daylight settings; overheating always measured here.
+        let form = &self.optimize.form;
         let opts = site_optimize::DaylightOpts {
-            overheat_hours: Some(self.optimize.form.overheat_hours),
-            ..self.optimize.form.to_request().daylight_opts()
+            overheat_hours: Some(form.overheat_hours),
+            climate: self
+                .session
+                .doc
+                .climate
+                .clone()
+                .filter(|_| form.use_climate)
+                .map(Arc::new),
+            ..form.to_request().daylight_opts()
         };
         let fresh = matches!(&self.optimize.current_q, Some((id, g, o, _)) if *id == source && *g == generation && *o == opts);
         if !fresh {
@@ -1401,6 +1459,13 @@ impl App {
                     });
                 ui.add_space(crate::theme::Spacing::XS);
                 ui.label(format!("{} {}", t("optimize.yield.floors"), floors_text(&floors)));
+                if q.daylight_source.is_some() {
+                    let climate = (q.daylight_source
+                        == Some(site_optimize::DaylightSource::Climate))
+                    .then(|| self.session.doc.climate.as_ref().map(climate_name))
+                    .flatten();
+                    ui.weak(daylight_source_text(climate.as_deref(), None));
+                }
             });
     }
 
@@ -1492,7 +1557,11 @@ fn pareto_plot(ui: &mut egui::Ui, rows: &[ResultRow], x_of: fn(&ResultRow) -> f6
         (lo, (hi - lo).max(1e-9))
     };
     let ((x0, dx), (y0, dy)) = (span(&x_of), span(&|r| r.score));
-    let inner = rect.shrink(10.0);
+    // Room above and to the right for the rank labels.
+    let inner = egui::Rect::from_min_max(
+        rect.min + egui::vec2(10.0, 18.0),
+        rect.max - egui::vec2(18.0, 10.0),
+    );
     let at = |r: &ResultRow| {
         egui::pos2(
             inner.left() + ((x_of(r) - x0) / dx) as f32 * inner.width(),
@@ -1677,12 +1746,13 @@ mod tests {
         sunny.constraints[11].0 = true;
         assert_eq!(
             columns(&sunny, &[row(0.0)]),
-            [Score, Lots, Dwellings, Floors, Park, Daylight]
+            [Score, Dwellings, Floors, Park, Daylight]
         );
         sunny.constraints[12].0 = true;
         assert_eq!(
             columns(&sunny, &[row(0.0)]),
-            [Score, Lots, Dwellings, Floors, Park, Daylight, Overheat]
+            [Score, Dwellings, Floors, Daylight, Overheat],
+            "five fit"
         );
         let mut f = OptimizeForm {
             objective: Objective::Lots,

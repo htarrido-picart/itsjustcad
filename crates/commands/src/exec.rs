@@ -213,6 +213,11 @@ enum Inverse {
         prev_loc: Option<itsjustcad_doc::GeoLocation>,
         prev_sun: Option<itsjustcad_doc::SunPosition>,
     },
+    /// `climate`: restore the previous climate and location.
+    Climate {
+        prev: Option<Box<itsjustcad_doc::Climate>>,
+        prev_loc: Option<itsjustcad_doc::GeoLocation>,
+    },
     /// `view save`: restore the previously saved view of that name (if any).
     ViewSaved {
         name: String,
@@ -1138,6 +1143,11 @@ impl Session {
             Inverse::Location { prev_loc, prev_sun } => {
                 self.doc.location = *prev_loc;
                 self.doc.sun = *prev_sun;
+                self.doc.generation += 1;
+            }
+            Inverse::Climate { prev, prev_loc } => {
+                self.doc.climate = prev.as_deref().cloned();
+                self.doc.location = *prev_loc;
                 self.doc.generation += 1;
             }
             Inverse::ViewSaved { name, prev } => {
@@ -5582,6 +5592,100 @@ fn exec_shadow_study(
 /// month, occlusion-tested against the scene BVH) plus isotropic-sky diffuse
 /// from the Diffuse-Horizontal bins. The bins are embedded into the logged
 /// command on first exec so replay never re-reads the EPW file.
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `climate <path.epw>` / `climate off` (#170). The first exec reads and
+/// summarises the EPW and embeds it in the logged op; replay uses that.
+fn exec_climate(
+    doc: &mut Document,
+    path: Option<String>,
+    data: Option<itsjustcad_doc::Climate>,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let inverse = Inverse::Climate {
+        prev: doc.climate.clone().map(Box::new),
+        prev_loc: doc.location,
+    };
+    let Some(path) = path else {
+        doc.climate = None;
+        doc.generation += 1;
+        let message = "climate cleared — facade daylight uses clear-sky sun hours".to_string();
+        return Ok((
+            Command::Climate {
+                path: None,
+                data: None,
+            },
+            inverse,
+            ApplyOutcome {
+                created: Vec::new(),
+                message,
+            },
+        ));
+    };
+    let c = match data {
+        Some(c)
+            if c.sunshine.len() == 288
+                && c.irradiance.len() == 288
+                && c.monthly_temp.len() == 12 =>
+        {
+            c
+        }
+        Some(_) => return Err(ExecError::Invalid("corrupt climate in op-log".into())),
+        None => {
+            let text = read_import_string(&path)?;
+            let e = itsjustcad_solar::parse_epw_climate(&text)
+                .map_err(|e| ExecError::Invalid(format!("EPW '{path}': {e}")))?;
+            itsjustcad_doc::Climate {
+                source: std::path::Path::new(&path)
+                    .file_name()
+                    .map_or_else(|| path.clone(), |f| f.to_string_lossy().into_owned()),
+                city: e.city,
+                location: itsjustcad_doc::GeoLocation {
+                    lat_deg: e.lat_deg,
+                    lon_deg: e.lon_deg,
+                    tz_hours: e.tz_hours,
+                },
+                sunshine: e.sunshine,
+                irradiance: e.radiation,
+                monthly_temp: e.monthly_dry_bulb.to_vec(),
+            }
+        }
+    };
+    let mut message = format!("climate: EPW '{}' ({})", c.city, c.source);
+    if let Some(m) = c.hottest_month() {
+        let t = c.monthly_temp[m as usize - 1].unwrap_or(f64::NAN);
+        message.push_str(&format!(
+            " — hottest month {} ({t:.1} °C)",
+            MONTHS[m as usize - 1]
+        ));
+    }
+    let sun = c.sunshine_hours();
+    let (lo, hi) = sun
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), h| (lo.min(*h), hi.max(*h)));
+    message.push_str(&format!(
+        ", sunshine {lo:.1}–{hi:.1} h/day; facade daylight now uses it"
+    ));
+    if doc.location.is_none() {
+        doc.location = Some(c.location);
+        message.push_str("; location set from the EPW");
+    }
+    doc.climate = Some(c.clone());
+    doc.generation += 1;
+    Ok((
+        Command::Climate {
+            path: Some(path),
+            data: Some(c),
+        },
+        inverse,
+        ApplyOutcome {
+            created: Vec::new(),
+            message,
+        },
+    ))
+}
+
 fn exec_radiation(
     doc: &mut Document,
     targets: Selector,
@@ -14167,6 +14271,7 @@ fn apply_forward(
                 },
             ))
         }
+        Command::Climate { path, data } => exec_climate(doc, path, data),
         Command::ShadowStudy { ids, year, month, day, from_min, to_min, step_min } => {
             exec_shadow_study(doc, ids, year, month, day, from_min, to_min, step_min)
         }
@@ -17023,6 +17128,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Sun { .. } => "sun",
         Command::SunOff => "sunoff",
         Command::Location { .. } => "location",
+        Command::Climate { .. } => "climate",
         Command::ShadowStudy { .. } => "shadowstudy",
         Command::SunHours { .. } => "sunhours",
         Command::SunPath { .. } => "sunpath",

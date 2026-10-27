@@ -17,6 +17,7 @@
 //!   overheating: the share with too many sun hours on the hottest month.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use glam::{DVec2, DVec3};
 use rayon::prelude::*;
@@ -26,6 +27,7 @@ use subdivision::Polygon2d;
 use crate::lot::SitePlanBake;
 use crate::lot::street_net::{NetEdge, StreetNetwork};
 use crate::site_optimize::Location;
+use itsjustcad_doc::Climate;
 
 // ── street network ──────────────────────────────────────────────────────────
 
@@ -117,7 +119,7 @@ pub enum DaylightPeriod {
 }
 
 /// What a facade daylight analysis measures.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DaylightOpts {
     pub period: DaylightPeriod,
     /// Direct-sun hours (per day, averaged over the period) a facade sample
@@ -126,6 +128,20 @@ pub struct DaylightOpts {
     /// When set, also measure the share of facade area with MORE than this
     /// many direct-sun hours on the hottest month's 21st (overheating).
     pub overheat_hours: Option<f64>,
+    /// The site climate (`climate <file.epw>`): when set, a sun slot counts
+    /// by its sunshine share (expected sunshine hours, not clear-sky hours)
+    /// and overheating is measured on the file's hottest month.
+    pub climate: Option<Arc<Climate>>,
+}
+
+/// Where a daylight measure's sun hours came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaylightSource {
+    /// Clear-sky sun geometry (no climate file).
+    ClearSky,
+    /// The site's EPW climate.
+    Climate,
 }
 
 const YEAR: i32 = 2025;
@@ -142,11 +158,18 @@ fn extreme_month(lat_deg: f64, longest: bool) -> u32 {
         .unwrap_or(1)
 }
 
-/// The hottest month as sun geometry sees it: the longest day at the site.
-/// (A climate file's monthly temperatures would be better; the document keeps
-/// none, so this is the proxy.)
+/// The hottest month as sun geometry sees it: the longest day at the site —
+/// the proxy without a climate file (see [`overheat_month`]).
 pub fn hottest_month(lat_deg: f64) -> u32 {
     extreme_month(lat_deg, true)
+}
+
+/// The month overheating is measured on: the climate's hottest month (mean
+/// dry-bulb) when there is one, else the longest day.
+pub fn overheat_month(loc: &Location, climate: Option<&Climate>) -> u32 {
+    climate
+        .and_then(Climate::hottest_month)
+        .unwrap_or_else(|| hottest_month(loc.lat_deg))
 }
 
 /// The month with the fewest sun hours at the site.
@@ -157,6 +180,20 @@ pub fn worst_month(lat_deg: f64) -> u32 {
 /// Sun directions (unit, z up) every 30 min of `month`/`day` at `loc`, sun
 /// above the horizon only.
 pub fn day_sun(loc: &Location, month: u32, day: u32) -> Vec<DVec3> {
+    day_slots(loc, month, day, None)
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect()
+}
+
+/// [`day_sun`] with each slot's weight: 1 under a clear sky, the climate's
+/// sunshine share at that month and local hour otherwise.
+pub fn day_slots(
+    loc: &Location,
+    month: u32,
+    day: u32,
+    climate: Option<&Climate>,
+) -> Vec<(DVec3, f64)> {
     (0..48)
         .filter_map(|slot| {
             let utc = (slot as f64 * 30.0 - loc.tz_hours * 60.0).rem_euclid(1440.0);
@@ -171,7 +208,8 @@ pub fn day_sun(loc: &Location, month: u32, day: u32) -> Vec<DVec3> {
             );
             (p.altitude_deg > 0.0).then(|| {
                 let d = itsjustcad_solar::sun_direction(p.azimuth_deg, p.altitude_deg);
-                DVec3::new(d[0] as f64, d[1] as f64, d[2] as f64)
+                let w = climate.map_or(1.0, |c| c.sunshine_at(month, slot as f64 / 2.0));
+                (DVec3::new(d[0] as f64, d[1] as f64, d[2] as f64), w)
             })
         })
         .collect()
@@ -196,6 +234,10 @@ pub struct FacadeDaylight {
     /// Share of facade area over the overheating threshold on the hottest
     /// month, when asked.
     pub overheat: Option<f64>,
+    /// Clear-sky sun hours, or the climate's sunshine.
+    pub source: DaylightSource,
+    /// The month overheating was measured on (when asked).
+    pub overheat_month: Option<u32>,
 }
 
 /// One facade sample: where, facing, weight (m²), building and storey.
@@ -265,11 +307,15 @@ pub fn facade_daylight(plan: &SitePlanBake, floor_h: f64, loc: &Location, opts: 
     if blds.buildings.is_empty() {
         return None;
     }
-    let days: Vec<Vec<DVec3>> = period_days(opts.period, loc)
+    let climate = opts.climate.as_deref();
+    let days: Vec<Vec<(DVec3, f64)>> = period_days(opts.period, loc)
         .into_iter()
-        .map(|(m, d)| day_sun(loc, m, d))
+        .map(|(m, d)| day_slots(loc, m, d, climate))
         .collect();
-    let hot = opts.overheat_hours.map(|h| (day_sun(loc, hottest_month(loc.lat_deg), 21), h));
+    let hot_month = overheat_month(loc, climate);
+    let hot = opts
+        .overheat_hours
+        .map(|h| (day_slots(loc, hot_month, 21, climate), h));
     let mut tris = Vec::new();
     let mut samples = Vec::new();
     for (i, b) in blds.buildings.iter().enumerate() {
@@ -281,32 +327,53 @@ pub fn facade_daylight(plan: &SitePlanBake, floor_h: f64, loc: &Location, opts: 
         return None;
     }
     let bvh = kernel_mesh::TriBvh::build(tris);
-    // Half-hour slots needed over the whole period (average ≥ hours a day).
-    let need = (opts.hours * 2.0 * days.len() as f64).ceil() as usize;
+    // Half-hour slots needed over the whole period (average ≥ hours a day),
+    // each slot weighted by its sunshine share (1 under a clear sky).
+    let need = if climate.is_some() {
+        opts.hours * 2.0 * days.len() as f64
+    } else {
+        (opts.hours * 2.0 * days.len() as f64).ceil()
+    };
+    const EPS: f64 = 1e-9;
     let lit = |o: DVec3, n: DVec3, d: &DVec3| n.dot(*d) > 0.0 && !bvh.ray_occluded(o, *d);
     let per: Vec<(bool, bool)> = samples
         .par_iter()
         .map(|s| {
             let o = s.p + s.n * 0.05;
+            let facing = |(d, w): &&(DVec3, f64)| *w > 0.0 && s.n.dot(*d) > 0.0;
             // Stop as soon as the threshold is met or can no longer be.
-            let mut got = 0usize;
-            let mut left: usize = days.iter().map(|d| d.iter().filter(|d| s.n.dot(**d) > 0.0).count()).sum();
+            let mut got = 0.0;
+            let mut left: f64 = days
+                .iter()
+                .flat_map(|d| d.iter().filter(facing))
+                .map(|(_, w)| w)
+                .sum();
             'days: for day in &days {
-                for d in day.iter().filter(|d| s.n.dot(**d) > 0.0) {
-                    if got >= need || got + left < need {
+                for (d, w) in day.iter().filter(facing) {
+                    if got >= need - EPS || got + left < need - EPS {
                         break 'days;
                     }
-                    left -= 1;
+                    left -= w;
                     if lit(o, s.n, d) {
-                        got += 1;
+                        got += w;
                     }
                 }
             }
             let over = hot.as_ref().is_some_and(|(sun, h)| {
-                let limit = (h * 2.0).floor() as usize;
-                sun.iter().filter(|d| lit(o, s.n, d)).take(limit + 1).count() > limit
+                let limit = if climate.is_some() {
+                    h * 2.0
+                } else {
+                    (h * 2.0).floor()
+                };
+                let mut sum = 0.0;
+                sun.iter().filter(facing).any(|(d, w)| {
+                    if lit(o, s.n, d) {
+                        sum += w;
+                    }
+                    sum > limit + EPS
+                })
             });
-            (got >= need, over)
+            (got >= need - EPS, over)
         })
         .collect();
     let total: f64 = samples.iter().map(|s| s.w).sum::<f64>().max(1e-9);
@@ -321,7 +388,13 @@ pub fn facade_daylight(plan: &SitePlanBake, floor_h: f64, loc: &Location, opts: 
     Some(FacadeDaylight {
         facade: share(&|x| x.0),
         floors: lit_storeys as f64 / storeys.len().max(1) as f64,
-        overheat: hot.map(|_| share(&|x| x.1)),
+        overheat: hot.as_ref().map(|_| share(&|x| x.1)),
+        source: if climate.is_some() {
+            DaylightSource::Climate
+        } else {
+            DaylightSource::ClearSky
+        },
+        overheat_month: hot.map(|_| hot_month),
     })
 }
 

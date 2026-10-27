@@ -5581,7 +5581,10 @@ unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 /// every key optional (null / `{}` = defaults). Returns
 /// `{"candidates":[{"rank","score","params":{…},"yield":{YieldReport, with "dwellings"},"ledger":{Ledger},"park_access","floors":[…],"daylight","dwellings"}],"pareto":[ranks…],
 /// "pareto_axis":"open"|"net_area"|"gfa"|"lots","evaluated":n,"feasible":n,
-/// "current":{"score","yield","ledger","violations"}|null,"beats_current":bool}`
+/// "current":{"score","yield","ledger","violations"}|null,"beats_current":bool,
+/// "daylight_source":{"source":"clear_sky"|"climate","climate":"city (file)"|null,
+/// "overheat_month":1..12|null}|null}` (daylight uses the document's
+/// [`ijc_climate_json`] climate unless the request sets `"use_climate":false`)
 /// or `{"error":"…"}` (unknown source, bad request, or no feasible layout —
 /// the message names the binding constraint). Pass a candidate's `params` to
 /// [`ijc_site_optimize_apply`]. Runs synchronously (seconds for budget 400);
@@ -5671,6 +5674,35 @@ pub unsafe extern "C" fn ijc_site_optimize_apply(
             )),
             Err(e) => fail(e),
         }
+    })
+}
+
+/// The document's site climate (`climate <file.epw>`, #170), which facade
+/// daylight and overheating use instead of clear-sky sun hours:
+/// `{"source":file,"city","location":{"lat_deg","lon_deg","tz_hours"},
+/// "hottest_month":1..12|null,"monthly_temp":[°C|null ×12],
+/// "sunshine_hours":[mean daily sunshine hours ×12]}`, or `null` without a
+/// climate or for a null/invalid handle. Set it by running `climate <path>`
+/// (`climate off` clears). Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_climate_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let v = (unsafe { handle_ref(h) })
+            .and_then(|app| app.session.doc.climate.as_ref())
+            .map_or(serde_json::Value::Null, |c| {
+                serde_json::json!({
+                    "source": c.source,
+                    "city": c.city,
+                    "location": c.location,
+                    "hottest_month": c.hottest_month(),
+                    "monthly_temp": c.monthly_temp,
+                    "sunshine_hours": c.sunshine_hours(),
+                })
+            });
+        into_c_string(v.to_string())
     })
 }
 
@@ -7058,6 +7090,45 @@ mod headless_tests {
             assert!(!plain.contains("$INSUNITS"));
             assert!(ijc_export(h, c("dxf profile=cut units=m").as_ptr(), &mut len).is_null());
             assert!(ijc_export(h, c("svg profile=cut").as_ptr(), &mut len).is_null());
+            ijc_free(h);
+        }
+    }
+
+    /// #170: `climate <file.epw>` sets the site climate; the optimizer's
+    /// daylight then names it as its source.
+    #[test]
+    fn climate_json_and_daylight_source() {
+        let h = ijc_init_headless();
+        unsafe {
+            let j = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            assert_eq!(j(ijc_climate_json(h)), serde_json::Value::Null);
+            let epw = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../commands/tests/fixtures/guayaquil_synthetic.epw"
+            );
+            for line in [
+                format!("climate {epw}"),
+                "lotsettings preset=walkable".into(),
+            ] {
+                let out = j(ijc_run_command_result(h, c(&line).as_ptr()));
+                assert_eq!(out["ok"], true, "{line}: {out}");
+            }
+            let rect = j(ijc_run_command_result(h, c("rect 0,0,0 200 150").as_ptr()));
+            let src = rect["created"][0].as_str().unwrap().to_string();
+            let v = j(ijc_climate_json(h));
+            assert_eq!(
+                (v["city"].as_str(), v["hottest_month"].as_u64()),
+                (Some("Guayaquil Synthetic"), Some(3))
+            );
+            assert_eq!(v["sunshine_hours"].as_array().unwrap().len(), 12);
+            assert_eq!(v["location"]["tz_hours"], -5.0);
+            let req = c(r#"{"budget":6,"max_overheat":0.95}"#);
+            let out = j(ijc_site_optimize_json(h, c(&src).as_ptr(), req.as_ptr()));
+            assert_eq!(out["daylight_source"]["source"], "climate", "{out}");
+            assert_eq!(out["daylight_source"]["overheat_month"], 3);
+            let req = c(r#"{"budget":6,"max_overheat":0.95,"use_climate":false}"#);
+            let out = j(ijc_site_optimize_json(h, c(&src).as_ptr(), req.as_ptr()));
+            assert_eq!(out["daylight_source"]["source"], "clear_sky", "{out}");
             ijc_free(h);
         }
     }

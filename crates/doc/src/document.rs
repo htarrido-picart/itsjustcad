@@ -242,6 +242,10 @@ pub struct Document {
     /// environmental analyses (`shadowstudy`, `sunhours`). Logged via a
     /// `location` op so saved files replay it.
     pub location: Option<GeoLocation>,
+    /// Site climate from an EPW file (`climate`, #170): facade daylight uses
+    /// its sunshine and hottest month instead of clear-sky sun hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub climate: Option<crate::Climate>,
     /// Named structural sections (profiles) referenced by frame members.
     /// `serde(default)` keeps pre-structural files loading.
     #[serde(default)]
@@ -374,6 +378,7 @@ impl Default for Document {
             basemap: None,
             sun: None,
             location: None,
+            climate: None,
             sections: BTreeMap::new(),
             materials: BTreeMap::new(),
             grids: BTreeMap::new(),
