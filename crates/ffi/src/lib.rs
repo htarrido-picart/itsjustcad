@@ -37,6 +37,7 @@
 
 mod boxsel;
 pub mod replay;
+pub mod selection;
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -3578,7 +3579,8 @@ fn edge_tags_value(
 /// uuid) — `role` is `front` | `street_side` | `side` | `rear`, or `auto` to
 /// clear the override (#143 phase 5). One undoable `edgerole` op; on a lot of a
 /// subdivision the override is stored on it and survives a refresh. Returns
-/// run-result JSON (as [`ijc_run_command_result`]). Free with
+/// run-result JSON (as [`ijc_run_command_result`]) plus `"selected"`, the
+/// re-derived objects now selected (see [`selection`]). Free with
 /// [`ijc_string_free`].
 ///
 /// # Safety
@@ -3617,21 +3619,23 @@ pub unsafe extern "C" fn ijc_edge_role_set(
         else {
             return fail("no object with that id");
         };
+        let focus = selection::focus_of(&app.session.doc, &[id]);
         let cmd = Command::EdgeRole {
             targets: itsjustcad_commands::Selector::Ids { ids: vec![id] },
             edge: edge as usize,
             role,
             ids: None,
         };
-        into_c_string(run_cmd_json(&mut app.session, cmd))
+        into_c_string(selection::run_refocus_json(&mut app.session, &focus, cmd))
     })
 }
 /// Pin the building floor count of lot `id` (short id or full uuid) of a site
 /// plan — `id` may also be a building standing on the lot — to `floors`; `floors
 /// <= 0` clears the pin. A shim over [`ijc_lot_set`] (`{"floors": n}` / `{"floors": null}`),
 /// kept for #156 hosts. One undoable `lotheight` op; the pin is stored on the
-/// plan and survives a refresh. Returns run-result JSON (as
-/// [`ijc_run_command_result`]). Free with [`ijc_string_free`].
+/// plan and survives a refresh. Returns
+/// run-result JSON (as [`ijc_run_command_result`]) plus `"selected"`, the
+/// re-derived objects now selected (see [`selection`]). Free with [`ijc_string_free`].
 ///
 /// # Safety
 /// `h` must be null or a live handle; `id` must be null or a valid
@@ -3664,12 +3668,13 @@ pub unsafe extern "C" fn ijc_lot_height_set(
         else {
             return fail("no object with that id");
         };
+        let focus = selection::focus_of(&app.session.doc, &[id]);
         let cmd = Command::LotHeight {
             targets: itsjustcad_commands::Selector::Ids { ids: vec![id] },
             floors: (floors > 0).then_some(floors as u32),
             ids: None,
         };
-        into_c_string(run_cmd_json(&mut app.session, cmd))
+        into_c_string(selection::run_refocus_json(&mut app.session, &focus, cmd))
     })
 }
 
@@ -3743,13 +3748,16 @@ fn lot_edit_from_json(v: &serde_json::Value) -> Result<itsjustcad_commands::LotE
 }
 
 /// Set and/or reset the rule overrides of lot `lot_id` (short id or full
-/// uuid) of a site plan — `lot_id` may also be a building standing on the lot.
+/// uuid) of a site plan — `lot_id` may also be a building standing on the lot,
+/// or a comma-separated list of lots/buildings edited together as ONE undo
+/// step (an unknown id fails the whole edit).
 /// `json` is an object such as `{"floors": 12, "typology": "midrise",
 /// "setback_front": 4}`; a field set to `null` resets it to the plan's rule and
 /// `"clear": true` (or a list of field names) resets several. One undoable
 /// `lotset` op; overrides are stored on the plan and survive a refresh.
-/// Returns run-result JSON (as [`ijc_run_command_result`]). Free with
-/// [`ijc_string_free`].
+/// Returns run-result JSON (as [`ijc_run_command_result`]) plus
+/// `"selected":[id…]`: the edited lots in the re-derived plan (new ids), now
+/// the core selection (see [`selection`]). Free with [`ijc_string_free`].
 ///
 /// # Safety
 /// `h` must be null or a live handle; `lot_id` and `json` must be null or
@@ -3783,15 +3791,16 @@ pub unsafe extern "C" fn ijc_lot_set(
             Err(e) => return fail(&format!("lotset: {e}")),
         };
         apply_pending(app);
-        let Some(id) = object_by_id(&app.session.doc, id) else {
+        let Some(ids) = selection::ids_by_list(&app.session.doc, id) else {
             return fail("no object with that id");
         };
+        let focus = selection::focus_of(&app.session.doc, &ids);
         let cmd = Command::LotSet {
-            targets: Selector::Ids { ids: vec![id] },
+            targets: Selector::Ids { ids },
             edit,
             ids: None,
         };
-        into_c_string(run_cmd_json(&mut app.session, cmd))
+        into_c_string(selection::run_refocus_json(&mut app.session, &focus, cmd))
     })
 }
 
@@ -4117,8 +4126,9 @@ pub unsafe extern "C" fn ijc_street_graph_json(
 /// `{"op":"reset","all":true}`. Runs `streetmove` / `streetnode` /
 /// `streetreset` as one undoable op that re-derives the plan; an edit that
 /// leaves the site, crosses a street without a node or thins a block below
-/// the minimum depth fails with the reason. Returns run-result JSON (as
-/// [`ijc_run_command_result`]). Free with [`ijc_string_free`].
+/// the minimum depth fails with the reason. Returns
+/// run-result JSON (as [`ijc_run_command_result`]) plus `"selected"`, the
+/// re-derived objects now selected (see [`selection`]). Free with [`ijc_string_free`].
 ///
 /// # Safety
 /// `h` must be null or a live handle; `source` and `json` must be null or
@@ -4162,12 +4172,16 @@ pub unsafe extern "C" fn ijc_street_edit(
             (None, _) => return fail("street (a street id) is required"),
             (Some(_), _) => return fail("street must be a street id"),
         };
+        let focus = match street.as_ref().and_then(|v| v.as_u64()) {
+            Some(id) => itsjustcad_commands::lot::Focus::Street { source, street_id: id as u32 },
+            None => itsjustcad_commands::lot::Focus::None,
+        };
         let cmd = Command::StreetGeometry {
             targets: Selector::Ids { ids: targets },
             op,
             ids: None,
         };
-        into_c_string(run_cmd_json(&mut app.session, cmd))
+        into_c_string(selection::run_refocus_json(&mut app.session, &focus, cmd))
     })
 }
 
@@ -4175,7 +4189,8 @@ pub unsafe extern "C" fn ijc_street_edit(
 /// `{"name"?: string, "class"?: "arterial"|"collector"|"local"|"alley",
 /// "width"?: number}` (an empty name clears it). Runs `streetset` on the
 /// street's roads as one undoable op that re-derives the plan. Returns
-/// run-result JSON (as [`ijc_run_command_result`]). Free with
+/// run-result JSON (as [`ijc_run_command_result`]) plus `"selected"`, the
+/// re-derived objects now selected (see [`selection`]). Free with
 /// [`ijc_string_free`].
 ///
 /// # Safety
@@ -4227,6 +4242,7 @@ pub unsafe extern "C" fn ijc_street_set(
         else {
             return fail("no such street");
         };
+        let focus = itsjustcad_commands::lot::Focus::Street { source: view.source, street_id };
         let cmd = Command::StreetSet {
             targets: Selector::Ids { ids: view.roads },
             name,
@@ -4234,7 +4250,7 @@ pub unsafe extern "C" fn ijc_street_set(
             width,
             ids: None,
         };
-        into_c_string(run_cmd_json(&mut app.session, cmd))
+        into_c_string(selection::run_refocus_json(&mut app.session, &focus, cmd))
     })
 }
 
