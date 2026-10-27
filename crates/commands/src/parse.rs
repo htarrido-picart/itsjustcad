@@ -508,6 +508,22 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 position: point(pos)?,
             })
         }
+        "insertpoint" => {
+            let [sel, idx, pos] =
+                take::<3>("insertpoint", "a curve selector, point index and x,y,z", &args)?;
+            Ok(Command::InsertPoint {
+                target: selector_one(sel)?,
+                index: idx.parse().map_err(|_| ParseError::BadNumber(idx.to_string()))?,
+                position: point(pos)?,
+            })
+        }
+        "deletepoint" => {
+            let [sel, idx] = take::<2>("deletepoint", "a curve selector and point index", &args)?;
+            Ok(Command::DeletePoint {
+                target: selector_one(sel)?,
+                index: idx.parse().map_err(|_| ParseError::BadNumber(idx.to_string()))?,
+            })
+        }
         "insertknot" => {
             let [sel, t] = take::<2>("insertknot", "a curve selector and a parameter 0..1", &args)?;
             Ok(Command::InsertKnot { target: selector_one(sel)?, t: number(t)? })
@@ -5649,6 +5665,20 @@ mod tests {
             Command::Helix { radius, height, turns, .. }
                 if radius == 3.0 && height == 12.0 && turns == 4.0
         ));
+    }
+
+    #[test]
+    fn parse_insertpoint_deletepoint() {
+        assert!(matches!(
+            parse("insertpoint last 2 4,5,0").unwrap(),
+            Command::InsertPoint { index: 2, target: Selector::Last { n: 1 }, .. }
+        ));
+        assert!(matches!(
+            parse("deletepoint last 3").unwrap(),
+            Command::DeletePoint { index: 3, target: Selector::Last { n: 1 } }
+        ));
+        assert!(parse("deletepoint last").is_err());
+        assert!(parse("insertpoint last x 1,1,0").is_err());
     }
 
     #[test]

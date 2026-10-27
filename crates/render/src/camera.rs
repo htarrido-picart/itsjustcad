@@ -192,6 +192,24 @@ impl OrbitCamera {
         let up = right.cross(forward).normalize();
         (right, up, forward)
     }
+
+    /// Zoom-extents framing: aim at `center` and back off so the bounding
+    /// sphere of a box with diagonal `diag` (plus a 5% margin) fits the
+    /// viewport in BOTH axes. The limiting half-angle is the smaller of the
+    /// vertical and horizontal ones, so on a viewport taller than wide the
+    /// width limits instead of the height. Ortho fits the sphere's radius to
+    /// the half-extent at the target; perspective keeps the whole sphere
+    /// inside the view cone. A non-finite or non-positive `aspect` counts as
+    /// square. Never closer than `min_distance`.
+    pub fn frame(&mut self, center: Vec3, diag: f32, aspect: f32, min_distance: f32) {
+        let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+        let r = diag * 0.5 * 1.05;
+        // tan of the limiting half-angle: tan(fov_x/2) = tan(fov_y/2) * aspect.
+        let t = (self.fov_y * 0.5).tan().max(1e-4) * aspect.min(1.0);
+        let d = if self.ortho { r / t } else { r / t.atan().sin() };
+        self.target = center;
+        self.distance = d.max(min_distance);
+    }
 }
 
 /// Horizontal angle of view for a full-frame (36mm-wide sensor) lens:
@@ -268,6 +286,54 @@ mod tests {
     fn screen_xy(m: Mat4, p: Vec3) -> glam::Vec2 {
         let c = m * p.extend(1.0);
         glam::Vec2::new(c.x / c.w, c.y / c.w)
+    }
+
+    /// Every corner of the box lands inside NDC [-1, 1] in both axes.
+    fn box_fits(cam: &OrbitCamera, min: Vec3, max: Vec3, aspect: f32) -> bool {
+        let m = cam.view_proj(aspect);
+        (0..8).all(|i| {
+            let p = Vec3::new(
+                if i & 1 == 0 { min.x } else { max.x },
+                if i & 2 == 0 { min.y } else { max.y },
+                if i & 4 == 0 { min.z } else { max.z },
+            );
+            let s = screen_xy(m, p);
+            s.x.abs() <= 1.0 && s.y.abs() <= 1.0
+        })
+    }
+
+    #[test]
+    fn frame_fits_wide_box_on_portrait_viewport() {
+        // A wide, flat shape on a portrait phone (9:19.5): fitting by height
+        // alone ran it off the sides.
+        let (min, max) = (Vec3::new(-20.0, -1.0, 0.0), Vec3::new(20.0, 1.0, 1.0));
+        let (center, diag) = ((min + max) * 0.5, (max - min).length());
+        let portrait = 9.0 / 19.5;
+        for view in [StandardView::Top, StandardView::Front, StandardView::Perspective] {
+            let mut cam = OrbitCamera::default();
+            cam.set_view(view);
+            let mut height_only = cam;
+            height_only.frame(center, diag, 1.0, 0.0);
+            assert!(!box_fits(&height_only, min, max, portrait), "{view:?}: old fit overflows");
+            cam.frame(center, diag, portrait, 0.0);
+            assert!(box_fits(&cam, min, max, portrait), "{view:?}: fits by width");
+            assert!(box_fits(&cam, min, max, 16.0 / 9.0), "{view:?}: and landscape");
+        }
+    }
+
+    #[test]
+    fn frame_landscape_keeps_height_fit_and_min_distance() {
+        let mut cam = OrbitCamera::default();
+        cam.frame(Vec3::ZERO, 10.0, 16.0 / 9.0, 0.0);
+        let landscape = cam.distance;
+        cam.frame(Vec3::ZERO, 10.0, 1.0, 0.0);
+        assert_eq!(cam.distance, landscape, "wide viewports fit by height");
+        cam.frame(Vec3::ZERO, 10.0, 0.5, 0.0);
+        assert!(cam.distance > landscape * 1.5, "tall viewports back off");
+        cam.frame(Vec3::ZERO, 10.0, f32::NAN, 0.0);
+        assert_eq!(cam.distance, landscape, "bad aspect counts as square");
+        cam.frame(Vec3::ZERO, 1.0, 1.0, 5.0);
+        assert_eq!(cam.distance, 5.0);
     }
 
     #[test]

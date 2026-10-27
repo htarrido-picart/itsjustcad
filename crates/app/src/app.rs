@@ -3463,10 +3463,14 @@ impl App {
 
     fn zoom_extents(&mut self) {
         if let Some(bb) = self.session.doc.scene_aabb() {
-            let center = bb.center();
-            let cam = self.active_camera();
-            cam.target = glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
-            cam.distance = (bb.size().length() as f32 * 1.2).max(5.0);
+            let c = bb.center();
+            let aspect = self.active_aspect;
+            self.active_camera().frame(
+                glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32),
+                bb.size().length() as f32,
+                aspect,
+                5.0,
+            );
         }
     }
 
@@ -3579,11 +3583,14 @@ impl App {
     fn zoom_selected(&mut self) {
         match self.session.doc.selection_aabb() {
             Some(bb) => {
-                let center = bb.center();
-                let cam = self.active_camera();
-                cam.target =
-                    glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
-                cam.distance = (bb.size().length() as f32 * 1.2).max(2.0);
+                let c = bb.center();
+                let aspect = self.active_aspect;
+                self.active_camera().frame(
+                    glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32),
+                    bb.size().length() as f32,
+                    aspect,
+                    2.0,
+                );
             }
             None => self
                 .command_line
@@ -3598,10 +3605,10 @@ impl App {
         if let Some(bb) = self.session.doc.scene_aabb() {
             let c = bb.center();
             let center = glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32);
-            let distance = (bb.size().length() as f32 * 1.2).max(5.0);
+            let diag = bb.size().length() as f32;
+            // Only the active pane's aspect is tracked; the others share it.
             for cam in &mut self.cameras {
-                cam.target = center;
-                cam.distance = distance;
+                cam.frame(center, diag, self.active_aspect, 5.0);
             }
         }
     }

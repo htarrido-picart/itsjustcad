@@ -1038,12 +1038,18 @@ pub unsafe extern "C" fn ijc_new_document(h: *mut AppHandle) {
     })
 }
 
-/// Point the camera at the whole scene (used after opening a document).
+/// Point the camera at the whole scene (used after opening a document), fit
+/// by both axes of the viewport (square when its size is unknown).
 fn frame_camera(app: &mut AppHandle) {
     if let Some(bb) = app.session.doc.scene_aabb() {
-        let center = bb.center();
-        app.camera.target = glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
-        app.camera.distance = (bb.size().length() as f32 * 1.2).max(5.0);
+        let c = bb.center();
+        let aspect = viewport_size(app).map_or(1.0, |(w, h)| w / h.max(1.0));
+        app.camera.frame(
+            glam::Vec3::new(c.x as f32, c.y as f32, c.z as f32),
+            bb.size().length() as f32,
+            aspect,
+            5.0,
+        );
     }
 }
 
@@ -4315,6 +4321,24 @@ fn object_points_json(doc: &itsjustcad_doc::Document, id: itsjustcad_doc::Object
         "points": points,
         "generated": doc.subdiv_source_of(id).is_some(),
     }))
+}
+
+/// The document's site location (set by `location <lat> <lon> [tz]` or an EPW
+/// import) as `{"lat":deg,"lon":deg,"tzHours":h}`, or `null` when unset or for
+/// a null/invalid handle. Reflects queued commands only after the next
+/// [`ijc_render_frame`] / [`ijc_flush`]. Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_location_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let v = (unsafe { handle_ref(h) }).and_then(|app| app.session.doc.location).map_or(
+            serde_json::Value::Null,
+            |l| serde_json::json!({ "lat": l.lat_deg, "lon": l.lon_deg, "tzHours": l.tz_hours }),
+        );
+        into_c_string(v.to_string())
+    })
 }
 
 /// The subdivision source with short id `source`, if it has a link.
@@ -7790,6 +7814,75 @@ mod headless_tests {
             let road = r(ijc_street_json(h, c(&source).as_ptr(), 0))["objects"][0].as_str().unwrap().to_string();
             let v = r(ijc_object_points_json(h, c(&road).as_ptr()));
             assert_eq!(v["generated"], true, "{v}");
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn insertpoint_deletepoint_through_command_path() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            let run = |line: &str| r(ijc_run_command_result(h, c(line).as_ptr()));
+            let poly = run("polyline 0,0,0 10,0,0 10,5,0")["created"][0].as_str().unwrap().to_string();
+            let pts = || r(ijc_object_points_json(h, c(&poly).as_ptr()))["points"].clone();
+            let before = ijc_undo_cursor(h);
+            assert_eq!(run(&format!("insertpoint id:{poly} 1 5,0,0"))["ok"], true);
+            assert_eq!(pts()[1], serde_json::json!([5.0, 0.0, 0.0]));
+            assert_eq!(pts().as_array().unwrap().len(), 4);
+            assert_eq!(run(&format!("deletepoint id:{poly} 3"))["ok"], true);
+            assert_eq!(pts().as_array().unwrap().len(), 3);
+            assert_eq!(ijc_undo_cursor(h), before + 2, "one undo step each");
+            let out = run(&format!("deletepoint id:{poly} 9"));
+            assert_eq!(out["ok"], false, "{out}");
+            assert_eq!(run(&format!("deletepoint id:{poly} 0"))["ok"], true);
+            let out = run(&format!("deletepoint id:{poly} 0"));
+            assert_eq!(out["ok"], false, "keeps 2 points: {out}");
+
+            let nurbs = run("curve 0,0,0 5,5,0 10,0,0 15,5,0")["created"][0].as_str().unwrap().to_string();
+            assert_eq!(run(&format!("insertpoint id:{nurbs} 4 20,0,0"))["ok"], true);
+            let v = r(ijc_object_points_json(h, c(&nurbs).as_ptr()));
+            assert_eq!(v["points"][4], serde_json::json!([20.0, 0.0, 0.0]));
+
+            let names: Vec<String> = r(ijc_command_catalog_json())
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e["name"].as_str().map(String::from))
+                .collect();
+            assert!(names.iter().any(|n| n == "insertpoint") && names.iter().any(|n| n == "deletepoint"));
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn location_json_null_until_set() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            assert_eq!(r(ijc_location_json(h)), serde_json::Value::Null);
+            assert_eq!(r(ijc_location_json(std::ptr::null_mut())), serde_json::Value::Null);
+            let out = r(ijc_run_command_result(h, c("location 40.4168 -3.7038 1").as_ptr()));
+            assert_eq!(out["ok"], true, "{out}");
+            assert_eq!(r(ijc_location_json(h)), serde_json::json!({"lat": 40.4168, "lon": -3.7038, "tzHours": 1.0}));
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn zoom_extents_fits_width_on_portrait_viewport() {
+        let h = ijc_init_headless();
+        unsafe {
+            ijc_run_command_result(h, c("polyline -20,0,0 20,0,0").as_ptr()).pipe_free();
+            let distance = |w: u32, ht: u32| {
+                ijc_resize(h, w, ht);
+                ijc_camera_zoom_extents(h);
+                assert!(ijc_flush(h));
+                (*h).camera.distance
+            };
+            let landscape = distance(1600, 900);
+            let portrait = distance(900, 1950);
+            assert!(portrait > landscape * 2.0, "portrait {portrait} vs landscape {landscape}");
             ijc_free(h);
         }
     }

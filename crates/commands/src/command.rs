@@ -631,6 +631,19 @@ pub enum Command {
         index: u32,
         position: DVec3,
     },
+    /// Insert a vertex/control point into a Polyline or NURBS curve so it
+    /// lands at `index` (0..=len). NURBS knots are regenerated clamped-uniform.
+    InsertPoint {
+        target: Selector,
+        index: u32,
+        position: DVec3,
+    },
+    /// Delete vertex/control point `index` of a Polyline or NURBS curve.
+    /// Refused below 2 points (3 closed) or `degree + 1` control points.
+    DeletePoint {
+        target: Selector,
+        index: u32,
+    },
     /// Insert a knot into a NURBS curve at normalized parameter `t` (0..1),
     /// preserving the shape exactly while adding one control point (Boehm).
     InsertKnot {
