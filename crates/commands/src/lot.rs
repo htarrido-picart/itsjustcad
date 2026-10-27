@@ -19,6 +19,7 @@
 //! byte-identical lots (the subdivider is deterministic for a fixed seed).
 
 pub mod focus;
+pub mod street_net;
 pub mod streets;
 pub use streets::StreetOp;
 pub use focus::{

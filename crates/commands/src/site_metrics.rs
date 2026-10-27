@@ -3,8 +3,9 @@
 
 //! Site-plan metrics the optimizer (#145) scores beyond the yield report:
 //!
-//! - **Park walk distance** along the street network: a graph of the plan's
-//!   road centerlines (split where they cross or meet), multi-source Dijkstra
+//! - **Park walk distance** along the street network: the plan's street graph
+//!   ([`StreetNetwork`], the graph `ijc_street_graph_json` draws — so edited
+//!   streets change the walk), multi-source Dijkstra
 //!   from the parks' street-facing access points, read at each lot's
 //!   frontage midpoint.
 //! - **Facade daylight**: sample points on the buildings' vertical faces (a
@@ -15,8 +16,7 @@
 //!   site's worst month, or a date; never a hemisphere assumption. Optional
 //!   overheating: the share with too many sun hours on the hottest month.
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 
 use glam::{DVec2, DVec3};
 use rayon::prelude::*;
@@ -24,12 +24,11 @@ use serde::{Deserialize, Serialize};
 use subdivision::Polygon2d;
 
 use crate::lot::SitePlanBake;
+use crate::lot::street_net::{NetEdge, StreetNetwork};
 use crate::site_optimize::Location;
 
 // ── street network ──────────────────────────────────────────────────────────
 
-/// Snap / meet tolerance between centerlines, m.
-const SNAP: f64 = 1.0;
 /// How far a park edge may sit from a centerline and still open onto it, m
 /// (half a wide road plus a verge).
 const PARK_REACH: f64 = 20.0;
@@ -38,193 +37,11 @@ const LOT_REACH: f64 = 40.0;
 /// Spacing of the access points sampled along a park's boundary, m.
 const PARK_STEP: f64 = 10.0;
 
-fn seg_project(p: DVec2, a: DVec2, b: DVec2) -> (f64, DVec2) {
-    let ab = b - a;
-    let t = if ab.length_squared() > 0.0 {
-        ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    (t, a + ab * t)
-}
-
-/// The road network as an undirected graph of split centerline segments.
-struct Network {
-    nodes: Vec<DVec2>,
-    /// (from, to) node per edge.
-    edges: Vec<(usize, usize)>,
-    adj: Vec<Vec<(usize, f64)>>,
-    /// Edge ids per 50 m cell, for nearest-edge queries.
-    grid: HashMap<(i64, i64), Vec<usize>>,
-}
-
-const CELL: f64 = 50.0;
-
-fn cell(p: DVec2) -> (i64, i64) {
-    ((p.x / CELL).floor() as i64, (p.y / CELL).floor() as i64)
-}
-
-impl Network {
-    fn build(roads: &[Vec<DVec2>], closed: &[bool]) -> Network {
-        let mut segs: Vec<(DVec2, DVec2)> = Vec::new();
-        for (i, r) in roads.iter().enumerate() {
-            segs.extend(r.windows(2).map(|w| (w[0], w[1])));
-            if closed.get(i).copied().unwrap_or(false) && r.len() > 2 {
-                segs.push((r[r.len() - 1], r[0]));
-            }
-        }
-        segs.retain(|(a, b)| a.distance(*b) > 1e-6);
-        // Split parameters per segment: crossings and endpoints that touch
-        // another segment's interior (T-junctions).
-        let mut cuts: Vec<Vec<f64>> = vec![vec![0.0, 1.0]; segs.len()];
-        let mut sgrid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-        for (i, (a, b)) in segs.iter().enumerate() {
-            let (lo, hi) = (cell(a.min(*b) - SNAP), cell(a.max(*b) + SNAP));
-            for x in lo.0..=hi.0 {
-                for y in lo.1..=hi.1 {
-                    sgrid.entry((x, y)).or_default().push(i);
-                }
-            }
-        }
-        let cross = |u: DVec2, v: DVec2| u.x * v.y - u.y * v.x;
-        let mut pairs: Vec<(usize, usize)> = sgrid
-            .values()
-            .flat_map(|ids| {
-                ids.iter()
-                    .flat_map(move |&i| ids.iter().filter(move |&&j| j > i).map(move |&j| (i, j)))
-            })
-            .collect();
-        pairs.sort_unstable();
-        pairs.dedup();
-        for (i, j) in pairs {
-            let ((a, b), (c, d)) = (segs[i], segs[j]);
-            let (r, s) = (b - a, d - c);
-            let den = cross(r, s);
-            if den.abs() > 1e-12 {
-                let t = cross(c - a, s) / den;
-                let u = cross(c - a, r) / den;
-                if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
-                    cuts[i].push(t);
-                    cuts[j].push(u);
-                }
-            }
-            // Endpoints lying on the other segment.
-            for (p, k, (e, f)) in [(a, j, (c, d)), (b, j, (c, d)), (c, i, (a, b)), (d, i, (a, b))] {
-                let (t, q) = seg_project(p, e, f);
-                if q.distance(p) <= SNAP {
-                    cuts[k].push(t);
-                }
-            }
-        }
-        let mut net = Network { nodes: Vec::new(), edges: Vec::new(), adj: Vec::new(), grid: HashMap::new() };
-        let mut ids: HashMap<(i64, i64), usize> = HashMap::new();
-        let mut node = |net: &mut Network, p: DVec2| -> usize {
-            let k = ((p.x / SNAP).round() as i64, (p.y / SNAP).round() as i64);
-            *ids.entry(k).or_insert_with(|| {
-                net.nodes.push(p);
-                net.adj.push(Vec::new());
-                net.nodes.len() - 1
-            })
-        };
-        for ((a, b), mut ts) in segs.into_iter().zip(cuts) {
-            ts.sort_by(f64::total_cmp);
-            ts.dedup_by(|x, y| (*x - *y).abs() < 1e-9);
-            for w in ts.windows(2) {
-                let (p, q) = (a + (b - a) * w[0], a + (b - a) * w[1]);
-                let (u, v) = (node(&mut net, p), node(&mut net, q));
-                if u == v {
-                    continue;
-                }
-                let len = net.nodes[u].distance(net.nodes[v]);
-                let e = net.edges.len();
-                net.edges.push((u, v));
-                net.adj[u].push((v, len));
-                net.adj[v].push((u, len));
-                let (pu, pv) = (net.nodes[u], net.nodes[v]);
-                let (lo, hi) = (cell(pu.min(pv)), cell(pu.max(pv)));
-                for x in lo.0..=hi.0 {
-                    for y in lo.1..=hi.1 {
-                        net.grid.entry((x, y)).or_default().push(e);
-                    }
-                }
-            }
-        }
-        net
-    }
-
-    /// The nearest edge to `p` within `reach`: (edge, projection, offset).
-    fn nearest(&self, p: DVec2, reach: f64) -> Option<(usize, DVec2, f64)> {
-        let (lo, hi) = (cell(p - reach), cell(p + reach));
-        let mut best: Option<(usize, DVec2, f64)> = None;
-        for x in lo.0..=hi.0 {
-            for y in lo.1..=hi.1 {
-                for &e in self.grid.get(&(x, y)).into_iter().flatten() {
-                    let (u, v) = self.edges[e];
-                    let (_, q) = seg_project(p, self.nodes[u], self.nodes[v]);
-                    let d = q.distance(p);
-                    if d <= reach && best.is_none_or(|b| d < b.2 || (d == b.2 && e < b.0)) {
-                        best = Some((e, q, d));
-                    }
-                }
-            }
-        }
-        best
-    }
-
-    /// Multi-source Dijkstra: shortest network distance from any source
-    /// (a point on an edge with an extra offset) to every node.
-    fn distances(&self, sources: &[(usize, DVec2, f64)]) -> Vec<f64> {
-        #[derive(PartialEq)]
-        struct Item(f64, usize);
-        impl Eq for Item {}
-        impl Ord for Item {
-            fn cmp(&self, o: &Self) -> Ordering {
-                o.0.total_cmp(&self.0).then(o.1.cmp(&self.1))
-            }
-        }
-        impl PartialOrd for Item {
-            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-                Some(self.cmp(o))
-            }
-        }
-        let mut dist = vec![f64::INFINITY; self.nodes.len()];
-        let mut heap = BinaryHeap::new();
-        for &(e, q, off) in sources {
-            let (u, v) = self.edges[e];
-            for n in [u, v] {
-                let d = off + q.distance(self.nodes[n]);
-                if d < dist[n] {
-                    dist[n] = d;
-                    heap.push(Item(d, n));
-                }
-            }
-        }
-        while let Some(Item(d, n)) = heap.pop() {
-            if d > dist[n] {
-                continue;
-            }
-            for &(m, w) in &self.adj[n] {
-                if d + w < dist[m] {
-                    dist[m] = d + w;
-                    heap.push(Item(d + w, m));
-                }
-            }
-        }
-        dist
-    }
-}
-
 /// Network walking distance from each of `lots` (access points) to the
-/// nearest park, along `roads` (centerlines; `closed` marks loops). Parks open
+/// nearest park, along the street network `net`. Parks open
 /// onto every centerline within reach of their boundary. A lot or park with
 /// no street within reach is unreachable (infinite).
-pub fn walk_distances(
-    roads: &[Vec<DVec2>],
-    closed: &[bool],
-    parks: &[Polygon2d],
-    lots: &[DVec2],
-) -> Vec<f64> {
-    let net = Network::build(roads, closed);
+pub fn walk_distances(net: &StreetNetwork, parks: &[Polygon2d], lots: &[DVec2]) -> Vec<f64> {
     let mut sources = Vec::new();
     for park in parks {
         for (a, b) in park.edges() {
@@ -244,7 +61,7 @@ pub fn walk_distances(
             let Some((e, q, off)) = net.nearest(*p, LOT_REACH) else {
                 return f64::INFINITY;
             };
-            let (u, v) = net.edges[e];
+            let NetEdge { from: u, to: v, .. } = net.edges[e];
             let via_nodes = (dist[u] + q.distance(net.nodes[u])).min(dist[v] + q.distance(net.nodes[v]));
             // A park opening onto the same edge is reached along it.
             let same_edge = sources
@@ -271,7 +88,11 @@ pub fn lot_access_point(lot: &subdivision::Block) -> DVec2 {
 /// `plan.lots`).
 pub fn park_walk(plan: &SitePlanBake) -> Vec<f64> {
     let access: Vec<DVec2> = plan.lots.lots.iter().map(lot_access_point).collect();
-    walk_distances(&plan.site.roads, &plan.site.road_closed, &plan.reserved, &access)
+    walk_distances(
+        &StreetNetwork::from_plan(&plan.site),
+        &plan.reserved,
+        &access,
+    )
 }
 
 // ── facade daylight ─────────────────────────────────────────────────────────
@@ -507,6 +328,20 @@ pub fn facade_daylight(plan: &SitePlanBake, floor_h: f64, loc: &Location, opts: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lot::street_net::StreetLine;
+
+    fn net(roads: &[Vec<DVec2>]) -> StreetNetwork {
+        let lines: Vec<StreetLine> = roads
+            .iter()
+            .enumerate()
+            .map(|(i, r)| StreetLine {
+                id: i as u32,
+                points: r.clone(),
+                closed: false,
+            })
+            .collect();
+        StreetNetwork::build(&lines)
+    }
 
     fn poly(pts: &[(f64, f64)]) -> Polygon2d {
         Polygon2d::from_pairs(pts.iter().copied()).unwrap()
@@ -524,11 +359,15 @@ mod tests {
         let lot = DVec2::new(30.0, 6.0); // frontage midpoint on the south street
         let straight = (lot - DVec2::new(30.0, 106.0)).length();
         assert!(straight < 400.0);
-        let d = walk_distances(&[south.clone(), north.clone(), link], &[false; 3], std::slice::from_ref(&park), &[lot]);
+        let d = walk_distances(
+            &net(&[south.clone(), north.clone(), link]),
+            std::slice::from_ref(&park),
+            &[lot],
+        );
         assert!(d[0] > 2000.0 && d[0] < 2200.0, "{}", d[0]);
         // A through street at x = 30 makes it a short walk.
         let cut = vec![DVec2::new(30.0, 0.0), DVec2::new(30.0, 100.0)];
-        let d = walk_distances(&[south, north, cut], &[false; 3], &[park], &[lot]);
+        let d = walk_distances(&net(&[south, north, cut]), &[park], &[lot]);
         assert!(d[0] < 130.0, "{}", d[0]);
     }
 
@@ -536,8 +375,8 @@ mod tests {
     fn unreachable_without_streets_or_parks() {
         let road = vec![DVec2::new(0.0, 0.0), DVec2::new(100.0, 0.0)];
         let lot = DVec2::new(50.0, 5.0);
-        assert!(walk_distances(std::slice::from_ref(&road), &[false], &[], &[lot])[0].is_infinite());
+        assert!(walk_distances(&net(std::slice::from_ref(&road)), &[], &[lot])[0].is_infinite());
         let far_park = poly(&[(0.0, 500.0), (10.0, 500.0), (10.0, 510.0), (0.0, 510.0)]);
-        assert!(walk_distances(&[road], &[false], &[far_park], &[lot])[0].is_infinite());
+        assert!(walk_distances(&net(&[road]), &[far_park], &[lot])[0].is_infinite());
     }
 }
