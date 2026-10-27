@@ -79,7 +79,9 @@ pub use open_space::{
     ReservedBlock,
 };
 pub use geometry::polygon2d::Polygon2d;
-pub use reporting::{FrontageStats, YieldComparison, YieldInputs, YieldReport};
+pub use reporting::{
+    DwellingRule, DwellingStats, FrontageStats, Spread, YieldComparison, YieldInputs, YieldReport,
+};
 pub use geometry::polyline::PolylineTools;
 pub use geometry::split::{split_by_line, Line2d};
 pub use settings::{

@@ -8702,6 +8702,38 @@ impl App {
                 if r.lot_coverage.is_some() { "%" } else { "" },
             ),
         ]);
+        // Dwellings by the plan's unit-size rule (#170), next to storeys.
+        if let Some(d) = &r.dwellings {
+            let spread = |s: &subdivision::Spread| {
+                if (s.max - s.min).abs() < 1e-9 {
+                    format!("{:.1}", s.avg)
+                } else {
+                    format!("{:.1} ({:.0}–{:.0})", s.avg, s.min, s.max)
+                }
+            };
+            rows.push((t("param.subdivision.yield.dwellings"), n(d.total), ""));
+            if let Some(b) = &d.per_building {
+                rows.push((
+                    t("param.subdivision.yield.dwellings_per_building"),
+                    spread(b),
+                    "",
+                ));
+            }
+            if let Some(l) = &d.per_lot {
+                rows.push((
+                    t("param.subdivision.yield.dwellings_per_lot"),
+                    spread(l),
+                    "",
+                ));
+            }
+            if let Some(v) = d.per_ha_net {
+                rows.push((
+                    t("param.subdivision.yield.density"),
+                    z(format!("{v:.0}")),
+                    "/ha",
+                ));
+            }
+        }
         // Side padding so the table doesn't run edge to edge with the panel.
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(crate::theme::Spacing::M as i8, 4))
@@ -12415,6 +12447,99 @@ mod tests {
         harness.snapshot("app_chat_toggle");
         std::mem::forget(harness);
         std::mem::forget(rt);
+    }
+
+    /// Render the whole window off-screen after `setup` and `steps` frames
+    /// (the same harness as [`snapshot_app`]), returning the image.
+    #[cfg(test)]
+    fn render_app(
+        size: egui::Vec2,
+        dark: bool,
+        setup: impl FnOnce(&mut App),
+        steps: usize,
+    ) -> image::RgbaImage {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(size)
+            .wgpu()
+            .build_eframe(|cc| App::new(cc, handle.clone()));
+        {
+            let app = harness.state_mut();
+            app.preview_no_viewport = true;
+            app.forced_dark = Some(dark);
+            app.show_template_picker = false;
+            setup(app);
+        }
+        harness.run_steps(steps);
+        let img = harness.render().expect("render");
+        std::mem::forget(harness);
+        std::mem::forget(rt);
+        img
+    }
+
+    /// The site plan optimizer panel (#170: dwellings next to storeys) on a
+    /// walkable site plan, results shown. Writes full-window and right-dock
+    /// crops to `$IJC_SHOT_DIR` (default `tests/snapshots`):
+    ///
+    ///   IJC_SHOT_DIR=/tmp/shots cargo test -p itsjustcad app_preview_optimize -- --ignored
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to render the optimizer panel"]
+    fn app_preview_optimize_panel() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("IJC_SHOT_DIR").unwrap_or_else(|_| "tests/snapshots".into()),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = |app: &mut App| {
+            for line in [
+                "lotsettings preset=walkable",
+                "rect 0,0,0 300 200",
+                "siteplan last",
+            ] {
+                app.execute_line(line.to_string());
+            }
+            let source = *app
+                .session
+                .doc
+                .subdivision_links
+                .keys()
+                .next()
+                .expect("a site plan");
+            app.session.doc.selection = [source].into();
+            app.panel_tabs.show(crate::tabstrip::PanelTab::Parameters);
+            source
+        };
+        for (name, seg) in [
+            ("yield", optimize_panel::SEG_YIELD),
+            ("optimize", optimize_panel::SEG_OPTIMIZE),
+        ] {
+            for dark in [false, true] {
+                // Tall, so the whole panel (results included) fits unscrolled.
+                let img = render_app(
+                    egui::vec2(1440.0, 1900.0),
+                    dark,
+                    |app| {
+                        let source = plan(app);
+                        app.subdiv_segment = seg;
+                        if seg == optimize_panel::SEG_OPTIMIZE {
+                            app.optimize.form.budget = 40;
+                            app.optimize.run_now(&app.session.doc, source);
+                        }
+                    },
+                    6,
+                );
+                let theme = if dark { "dark" } else { "light" };
+                img.save(dir.join(format!("{name}_{theme}_full.png")))
+                    .unwrap();
+                // The right dock.
+                let (w, h) = img.dimensions();
+                let x = w * 7 / 10;
+                image::imageops::crop_imm(&img, x, 0, w - x, h)
+                    .to_image()
+                    .save(dir.join(format!("{name}_{theme}.png")))
+                    .unwrap();
+            }
+        }
     }
 
     #[test]

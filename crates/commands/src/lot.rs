@@ -1047,6 +1047,9 @@ pub fn gather_yield_inputs(
     let mut reserved_block_areas: Vec<f64> = Vec::new();
     let mut building_gfas: Vec<f64> = Vec::new();
     let mut building_footprints: Vec<f64> = Vec::new();
+    // Plan centre of each building's mass (to find its lot), parallel to
+    // `building_gfas`.
+    let mut building_centres: Vec<Option<DVec2>> = Vec::new();
     let mut site_candidates: Vec<f64> = Vec::new();
 
     for obj in doc.objects() {
@@ -1082,6 +1085,16 @@ pub fn gather_yield_inputs(
                     && let Some((gfa, fp)) = parse_mass_name(name)
                 {
                     building_gfas.push(gfa);
+                    building_centres.push(match &obj.geometry {
+                        Geometry::Mesh(m) if !m.positions().is_empty() => {
+                            let (lo, hi) = m.positions().iter().fold(
+                                (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)),
+                                |(lo, hi), p| (lo.min(p.truncate()), hi.max(p.truncate())),
+                            );
+                            Some((lo + hi) / 2.0)
+                        }
+                        _ => None,
+                    });
                     if fp > 0.0 {
                         building_footprints.push(fp);
                     }
@@ -1122,8 +1135,13 @@ pub fn gather_yield_inputs(
         gross_site_area,
         open_space_feature_areas,
         reserved_block_areas,
+        building_lots: building_centres
+            .iter()
+            .map(|c| c.and_then(|c| lots.iter().position(|l| l.polygon.contains(c))))
+            .collect(),
         building_gfas,
         building_footprints,
+        dwelling_rule: Some(settings.dwelling_rule()),
     }
 }
 
@@ -1706,6 +1724,7 @@ mod tests {
             reserved_block_areas: Vec::new(),
             building_gfas: bake.buildings.iter().map(|b| b.gfa).collect(),
             building_footprints: bake.buildings.iter().map(|b| b.footprint.area()).collect(),
+            ..Default::default()
         });
         assert!((report.total_gfa - total).abs() < 1e-6);
         // No variation, no pins: the same as `compute_buildings`.

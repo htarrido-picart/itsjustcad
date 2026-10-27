@@ -452,6 +452,14 @@ pub struct SubdivisionSettings {
     /// 0..1: how much the gradient (vs the random draw) sets a lot's place in
     /// its floor range. 1 = pure gradient, 0 = pure random.
     pub falloff_strength: f64,
+
+    /// Average dwelling size, m² of net floor area: a building holds
+    /// `GFA × dwelling_efficiency / dwelling_area` dwellings (rounded down, at
+    /// least one). Default 80 m².
+    pub dwelling_area: f64,
+    /// Net-to-gross floor area of a building (the share that is dwellings,
+    /// not cores, corridors or walls), in (0, 1]. Default 0.8.
+    pub dwelling_efficiency: f64,
 }
 
 impl Default for SubdivisionSettings {
@@ -514,11 +522,21 @@ impl Default for SubdivisionSettings {
             height_falloff: HeightFalloff::None,
             falloff_point: [0.0, 0.0],
             falloff_strength: 0.75,
+            dwelling_area: 80.0,
+            dwelling_efficiency: 0.8,
         }
     }
 }
 
 impl SubdivisionSettings {
+    /// The unit-size rule of these settings.
+    pub fn dwelling_rule(&self) -> crate::DwellingRule {
+        crate::DwellingRule {
+            area: self.dwelling_area,
+            efficiency: self.dwelling_efficiency,
+        }
+    }
+
     /// The effective upper clamp for `irregularity` given `loose`.
     pub fn irregularity_cap(&self) -> f64 {
         if self.loose {

@@ -7100,6 +7100,12 @@ fn exec_lot_settings(
                 s.falloff_point = [x, y];
             }
             "falloff_strength" => s.falloff_strength = num()?.clamp(0.0, 1.0),
+            // Unit-size rule: dwellings = GFA × efficiency / area (#170).
+            "dwelling_area" | "unit_area" => s.dwelling_area = num()?.max(1.0),
+            "dwelling_efficiency" | "efficiency" => {
+                let e = num()?;
+                s.dwelling_efficiency = (if e > 1.0 { e / 100.0 } else { e }).clamp(0.05, 1.0);
+            }
             // Skeleton backend — `skeleton=felkel|offset`. Default
             // offset (robust). felkel = true straight skeleton (convex-exact,
             // non-convex fallback to offset).
@@ -7116,7 +7122,8 @@ fn exec_lot_settings(
                      force_street/method/seed/region/loading/widthmix/depth/corner/flag/\
                      mergeslivers/front/side/rear/buildto/typology/footprint/floors/floorheight/\
                      coverage/roof/pitch/stepback/floors_min/floors_max/floors_range/height_seed/\
-                     height_mix/falloff/falloff_point/falloff_strength/skeleton)"
+                     height_mix/falloff/falloff_point/falloff_strength/dwelling_area/\
+                     dwelling_efficiency/skeleton)"
                 )));
             }
         }

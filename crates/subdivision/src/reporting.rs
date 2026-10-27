@@ -45,6 +45,72 @@ pub struct YieldInputs {
     /// Footprint (ground-floor) area of every building (m²). Empty when no
     /// footprints are present; then lot-coverage is omitted.
     pub building_footprints: Vec<f64>,
+    /// The lot (index into `lot_areas`) each building stands on, parallel to
+    /// `building_gfas`. Empty when unknown; then the per-lot dwelling spread
+    /// is omitted (the average per lot is still reported).
+    pub building_lots: Vec<Option<usize>>,
+    /// How floor area turns into dwellings. `None` = no dwelling count.
+    pub dwelling_rule: Option<DwellingRule>,
+}
+
+/// The unit-size rule that turns built floor area into dwellings: the
+/// `efficiency` share of a building's GFA (net of cores, corridors and walls)
+/// divided by the average dwelling size, rounded down — at least one dwelling
+/// per building with floor area.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DwellingRule {
+    /// Average dwelling size, m² of net floor area.
+    pub area: f64,
+    /// Net-to-gross floor area, in (0, 1].
+    pub efficiency: f64,
+}
+
+impl DwellingRule {
+    /// Dwellings in a building of `gfa` m².
+    pub fn dwellings(&self, gfa: f64) -> usize {
+        if gfa <= 0.0 {
+            return 0;
+        }
+        let net = gfa * self.efficiency.clamp(0.0, 1.0);
+        ((net / self.area.max(1.0)) + 1e-9).floor().max(1.0) as usize
+    }
+}
+
+/// Dwellings in a yield: the total, how they spread per building and per lot,
+/// and the density per hectare.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DwellingStats {
+    pub total: usize,
+    /// The rule used.
+    pub area: f64,
+    pub efficiency: f64,
+    /// Per building (`None` without buildings).
+    pub per_building: Option<Spread>,
+    /// Per lot, lots without a building counting 0 (`None` without lots).
+    /// `min` / `max` are only known when buildings are matched to lots;
+    /// otherwise they equal the average.
+    pub per_lot: Option<Spread>,
+    /// Dwellings per hectare of net developable area / of the gross site.
+    pub per_ha_net: Option<f64>,
+    pub per_ha_gross: Option<f64>,
+}
+
+/// min / average / max of a count.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Spread {
+    pub min: f64,
+    pub avg: f64,
+    pub max: f64,
+}
+
+impl Spread {
+    fn of(v: &[f64]) -> Option<Spread> {
+        (!v.is_empty()).then(|| Spread {
+            min: v.iter().copied().fold(f64::INFINITY, f64::min),
+            avg: v.iter().sum::<f64>() / v.len() as f64,
+            max: v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        })
+    }
 }
 
 /// A computed yield summary. All areas m², FAR/ratios dimensionless.
@@ -82,6 +148,11 @@ pub struct YieldReport {
     pub far_gross: Option<f64>,
     /// Σ footprint / Σ lot area, in [0, 1]. `None` when no footprints supplied.
     pub lot_coverage: Option<f64>,
+
+    // ── Dwellings ───────────────────────────────────────────────────────
+    /// `None` without a dwelling rule.
+    #[serde(default)]
+    pub dwellings: Option<DwellingStats>,
 }
 
 /// Frontage distribution stats (m).
@@ -144,6 +215,49 @@ impl YieldReport {
             Some((fp / total_lot_area).clamp(0.0, 1.0))
         };
 
+        let dwellings = inp.dwelling_rule.map(|rule| {
+            let per_building: Vec<usize> = inp
+                .building_gfas
+                .iter()
+                .map(|g| rule.dwellings(*g))
+                .collect();
+            let total: usize = per_building.iter().sum();
+            let per_lot = if lot_count == 0 {
+                None
+            } else if inp.building_lots.len() == per_building.len() {
+                let mut n = vec![0.0; lot_count];
+                for (d, l) in per_building.iter().zip(&inp.building_lots) {
+                    if let Some(slot) = l.and_then(|l| n.get_mut(l)) {
+                        *slot += *d as f64;
+                    }
+                }
+                // Buildings on no lot still count toward the average.
+                Spread::of(&n).map(|s| Spread {
+                    avg: total as f64 / lot_count as f64,
+                    ..s
+                })
+            } else {
+                let avg = total as f64 / lot_count as f64;
+                Some(Spread {
+                    min: avg,
+                    avg,
+                    max: avg,
+                })
+            };
+            let per_ha = |a: f64| (a > 0.0).then(|| total as f64 / (a / 10_000.0));
+            DwellingStats {
+                total,
+                area: rule.area,
+                efficiency: rule.efficiency,
+                per_building: Spread::of(
+                    &per_building.iter().map(|d| *d as f64).collect::<Vec<_>>(),
+                ),
+                per_lot,
+                per_ha_net: per_ha(net_developable_area),
+                per_ha_gross: per_ha(gross),
+            }
+        });
+
         YieldReport {
             lot_count,
             total_lot_area,
@@ -161,6 +275,7 @@ impl YieldReport {
             far_net,
             far_gross,
             lot_coverage,
+            dwellings,
         }
     }
 
@@ -212,6 +327,29 @@ impl YieldReport {
         }
         if let Some(c) = self.lot_coverage {
             s.push_str(&format!("| Lot coverage | {:.1}% |\n", c * 100.0));
+        }
+        if let Some(d) = &self.dwellings {
+            s.push_str(&format!(
+                "| **Dwellings** | {} ({:.0} m² × {:.0}% efficiency) |\n",
+                d.total,
+                d.area,
+                d.efficiency * 100.0
+            ));
+            if let Some(b) = d.per_building {
+                s.push_str(&format!(
+                    "| Dwellings per building (min / avg / max) | {:.0} / {:.1} / {:.0} |\n",
+                    b.min, b.avg, b.max
+                ));
+            }
+            if let Some(l) = d.per_lot {
+                s.push_str(&format!(
+                    "| Dwellings per lot (min / avg / max) | {:.0} / {:.1} / {:.0} |\n",
+                    l.min, l.avg, l.max
+                ));
+            }
+            if let Some(v) = d.per_ha_net {
+                s.push_str(&format!("| Density (net) | {v:.0} dwellings/ha |\n"));
+            }
         }
         s
     }
@@ -428,6 +566,11 @@ mod tests {
             reserved_block_areas: vec![50.0],
             building_gfas: vec![300.0, 500.0],
             building_footprints: vec![100.0, 150.0],
+            building_lots: vec![Some(0), Some(1)],
+            dwelling_rule: Some(DwellingRule {
+                area: 80.0,
+                efficiency: 0.8,
+            }),
         };
         let a = YieldReport::compute(&inp);
         let b = YieldReport::compute(&inp);
@@ -475,5 +618,82 @@ mod tests {
         assert!(md.contains("Net developable area"));
         assert!(md.contains("FAR (net)"));
         assert!(md.contains("Lot coverage"));
+    }
+
+    /// The unit-size rule: 80 m² at 80 % efficiency; per building, per lot
+    /// (a lot without a building counts 0) and per hectare.
+    #[test]
+    fn dwellings_per_building_lot_and_hectare() {
+        let rule = DwellingRule {
+            area: 80.0,
+            efficiency: 0.8,
+        };
+        assert_eq!(rule.dwellings(0.0), 0);
+        assert_eq!(
+            rule.dwellings(50.0),
+            1,
+            "a small house is still one dwelling"
+        );
+        assert_eq!(rule.dwellings(1000.0), 10);
+        assert_eq!(rule.dwellings(999.0), 9);
+        let r = YieldReport::compute(&YieldInputs {
+            lot_areas: vec![500.0, 500.0, 500.0],
+            gross_site_area: 20_000.0,
+            reserved_block_areas: vec![10_000.0],
+            building_gfas: vec![1000.0, 2000.0],
+            building_lots: vec![Some(0), Some(0)],
+            dwelling_rule: Some(rule),
+            ..Default::default()
+        });
+        let d = r.dwellings.as_ref().unwrap();
+        assert_eq!(d.total, 30);
+        assert_eq!(
+            d.per_building,
+            Some(Spread {
+                min: 10.0,
+                avg: 15.0,
+                max: 20.0
+            })
+        );
+        assert_eq!(
+            d.per_lot,
+            Some(Spread {
+                min: 0.0,
+                avg: 10.0,
+                max: 30.0
+            })
+        );
+        assert_eq!((d.per_ha_net, d.per_ha_gross), (Some(30.0), Some(15.0)));
+        assert!(
+            r.to_markdown("y")
+                .contains("| **Dwellings** | 30 (80 m² × 80% efficiency) |")
+        );
+        // Unknown lots: the per-lot spread is the average.
+        let r = YieldReport::compute(&YieldInputs {
+            lot_areas: vec![500.0, 500.0],
+            building_gfas: vec![1000.0],
+            dwelling_rule: Some(rule),
+            ..Default::default()
+        });
+        assert_eq!(
+            r.dwellings.unwrap().per_lot,
+            Some(Spread {
+                min: 5.0,
+                avg: 5.0,
+                max: 5.0
+            })
+        );
+        let none = YieldReport::compute(&YieldInputs {
+            building_gfas: vec![1000.0],
+            ..Default::default()
+        });
+        assert!(none.dwellings.is_none());
+        let old: YieldReport = serde_json::from_value({
+            let mut v = serde_json::to_value(&none).unwrap();
+            v.as_object_mut().unwrap().remove("dwellings");
+            v
+        })
+        .unwrap();
+        assert_eq!(old, none, "reports stored before dwellings still load");
     }
 }
