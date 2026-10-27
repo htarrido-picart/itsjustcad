@@ -46,7 +46,11 @@ pub enum Objective {
     /// Σ lot area — the land actually sold as lots.
     NetArea,
     Gfa,
-    /// Σ weight × metric over `weights` (`lots`, `far`, `net_area`, `gfa`, `open`).
+    /// Dwellings: GFA through the plan's unit-size rule
+    /// ([`SubdivisionSettings::dwelling_rule`]).
+    Dwellings,
+    /// Σ weight × metric over `weights` (`lots`, `far`, `net_area`, `gfa`,
+    /// `open`, `dwellings`, `density`, …).
     Weighted,
 }
 
@@ -58,6 +62,7 @@ impl Objective {
             "far" | "far_net" => Some(Objective::FarNet),
             "net_area" | "area" => Some(Objective::NetArea),
             "gfa" => Some(Objective::Gfa),
+            "dwellings" | "units" => Some(Objective::Dwellings),
             "weighted" => Some(Objective::Weighted),
             _ => None,
         }
@@ -70,6 +75,7 @@ impl Objective {
             Objective::FarNet => "far_net",
             Objective::NetArea => "net_area",
             Objective::Gfa => "gfa",
+            Objective::Dwellings => "dwellings",
             Objective::Weighted => "weighted",
         }
     }
@@ -123,6 +129,15 @@ pub struct OptimizeRequest {
     /// Storey cap: the search draws heights within it (`floors_cap`).
     /// Default 6.
     pub max_stories: Option<usize>,
+    /// Fewest dwellings in the plan.
+    pub min_dwellings: Option<f64>,
+    /// Least density, dwellings per hectare of net developable area.
+    pub min_density: Option<f64>,
+    /// Unit-size rule overrides (the plan's `dwelling_area` /
+    /// `dwelling_efficiency` when unset); an override is folded into every
+    /// candidate's params, so applying one keeps the rule it was scored with.
+    pub dwelling_area: Option<f64>,
+    pub dwelling_efficiency: Option<f64>,
     /// Least share of lots within `economics.park_distance` of a park.
     pub min_park_access: Option<f64>,
     /// Least share of facade area whose direct sun averages ≥ `daylight_hours`
@@ -269,6 +284,9 @@ pub struct Quantities {
 pub struct BuiltQ {
     pub gfa: f64,
     pub floors: usize,
+    /// Dwellings, by the plan's unit-size rule.
+    #[serde(default)]
+    pub dwellings: usize,
     pub near_park: bool,
 }
 
@@ -435,6 +453,10 @@ impl Default for OptimizeRequest {
             access_share: 0.02,
             max_block_perimeter: Some(800.0),
             max_stories: Some(6),
+            min_dwellings: None,
+            min_density: None,
+            dwelling_area: None,
+            dwelling_efficiency: None,
             min_park_access: Some(DEFAULT_PARK_ACCESS),
             min_daylight: None,
             daylight_hours: 2.0,
@@ -494,7 +516,7 @@ impl OptimizeRequest {
         match key {
             "objective" => {
                 self.objective = Objective::parse(v).ok_or_else(|| {
-                    format!("objective= must be value|lots|far_net|net_area|gfa|weighted, got '{v}'")
+                    format!("objective= must be value|lots|far_net|net_area|gfa|dwellings|weighted, got '{v}'")
                 })?;
             }
             "weights" => {
@@ -539,6 +561,15 @@ impl OptimizeRequest {
                     "min_park_access" => self.min_park_access = (!off).then(|| num().map(ratio)).transpose()?,
                     "min_open" => self.min_open = (!off).then(num).transpose()?,
                     _ => self.min_daylight = (!off).then(|| num().map(ratio)).transpose()?,
+                }
+            }
+            "min_dwellings" | "min_density" | "dwelling_area" | "dwelling_efficiency" => {
+                let v = (!v.eq_ignore_ascii_case("off")).then(num).transpose()?;
+                match key {
+                    "min_dwellings" => self.min_dwellings = v,
+                    "min_density" => self.min_density = v,
+                    "dwelling_area" => self.dwelling_area = v,
+                    _ => self.dwelling_efficiency = v.map(ratio),
                 }
             }
             "daylight_hours" => self.daylight_hours = num()?,
@@ -587,6 +618,15 @@ impl OptimizeRequest {
                 SEARCHED.join(", ")
             ));
         }
+        if self.dwelling_area.is_some_and(|a| a <= 0.0) {
+            return Err("siteoptimize: dwelling_area must be > 0".into());
+        }
+        if self
+            .dwelling_efficiency
+            .is_some_and(|e| e <= 0.0 || e > 1.0)
+        {
+            return Err("siteoptimize: dwelling_efficiency must be in (0, 1]".into());
+        }
         if self.objective == Objective::Weighted {
             if self.weights.is_empty() {
                 return Err("siteoptimize: objective=weighted needs weights=lots:1,far:…".into());
@@ -633,7 +673,19 @@ fn ratio(v: f64) -> f64 {
     if v > 1.0 { v / 100.0 } else { v }
 }
 
-const METRICS: &[&str] = &["lots", "far", "net_area", "gfa", "open", "value", "park", "daylight", "overheat"];
+const METRICS: &[&str] = &[
+    "lots",
+    "far",
+    "net_area",
+    "gfa",
+    "open",
+    "value",
+    "park",
+    "daylight",
+    "overheat",
+    "dwellings",
+    "density",
+];
 
 fn metric(r: &YieldReport, l: &Ledger, q: &Quantities, key: &str) -> f64 {
     match key {
@@ -646,6 +698,12 @@ fn metric(r: &YieldReport, l: &Ledger, q: &Quantities, key: &str) -> f64 {
         "net_area" => r.total_lot_area,
         "gfa" => r.total_gfa,
         "open" => r.open_space_ratio,
+        "dwellings" => r.dwellings.as_ref().map_or(0.0, |d| d.total as f64),
+        "density" => r
+            .dwellings
+            .as_ref()
+            .and_then(|d| d.per_ha_net)
+            .unwrap_or(0.0),
         _ => 0.0,
     }
 }
@@ -725,6 +783,15 @@ pub fn evaluate(
                 .map(|b| (b.gfa, b.footprint.area()))
                 .unzip()
         });
+    // The lot holding each building (its footprint centroid).
+    let lot_of = lot_locator(&plan.lots.polygons);
+    let building_lots: Vec<Option<usize>> = plan.buildings.as_ref().map_or_else(Vec::new, |b| {
+        b.buildings
+            .iter()
+            .map(|b| lot_of(b.footprint.centroid()))
+            .collect()
+    });
+    let rule = settings.dwelling_rule();
     let report = YieldReport::compute(&YieldInputs {
         lot_areas: plan.lots.polygons.iter().map(|p| p.area()).collect(),
         lot_frontages: fronts.setback.clone(),
@@ -733,6 +800,8 @@ pub fn evaluate(
         reserved_block_areas: plan.reserved.iter().map(|p| p.area()).collect(),
         building_gfas: gfas,
         building_footprints: footprints,
+        building_lots: building_lots.clone(),
+        dwelling_rule: Some(rule),
     });
     let depth_ratios: Vec<f64> = plan
         .lots
@@ -759,15 +828,16 @@ pub fn evaluate(
     let park_walk = crate::site_metrics::park_walk(&plan);
     let lot_near_park: Vec<bool> =
         park_walk.iter().map(|d| *d <= req.economics.park_distance).collect();
-    // A building earns its lot's park premium (the lot holding its centroid).
-    let lot_of = lot_locator(&plan.lots.polygons);
+    // A building earns its lot's park premium.
     let buildings: Vec<BuiltQ> = plan.buildings.as_ref().map_or_else(Vec::new, |b| {
         b.buildings
             .iter()
-            .map(|b| BuiltQ {
+            .zip(&building_lots)
+            .map(|(b, lot)| BuiltQ {
                 gfa: b.gfa,
                 floors: b.floor_areas.len(),
-                near_park: lot_of(b.footprint.centroid()).is_some_and(|i| lot_near_park[i]),
+                dwellings: rule.dwellings(b.gfa),
+                near_park: lot.is_some_and(|i| lot_near_park[i]),
             })
             .collect()
     });
@@ -777,6 +847,9 @@ pub fn evaluate(
         lot_near_park.iter().filter(|n| **n).count() as f64 / lot_near_park.len() as f64
     };
     let tol = req.lot_rule_share + 1e-9;
+    let (dwellings, density) = report.dwellings.as_ref().map_or((0.0, 0.0), |d| {
+        (d.total as f64, d.per_ha_net.unwrap_or(0.0))
+    });
     let checks = [
         ("min_park_access", req.min_park_access.map(|m| m - park_access)),
         // Daylight / overheating are measured after the search (see `rank`).
@@ -792,7 +865,16 @@ pub fn evaluate(
             req.max_depth_ratio
                 .map(|m| share(&depth_ratios, &|r| r > m) - req.lot_rule_share - 1e-9),
         ),
-        ("max_block_perimeter", req.max_block_perimeter.map(|m| over(max_block_perimeter, m))),
+        (
+            "max_block_perimeter",
+            req.max_block_perimeter
+                .map(|m| over(max_block_perimeter, m)),
+        ),
+        (
+            "min_dwellings",
+            req.min_dwellings.map(|m| -over(dwellings, m)),
+        ),
+        ("min_density", req.min_density.map(|m| -over(density, m))),
         (
             "street_access",
             Some((report.lot_count - fronts.with_street.min(report.lot_count)) as f64 / n - req.access_share - 1e-9),
@@ -1147,6 +1229,19 @@ pub fn optimize_with(
     req: &OptimizeRequest,
 ) -> Result<OptimizeResult, String> {
     req.validate()?;
+    // The unit-size rule overrides, folded onto the base and every candidate.
+    let rule_params: BTreeMap<String, String> = [
+        ("dwelling_area", req.dwelling_area),
+        ("dwelling_efficiency", req.dwelling_efficiency),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| Some((k.to_string(), v?.to_string())))
+    .collect();
+    let base = &if rule_params.is_empty() {
+        base.clone()
+    } else {
+        settings_with(base, &rule_params)?
+    };
     let (area_lo, width_lo) = floors(base, req);
     let req = &OptimizeRequest {
         min_lot_area: Some(req.min_lot_area.unwrap_or(area_lo)),
@@ -1166,7 +1261,11 @@ pub fn optimize_with(
             .into_par_iter()
             .map(|genome| {
                 let mut params = decode(&dims, &genome, base);
-                params.insert("floors_cap".into(), req.max_stories.unwrap_or(0).to_string());
+                params.insert(
+                    "floors_cap".into(),
+                    req.max_stories.unwrap_or(0).to_string(),
+                );
+                params.extend(rule_params.clone());
                 let eval =
                     settings_with(base, &params).and_then(|s| evaluate(site, &s, edits, req));
                 Trial {
@@ -1291,6 +1390,8 @@ fn rank(
             "max_lot_area" => req.max_lot_area,
             "max_depth_ratio" => req.max_depth_ratio,
             "max_block_perimeter" => req.max_block_perimeter,
+            "min_dwellings" => req.min_dwellings,
+            "min_density" => req.min_density,
             "min_park_access" => req.min_park_access,
             "min_daylight" => req.min_daylight,
             "max_overheat" => req.max_overheat,
@@ -1447,7 +1548,7 @@ impl OptimizeResult {
     pub fn to_markdown(&self) -> String {
         let mut s = format!(
             "**Site optimize — {}** ({} evaluated, {} feasible)\n\n\
-             | # | score | lots | lot area m² | FAR net | open % | params |\n|---|---|---|---|---|---|---|\n",
+             | # | score | lots | dwellings | lot area m² | FAR net | open % | params |\n|---|---|---|---|---|---|---|---|\n",
             self.objective.token(),
             self.evaluated,
             self.feasible
@@ -1466,10 +1567,11 @@ impl OptimizeResult {
                     .collect()
             });
             s.push_str(&format!(
-                "| {} | {:.2} | {} | {:.0} | {} | {:.1} | {} |\n",
+                "| {} | {:.2} | {} | {} | {:.0} | {} | {:.1} | {} |\n",
                 rank,
                 e.score + 0.0,
                 r.lot_count,
+                r.dwellings.as_ref().map_or(0, |d| d.total),
                 r.total_lot_area,
                 r.far_net.map_or("—".into(), |f| format!("{:.2}", f + 0.0)),
                 r.open_space_ratio * 100.0 + 0.0,
@@ -1516,6 +1618,7 @@ impl OptimizeResult {
                     "rank": c.rank, "score": c.eval.score, "params": params, "yield": c.eval.report,
                     "ledger": c.eval.ledger, "park_access": c.eval.quantities.park_access(),
                     "floors": c.eval.quantities.floors_sorted(), "daylight": c.eval.quantities.daylight,
+                    "dwellings": c.eval.report.dwellings.as_ref().map(|d| d.total),
                 })
             })
             .collect();
@@ -1528,7 +1631,7 @@ impl OptimizeResult {
             "current": self.current.as_ref().map(|e| serde_json::json!({
                 "score": e.score, "yield": e.report, "ledger": e.ledger, "violations": e.violations,
                 "park_access": e.quantities.park_access(), "floors": e.quantities.floors_sorted(),
-                "daylight": e.quantities.daylight,
+                "daylight": e.quantities.daylight, "dwellings": e.report.dwellings.as_ref().map(|d| d.total),
             })),
             "beats_current": self.beats_current(),
         })
@@ -1776,8 +1879,18 @@ mod tests {
         // Developing: buy the site, build, sell floor area.
         let built = Quantities {
             buildings: vec![
-                BuiltQ { gfa: 1000.0, floors: 1, near_park: false },
-                BuiltQ { gfa: 2000.0, floors: 3, near_park: true },
+                BuiltQ {
+                    gfa: 1000.0,
+                    floors: 1,
+                    near_park: false,
+                    dwellings: 0,
+                },
+                BuiltQ {
+                    gfa: 2000.0,
+                    floors: 3,
+                    near_park: true,
+                    dwellings: 0,
+                },
             ],
             ..q.clone()
         };
@@ -2277,6 +2390,195 @@ mod tests {
         assert!(s.doc.subdivision_links[&source].lot_overrides.is_empty());
         run(&mut s, "undo");
         assert_eq!(s.doc.subdivision_links[&source].lot_overrides, before, "undo restores it");
+    }
+
+    /// #170: dwellings come from GFA through the unit-size rule, per building
+    /// and in total; they can be the objective and a constraint, and a rule
+    /// override is folded into the applied params.
+    #[test]
+    fn dwellings_objective_constraint_and_rule_override() {
+        let site = rect(200.0, 150.0);
+        let base = SubdivisionSettings::walkable();
+        let e = evaluate(
+            &site,
+            &base,
+            &PlanEdits::default(),
+            &OptimizeRequest::default(),
+        )
+        .unwrap();
+        let d = e.report.dwellings.as_ref().unwrap();
+        let rule = base.dwelling_rule();
+        assert_eq!(
+            d.total,
+            e.quantities
+                .buildings
+                .iter()
+                .map(|b| b.dwellings)
+                .sum::<usize>()
+        );
+        assert!(
+            e.quantities
+                .buildings
+                .iter()
+                .all(|b| b.dwellings == rule.dwellings(b.gfa))
+        );
+        assert!(
+            d.total > e.report.building_count,
+            "multi-storey buildings hold several dwellings"
+        );
+        assert!(d.per_ha_net.unwrap() > 0.0);
+
+        let r = optimize(
+            &site,
+            &base,
+            &OptimizeRequest {
+                objective: Objective::Dwellings,
+                budget: 24,
+                ..OptimizeRequest::default()
+            },
+        )
+        .unwrap();
+        for c in &r.candidates {
+            assert_eq!(
+                c.eval.score,
+                c.eval.report.dwellings.as_ref().unwrap().total as f64
+            );
+        }
+        assert_eq!(
+            r.to_json()["candidates"][0]["dwellings"],
+            r.candidates[0].eval.score
+        );
+        assert!(r.to_markdown().contains("| dwellings |"));
+
+        // A bigger unit halves the count; it rides along in the params.
+        let req = OptimizeRequest {
+            objective: Objective::Dwellings,
+            budget: 24,
+            dwelling_area: Some(160.0),
+            ..OptimizeRequest::default()
+        };
+        let big = optimize(&site, &base, &req).unwrap();
+        assert_eq!(
+            big.candidates[0]
+                .params
+                .get("dwelling_area")
+                .map(String::as_str),
+            Some("160")
+        );
+        let cur = |r: &OptimizeResult| {
+            r.current
+                .as_ref()
+                .unwrap()
+                .report
+                .dwellings
+                .as_ref()
+                .unwrap()
+                .total
+        };
+        assert!(cur(&big) < cur(&r), "{} vs {}", cur(&big), cur(&r));
+
+        // As a constraint: the floor holds for every candidate, or the search
+        // names it.
+        let need = (cur(&r) as f64 * 0.8).floor();
+        let c = optimize(
+            &site,
+            &base,
+            &OptimizeRequest {
+                min_dwellings: Some(need),
+                budget: 24,
+                ..OptimizeRequest::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            c.candidates
+                .iter()
+                .all(|c| c.eval.report.dwellings.as_ref().unwrap().total as f64 >= need)
+        );
+        let err = optimize(
+            &site,
+            &base,
+            &OptimizeRequest {
+                min_density: Some(1e6),
+                budget: 8,
+                ..OptimizeRequest::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("binding constraint: min_density"), "{err}");
+
+        let crate::Command::SiteOptimize { request, .. } =
+            parse("siteoptimize last objective=dwellings min_dwellings=40 min_density=off dwelling_area=90 dwelling_efficiency=75").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(request.objective, Objective::Dwellings);
+        assert_eq!(
+            (request.min_dwellings, request.min_density),
+            (Some(40.0), None)
+        );
+        assert_eq!(
+            (request.dwelling_area, request.dwelling_efficiency),
+            (Some(90.0), Some(0.75))
+        );
+        let bad = OptimizeRequest {
+            dwelling_efficiency: Some(1.5),
+            ..req
+        };
+        assert!(
+            optimize(&site, &base, &bad)
+                .unwrap_err()
+                .contains("dwelling_efficiency")
+        );
+    }
+
+    /// The unit-size rule is a lot setting; the document yield (`lotreport`,
+    /// `ijc_subdivision_yield_json`) reports dwellings per building, per lot
+    /// (buildings matched to their lot) and in total.
+    #[test]
+    fn lotsettings_rule_drives_the_document_yield() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            "lotsettings preset=walkable dwelling_area=100 dwelling_efficiency=75",
+        );
+        assert_eq!(
+            (
+                s.doc.subdivision_settings.dwelling_area,
+                s.doc.subdivision_settings.dwelling_efficiency
+            ),
+            (100.0, 0.75)
+        );
+        run(&mut s, "rect 0,0,0 200 150");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "siteplan last");
+        let link = s.doc.subdivision_links[&source].clone();
+        assert_eq!(link.settings.dwelling_area, 100.0);
+        let mut ids = vec![source];
+        ids.extend(link.produced.iter().copied());
+        let r = lot::yield_report(&s.doc, &ids, &link.settings);
+        let d = r.dwellings.as_ref().unwrap();
+        let site = site_boundary(&s.doc, &[source]).unwrap().1;
+        let e = evaluate(
+            &site,
+            &link.settings,
+            &PlanEdits::default(),
+            &OptimizeRequest::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            d.total,
+            e.report.dwellings.as_ref().unwrap().total,
+            "baked = scored"
+        );
+        let per_lot = d.per_lot.unwrap();
+        assert!(
+            per_lot.min < per_lot.max,
+            "buildings matched to lots: {per_lot:?}"
+        );
+        assert!((per_lot.avg - d.total as f64 / r.lot_count as f64).abs() < 1e-9);
+        let out = run(&mut s, "lotreport");
+        assert!(out.message.contains("**Dwellings**"), "{}", out.message);
     }
 
     #[test]

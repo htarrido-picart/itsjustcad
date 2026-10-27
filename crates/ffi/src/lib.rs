@@ -3495,11 +3495,14 @@ fn subdivisions_json(doc: &itsjustcad_doc::Document) -> String {
 
 /// One subdivision's yield, as data — what `lotreport` tabulates for its
 /// boundary and everything it generated, computed from the link's own
-/// settings: `{"lot_count","total_lot_area","avg_lot_area","min_lot_area",
+/// settings (its unit-size rule `dwelling_area` / `dwelling_efficiency` gives
+/// the dwellings): `{"lot_count","total_lot_area","avg_lot_area","min_lot_area",
 /// "max_lot_area","frontage":{…}|null,"gross_site_area",
 /// "open_space_feature_area","reserved_block_area","net_developable_area",
 /// "open_space_ratio","building_count","total_gfa","far_net","far_gross",
-/// "lot_coverage","road_count","block_count","setback_count"}` (m², ratios
+/// "lot_coverage","dwellings":{"total","area","efficiency","per_building":
+/// {"min","avg","max"}|null,"per_lot":{"min","avg","max"}|null,"per_ha_net",
+/// "per_ha_gross"},"road_count","block_count","setback_count"}` (m², ratios
 /// dimensionless; nullable when undefined). The `*_count`s are the link's
 /// produced objects on the roads / blocks / setbacks layers (0 for a Lots
 /// link). Pure: stores no `lotreport` snapshot. Returns `null` for an unknown source,
@@ -5564,14 +5567,14 @@ unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 
 /// Search the `siteplan` params of the site boundary `source` (short id) for
 /// the best yield, evaluating every candidate off-document (nothing is baked,
-/// nothing logged). `request_json` is `{"objective":"value|lots|far_net|net_area|gfa|weighted",
+/// nothing logged). `request_json` is `{"objective":"value|lots|far_net|net_area|gfa|dwellings|weighted",
 /// "weights":{…},"budget":400,"seed":1,"top":5,"lock":[…],"patterns":[…],
 /// "min_lot_area","min_lot_width","min_frontage","min_open","max_far","max_coverage",
-/// "max_lot_area","max_depth_ratio" (default 3),"lot_rule_share" (default 0.05, share of lots that may break the per-lot rules), "access_share" (default 0.02), "max_stories" (default 6), "min_park_access" (default 0.9), "min_daylight" (facade share), "daylight_hours" (default 2), "daylight_period" ("annual" default | "worst_month" | {"custom":{"month","day"}}), "max_overheat", "overheat_hours" (default 6), "location":{"lat_deg","lon_deg","tz_hours"},
+/// "max_lot_area","max_depth_ratio" (default 3),"lot_rule_share" (default 0.05, share of lots that may break the per-lot rules), "access_share" (default 0.02), "max_stories" (default 6), "min_dwellings", "min_density" (dwellings per net ha), "dwelling_area", "dwelling_efficiency" (unit-size rule overrides, folded into the params), "min_park_access" (default 0.9), "min_daylight" (facade share), "daylight_hours" (default 2), "daylight_period" ("annual" default | "worst_month" | {"custom":{"month","day"}}), "max_overheat", "overheat_hours" (default 6), "location":{"lat_deg","lon_deg","tz_hours"},
 /// "max_block_perimeter" (default 800),
 /// "economics":{"price","road_cost","utility_cost","lot_cost","open_cost","size_exponent","ref_lot_area"}}`,
 /// every key optional (null / `{}` = defaults). Returns
-/// `{"candidates":[{"rank","score","params":{…},"yield":{YieldReport},"ledger":{Ledger}}],"pareto":[ranks…],
+/// `{"candidates":[{"rank","score","params":{…},"yield":{YieldReport, with "dwellings"},"ledger":{Ledger},"park_access","floors":[…],"daylight","dwellings"}],"pareto":[ranks…],
 /// "pareto_axis":"open"|"net_area"|"gfa"|"lots","evaluated":n,"feasible":n,
 /// "current":{"score","yield","ledger","violations"}|null,"beats_current":bool}`
 /// or `{"error":"…"}` (unknown source, bad request, or no feasible layout —
@@ -8019,6 +8022,20 @@ mod headless_tests {
             assert!(y["road_count"].as_u64().unwrap() > 0, "{y}");
             assert!(y["block_count"].as_u64().unwrap() > 0, "{y}");
             assert_eq!(y["setback_count"], y["lot_count"], "one setback per lot: {y}");
+            let d = &y["dwellings"];
+            assert!(
+                d["total"].as_u64().unwrap() >= y["building_count"].as_u64().unwrap(),
+                "{y}"
+            );
+            assert_eq!(
+                (d["area"].as_f64(), d["efficiency"].as_f64()),
+                (Some(80.0), Some(0.8))
+            );
+            assert!(
+                d["per_lot"]["avg"].as_f64().unwrap() > 0.0
+                    && d["per_ha_net"].as_f64().unwrap() > 0.0,
+                "{y}"
+            );
             ijc_free(h);
         }
     }

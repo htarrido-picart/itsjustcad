@@ -665,6 +665,26 @@ pub fn subdivision_fields() -> Vec<ParamField> {
             1,
             Widget::Numeric,
         ),
+        ParamField::float(
+            "dwelling_area",
+            "param.subdivision.dwelling_area",
+            80.0,
+            Some(20.0),
+            Some(1000.0),
+            5.0,
+            Widget::Numeric,
+            Unit::None,
+        ),
+        ParamField::float(
+            "dwelling_efficiency",
+            "param.subdivision.dwelling_efficiency",
+            0.8,
+            Some(0.3),
+            Some(1.0),
+            0.05,
+            Widget::Slider,
+            Unit::None,
+        ),
         // ── Open space ──
         ParamField::float(
             "open_space_reserve_frac",
@@ -749,6 +769,8 @@ const FIELD_GROUPS: &[(&str, &[&str])] = &[
             "falloff_point",
             "falloff_strength",
             "height_seed",
+            "dwelling_area",
+            "dwelling_efficiency",
         ],
     ),
     (
@@ -922,6 +944,11 @@ pub fn settings_to_params(s: &SubdivisionSettings) -> ParamMap {
     );
     m.insert("falloff_strength".into(), ParamValue::Float(s.falloff_strength));
     m.insert("height_seed".into(), ParamValue::Int(s.height_seed as i64));
+    m.insert("dwelling_area".into(), ParamValue::Float(s.dwelling_area));
+    m.insert(
+        "dwelling_efficiency".into(),
+        ParamValue::Float(s.dwelling_efficiency),
+    );
     // Open space
     m.insert(
         "open_space_reserve_frac".into(),
@@ -1140,6 +1167,12 @@ pub fn params_to_settings(base: &SubdivisionSettings, params: &ParamMap) -> Subd
     }
     if let Some(v) = p.get("height_seed").and_then(|v| v.as_i64()) {
         s.height_seed = v.max(0) as u64;
+    }
+    if let Some(v) = p.get("dwelling_area").and_then(|v| v.as_f64()) {
+        s.dwelling_area = v;
+    }
+    if let Some(v) = p.get("dwelling_efficiency").and_then(|v| v.as_f64()) {
+        s.dwelling_efficiency = v;
     }
     // Open space
     if let Some(v) = p.get("open_space_reserve_frac").and_then(|v| v.as_f64()) {

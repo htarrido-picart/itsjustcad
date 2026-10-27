@@ -34,6 +34,7 @@ const OBJECTIVES: &[(Objective, &str)] = &[
     (Objective::FarNet, "optimize.objective.far_net"),
     (Objective::NetArea, "optimize.objective.net_area"),
     (Objective::Gfa, "optimize.objective.gfa"),
+    (Objective::Dwellings, "optimize.objective.dwellings"),
     (Objective::Weighted, "optimize.objective.weighted"),
 ];
 
@@ -44,6 +45,7 @@ const METRICS: &[(&str, &str)] = &[
     ("net_area", "optimize.objective.net_area"),
     ("gfa", "optimize.objective.gfa"),
     ("open", "optimize.weight.open"),
+    ("dwellings", "optimize.objective.dwellings"),
 ];
 
 /// Hard constraints, in form order. Ratios are entered as percentages.
@@ -62,10 +64,13 @@ pub(super) enum Constraint {
     MinParkAccess,
     MinDaylight,
     MaxOverheat,
+    MinDwellings,
+    /// Dwellings per hectare of net developable area.
+    MinDensity,
 }
 
 impl Constraint {
-    pub(super) const ALL: [Constraint; 13] = [
+    pub(super) const ALL: [Constraint; 15] = [
         Constraint::MinLotArea,
         Constraint::MinLotWidth,
         Constraint::MinFrontage,
@@ -79,6 +84,8 @@ impl Constraint {
         Constraint::MinParkAccess,
         Constraint::MinDaylight,
         Constraint::MaxOverheat,
+        Constraint::MinDwellings,
+        Constraint::MinDensity,
     ];
 
     /// On out of the box (the core's defaults): no strip lots, no
@@ -109,6 +116,8 @@ impl Constraint {
             Constraint::MinParkAccess => "optimize.min_park_access",
             Constraint::MinDaylight => "optimize.min_daylight",
             Constraint::MaxOverheat => "optimize.max_overheat",
+            Constraint::MinDwellings => "optimize.min_dwellings",
+            Constraint::MinDensity => "optimize.min_density",
         }
     }
 
@@ -128,6 +137,8 @@ impl Constraint {
             Constraint::MinParkAccess => (90.0, 1.0, "%"),
             Constraint::MinDaylight => (50.0, 1.0, "%"),
             Constraint::MaxOverheat => (30.0, 1.0, "%"),
+            Constraint::MinDwellings => (100.0, 1.0, ""),
+            Constraint::MinDensity => (60.0, 1.0, "/ha"),
         }
     }
 
@@ -148,9 +159,9 @@ impl Constraint {
 pub(super) struct OptimizeForm {
     pub objective: Objective,
     /// Weights per [`METRICS`] entry (used by `Weighted`; zero = omitted).
-    pub weights: [f64; 5],
+    pub weights: [f64; 6],
     /// Per [`Constraint::ALL`]: (enabled, value in form units).
-    pub constraints: [(bool, f64); 13],
+    pub constraints: [(bool, f64); 15],
     pub budget: usize,
     pub seed: u64,
     pub locks: BTreeSet<String>,
@@ -162,14 +173,22 @@ pub(super) struct OptimizeForm {
     pub daylight_period: DaylightPeriod,
     pub daylight_hours: f64,
     pub overheat_hours: f64,
+    /// Unit-size rule: average dwelling m² and net-to-gross efficiency
+    /// (a fraction), seeded from the plan; sent as overrides when changed.
+    pub dwelling_area: f64,
+    pub dwelling_efficiency: f64,
+    /// The plan's own rule (what an unchanged form leaves alone).
+    pub plan_rule: (f64, f64),
 }
 
 impl Default for OptimizeForm {
     fn default() -> Self {
         let d = OptimizeRequest::default();
+        let s = subdivision::SubdivisionSettings::default();
+        let rule = (s.dwelling_area, s.dwelling_efficiency);
         OptimizeForm {
             objective: d.objective,
-            weights: [1.0, 0.0, 0.0, 0.0, 0.0],
+            weights: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             constraints: Constraint::ALL.map(|c| (c.default_on(), c.widget().0)),
             budget: d.budget,
             seed: d.seed,
@@ -179,6 +198,9 @@ impl Default for OptimizeForm {
             daylight_period: d.daylight_period,
             daylight_hours: d.daylight_hours,
             overheat_hours: d.overheat_hours,
+            dwelling_area: rule.0,
+            dwelling_efficiency: rule.1,
+            plan_rule: rule,
         }
     }
 }
@@ -247,7 +269,13 @@ impl OptimizeForm {
                 Constraint::MinParkAccess => req.min_park_access = v,
                 Constraint::MinDaylight => req.min_daylight = v,
                 Constraint::MaxOverheat => req.max_overheat = v,
+                Constraint::MinDwellings => req.min_dwellings = v,
+                Constraint::MinDensity => req.min_density = v,
             }
+        }
+        if (self.dwelling_area, self.dwelling_efficiency) != self.plan_rule {
+            req.dwelling_area = Some(self.dwelling_area);
+            req.dwelling_efficiency = Some(self.dwelling_efficiency);
         }
         req
     }
@@ -296,6 +324,9 @@ pub(super) struct Metrics {
     pub daylight_pct: Option<f64>,
     /// Facade area overheating on the hottest month, percent (when asked).
     pub overheat_pct: Option<f64>,
+    /// Dwellings, and dwellings per net hectare (with a unit-size rule).
+    pub dwellings: Option<f64>,
+    pub density: Option<f64>,
 }
 
 impl Metrics {
@@ -310,6 +341,8 @@ impl Metrics {
             park_pct: None,
             daylight_pct: None,
             overheat_pct: None,
+            dwellings: y.dwellings.as_ref().map(|d| d.total as f64),
+            density: y.dwellings.as_ref().and_then(|d| d.per_ha_net),
         }
     }
 
@@ -338,6 +371,8 @@ impl Metrics {
             Col::Park => self.park_pct,
             Col::Daylight => self.daylight_pct,
             Col::Overheat => self.overheat_pct,
+            Col::Dwellings => self.dwellings,
+            Col::Density => self.density,
         }
     }
 
@@ -383,10 +418,13 @@ pub(super) enum Col {
     Park,
     Daylight,
     Overheat,
+    Dwellings,
+    /// Dwellings per net hectare.
+    Density,
 }
 
 impl Col {
-    const ALL: [Col; 10] = [
+    const ALL: [Col; 12] = [
         Col::Score,
         Col::Lots,
         Col::Net,
@@ -397,6 +435,8 @@ impl Col {
         Col::Park,
         Col::Daylight,
         Col::Overheat,
+        Col::Dwellings,
+        Col::Density,
     ];
 
     fn label_key(self) -> &'static str {
@@ -411,6 +451,8 @@ impl Col {
             Col::Park => "optimize.col.park",
             Col::Daylight => "optimize.col.daylight",
             Col::Overheat => "optimize.col.overheat",
+            Col::Dwellings => "optimize.col.dwellings",
+            Col::Density => "optimize.col.density",
         }
     }
 
@@ -420,7 +462,15 @@ impl Col {
         match self {
             Col::Score if (a - a.round()).abs() < 1e-9 => format!("{a:.0}"),
             Col::Score | Col::Far => format!("{a:.2}"),
-            Col::Lots | Col::Floors | Col::Park | Col::Daylight | Col::Overheat => format!("{a:.0}"),
+            Col::Lots
+            | Col::Floors
+            | Col::Park
+            | Col::Daylight
+            | Col::Overheat
+            | Col::Dwellings
+            | Col::Density => {
+                format!("{a:.0}")
+            }
             Col::Open => format!("{a:.1}"),
             Col::Net | Col::Gfa => match a {
                 a if a < 10_000.0 => format!("{a:.0}"),
@@ -484,10 +534,15 @@ pub(super) fn columns(form: &OptimizeForm, rows: &[ResultRow]) -> Vec<Col> {
     if weighted || value {
         cols.push(Col::Score);
     }
+    // Dwellings sit next to lots (storeys stay too); density when it is
+    // constrained.
+    let density = on(Constraint::MinDensity).then_some(Col::Density);
     if value {
         // Profit comes from built floor area: storeys and park access are
         // what tell the layouts apart (areas are in the hover).
-        cols.extend([Col::Lots, Col::Floors, Col::Park]);
+        cols.extend([Col::Lots, Col::Dwellings]);
+        cols.extend(density);
+        cols.extend([Col::Floors, Col::Park]);
         if on(Constraint::MinDaylight) || weight("daylight") {
             cols.push(Col::Daylight);
         }
@@ -496,7 +551,9 @@ pub(super) fn columns(form: &OptimizeForm, rows: &[ResultRow]) -> Vec<Col> {
         }
         return cols;
     }
-    cols.extend([Col::Lots, Col::Net, Col::Gfa]);
+    cols.extend([Col::Lots, Col::Dwellings]);
+    cols.extend(density);
+    cols.extend([Col::Net, Col::Gfa]);
     if form.objective == Objective::FarNet || on(Constraint::MaxFar) || weight("far") {
         cols.push(Col::Far);
     }
@@ -514,6 +571,10 @@ fn axis_of(axis: &str) -> (fn(&ResultRow) -> f64, &'static str) {
         "net_area" => (|r| r.metrics.net_area, "optimize.objective.net_area"),
         "gfa" => (|r| r.metrics.gfa, "optimize.objective.gfa"),
         "lots" => (|r| r.metrics.lots as f64, "optimize.objective.lots"),
+        "dwellings" => (
+            |r| r.metrics.dwellings.unwrap_or(0.0),
+            "optimize.objective.dwellings",
+        ),
         _ => (|r| r.metrics.open_pct, "optimize.weight.open"),
     }
 }
@@ -642,7 +703,7 @@ pub(super) struct Job {
 pub(super) struct OptimizePanel {
     /// The site plan boundary the form is open for.
     source: Option<ObjectId>,
-    form: OptimizeForm,
+    pub(super) form: OptimizeForm,
     job: Option<Job>,
     /// Last finished search: (elapsed, rows + summary, or the error).
     result: Option<(Duration, Result<Finished, String>)>,
@@ -659,6 +720,8 @@ impl OptimizeForm {
         self.constraints[0] = (true, 0.5 * settings.lot_area_min);
         self.constraints[1] = (true, settings.lot_width_min);
         self.constraints[6] = (true, 3.0 * settings.lot_area_min);
+        self.plan_rule = (settings.dwelling_area, settings.dwelling_efficiency);
+        (self.dwelling_area, self.dwelling_efficiency) = self.plan_rule;
     }
 }
 
@@ -706,25 +769,44 @@ impl OptimizePanel {
             Err(mpsc::TryRecvError::Disconnected) => Err("siteoptimize: the search stopped".into()),
         };
         let elapsed = job.started.elapsed();
-        let finished = got.map(|r| {
-            let rows = result_rows(&r);
-            Finished {
-                cols: columns(&job.form, &rows),
-                rows,
-                evaluated: r.evaluated,
-                feasible: r.feasible,
-                axis: r.pareto_axis,
-                score_key: if job.form.objective == Objective::Value {
-                    "optimize.col.value"
-                } else {
-                    "optimize.col.score"
-                },
-                current: current_row(&r),
-                beats_current: r.beats_current(),
-            }
-        });
+        let finished = got.map(|r| Finished::new(&job.form, &r));
         self.job = None;
         self.result = Some((elapsed, finished));
+    }
+
+    /// Run a search for `source` to completion on this thread (previews).
+    #[cfg(test)]
+    pub(super) fn run_now(&mut self, doc: &itsjustcad_doc::Document, source: ObjectId) {
+        let link = doc.subdivision_links.get(&source).expect("a site plan");
+        self.open_for(source, &link.settings);
+        let req = OptimizeRequest {
+            location: doc.location.map(location),
+            ..self.form.to_request()
+        };
+        let started = Instant::now();
+        let r = site_optimize::optimize_doc(doc, &[source], &req)
+            .map(|(_, r)| Finished::new(&self.form, &r));
+        self.result = Some((started.elapsed(), r));
+    }
+}
+
+impl Finished {
+    fn new(form: &OptimizeForm, r: &OptimizeResult) -> Finished {
+        let rows = result_rows(r);
+        Finished {
+            cols: columns(form, &rows),
+            rows,
+            evaluated: r.evaluated,
+            feasible: r.feasible,
+            axis: r.pareto_axis,
+            score_key: if form.objective == Objective::Value {
+                "optimize.col.value"
+            } else {
+                "optimize.col.score"
+            },
+            current: current_row(r),
+            beats_current: r.beats_current(),
+        }
     }
 }
 
@@ -797,6 +879,29 @@ impl App {
                             ui.end_row();
                         }
                     }
+                    // The unit-size rule turning floor area into dwellings.
+                    ui.label(t("optimize.dwelling_area"));
+                    ui.add(
+                        egui::DragValue::new(&mut form.dwelling_area)
+                            .speed(1.0)
+                            .range(20.0..=1000.0)
+                            .suffix(" m²"),
+                    );
+                    ui.end_row();
+                    ui.label(t("optimize.dwelling_efficiency"));
+                    let mut pct = form.dwelling_efficiency * 100.0;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut pct)
+                                .speed(0.5)
+                                .range(30.0..=100.0)
+                                .suffix(" %"),
+                        )
+                        .changed()
+                    {
+                        form.dwelling_efficiency = pct / 100.0;
+                    }
+                    ui.end_row();
                 });
 
             ui.add_space(crate::theme::Spacing::S);
@@ -914,6 +1019,8 @@ impl App {
                                 Col::Park => Some("optimize.yield.park"),
                                 Col::Daylight => Some("optimize.yield.daylight"),
                                 Col::Overheat => Some("optimize.yield.overheat"),
+                                Col::Dwellings => Some("optimize.yield.dwellings"),
+                                Col::Density => Some("optimize.yield.density"),
                                 _ => None,
                             };
                             if let Some(k) = full {
@@ -1327,7 +1434,7 @@ mod tests {
     fn form_maps_to_request() {
         let mut f = OptimizeForm {
             objective: Objective::Weighted,
-            weights: [1.0, 0.0, 0.0, 0.5, 2.0],
+            weights: [1.0, 0.0, 0.0, 0.5, 2.0, 0.0],
             budget: 40,
             seed: 7,
             ..OptimizeForm::default()
@@ -1359,7 +1466,7 @@ mod tests {
     fn weights_only_sent_for_weighted() {
         let f = OptimizeForm {
             objective: Objective::Gfa,
-            weights: [1.0, 1.0, 1.0, 1.0, 1.0],
+            weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
             ..OptimizeForm::default()
         };
         assert!(f.to_request().weights.is_empty());
@@ -1447,6 +1554,8 @@ mod tests {
                 park_pct: None,
                 daylight_pct: None,
                 overheat_pct: None,
+                dwellings: Some(4.0),
+                density: Some(40.0),
             },
             pareto: true,
             params: BTreeMap::new(),
@@ -1460,22 +1569,65 @@ mod tests {
         use Col::*;
         let value = OptimizeForm::default();
         assert_eq!(value.objective, Objective::Value, "value is the default");
-        assert_eq!(columns(&value, &[row(0.0)]), [Score, Lots, Floors, Park], "profit/m², storeys, parks");
+        assert_eq!(
+            columns(&value, &[row(0.0)]),
+            [Score, Lots, Dwellings, Floors, Park],
+            "profit/m², dwellings, storeys, parks"
+        );
         let mut sunny = value.clone();
         sunny.constraints[11].0 = true;
-        assert_eq!(columns(&sunny, &[row(0.0)]), [Score, Lots, Floors, Park, Daylight]);
+        assert_eq!(
+            columns(&sunny, &[row(0.0)]),
+            [Score, Lots, Dwellings, Floors, Park, Daylight]
+        );
         sunny.constraints[12].0 = true;
-        assert_eq!(columns(&sunny, &[row(0.0)]), [Score, Lots, Floors, Park, Daylight, Overheat]);
-        let mut f = OptimizeForm { objective: Objective::Lots, ..value };
+        assert_eq!(
+            columns(&sunny, &[row(0.0)]),
+            [Score, Lots, Dwellings, Floors, Park, Daylight, Overheat]
+        );
+        let mut f = OptimizeForm {
+            objective: Objective::Lots,
+            ..value
+        };
         f.constraints[3].0 = false; // min open (on by default)
-        assert_eq!(columns(&f, &[row(0.0)]), [Lots, Net, Gfa], "lots: score = lots column");
-        assert_eq!(columns(&f, &[row(0.0), row(4.0)]), [Lots, Net, Gfa, Open], "open varies");
-        let mut far = OptimizeForm { objective: Objective::FarNet, ..f.clone() };
-        assert_eq!(columns(&far, &[row(0.0)]), [Lots, Net, Gfa, Far]);
+        assert_eq!(
+            columns(&f, &[row(0.0)]),
+            [Lots, Dwellings, Net, Gfa],
+            "lots: score = lots column"
+        );
+        assert_eq!(
+            columns(&f, &[row(0.0), row(4.0)]),
+            [Lots, Dwellings, Net, Gfa, Open],
+            "open varies"
+        );
+        let mut far = OptimizeForm {
+            objective: Objective::FarNet,
+            ..f.clone()
+        };
+        assert_eq!(columns(&far, &[row(0.0)]), [Lots, Dwellings, Net, Gfa, Far]);
         far.constraints[3].0 = true; // min open
-        assert_eq!(columns(&far, &[row(0.0)]), [Lots, Net, Gfa, Far, Open]);
-        let w = OptimizeForm { objective: Objective::Weighted, weights: [1.0, 0.0, 0.0, 0.0, 1.0], ..f };
-        assert_eq!(columns(&w, &[row(0.0)]), [Score, Lots, Net, Gfa, Open]);
+        assert_eq!(
+            columns(&far, &[row(0.0)]),
+            [Lots, Dwellings, Net, Gfa, Far, Open]
+        );
+        let w = OptimizeForm {
+            objective: Objective::Weighted,
+            weights: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            ..f.clone()
+        };
+        assert_eq!(
+            columns(&w, &[row(0.0)]),
+            [Score, Lots, Dwellings, Net, Gfa, Open]
+        );
+        let mut dense = OptimizeForm {
+            objective: Objective::Dwellings,
+            ..f
+        };
+        dense.constraints[14].0 = true; // min density
+        assert_eq!(
+            columns(&dense, &[row(0.0)]),
+            [Lots, Dwellings, Density, Net, Gfa]
+        );
     }
 
     #[test]
@@ -1554,6 +1706,50 @@ mod tests {
         f.constraints[8].0 = false;
         let r = f.to_request();
         assert_eq!((r.max_depth_ratio, r.max_block_perimeter), (None, None), "unchecked lifts them");
+    }
+
+    /// #170: dwelling constraints and the unit-size rule reach the request;
+    /// an unchanged rule is the plan's and is not sent.
+    #[test]
+    fn dwelling_constraints_and_rule_reach_the_request() {
+        let mut f = OptimizeForm::default();
+        let s = subdivision::SubdivisionSettings {
+            dwelling_area: 95.0,
+            ..Default::default()
+        };
+        f.seed_from_plan(&s);
+        assert_eq!(f.dwelling_area, 95.0);
+        let r = f.to_request();
+        assert_eq!(
+            (
+                r.dwelling_area,
+                r.dwelling_efficiency,
+                r.min_dwellings,
+                r.min_density
+            ),
+            (None, None, None, None)
+        );
+        f.constraints[13] = (true, 120.0);
+        f.constraints[14] = (true, 80.0);
+        f.dwelling_efficiency = 0.7;
+        f.objective = Objective::Dwellings;
+        let r = f.to_request();
+        assert_eq!((r.min_dwellings, r.min_density), (Some(120.0), Some(80.0)));
+        assert_eq!(
+            (r.dwelling_area, r.dwelling_efficiency),
+            (Some(95.0), Some(0.7))
+        );
+        assert_eq!(r.objective, Objective::Dwellings);
+        let y = subdivision::YieldReport::compute(&subdivision::YieldInputs {
+            lot_areas: vec![500.0],
+            gross_site_area: 10_000.0,
+            building_gfas: vec![1000.0],
+            dwelling_rule: Some(s.dwelling_rule()),
+            ..Default::default()
+        });
+        let m = Metrics::from_report(&y);
+        assert_eq!((m.dwellings, m.density), (Some(8.0), Some(8.0)));
+        assert_eq!(m.cell(Col::Dwellings), "8");
     }
 
     #[test]
