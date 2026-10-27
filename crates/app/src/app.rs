@@ -12509,9 +12509,11 @@ mod tests {
             app.panel_tabs.show(crate::tabstrip::PanelTab::Parameters);
             source
         };
+        let running = "running";
         for (name, seg) in [
             ("yield", optimize_panel::SEG_YIELD),
             ("optimize", optimize_panel::SEG_OPTIMIZE),
+            (running, optimize_panel::SEG_OPTIMIZE),
         ] {
             for dark in [false, true] {
                 // Tall, so the whole panel (results included) fits unscrolled.
@@ -12521,7 +12523,17 @@ mod tests {
                     |app| {
                         let source = plan(app);
                         app.subdiv_segment = seg;
-                        if seg == optimize_panel::SEG_OPTIMIZE {
+                        if name == running {
+                            use itsjustcad_commands::site_optimize::{Phase, Progress};
+                            let p = Progress {
+                                phase: Phase::Search,
+                                evaluated: 144,
+                                budget: 400,
+                                feasible: 37,
+                                best: Some(612.0),
+                            };
+                            app.optimize.fake_running(source, p, false);
+                        } else if seg == optimize_panel::SEG_OPTIMIZE {
                             app.optimize.form.budget = 40;
                             app.optimize.run_now(&app.session.doc, source);
                         }
