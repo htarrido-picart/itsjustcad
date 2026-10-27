@@ -3893,8 +3893,9 @@ impl App {
 
     /// Click-select: ray through the clicked pixel vs object AABBs. Unless
     /// `expand` is off (Cmd held), the hit expands to its whole group.
-    /// The topmost visible object whose AABB the screen ray crosses, if any.
-    /// Shared by single-click pick and the double-click Blocks-tab reveal.
+    /// The object under the click ([`itsjustcad_doc::pick::pick_object`]:
+    /// curves by their drawn line, the rest by the nearest AABB the ray
+    /// crosses), if any. Shared by single-click pick and the double-click Blocks-tab reveal.
     fn hit_object(
         &self,
         view_proj: glam::Mat4,
@@ -3902,78 +3903,14 @@ impl App {
         pos: egui::Pos2,
     ) -> Option<itsjustcad_doc::ObjectId> {
         let (origin, dir) = screen_ray(view_proj, rect, pos);
-        // Build a BVH over visible object AABBs so the ray only tests the boxes
-        // it actually crosses rather than every object in the scene.
-        // Keep the Curve ref alongside the AABB so the narrow phase doesn't
-        // re-fetch the object by id (the ref is valid for this whole `&self`
-        // borrow). `None` = non-curve geometry (mesh/solid), picked by bounds.
-        let pickable: Vec<(itsjustcad_doc::ObjectId, kernel_mesh::Aabb, Option<&kernel_curve::Curve>)> =
-            self.session
-                .doc
-                .objects()
-                .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
-                .map(|obj| {
-                    let curve = match &obj.geometry {
-                        itsjustcad_doc::Geometry::Curve(c) => Some(c),
-                        _ => None,
-                    };
-                    (obj.id, self.session.doc.geometry_aabb(&obj.geometry), curve)
-                })
-                .collect();
-        let bvh = kernel_mesh::Bvh::build(&pickable.iter().map(|(_, bb, _)| *bb).collect::<Vec<_>>());
-        // A curve is HIT only when the click lands within this many pixels of the
-        // ACTUAL projected line — not anywhere inside its bounding box (clicking
-        // empty space inside a diagonal line's AABB must NOT re-select it). 8px is
-        // comfortable for thin lines. Meshes/solids pick by their AABB footprint.
-        const PICK_PX: f32 = 8.0;
-        // A fully on-screen curve is ranked by its SCREEN distance to the cursor
-        // (so a click dead-on the nearer line wins over one that merely has a
-        // closer bounding box); meshes/off-screen curves are ranked by ray depth.
-        // A qualifying curve is preferred over a mesh — a thin wireframe reads as
-        // foreground in CAD.
-        let mut best_curve: Option<(f32, itsjustcad_doc::ObjectId)> = None; // (screen dist, id)
-        let mut best_depth: Option<(f64, itsjustcad_doc::ObjectId)> = None; // (ray t, id)
-        // Fully on-screen curves: a SCREEN-space broad phase (projected AABB
-        // grown by PICK_PX), not the ray-vs-AABB one — that misses a click just
-        // outside a curve lying on its box's edge, e.g. any edge of a flat
-        // polyline seen in Top/Front/Right (#163).
-        let mut on_screen = std::collections::HashSet::new();
-        for &(id, bb, curve) in &pickable {
-            let Some(c) = curve else { continue };
-            if projected_rect(view_proj, rect, bb.min, bb.max)
-                .is_some_and(|r| !r.expand(PICK_PX).contains(pos))
-            {
-                continue;
-            }
-            let pts = curve_screen_pts(c, view_proj, rect);
-            // Any point behind the camera makes the screen polyline unreliable
-            // (a visible span can have no on-screen segment); such a curve
-            // falls back to the AABB depth test below so it stays pickable.
-            if pts.iter().any(|p| p.is_none()) {
-                continue;
-            }
-            on_screen.insert(id);
-            if let Some(d) = crate::boxsel::dist_to_polyline(&pts, pos)
-                && d <= PICK_PX
-                && best_curve.is_none_or(|(bd, _)| d < bd)
-            {
-                best_curve = Some((d, id));
-            }
-        }
-        for i in bvh.ray_candidates(origin, dir) {
-            let (id, bb, curve) = pickable[i as usize];
-            if curve.is_some() && on_screen.contains(&id) {
-                continue; // on-screen curve decided by screen distance only
-            }
-            // Depth along the ray (nearest wins); None when the ray misses the AABB.
-            let Some(t) = ray_aabb(origin, dir, bb.min, bb.max) else { continue };
-            if best_depth.is_none_or(|(bt, _)| t < bt) {
-                best_depth = Some((t, id));
-            }
-        }
-        best_curve
-            .map(|(_, id)| id)
-            .or(best_depth.map(|(_, id)| id))
+        itsjustcad_doc::pick::pick_object(
+            &self.session.doc,
+            view_proj,
+            glam::Vec2::new(rect.width(), rect.height()),
+            glam::Vec2::new(pos.x - rect.left(), pos.y - rect.top()),
+            origin,
+            dir,
+        )
     }
 
     /// A viewport double-click: if it lands on a block instance, reveal the
@@ -11097,15 +11034,6 @@ fn draw_rubber_box(
     }
 }
 
-fn ray_aabb(origin: glam::DVec3, dir: glam::DVec3, min: glam::DVec3, max: glam::DVec3) -> Option<f64> {
-    let inv = dir.recip();
-    let t1 = (min - origin) * inv;
-    let t2 = (max - origin) * inv;
-    let t_min = t1.min(t2).max_element();
-    let t_max = t1.max(t2).min_element();
-    (t_max >= t_min.max(0.0)).then_some(t_min.max(0.0))
-}
-
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         // Pencil mode forces paper white regardless of the egui theme.
@@ -13107,19 +13035,9 @@ mod tests {
         // 4 vertices + appended first = 5, last repeats first (the closing vertex).
         assert_eq!(pts.len(), 5, "closed curve appends the first point");
         assert_eq!(pts[0], pts[4], "closing vertex repeats the first");
-        // Closing edge = last→first = the left side (x=-0.5 → screen x=50, y 50..150).
-        // Its midpoint world (-0.5,0,0) → screen (50,100): on the line only because
-        // the closing segment now exists.
-        let mid = egui::pos2(50.0, 100.0);
-        let d = crate::boxsel::dist_to_polyline(&pts, mid).unwrap();
-        assert!(d < 0.001, "click on the closing edge is on the line: {d}");
-        // The OPEN version lacks that edge, so the same click is far (~50px) — the
-        // append is exactly what fixes the closed-curve pick.
         let open = kernel_curve::Curve::Polyline { points: corners, closed: false };
         let open_pts = curve_screen_pts(&open, vp, rect);
         assert_eq!(open_pts.len(), 4, "open curve is not closed");
-        let d_open = crate::boxsel::dist_to_polyline(&open_pts, mid).unwrap();
-        assert!(d_open > 40.0, "open square's missing left edge: click is far: {d_open}");
     }
 
     #[test]
