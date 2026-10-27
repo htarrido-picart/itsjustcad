@@ -1600,6 +1600,10 @@ pub enum Command {
     },
     /// List saved views (query, never logged).
     ViewList,
+    /// Delete a saved view (#187). Logged; undo restores it.
+    ViewDelete {
+        name: String,
+    },
     Select {
         targets: Selector,
     },

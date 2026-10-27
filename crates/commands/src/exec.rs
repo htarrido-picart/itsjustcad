@@ -14748,6 +14748,28 @@ fn apply_forward(
                 },
             ))
         }
+        Command::ViewDelete { name } => {
+            let Some(view) = doc.named_views.remove(&name) else {
+                return Err(ExecError::Invalid(format!(
+                    "view delete: no saved view '{name}'"
+                )));
+            };
+            doc.generation += 1;
+            Ok((
+                Command::ViewDelete { name: name.clone() },
+                Inverse::ViewSaved {
+                    name: name.clone(),
+                    prev: Some(view),
+                },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "view '{name}' deleted ({} saved view(s))",
+                        doc.named_views.len()
+                    ),
+                },
+            ))
+        }
         Command::ViewRestore { name } => {
             let Some(view) = doc.named_views.get(&name).copied() else {
                 let known = if doc.named_views.is_empty() {
@@ -17180,6 +17202,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::ViewSave { .. } => "view save",
         Command::ViewRestore { .. } => "view",
         Command::ViewList => "view list",
+        Command::ViewDelete { .. } => "view delete",
         Command::Select { .. } => "select",
         Command::SelectNone => "selectnone",
         Command::Distance { .. } => "distance",
@@ -18630,6 +18653,25 @@ mod tests {
         assert_eq!(s.doc.named_views["entry"], v);
         run(&mut s, "redo");
         assert_eq!(s.doc.named_views["entry"], v2);
+    }
+
+    #[test]
+    fn view_delete_is_logged_and_undoable() {
+        let mut s = Session::default();
+        let v = sample_view(12.0);
+        s.run(Command::ViewSave { name: "entry".to_string(), camera: Some(v) })
+            .unwrap();
+        let out = run(&mut s, "view delete entry");
+        assert!(out.message.contains("deleted"), "{}", out.message);
+        assert!(s.doc.named_views.is_empty());
+        let log = s.save_log();
+        assert!(matches!(log.last(), Some(Command::ViewDelete { name }) if name == "entry"));
+        run(&mut s, "undo");
+        assert_eq!(s.doc.named_views.get("entry"), Some(&v));
+        run(&mut s, "redo");
+        assert!(s.doc.named_views.is_empty());
+        let err = s.run(parse("view delete entry").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no saved view"), "{err}");
     }
 
     #[test]

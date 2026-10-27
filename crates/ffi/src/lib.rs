@@ -3846,6 +3846,44 @@ pub unsafe extern "C" fn ijc_lot_set(
     })
 }
 
+/// Reset lot `lot_id` (short id or full uuid; a building standing on the lot,
+/// or a comma-separated list of lots/buildings reset together) to its plan's
+/// rules: clears every `lotset` override and hand-set edge role (`lotreset`),
+/// as ONE undo step. An unknown id fails the whole reset. Returns run-result
+/// JSON (as [`ijc_run_command_result`]) plus `"selected":[id…]`: the reset lots
+/// in the re-derived plan (new ids), now the core selection (see
+/// [`selection`]). Free with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `lot_id` must be null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_lot_reset(h: *mut AppHandle, lot_id: *const c_char) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        if lot_id.is_null() {
+            return fail("lot_id is null");
+        }
+        let Ok(id) = unsafe { CStr::from_ptr(lot_id) }.to_str() else {
+            return fail("lot_id is not valid UTF-8");
+        };
+        apply_pending(app);
+        let Some(ids) = selection::ids_by_list(&app.session.doc, id) else {
+            return fail("no object with that id");
+        };
+        let focus = selection::focus_of(&app.session.doc, &ids);
+        let cmd = Command::LotReset {
+            targets: Selector::Ids { ids },
+            ids: None,
+        };
+        into_c_string(selection::run_refocus_json(&mut app.session, &focus, cmd))
+    })
+}
+
 /// The rule overrides of the site-plan lot `lot_id` (short id or full uuid;
 /// a building standing on the lot works too) as JSON: `{"lot", "source",
 /// "effective": {floors, typology, setback_front, setback_side,
@@ -7584,6 +7622,60 @@ mod headless_tests {
             let out = r(ijc_lot_height_set(h, c(&lot(h)).as_ptr(), 0));
             assert_eq!(out["ok"], true, "{out}");
             assert_eq!(pins(h), 0);
+            ijc_free(h);
+        }
+    }
+
+    /// `ijc_lot_reset` clears overrides and edge roles in one undo step and
+    /// re-selects the reset lot (#187).
+    #[test]
+    fn lot_reset_one_undo_and_reselects() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            for line in ["rect 0,0,0 600 450", "siteplan last"] {
+                assert_eq!(r(ijc_run_command_result(h, c(line).as_ptr()))["ok"], true);
+            }
+            let lot = {
+                let guard = handle_ref(h).unwrap();
+                let doc = &guard.session.doc;
+                let lots = itsjustcad_commands::lot::LOTS_LAYER;
+                doc.objects().find(|o| o.layer == lots).unwrap().id.to_string()
+            };
+            let out = r(ijc_lot_set(h, c(&lot).as_ptr(), c(r#"{"floors": 9}"#).as_ptr()));
+            let lot = out["selected"][0].as_str().unwrap().to_string();
+            let out = r(ijc_edge_role_set(h, c(&lot).as_ptr(), 0, c("rear").as_ptr()));
+            assert_eq!(out["ok"], true, "{out}");
+            let lot = out["selected"][0].as_str().unwrap().to_string();
+            let o = r(ijc_lot_json(h, c(&lot).as_ptr()))["overridden"].clone();
+            assert_eq!(
+                (o["floors"].clone(), o["edge_roles"].clone()),
+                (true.into(), true.into()),
+                "{o}"
+            );
+
+            let before = ijc_undo_cursor(h);
+            let out = r(ijc_lot_reset(h, c(&lot).as_ptr()));
+            assert_eq!(out["ok"], true, "{out}");
+            assert_eq!(ijc_undo_cursor(h), before + 1, "one undo step");
+            let sel = out["selected"].as_array().unwrap();
+            assert_eq!(sel.len(), 1, "{out}");
+            let lot = sel[0].as_str().unwrap().to_string();
+            let selection = r(ijc_selection_json(h));
+            assert_eq!(selection[0]["id"], lot.as_str(), "core selection follows");
+            let o = r(ijc_lot_json(h, c(&lot).as_ptr()))["overridden"].clone();
+            assert_eq!(
+                (o["floors"].clone(), o["edge_roles"].clone()),
+                (false.into(), false.into()),
+                "{o}"
+            );
+
+            assert_eq!(r(ijc_lot_reset(h, c("nope").as_ptr()))["ok"], false);
+            assert_eq!(r(ijc_lot_reset(h, std::ptr::null()))["ok"], false);
+            assert_eq!(
+                r(ijc_lot_reset(std::ptr::null_mut(), c(&lot).as_ptr()))["ok"],
+                false
+            );
             ijc_free(h);
         }
     }

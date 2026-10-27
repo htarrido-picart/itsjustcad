@@ -5,7 +5,7 @@
 //!
 //! A lot or street edit re-derives the site plan, which mints fresh lot and
 //! road ids. The edit entry points ([`super::ijc_lot_set`],
-//! [`super::ijc_lot_height_set`], [`super::ijc_edge_role_set`],
+//! [`super::ijc_lot_height_set`], [`super::ijc_lot_reset`], [`super::ijc_edge_role_set`],
 //! [`super::ijc_street_set`], [`super::ijc_street_edit`]) therefore re-select
 //! what they edited, as the desktop inspector does with `lot::focus_anchor` +
 //! `lot::refocus`, and report the new ids in their run-result JSON under

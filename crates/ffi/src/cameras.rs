@@ -22,7 +22,8 @@
 //!
 //! # Named views
 //! `view save <name>` stores the active camera (logged, undoable; saved in
-//! the document); `view <name>` applies a saved view to the active camera;
+//! the document); `view delete <name>` removes one (logged, undoable);
+//! `view <name>` applies a saved view to the active camera;
 //! [`ijc_camera_set_view`] applies a standard or saved view to any camera;
 //! [`ijc_views_json`] lists them.
 
@@ -191,7 +192,8 @@ pub(crate) fn run_with_camera(
 /// (radians; `pano` only for a panorama/fisheye view, as
 /// `{"kind":"equirect"}` / `{"kind":"fisheye","fov"}`). Save with the
 /// `view save <name>` command (it captures the active camera), apply with
-/// `view <name>` or [`ijc_camera_set_view`]. Returns `"[]"` for a
+/// `view <name>` or [`ijc_camera_set_view`], delete with `view delete <name>`
+/// (logged, undoable). Returns `"[]"` for a
 /// null/invalid handle. Free with [`super::ijc_string_free`].
 ///
 /// # Safety
@@ -605,6 +607,25 @@ mod tests {
                 r(ijc_views_json(std::ptr::null_mut())),
                 serde_json::json!([])
             );
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn view_delete_is_undoable() {
+        let h = ijc_init_headless();
+        unsafe {
+            ok(h, "view save plan");
+            let out = ok(h, "view delete plan");
+            assert!(
+                out["message"].as_str().unwrap().contains("deleted"),
+                "{out}"
+            );
+            assert_eq!(r(ijc_views_json(h)), serde_json::json!([]));
+            ok(h, "undo");
+            assert_eq!(r(ijc_views_json(h))[0]["name"], "plan");
+            let bad = r(ijc_run_command_result(h, c("view delete nope").as_ptr()));
+            assert_eq!(bad["ok"], false);
             ijc_free(h);
         }
     }

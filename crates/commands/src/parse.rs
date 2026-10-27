@@ -1775,8 +1775,15 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
                 camera: None,
             }),
             ["list"] => Ok(Command::ViewList),
+            ["delete", name] => Ok(Command::ViewDelete {
+                name: (*name).to_string(),
+            }),
             [name] if *name != "save" => Ok(Command::ViewRestore { name: (*name).to_string() }),
-            _ => wrong("view", "'save <name>', a saved view name, or 'list'", &args),
+            _ => wrong(
+                "view",
+                "'save <name>', 'delete <name>', a saved view name, or 'list'",
+                &args,
+            ),
         },
         "option" | "opt" => match args.as_slice() {
             ["save", name] => Ok(Command::Option(OptionOp::Save { name: (*name).to_string() })),
@@ -5433,6 +5440,17 @@ mod tests {
             Command::ViewRestore { name: "entry".to_string() }
         );
         assert_eq!(parse("view list").unwrap(), Command::ViewList);
+        assert_eq!(
+            parse("view delete entry").unwrap(),
+            Command::ViewDelete {
+                name: "entry".to_string()
+            }
+        );
+        assert_eq!(
+            parse("view delete").unwrap(),
+            Command::ViewRestore { name: "delete".to_string() },
+            "a view saved as 'delete' still restores"
+        );
         assert!(parse("view").unwrap_err().to_string().contains("save"));
         assert!(parse("view save").unwrap_err().to_string().contains("save"));
         assert!(parse("view save a b").is_err());
