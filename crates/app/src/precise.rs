@@ -20,9 +20,8 @@ pub enum PointInput {
 }
 
 /// Characters the drawing input buffer accepts (everything parse can use).
-pub fn accepts_char(c: char) -> bool {
-    c.is_ascii_digit() || matches!(c, '.' | ',' | '@' | '-' | '+')
-}
+/// Shared with the guided engine's typed-buffer filter.
+pub use itsjustcad_guided::accepts_char;
 
 fn coords(s: &str, what: &str) -> Result<DVec3, String> {
     let parts: Vec<&str> = s.split(',').collect();

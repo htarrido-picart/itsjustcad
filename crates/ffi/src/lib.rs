@@ -37,6 +37,7 @@
 
 mod boxsel;
 pub mod cameras;
+pub mod guided;
 pub mod replay;
 pub mod selection;
 pub mod snap;
@@ -284,6 +285,9 @@ pub struct AppHandle {
     /// `ijc_render_frame` draws an amber ghost wireframe of the selection under
     /// the pending transform; `ijc_gumball_commit` turns it into a real command.
     gumball_preview: Option<GumballPreview>,
+
+    /// Guided verb run (itsjustcad-ios#121).
+    guided: guided::GuidedState,
 
     // async / deck (shared across threads via Arc)
     runtime: tokio::runtime::Runtime,
@@ -800,6 +804,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         mode: DisplayMode::default(),
         underlay_cache: None,
         gumball_preview: None,
+        guided: Default::default(),
         runtime,
         deck: None,
         deck_config: None,
@@ -1025,6 +1030,7 @@ pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: u
         match io::from_json(json) {
             Ok(session) => {
                 app.session = session;
+                app.guided = Default::default();
                 if let Ok(mut hist) = app.history.lock() {
                     hist.clear();
                 }
@@ -1051,6 +1057,7 @@ pub unsafe extern "C" fn ijc_new_document(h: *mut AppHandle) {
             return;
         };
         app.session = Session::default();
+        app.guided = Default::default();
         if let Ok(mut hist) = app.history.lock() {
             hist.clear();
         }

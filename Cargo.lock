@@ -2731,6 +2731,7 @@ dependencies = [
  "itsjustcad-commands",
  "itsjustcad-deck",
  "itsjustcad-doc",
+ "itsjustcad-guided",
  "itsjustcad-raytrace",
  "itsjustcad-render",
  "itsjustcad-solar",
@@ -2829,6 +2830,7 @@ dependencies = [
  "itsjustcad-commands",
  "itsjustcad-deck",
  "itsjustcad-doc",
+ "itsjustcad-guided",
  "itsjustcad-render",
  "kernel-curve",
  "kernel-mesh",
@@ -2837,6 +2839,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "wgpu",
+]
+
+[[package]]
+name = "itsjustcad-guided"
+version = "0.7.0"
+dependencies = [
+ "glam 0.30.10",
+ "kernel-mesh",
 ]
 
 [[package]]

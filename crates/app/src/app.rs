@@ -13,7 +13,7 @@ use itsjustcad_render::{
 use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
 use crate::draw_tool::DrawTool;
-use crate::guided::{GuidedTool, ObjFilter, StartResult, StepResult};
+use itsjustcad_guided::{GuidedTool, ObjFilter, StartResult, StepResult};
 use crate::gumball::Gumball;
 use crate::journal::{self, Journal};
 use crate::keymap;

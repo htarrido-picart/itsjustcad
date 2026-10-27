@@ -36,19 +36,9 @@ pub struct DrawTool {
 /// visible, not guessed.
 const CLOSE_SNAP: f64 = 0.5;
 
-/// Millimeter rounding for emitted command strings — points arrive already
-/// resolved (osnap hit or grid snap), this only strips float noise.
-pub(crate) fn num(v: f64) -> f64 {
-    (v * 1000.0).round() / 1000.0
-}
-
-pub(crate) fn fmt(p: DVec3) -> String {
-    if p.z.abs() < 1e-9 {
-        format!("{},{}", num(p.x), num(p.y))
-    } else {
-        format!("{},{},{}", num(p.x), num(p.y), num(p.z))
-    }
-}
+/// Millimeter rounding and coordinate formatting for emitted command strings,
+/// shared with the guided engine so both emit identical numbers.
+pub(crate) use itsjustcad_guided::{fmt, num};
 
 impl DrawTool {
     pub fn active(&self) -> bool {

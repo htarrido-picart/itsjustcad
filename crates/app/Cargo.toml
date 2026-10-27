@@ -28,6 +28,7 @@ itsjustcad-solar.workspace = true
 kernel-curve.workspace = true
 itsjustcad-commands.workspace = true
 itsjustcad-deck.workspace = true
+itsjustcad-guided.workspace = true
 itsjustcad-render.workspace = true
 itsjustcad-raytrace.workspace = true
 kernel-mesh.workspace = true
