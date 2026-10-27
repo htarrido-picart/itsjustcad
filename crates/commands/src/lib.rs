@@ -48,7 +48,9 @@ pub use command::{
     LotEdit, LotField, MirrorPlane, OptionOp, PlotStyleOp, RegionMode, Selector, SheetSetOp, SheetViewSet, SimilarBy,
 };
 pub use error::{ExecError, ParseError};
-pub use exec::{trim_preview, trim_removed_piece, ApplyOutcome, ImportSummary, Session, MAIN_BRANCH};
+pub use exec::{
+    resolve_targets, trim_preview, trim_removed_piece, ApplyOutcome, ImportSummary, Session, MAIN_BRANCH,
+};
 pub use parse::parse;
 pub use plugin::{Plugin, PluginError, PluginParam, PluginRegistry};
 pub use registry::{registry, Category, CommandSpec, SELECTOR_HELP};

@@ -14,7 +14,7 @@
 use itsjustcad_commands::{PluginRegistry, registry};
 
 use crate::prompt::{
-    CATEGORY_ORDER, CLARIFY_HELP, CODECHECK_HELP, ENVIRO_CRITIQUE_HELP, PLAN_HELP, RAMP_STAIR_HELP,
+    CATEGORY_ORDER, CLARIFY_HELP, CODECHECK_HELP, CUTCHECK_HELP, ENVIRO_CRITIQUE_HELP, PLAN_HELP, RAMP_STAIR_HELP,
     TABLE_HELP, YIELD_CRITIQUE_HELP, category_label,
 };
 use crate::retrieve::{CORE_VERBS, GATED_VERBS, retrieved_block, tokens};
@@ -104,6 +104,22 @@ fn guidance_for(request: &str) -> String {
         "accessible",
     ]) {
         out.push_str(CODECHECK_HELP);
+    }
+    if has(&[
+        "sendcutsend",
+        "cutcheck",
+        "cutmaterials",
+        "laser",
+        "lasercut",
+        "waterjet",
+        "router",
+        "cnc",
+        "fabricate",
+        "fabrication",
+        "manufacture",
+        "dxf",
+    ]) {
+        out.push_str(CUTCHECK_HELP);
     }
     if has(&[
         "lot",
@@ -423,5 +439,8 @@ mod tests {
         assert!(p("a staircase rising 3 m").contains("Ramp & stair layout"));
         assert!(!p("draw a box").contains("Ramp & stair layout"));
         assert!(p("run a codecheck").contains("Compliance pre-checks"));
+        assert!(p("make this SendCutSend-ready in 3 mm aluminum").contains("## Fabrication: SendCutSend-ready"));
+        assert!(p("laser cut this bracket").contains("cutcheck units=mm"));
+        assert!(!p("draw a box").contains("## Fabrication"));
     }
 }

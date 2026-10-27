@@ -2992,6 +2992,12 @@ fn freeze_selected(op: Command, selection: &[ObjectId]) -> Command {
     serde_json::from_value(v).unwrap_or(op)
 }
 
+/// Resolve a selector to live, unlocked object ids — the same resolution every
+/// command uses. Public for hosts (FFI) that take a selector outside a command.
+pub fn resolve_targets(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
+    resolve(doc, sel)
+}
+
 fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
     let raw: Vec<ObjectId> = match sel {
         // Validate ids against the document: the parser never emits `Ids`, but a

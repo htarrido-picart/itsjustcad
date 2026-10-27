@@ -332,6 +332,33 @@ impl PluginRegistry {
     }
 }
 
+/// Plugins that ship with the program (listed in the Plugins window on a
+/// fresh install). A user plugin with the same name overrides one of these.
+/// Still macros only: every line is an ordinary core command.
+pub fn bundled() -> Vec<Plugin> {
+    const SOURCES: &[&str] = &[include_str!("../../../assets/plugins/sendcutsend/plugin.json")];
+    SOURCES
+        .iter()
+        .map(|s| serde_json::from_str(s).expect("bundled plugin JSON is valid"))
+        .collect()
+}
+
+impl PluginRegistry {
+    /// [`bundled`] plugins plus everything under `dir` (user plugins win on
+    /// a name clash). What the app loads at startup and on `plugin reload`.
+    pub fn load_dir_with_bundled(dir: &Path) -> (Self, Vec<String>) {
+        let (user, warnings) = Self::load_dir(dir);
+        let mut reg = Self::new();
+        for p in bundled() {
+            reg.insert(p);
+        }
+        for p in user.plugins.into_values() {
+            reg.insert(p);
+        }
+        (reg, warnings)
+    }
+}
+
 /// Default on-disk location for plugins: `~/.config/itsjustcad/plugins`.
 pub fn default_dir() -> Option<PathBuf> {
     Some(crate::config_dir()?.join("plugins"))
@@ -354,6 +381,29 @@ pub enum PluginError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sendcutsend_plugin_is_bundled_and_runs_check_then_export() {
+        let dir = std::env::temp_dir().join(format!("ijc_bundled_plugins_{}", std::process::id()));
+        let (reg, warnings) = PluginRegistry::load_dir_with_bundled(&dir);
+        assert!(warnings.is_empty());
+        let p = reg.get("sendcutsend").expect("bundled sendcutsend plugin");
+        assert_eq!(p.menu_category(), "Fabrication");
+        let out = crate::config_dir().unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let path = out.join("scs_plugin.dxf");
+        let lines = p.expand(&[path.display().to_string(), "3".into()]).unwrap();
+        assert!(lines[0].starts_with("cutcheck units=mm thickness=3"), "{lines:?}");
+        let mut s = crate::Session::default();
+        for l in ["rect 0,0,0 0.05 0.03", "circle 0.01,0.015,0 0.0025"] {
+            s.run(crate::parse(l).unwrap()).unwrap();
+        }
+        let msgs: Vec<String> =
+            lines.iter().map(|l| s.run(crate::parse(l).unwrap()).unwrap().message).collect();
+        assert!(msgs[0].contains("cutcheck: clean"), "{msgs:?}");
+        assert!(msgs[1].contains("$INSUNITS=4"), "{msgs:?}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("CIRCLE"));
+    }
 
     fn column_grid() -> Plugin {
         Plugin {
