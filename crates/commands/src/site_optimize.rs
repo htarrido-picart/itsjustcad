@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use subdivision::{FrontageAt, Polygon2d, SubdivisionSettings, YieldInputs, YieldReport};
 
 use crate::lot::{self, SitePlanBake};
-pub use crate::site_metrics::{DaylightOpts, DaylightPeriod, FacadeDaylight};
+pub use crate::site_metrics::{DaylightOpts, DaylightPeriod, DaylightSource, FacadeDaylight};
 use crate::site_metrics::facade_daylight;
 
 /// What to maximize.
@@ -156,6 +156,13 @@ pub struct OptimizeRequest {
     pub overheat_hours: f64,
     /// Observer location for daylight (the document's, when unset).
     pub location: Option<Location>,
+    /// Use the document's climate (`climate <file.epw>`) for daylight when it
+    /// has one (default); false keeps clear-sky sun hours.
+    pub use_climate: bool,
+    /// The site climate daylight reads (filled from the document by
+    /// [`prepare_doc`] when `use_climate`; not part of the request JSON).
+    #[serde(skip)]
+    pub climate: Option<std::sync::Arc<itsjustcad_doc::Climate>>,
     /// Unit prices of the `value` objective.
     pub economics: Economics,
 }
@@ -275,6 +282,9 @@ pub struct Quantities {
     pub daylight_floors: Option<f64>,
     /// Share of facade area overheating on the hottest month, when asked.
     pub overheat: Option<f64>,
+    /// Where the daylight sun hours came from, when daylight was measured.
+    #[serde(default)]
+    pub daylight_source: Option<DaylightSource>,
     /// Each lot's walk to the nearest park along the streets, m.
     pub park_walk: Vec<f64>,
 }
@@ -464,6 +474,8 @@ impl Default for OptimizeRequest {
             max_overheat: None,
             overheat_hours: 6.0,
             location: None,
+            use_climate: true,
+            climate: None,
             economics: Economics::default(),
         }
     }
@@ -602,6 +614,13 @@ impl OptimizeRequest {
                     tz_hours: rest.first().copied().unwrap_or((lon / 15.0).round()),
                 });
             }
+            // climate=off: clear-sky sun hours even with a climate file.
+            "climate" => {
+                self.use_climate = !matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "off" | "0" | "false" | "clear_sky"
+                );
+            }
             k if self.economics.set(k, num()?) => {}
             _ => return Err(format!("siteoptimize: unknown option '{key}'")),
         }
@@ -664,6 +683,7 @@ impl OptimizeRequest {
             period: self.daylight_period,
             hours: self.daylight_hours,
             overheat_hours: overheat.then_some(self.overheat_hours),
+            climate: self.climate.clone().filter(|_| self.use_climate),
         }
     }
 }
@@ -897,6 +917,7 @@ pub fn evaluate(
         daylight: None,
         daylight_floors: None,
         overheat: None,
+        daylight_source: None,
         park_walk,
     };
     let ledger = req.economics.ledger(&quantities);
@@ -936,6 +957,58 @@ pub struct OptimizeResult {
     /// The plan the search started from (the boundary's site plan, or the
     /// sticky settings), scored the same way. `None` if it failed to plan.
     pub current: Option<Evaluation>,
+    /// How daylight was measured, when the search measured it.
+    pub daylight: Option<DaylightInfo>,
+}
+
+/// Which sun hours a search's daylight used: clear-sky geometry or the site's
+/// EPW climate, and the month overheating was measured on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaylightInfo {
+    pub source: DaylightSource,
+    /// The climate (`"<city> (<file>)"`) when `source` is `climate`.
+    pub climate: Option<String>,
+    /// The overheating month (1–12), when overheating was measured.
+    pub overheat_month: Option<u32>,
+}
+
+impl DaylightInfo {
+    /// What `opts` measures at `loc`.
+    pub fn of(opts: &DaylightOpts, loc: &Location) -> DaylightInfo {
+        let c = opts.climate.as_deref();
+        DaylightInfo {
+            source: if c.is_some() {
+                DaylightSource::Climate
+            } else {
+                DaylightSource::ClearSky
+            },
+            climate: c.map(|c| format!("{} ({})", c.city, c.source)),
+            overheat_month: opts
+                .overheat_hours
+                .map(|_| crate::site_metrics::overheat_month(loc, c)),
+        }
+    }
+
+    /// One line for a report.
+    pub fn describe(&self) -> String {
+        let mut s = match &self.climate {
+            Some(c) => format!("Daylight: sunshine hours from the EPW climate {c}"),
+            None => {
+                "Daylight: clear-sky sun hours (no climate file; `climate <file.epw>` sets one)"
+                    .to_string()
+            }
+        };
+        if let Some(m) = self.overheat_month {
+            let how = if self.climate.is_some() {
+                "hottest month"
+            } else {
+                "longest day"
+            };
+            s.push_str(&format!("; overheating on the 21st of month {m} ({how})"));
+        }
+        s.push('.');
+        s
+    }
 }
 
 /// How one searched param maps the unit interval.
@@ -1436,8 +1509,9 @@ pub fn optimize_ctl(
         set_daylight(&mut c.quantities, plan_daylight(site, base, edits, &loc, &opts));
         c.score = req.score(&c.report, &c.ledger, &c.quantities);
     }
+    let info = daylight.map(|loc| DaylightInfo::of(&opts, &loc));
     rank(trials, req, daylight.map(|_| &day as DaylightOf), ctl)
-        .map(|r| OptimizeResult { current, ..r })
+        .map(|r| OptimizeResult { current, daylight: info, ..r })
 }
 
 const NEEDS_LOCATION: &str = "siteoptimize: daylight needs a location — set one with \
@@ -1455,6 +1529,7 @@ pub fn set_daylight(q: &mut Quantities, d: Option<FacadeDaylight>) {
     q.daylight = d.map(|d| d.facade);
     q.daylight_floors = d.map(|d| d.floors);
     q.overheat = d.and_then(|d| d.overheat);
+    q.daylight_source = d.map(|d| d.source);
 }
 
 fn rank(
@@ -1648,6 +1723,7 @@ fn rank(
         evaluated,
         feasible: n_feasible,
         current: None,
+        daylight: None,
     })
 }
 
@@ -1712,6 +1788,10 @@ impl OptimizeResult {
         if !self.beats_current() {
             s.push_str("\nThe current plan is already the best found.");
         }
+        if let Some(d) = &self.daylight {
+            s.push('\n');
+            s.push_str(&d.describe());
+        }
         s
     }
 
@@ -1759,6 +1839,7 @@ impl OptimizeResult {
                 "daylight": e.quantities.daylight, "dwellings": e.report.dwellings.as_ref().map(|d| d.total),
             })),
             "beats_current": self.beats_current(),
+            "daylight_source": self.daylight,
         })
     }
 }
@@ -1844,6 +1925,11 @@ pub fn prepare_doc(
             lon_deg: l.lon_deg,
             tz_hours: l.tz_hours,
         })),
+        climate: req
+            .climate
+            .clone()
+            .or_else(|| doc.climate.clone().map(std::sync::Arc::new))
+            .filter(|_| req.use_climate),
         ..req.clone()
     };
     Ok(Prepared {
@@ -2190,7 +2276,7 @@ mod tests {
         let (low, tall) = (plan(&s), plan(&SubdivisionSettings { floors_min: 6, floors_max: 6, floors_cap: 0, ..s.clone() }));
         let madrid = Location { lat_deg: 40.4, lon_deg: -3.7, tz_hours: 1.0 };
         let bogota = Location { lat_deg: 4.7, lon_deg: -74.1, tz_hours: -5.0 };
-        let opts = |period, hours| DaylightOpts { period, hours, overheat_hours: Some(6.0) };
+        let opts = |period, hours| DaylightOpts { period, hours, overheat_hours: Some(6.0), climate: None };
         let fd = |p: &SitePlanBake, loc: &Location, o: &DaylightOpts| facade_daylight(p, s.floor_height, loc, o).unwrap();
         for loc in [madrid, bogota] {
             let annual = fd(&low, &loc, &opts(DaylightPeriod::Annual, 2.0));
@@ -2913,6 +2999,157 @@ mod tests {
         assert_ne!(
             lot::streets::street_graph_json(&t.doc, source).unwrap()["edges"],
             graph["edges"]
+        );
+    }
+
+    /// The tiny synthetic EPW (Guayaquil-like: overcast wet-season
+    /// afternoons, March hottest), copied to a temp file the test may delete.
+    fn climate_fixture(name: &str) -> std::path::PathBuf {
+        let src = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/guayaquil_synthetic.epw"
+        );
+        let dir = std::env::temp_dir().join(format!("ijc_climate_{}_{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("site.epw");
+        std::fs::copy(src, &path).unwrap();
+        path
+    }
+
+    /// #170: `climate <file.epw>` stores the parsed climate (and the location
+    /// when there is none) in one logged, undoable op that replays without
+    /// the file; `climate off` clears it.
+    #[test]
+    fn climate_command_logs_replays_and_undoes() {
+        let path = climate_fixture("cmd");
+        let mut s = Session::default();
+        let out = run(&mut s, &format!("climate {}", path.display()));
+        assert!(
+            out.message.contains("hottest month Mar (28.5 °C)"),
+            "{}",
+            out.message
+        );
+        assert!(
+            out.message.contains("location set from the EPW"),
+            "{}",
+            out.message
+        );
+        let c = s.doc.climate.clone().unwrap();
+        assert_eq!(
+            (c.source.as_str(), c.city.as_str(), c.hottest_month()),
+            ("site.epw", "Guayaquil Synthetic", Some(3))
+        );
+        assert_eq!(s.doc.location.unwrap().tz_hours, -5.0);
+        let sun = c.sunshine_hours();
+        assert_eq!(
+            (sun[2], sun[7]),
+            (5.0, 12.0),
+            "wet-season afternoons are overcast"
+        );
+        let log = s.save_log();
+        std::fs::remove_file(&path).unwrap();
+        let replayed = Session::replay(log).unwrap();
+        assert_eq!(
+            replayed.doc.climate, s.doc.climate,
+            "replays without the EPW"
+        );
+        run(&mut s, "undo");
+        assert_eq!(
+            (s.doc.climate.is_none(), s.doc.location.is_none()),
+            (true, true)
+        );
+        run(&mut s, "redo");
+        assert!(s.doc.climate.is_some());
+        run(&mut s, "climate off");
+        assert!(s.doc.climate.is_none() && s.doc.location.is_some());
+        assert!(parse("climate").is_err());
+        let missing = s
+            .run(parse("climate /nope/none.epw").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("none.epw"), "{missing}");
+    }
+
+    /// #170: with a climate, facade daylight counts sunshine (overcast hours
+    /// drop out) and overheating uses the hottest month by temperature, not
+    /// the longest day; the search report names its source.
+    #[test]
+    fn facade_daylight_uses_the_climate_when_present() {
+        use crate::site_metrics::hottest_month;
+        let mut s = Session::default();
+        run(&mut s, "lotsettings preset=walkable");
+        run(
+            &mut s,
+            &format!("climate {}", climate_fixture("daylight").display()),
+        );
+        let climate = std::sync::Arc::new(s.doc.climate.clone().unwrap());
+        let l = s.doc.location.unwrap();
+        let loc = Location {
+            lat_deg: l.lat_deg,
+            lon_deg: l.lon_deg,
+            tz_hours: l.tz_hours,
+        };
+        let site = rect(200.0, 150.0);
+        let base = SubdivisionSettings::walkable();
+        let opts = DaylightOpts {
+            period: DaylightPeriod::Annual,
+            hours: 3.0,
+            overheat_hours: Some(4.0),
+            climate: None,
+        };
+        let clear = plan_daylight(&site, &base, &PlanEdits::default(), &loc, &opts).unwrap();
+        let epw = DaylightOpts {
+            climate: Some(climate),
+            ..opts
+        };
+        let real = plan_daylight(&site, &base, &PlanEdits::default(), &loc, &epw).unwrap();
+        eprintln!("clear {clear:?}\nclimate {real:?}");
+        assert_eq!(
+            (clear.source, real.source),
+            (DaylightSource::ClearSky, DaylightSource::Climate)
+        );
+        assert!(
+            real.facade < clear.facade,
+            "overcast afternoons cut sun hours"
+        );
+        assert_eq!(real.overheat_month, Some(3), "hottest by dry-bulb");
+        assert_eq!(clear.overheat_month, Some(hottest_month(loc.lat_deg)));
+        assert_ne!(clear.overheat_month, Some(3));
+
+        run(&mut s, "rect 0,0,0 200 150");
+        let out = run(&mut s, "siteoptimize last budget=8 max_overheat=95");
+        assert!(
+            out.message
+                .contains("sunshine hours from the EPW climate Guayaquil Synthetic (site.epw)"),
+            "{}",
+            out.message
+        );
+        assert!(
+            out.message.contains("month 3 (hottest month)"),
+            "{}",
+            out.message
+        );
+        let r = &s.last_site_optimize.as_ref().unwrap().1;
+        assert_eq!(r.to_json()["daylight_source"]["source"], "climate");
+        assert!(
+            r.candidates
+                .iter()
+                .all(|c| c.eval.quantities.daylight_source == Some(DaylightSource::Climate))
+        );
+        let out = run(
+            &mut s,
+            "siteoptimize last budget=8 max_overheat=95 climate=off",
+        );
+        assert!(
+            out.message.contains("clear-sky sun hours"),
+            "{}",
+            out.message
+        );
+        let out = run(&mut s, "siteoptimize last budget=8");
+        assert!(
+            !out.message.contains("Daylight:"),
+            "no daylight, no line: {}",
+            out.message
         );
     }
 

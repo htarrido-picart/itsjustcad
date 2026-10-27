@@ -12514,15 +12514,25 @@ mod tests {
             ("yield", optimize_panel::SEG_YIELD),
             ("optimize", optimize_panel::SEG_OPTIMIZE),
             (running, optimize_panel::SEG_OPTIMIZE),
+            ("climate", optimize_panel::SEG_OPTIMIZE),
+            ("climate_yield", optimize_panel::SEG_YIELD),
         ] {
             for dark in [false, true] {
                 // Tall, so the whole panel (results included) fits unscrolled.
                 let img = render_app(
-                    egui::vec2(1440.0, 1900.0),
+                    egui::vec2(1440.0, 2300.0),
                     dark,
                     |app| {
                         let source = plan(app);
                         app.subdiv_segment = seg;
+                        if name.starts_with("climate") {
+                            let epw = concat!(
+                                env!("CARGO_MANIFEST_DIR"),
+                                "/../commands/tests/fixtures/guayaquil_synthetic.epw"
+                            );
+                            app.execute_line(format!("climate {epw}"));
+                            app.optimize.form.constraints[12] = (true, 95.0); // max overheating
+                        }
                         if name == running {
                             use itsjustcad_commands::site_optimize::{Phase, Progress};
                             let p = Progress {

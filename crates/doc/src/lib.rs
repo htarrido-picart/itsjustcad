@@ -66,6 +66,55 @@ pub struct SunPosition {
     pub altitude_deg: f64,
 }
 
+/// A site's climate from an EPW weather file (`climate <file.epw>`, #170):
+/// what facade daylight and overheating read instead of clear-sky sun hours.
+/// Embedded in the logged `climate` op, so files replay without the EPW.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Climate {
+    /// File name of the EPW it came from (reference only).
+    pub source: String,
+    /// The EPW LOCATION city.
+    pub city: String,
+    /// The EPW LOCATION (set as the document location when it has none).
+    pub location: GeoLocation,
+    /// Month × hour, `[(month-1)*24 + hour-1]` (local standard time, hour
+    /// ending): the share of the month's days with direct-normal irradiance
+    /// ≥ 120 W/m² (the WMO sunshine threshold) at that hour.
+    pub sunshine: Vec<f64>,
+    /// Same index: mean `[direct normal, diffuse horizontal]` irradiance, Wh/m².
+    pub irradiance: Vec<[f64; 2]>,
+    /// Mean dry-bulb temperature per month (12), °C; `None` where the file has
+    /// none.
+    pub monthly_temp: Vec<Option<f64>>,
+}
+
+impl Climate {
+    /// The month (1–12) with the highest mean dry-bulb temperature.
+    pub fn hottest_month(&self) -> Option<u32> {
+        self.monthly_temp
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| Some((i as u32 + 1, (*t)?)))
+            .reduce(|a, b| if b.1 > a.1 + 1e-9 { b } else { a })
+            .map(|(m, _)| m)
+    }
+
+    /// Sunshine share at `month` (1–12) and local clock time `hours`
+    /// (0–24): the EPW hour ending at or after it.
+    pub fn sunshine_at(&self, month: u32, hours: f64) -> f64 {
+        let h = (hours.ceil() as usize).clamp(1, 24) - 1;
+        let k = (month.clamp(1, 12) as usize - 1) * 24 + h;
+        self.sunshine.get(k).copied().unwrap_or(0.0)
+    }
+
+    /// Mean daily sunshine hours per month.
+    pub fn sunshine_hours(&self) -> Vec<f64> {
+        (0..12)
+            .map(|m| self.sunshine.iter().skip(m * 24).take(24).sum())
+            .collect()
+    }
+}
+
 /// Observer location on Earth, recorded by the `sun` command or an EPW import.
 /// Needed by environmental analyses (`shadowstudy`, `sunhours`) to recompute
 /// sun positions over a day. Stored in the op-log via a `location` op so saved

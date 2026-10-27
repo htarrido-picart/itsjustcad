@@ -2065,6 +2065,19 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             Ok(Command::FaceSunHours { targets, ids: None, year, month, day })
         }
         // radiation <selector> <path.epw>
+        // climate <path.epw> | climate off
+        "climate" => match args.as_slice() {
+            [] => wrong("climate", "an EPW path, or off", &args),
+            [off] if off.eq_ignore_ascii_case("off") => Ok(Command::Climate {
+                path: None,
+                data: None,
+            }),
+            // Spaces in a path survive (as `import`).
+            _ => Ok(Command::Climate {
+                path: Some(args.join(" ")),
+                data: None,
+            }),
+        },
         "radiation" => {
             let (targets, rest) = selector(&args, "radiation")?;
             if rest.is_empty() {

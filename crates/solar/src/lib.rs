@@ -651,6 +651,77 @@ pub fn parse_epw(text: &str) -> Result<EpwSummary, String> {
     })
 }
 
+/// Direct-normal irradiance at or above which an hour counts as sunshine
+/// (the WMO sunshine-duration threshold), W/m².
+pub const SUNSHINE_DNI: f64 = 120.0;
+
+/// An EPW file's climate as facade daylight reads it (#170): the header
+/// location plus month × hour statistics of the 8760 rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpwClimate {
+    pub city: String,
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub tz_hours: f64,
+    /// `[(month-1)*24 + hour-1]` (local standard time, hour ending): the share
+    /// of the month's rows at that hour with direct-normal irradiance ≥
+    /// [`SUNSHINE_DNI`]. 0 where the file has no row.
+    pub sunshine: Vec<f64>,
+    /// Same index: mean `[direct normal, diffuse horizontal]` irradiance, Wh/m²
+    /// (as [`parse_epw_radiation`]).
+    pub radiation: RadiationBins,
+    /// Mean dry-bulb temperature per month, °C (`None` where the file has none).
+    pub monthly_dry_bulb: [Option<f64>; 12],
+}
+
+/// Parse an EPW file's climate: the LOCATION header, and per row the month
+/// (field 1), hour (field 3, 1–24 hour ending), dry-bulb (field 6, 99.9 =
+/// missing), direct-normal (field 14) and diffuse-horizontal (field 15)
+/// irradiance (9999 = missing, counted as 0).
+pub fn parse_epw_climate(text: &str) -> Result<EpwClimate, String> {
+    let head = parse_epw(text)?;
+    let radiation = parse_epw_radiation(text)?;
+    let mut sunny = [0u32; 288];
+    let mut rows = [0u32; 288];
+    let mut temp = [(0.0f64, 0u32); 12];
+    for line in text.lines() {
+        let f: Vec<&str> = line.trim().split(',').collect();
+        if !(f[0].len() == 4 && f[0].chars().all(|c| c.is_ascii_digit())) || f.len() < 16 {
+            continue;
+        }
+        let num = |i: usize| f[i].trim().parse::<f64>().ok();
+        let (Some(m), Some(h)) = (num(1), num(3)) else {
+            continue;
+        };
+        let (m, h) = (m as usize, h as usize);
+        if !(1..=12).contains(&m) || !(1..=24).contains(&h) {
+            continue;
+        }
+        let k = (m - 1) * 24 + (h - 1);
+        rows[k] += 1;
+        if num(14).is_some_and(|d| (SUNSHINE_DNI..9999.0).contains(&d)) {
+            sunny[k] += 1;
+        }
+        if let Some(t) = num(6).filter(|t| (t - 99.9).abs() > 1e-6) {
+            temp[m - 1].0 += t;
+            temp[m - 1].1 += 1;
+        }
+    }
+    Ok(EpwClimate {
+        city: head.city,
+        lat_deg: head.lat_deg,
+        lon_deg: head.lon_deg,
+        tz_hours: head.tz_hours,
+        sunshine: sunny
+            .iter()
+            .zip(rows)
+            .map(|(s, n)| if n > 0 { *s as f64 / n as f64 } else { 0.0 })
+            .collect(),
+        radiation,
+        monthly_dry_bulb: temp.map(|(t, n)| (n > 0).then(|| t / n as f64)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,6 +1105,34 @@ DATA PERIODS,1,1,Data,Sunday,1/1,12/31
             }
         }
         s
+    }
+
+    /// Sunshine is the share of rows at an hour with DNI ≥ 120 W/m²; the
+    /// monthly dry-bulb means find the hottest month.
+    #[test]
+    fn epw_climate_sunshine_and_monthly_temperature() {
+        let mut epw = synth_epw();
+        // A second, overcast (DNI 50) row for 21 July at noon, and a warm July.
+        epw.push_str("1999,7,22,12,60,A7,30.0,5.0,80,81100,0,0,300,600,50,300\n");
+        let c = parse_epw_climate(&epw).unwrap();
+        assert_eq!(
+            (c.city.as_str(), c.lat_deg, c.tz_hours),
+            ("Testville", 40.71, -5.0)
+        );
+        assert_eq!(c.sunshine[11], 1.0, "January noon: DNI 500");
+        assert_eq!(c.sunshine[2], 0.0, "night");
+        assert_eq!(
+            c.sunshine[6 * 24 + 11],
+            0.5,
+            "July noon: one sunny row of two"
+        );
+        assert_eq!(c.monthly_dry_bulb[0], Some(10.0));
+        assert!(c.monthly_dry_bulb[6].unwrap() > 10.0);
+        assert_eq!(c.radiation, parse_epw_radiation(&epw).unwrap());
+        assert!(
+            parse_epw_climate("1999,1,1,1,60,A7,10.0\n").is_err(),
+            "no LOCATION"
+        );
     }
 
     #[test]
