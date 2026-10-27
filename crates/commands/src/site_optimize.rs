@@ -2832,6 +2832,90 @@ mod tests {
         assert!(phases.into_inner().unwrap().contains(&Phase::Daylight));
     }
 
+    /// #170: the park walk follows the plan's one street graph — the graph
+    /// `ijc_street_graph_json` draws from the baked roads is the graph the
+    /// optimizer walks, and editing a street node changes the walk.
+    #[test]
+    fn editing_a_street_node_changes_the_walk() {
+        use crate::lot::street_net::StreetNetwork;
+        let mut s = Session::default();
+        run(&mut s, "lotsettings preset=walkable");
+        run(&mut s, "rect 0,0,0 400 300");
+        let source = s.doc.objects().next().unwrap().id;
+        run(&mut s, "siteplan last");
+        let site = site_boundary(&s.doc, &[source]).unwrap().1;
+        let walk = |s: &Session| {
+            let (base, edits) = base_plan(&s.doc, source);
+            let plan = lot::plan_site(
+                &site,
+                0.0,
+                &base,
+                &edits.streets,
+                &mut edits.edge_roles.clone(),
+                &mut edits.lot_overrides.clone(),
+            )
+            .unwrap();
+            let (doc_net, _) = StreetNetwork::from_doc(&s.doc, source);
+            let plan_net = StreetNetwork::from_plan(&plan.site);
+            assert_eq!(
+                doc_net.nodes.len(),
+                plan_net.nodes.len(),
+                "one street graph"
+            );
+            assert!((doc_net.length() - plan_net.length()).abs() < 1e-6);
+            evaluate(&site, &base, &edits, &OptimizeRequest::default())
+                .unwrap()
+                .quantities
+                .park_walk
+        };
+        let before = walk(&s);
+        assert!(
+            before.iter().any(|d| d.is_finite()),
+            "parks reachable: {before:?}"
+        );
+        let graph = lot::streets::street_graph_json(&s.doc, source).unwrap();
+        // Bend the first street with an interior-free span: move its middle.
+        // The road object of street `id` (a re-derive re-creates them).
+        let road = |s: &Session, id: u64| {
+            s.doc
+                .objects()
+                .find(|o| o.street.as_ref().is_some_and(|i| u64::from(i.id) == id))
+                .unwrap()
+                .id
+        };
+        let moved = graph["edges"].as_array().unwrap().iter().any(|e| {
+            let pts = e["points"].as_array().unwrap();
+            let (a, b) = (&pts[0], &pts[pts.len() - 1]);
+            let mid = |i: usize| (a[i].as_f64().unwrap() + b[i].as_f64().unwrap()) / 2.0;
+            let street = e["street"].as_u64().unwrap();
+            // An inserted node changes no geometry; moving it bends the street.
+            let insert = format!(
+                "streetnode id:{} insert at={},{}",
+                road(&s, street),
+                mid(0),
+                mid(1)
+            );
+            if s.run(parse(&insert).unwrap()).is_err() {
+                return false;
+            }
+            let bend = format!(
+                "streetnode id:{} 1 to={},{}",
+                road(&s, street),
+                mid(0) + 9.0,
+                mid(1) + 9.0
+            );
+            s.run(parse(&bend).unwrap()).is_ok()
+        });
+        assert!(moved, "some street takes a node edit");
+        let t = &s;
+        let after = walk(t);
+        assert_ne!(before, after, "the walk follows the edited street");
+        assert_ne!(
+            lot::streets::street_graph_json(&t.doc, source).unwrap()["edges"],
+            graph["edges"]
+        );
+    }
+
     #[test]
     fn apply_without_a_search_errors() {
         let mut s = Session::default();

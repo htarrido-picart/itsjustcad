@@ -387,8 +387,10 @@ fn link_roads(doc: &Document, source: ObjectId) -> Vec<(ObjectId, u32, Vec<DVec2
 /// `{"source","nodes":[{"id","at":[x,y],"streets":[…],"boundary"}],
 /// "edges":[{"street","object","from","to","points":[[x,y]…],"width","class",
 /// "name"?,"overridden":{"geometry","name","class","width"}}]}`. Nodes are the
-/// street ends and junctions (an end resting on another street's side joins
-/// it); `from` / `to` are the node ids of an edge's ends; `points` index the
+/// street ends, then the other junctions (crossings), of the plan's street
+/// network ([`super::street_net::StreetNetwork`], the graph the optimizer's
+/// park walk follows): an end resting on (within 1 m of) another street joins
+/// it; `from` / `to` are the node ids of an edge's ends; `points` index the
 /// `streetnode` node indices. `None` when `source` is not a site plan.
 pub fn street_graph_json(doc: &Document, source: ObjectId) -> Option<serde_json::Value> {
     let link = doc.subdiv_link(source)?;
@@ -397,38 +399,54 @@ pub fn street_graph_json(doc: &Document, source: ObjectId) -> Option<serde_json:
     }
     let site = site_polygon(doc, source);
     let roads = link_roads(doc, source);
-    let mut nodes: Vec<DVec2> = Vec::new();
-    let mut node_of = |p: DVec2| -> usize {
-        nodes.iter().position(|n| n.distance(p) < NODE_TOL).unwrap_or_else(|| {
-            nodes.push(p);
+    // The one street graph (#170): the walk distances use it too.
+    let lines: Vec<super::street_net::StreetLine> = roads
+        .iter()
+        .map(|(obj, id, pts, _)| super::street_net::StreetLine {
+            id: *id,
+            points: pts.clone(),
+            closed: doc
+                .get(*obj)
+                .is_some_and(|o| matches!(&o.geometry, Geometry::Curve(c) if c.is_closed())),
+        })
+        .collect();
+    let net = super::street_net::StreetNetwork::build(&lines);
+    // Listed nodes: street ends (in street order), then the other junctions
+    // (crossings, a street passing through another's bend).
+    let mut nodes: Vec<usize> = Vec::new();
+    let mut node_of = |n: usize| -> usize {
+        nodes.iter().position(|m| *m == n).unwrap_or_else(|| {
+            nodes.push(n);
             nodes.len() - 1
         })
     };
-    let ends: Vec<(usize, usize)> = roads
+    let at = |p: DVec2| net.node_at(p);
+    // `None` for a road too short to be an edge.
+    let ends: Vec<Option<(usize, usize)>> = roads
         .iter()
-        .map(|(_, _, pts, _)| (node_of(pts[0]), node_of(*pts.last().unwrap())))
+        .map(|(_, _, pts, _)| Some((node_of(at(pts[0])?), node_of(at(*pts.last()?)?))))
         .collect();
+    for n in 0..net.nodes.len() {
+        if net.degree(n) >= 3 {
+            node_of(n);
+        }
+    }
     let xy = |p: DVec2| serde_json::json!([p.x, p.y]);
     let nodes_json: Vec<_> = nodes
         .iter()
         .enumerate()
-        .map(|(k, p)| {
-            let mut streets: Vec<u32> = roads
-                .iter()
-                .filter(|(_, _, pts, _)| dist_to_polyline(*p, pts) < NODE_TOL)
-                .map(|(_, id, _, _)| *id)
-                .collect();
-            streets.sort_unstable();
-            streets.dedup();
+        .map(|(k, n)| {
+            let p = net.nodes[*n];
             let boundary = site
                 .as_ref()
-                .is_some_and(|s| s.edges().any(|(a, b)| seg_project(*p, a, b).0 < NODE_TOL));
-            serde_json::json!({ "id": k, "at": xy(*p), "streets": streets, "boundary": boundary })
+                .is_some_and(|s| s.edges().any(|(a, b)| seg_project(p, a, b).0 < NODE_TOL));
+            serde_json::json!({ "id": k, "at": xy(p), "streets": net.streets_at(*n), "boundary": boundary })
         })
         .collect();
     let edges: Vec<_> = roads
         .iter()
         .zip(ends)
+        .filter_map(|(r, e)| Some((r, e?)))
         .map(|((obj, id, pts, info), (from, to))| {
             let edit = link.streets.get(id);
             let mut e = serde_json::json!({
