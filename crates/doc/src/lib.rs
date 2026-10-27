@@ -13,6 +13,7 @@ pub mod hershey;
 pub mod loads;
 mod object;
 pub mod param_schema;
+pub mod pick;
 mod plotstyle;
 mod sheet;
 mod structure;

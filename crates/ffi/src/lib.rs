@@ -1549,50 +1549,30 @@ fn screen_ray(
     Some((origin, delta.normalize()))
 }
 
-/// Slab ray/AABB test; returns the nearest non-negative hit distance `t` along
-/// the ray, or `None` on a miss. Compact reimplementation of the desktop
-/// `ray_aabb`.
-fn ray_aabb(
-    origin: glam::DVec3,
-    dir: glam::DVec3,
-    min: glam::DVec3,
-    max: glam::DVec3,
-) -> Option<f64> {
-    let inv = dir.recip();
-    let t1 = (min - origin) * inv;
-    let t2 = (max - origin) * inv;
-    let t_min = t1.min(t2).max_element();
-    let t_max = t1.max(t2).min_element();
-    (t_max >= t_min.max(0.0)).then_some(t_min.max(0.0))
-}
+use itsjustcad_doc::pick::ray_aabb;
 
-/// Broad phase of [`ijc_pick`]: the nearest VISIBLE object whose world AABB
-/// the ray crosses. Block instances are tested against their real block extent
-/// (`Document::geometry_aabb`), not a placeholder around the insertion point.
+/// The object a tap at `(x_px, y_px)` picks, through the pick ray
+/// `origin`/`dir`: [`itsjustcad_doc::pick::pick_object`], the desktop's pick
+/// (curves by their drawn line or a road's width, the rest by the nearest
+/// AABB the ray crosses).
 fn pick_nearest(
     doc: &itsjustcad_doc::Document,
+    vp: glam::Mat4,
+    (w, h): (f32, f32),
+    (x_px, y_px): (f32, f32),
     origin: glam::DVec3,
     dir: glam::DVec3,
 ) -> Option<itsjustcad_doc::ObjectId> {
-    let mut best: Option<(f64, itsjustcad_doc::ObjectId)> = None;
-    for obj in doc.objects() {
-        if !(obj.visible && doc.layer_visible(&obj.layer)) {
-            continue;
-        }
-        let bb = doc.geometry_aabb(&obj.geometry);
-        if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
-            && best.is_none_or(|(bt, _)| t < bt)
-        {
-            best = Some((t, obj.id));
-        }
-    }
-    best.map(|(_, id)| id)
+    let (size, pos) = (glam::Vec2::new(w, h), glam::Vec2::new(x_px, y_px));
+    itsjustcad_doc::pick::pick_object(doc, vp, size, pos, origin, dir)
 }
 
 /// Tap-to-select. Builds a pick ray from `(x_px, y_px)` (physical drawable
-/// pixels, the same space as [`ijc_resize`]) and finds the nearest VISIBLE
-/// object whose world AABB the ray crosses (AABB broad-phase only — enough for
-/// v1; curve narrow-phase is left to a later pass).
+/// pixels, the same space as [`ijc_resize`]) and picks the VISIBLE object under
+/// it as the desktop does: the nearest curve within 8 px of its drawn line (a
+/// generated road within half its width of the centreline), else the nearest
+/// other object whose world AABB the ray crosses. A curve is never picked by its
+/// bounding box, so a tap inside a site boundary no longer picks the boundary.
 ///
 /// * **Hit:** when `additive`, toggles that id in `doc.selection` (tap again to
 ///   deselect); otherwise replaces the selection with just that id.
@@ -1624,7 +1604,7 @@ pub unsafe extern "C" fn ijc_pick(h: *mut AppHandle, x_px: f32, y_px: f32, addit
             return false;
         };
 
-        let best = pick_nearest(&app.session.doc, origin, dir);
+        let best = pick_nearest(&app.session.doc, vp, (w, h), (x_px, y_px), origin, dir);
         apply_pick(&mut app.session.doc, best, additive);
         best.is_some()
     })
@@ -1723,7 +1703,8 @@ fn apply_pick(
 /// returns the hit as JSON: `{"hit":true,"id","uuid","kind","point":[x,y,z]}`,
 /// or `{"hit":false}` on a miss. `kind` is the digest's kind token (as in
 /// [`ijc_selection_json`]). `point` is where the ray meets the object: the
-/// exact triangle for meshes, the bounding box for everything else. Caller
+/// exact triangle for meshes, the ray's closest approach for curves, the
+/// bounding box for everything else. Caller
 /// must [`ijc_string_free`] the result.
 ///
 /// Headless handle ([`ijc_init_headless`]): returns `{"hit":false}` and leaves
@@ -1753,12 +1734,16 @@ pub unsafe extern "C" fn ijc_pick_json(
             return miss();
         };
         let doc = &mut app.session.doc;
-        let best = pick_nearest(doc, origin, dir);
+        let best = pick_nearest(doc, vp, (w, h), (x_px, y_px), origin, dir);
         apply_pick(doc, best, additive);
         let Some(obj) = best.and_then(|id| doc.get(id)) else {
             return miss();
         };
-        let t = object_hit(doc, &obj.geometry, origin, dir, true).unwrap_or(0.0);
+        let t = match &obj.geometry {
+            itsjustcad_doc::Geometry::Curve(c) => itsjustcad_doc::pick::ray_curve_t(c, origin, dir),
+            g => object_hit(doc, g, origin, dir, true),
+        }
+        .unwrap_or(0.0);
         let p = origin + dir * t;
         into_c_string(
             serde_json::json!({
@@ -6225,9 +6210,18 @@ mod tests {
         // Scaled 2x then rotated 90° about Z: world x∈[8,10], y∈[0,4], z∈[0,2].
         // (3.5 is far outside the old ±scale placeholder cube around 10,0,0.)
         let down = glam::DVec3::new(0.0, 0.0, -1.0);
-        let hit = pick_nearest(&s.doc, glam::DVec3::new(8.5, 3.5, 10.0), down);
-        assert_eq!(hit, Some(inst));
-        assert_eq!(pick_nearest(&s.doc, glam::DVec3::new(11.0, 3.5, 10.0), down), None);
+        let pick = |o| {
+            pick_nearest(
+                &s.doc,
+                glam::Mat4::IDENTITY,
+                (1.0, 1.0),
+                (0.0, 0.0),
+                o,
+                down,
+            )
+        };
+        assert_eq!(pick(glam::DVec3::new(8.5, 3.5, 10.0)), Some(inst));
+        assert_eq!(pick(glam::DVec3::new(11.0, 3.5, 10.0)), None);
 
         s.doc.selection.insert(inst);
         let bb = s.doc.selection_aabb().unwrap();
@@ -8110,6 +8104,89 @@ mod headless_tests {
             let landscape = distance(1600, 900);
             let portrait = distance(900, 1950);
             assert!(portrait > landscape * 2.0, "portrait {portrait} vs landscape {landscape}");
+            ijc_free(h);
+        }
+    }
+
+    /// Tap at `(x, y)` on a headless handle as `ijc_pick` would on a drawable
+    /// of `size` (#188); returns `ijc_focus_json`.
+    unsafe fn tap_focus(
+        h: *mut AppHandle,
+        size: (f32, f32),
+        (x, y): (f32, f32),
+    ) -> serde_json::Value {
+        let mut guard = unsafe { handle_mut(h) }.unwrap();
+        let app: &mut AppHandle = &mut guard;
+        let vp = app.camera.view_proj(size.0 / size.1);
+        let (origin, dir) = screen_ray(vp, size.0, size.1, x, y).unwrap();
+        let best = pick_nearest(&app.session.doc, vp, size, (x, y), origin, dir);
+        apply_pick(&mut app.session.doc, best, false);
+        drop(guard);
+        serde_json::from_str(&unsafe { take(ijc_focus_json(h)) }).unwrap()
+    }
+
+    #[test]
+    fn tap_on_a_site_plan_road_picks_the_street() {
+        use itsjustcad_commands::lot::{LOTS_LAYER, ROADS_LAYER};
+        let h = ijc_init_headless();
+        unsafe {
+            for line in ["rect 0,0,0 200 150", "siteplan last", "view top"] {
+                take(ijc_run_command_result(h, c(line).as_ptr()));
+            }
+            let size = (1600.0, 1200.0);
+            ijc_resize(h, size.0 as u32, size.1 as u32);
+            ijc_camera_zoom_extents(h);
+            assert!(ijc_flush(h));
+            let (vp, road_mid, across, lot_in) = {
+                let guard = handle_ref(h).unwrap();
+                let doc = &guard.session.doc;
+                // A north–south street between blocks: its centreline midpoint.
+                let road = doc
+                    .objects()
+                    .filter(|o| o.layer == ROADS_LAYER)
+                    .find_map(|o| match &o.geometry {
+                        itsjustcad_doc::Geometry::Curve(kernel_curve::Curve::Polyline {
+                            points,
+                            ..
+                        }) if (points[0].x - points[points.len() - 1].x).abs() < 1e-6
+                            && points[0].x > 1.0
+                            && points[0].x < 199.0 =>
+                        {
+                            Some((
+                                (points[0] + points[1]) * 0.5,
+                                o.street.as_ref().unwrap().width,
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .expect("an interior north-south road");
+                // A lot's centre: the centroid of its corners.
+                let lot = doc.objects().find(|o| o.layer == LOTS_LAYER).unwrap();
+                let bb = doc.geometry_aabb(&lot.geometry);
+                let vp = guard.camera.view_proj(size.0 / size.1);
+                (
+                    vp,
+                    road.0,
+                    road.1,
+                    ((bb.min + bb.max) * 0.5, lot.id.to_string()),
+                )
+            };
+            let px = |p: glam::DVec3| {
+                let q =
+                    itsjustcad_doc::pick::project(vp, glam::Vec2::new(size.0, size.1), p).unwrap();
+                (q.x, q.y)
+            };
+            let f = tap_focus(h, size, px(road_mid));
+            assert_eq!(f["kind"], "street", "{f}");
+            // Off the centreline but inside the right-of-way (and > 8 px off).
+            let off = road_mid + glam::DVec3::new(across * 0.25, 0.0, 0.0);
+            assert!((px(off).0 - px(road_mid).0).abs() > itsjustcad_doc::pick::PICK_PX);
+            assert_eq!(tap_focus(h, size, px(off))["kind"], "street");
+            // Inside a lot, away from every line: that lot, not
+            // the site boundary.
+            let f = tap_focus(h, size, px(lot_in.0));
+            assert_eq!(f["kind"], "lot", "{f}");
+            assert_eq!(f["lots"], serde_json::json!([lot_in.1]), "{f}");
             ijc_free(h);
         }
     }
