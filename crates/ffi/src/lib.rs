@@ -36,6 +36,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod boxsel;
+pub mod cameras;
 pub mod replay;
 pub mod selection;
 
@@ -257,7 +258,10 @@ pub struct AppHandle {
 
     // scene (render-thread only)
     session: Session,
+    /// The ACTIVE camera: every camera call, pick and screen query uses it.
+    /// Other cameras (#165 multi-pane) wait in `cams` until activated.
     camera: OrbitCamera,
+    cams: cameras::Cameras,
     /// Last size passed to [`ijc_resize`] on a headless handle (which has no
     /// drawable), for [`ijc_camera_state_json`] / [`ijc_screen_to_world`].
     /// `None` until set; unused on a GPU handle.
@@ -291,6 +295,12 @@ pub struct AppHandle {
 /// The wgpu device, the `CAMetalLayer` surface and its swapchain config, and the
 /// on-screen renderer. Absent on a headless handle.
 struct Gpu {
+    /// Kept to create extra pane surfaces ([`cameras::ijc_surface_new`]).
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    /// Extra pane surfaces by id (≥ 1); surface 0 is `surface` below.
+    panes: std::collections::BTreeMap<u32, cameras::PaneSurface>,
+    next_pane: u32,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
@@ -743,6 +753,10 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
         let depth_view = make_depth(&device, config.width, config.height);
 
         let gpu = Gpu {
+            instance,
+            adapter,
+            panes: Default::default(),
+            next_pane: 0,
             device,
             queue,
             surface,
@@ -775,6 +789,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         gpu,
         session: Session::default(),
         camera: OrbitCamera::default(),
+        cams: cameras::Cameras::default(),
         viewport: None,
         last_gen: None,
         theme: Theme::Dark,
@@ -1064,7 +1079,7 @@ fn apply_pending(app: &mut AppHandle) {
     for op in ops {
         match op {
             PendingOp::Cmd(cmd) => {
-                let _ = app.session.run(cmd);
+                let _ = cameras::run_with_camera(app, cmd);
             }
             PendingOp::Camera(k) => apply_camera(app, k),
         }
@@ -1192,7 +1207,10 @@ pub unsafe extern "C" fn ijc_run_command_result(
         };
         apply_pending(app);
         match op {
-            PendingOp::Cmd(cmd) => into_c_string(run_cmd_json(&mut app.session, cmd)),
+            PendingOp::Cmd(cmd) => into_c_string(match cameras::run_with_camera(app, cmd) {
+                Ok(out) => run_result_json(true, Some(&out.message), None, &out.created),
+                Err(e) => run_result_json(false, None, Some(&e.to_string()), &[]),
+            }),
             PendingOp::Camera(k) => {
                 apply_camera(app, k);
                 into_c_string(run_result_json(true, None, None, &[]))
@@ -1478,7 +1496,7 @@ pub unsafe extern "C" fn ijc_camera_zoom_extents(h: *mut AppHandle) {
 /// handle.
 fn drawable_size(app: &AppHandle) -> Option<(f32, f32)> {
     let c = &app.gpu.as_ref()?.config;
-    Some((c.width as f32, c.height.max(1) as f32))
+    Some(app.cams.active_viewport().unwrap_or((c.width as f32, c.height.max(1) as f32)))
 }
 
 /// Build a world-space pick ray from a pixel coordinate, mirroring the desktop
@@ -1833,7 +1851,7 @@ pub unsafe extern "C" fn ijc_project_point(
 /// The viewport for camera queries: the drawable on a GPU handle, else the
 /// last size a headless handle got from [`ijc_resize`] (`None` if never set).
 fn viewport_size(app: &AppHandle) -> Option<(f32, f32)> {
-    drawable_size(app).or(app.viewport)
+    drawable_size(app).or(app.cams.active_viewport()).or(app.viewport)
 }
 
 /// Serialize the camera as the [`ijc_camera_state_json`] object. `eye` and
@@ -2496,7 +2514,8 @@ pub unsafe extern "C" fn ijc_bytes_free(ptr: *mut u8, len: usize) {
 // Render
 // ---------------------------------------------------------------------------
 
-/// Apply the queued ops, then draw one frame to the view's surface.
+/// Apply the queued ops, then draw one frame of camera 0 to the view's
+/// surface ([`cameras::ijc_render_camera`]`(h, 0, 0)`).
 /// Headless handle ([`ijc_init_headless`]): a no-op that does not apply the
 /// queue either; use [`ijc_flush`].
 ///
@@ -2508,125 +2527,144 @@ pub unsafe extern "C" fn ijc_render_frame(h: *mut AppHandle) {
         let Some(mut guard) = (unsafe { handle_mut(h) }) else {
             return;
         };
-        // Reborrow the inner `&mut AppHandle` once so the compiler can split
-        // disjoint field borrows (device/queue/renderer/surface) below — a plain
-        // `Deref` through the guard would treat every access as borrowing the
-        // whole `AppHandle`.
-        let app: &mut AppHandle = &mut guard;
-        // Headless: nothing to draw. The queue is left for `ijc_flush`.
-        if app.gpu.is_none() {
-            return;
-        }
-
-        apply_pending(app);
-        let Some(gpu) = app.gpu.as_mut() else {
-            return;
-        };
-
-        // Re-upload geometry only when the document changed.
-        let doc_gen = app.session.doc.generation;
-        if app.last_gen != Some(doc_gen) {
-            let mut scene = snapshot(&app.session.doc, app.theme);
-            // The host owns image decoding (the render crate has no `image` dep),
-            // so attach the decoded underlay here — the FFI twin of the desktop's
-            // `App::decode_underlay`. Without this a granted underlay applies to
-            // the doc but never draws on device.
-            scene.underlay = decode_underlay(&app.session.doc, &mut app.underlay_cache);
-            gpu.renderer
-                .set_scene(&gpu.device, &gpu.queue, &scene, doc_gen);
-            app.last_gen = Some(doc_gen);
-        }
-
-        // Gumball ghost: an amber wireframe of the selection under the pending
-        // preview transform. Recomputed every frame from `doc.selection` (so it
-        // tracks the current preview params) and uploaded to the renderer's
-        // additive ghost buffers. Cleared when no preview is armed.
-        if let Some(preview) = &app.gumball_preview {
-            let mat = preview.kind.matrix();
-            let doc = &app.session.doc;
-            let ghost: Vec<LineEntry> = doc
-                .selection
-                .iter()
-                .filter_map(|id| doc.get(*id))
-                .filter_map(|obj| {
-                    let segs = object_wireframe_world(obj);
-                    if segs.is_empty() {
-                        return None;
-                    }
-                    // Transform both endpoints of every segment by the preview
-                    // matrix; keep the flat LineList pair layout the ghost pass
-                    // (edge pipeline) consumes.
-                    let mut pts: Vec<[f32; 3]> = Vec::with_capacity(segs.len() * 2);
-                    for [a, b] in segs {
-                        let a = mat.transform_point3(a);
-                        let b = mat.transform_point3(b);
-                        pts.push([a.x as f32, a.y as f32, a.z as f32]);
-                        pts.push([b.x as f32, b.y as f32, b.z as f32]);
-                    }
-                    Some((pts, GHOST_COLOR, 0.0))
-                })
-                .collect();
-            gpu.renderer.set_ghost_lines(&gpu.device, &ghost);
-        } else {
-            gpu.renderer.clear_ghost_lines();
-        }
-
-        // Camera uniform.
-        let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
-        let vp = app.camera.view_proj(aspect);
-        let eye = app.camera.eye();
-        let cam = camera_uniform_with_mode(vp, eye, app.mode);
-        gpu.renderer.write_camera(&gpu.device, &gpu.queue, 0, &cam);
-
-        let frame = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            _ => {
-                // Timeout / Occluded / Outdated / Lost / OutOfMemory: reconfigure
-                // and skip this frame.
-                gpu.surface.configure(&gpu.device, &gpu.config);
-                return;
-            }
-        };
-        let view = frame.texture.create_view(&Default::default());
-        let [r, g, b, a] = app.theme.background();
-
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        {
-            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ijc_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: r as f64,
-                            g: g as f64,
-                            b: b as f64,
-                            a: a as f64,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &gpu.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            let mut pass = pass.forget_lifetime();
-            gpu.renderer.paint(&mut pass, 0, app.mode, true);
-        }
-        gpu.queue.submit([encoder.finish()]);
-        frame.present();
+        // Camera 0 on the view's own surface: the single-surface path.
+        render_view(&mut guard, 0, 0);
     })
+}
+
+/// Draw camera `cam` into surface `surface` (0 = the [`ijc_init`] view):
+/// apply the queue, re-upload the scene if it changed, then paint. False on a
+/// headless handle (queue left for [`ijc_flush`]), an unknown camera or
+/// surface, or a skipped frame.
+pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
+    // Headless: nothing to draw. The queue is left for `ijc_flush`.
+    if app.gpu.is_none() {
+        return false;
+    }
+
+    apply_pending(app);
+    let Some(camera) = app.cams.camera(&app.camera, cam) else {
+        return false;
+    };
+    let Some((tw, th)) = app.gpu.as_ref().and_then(|g| cameras::surface_size(g, surface)) else {
+        return false;
+    };
+    if cam != 0 || surface != 0 {
+        app.cams.set_viewport(cam, (tw as f32, th.max(1) as f32));
+    }
+    let Some(gpu) = app.gpu.as_mut() else {
+        return false;
+    };
+
+    // Re-upload geometry only when the document changed.
+    let doc_gen = app.session.doc.generation;
+    if app.last_gen != Some(doc_gen) {
+        let mut scene = snapshot(&app.session.doc, app.theme);
+        // The host owns image decoding (the render crate has no `image` dep),
+        // so attach the decoded underlay here — the FFI twin of the desktop's
+        // `App::decode_underlay`. Without this a granted underlay applies to
+        // the doc but never draws on device.
+        scene.underlay = decode_underlay(&app.session.doc, &mut app.underlay_cache);
+        gpu.renderer
+            .set_scene(&gpu.device, &gpu.queue, &scene, doc_gen);
+        app.last_gen = Some(doc_gen);
+    }
+
+    // Gumball ghost: an amber wireframe of the selection under the pending
+    // preview transform. Recomputed every frame from `doc.selection` (so it
+    // tracks the current preview params) and uploaded to the renderer's
+    // additive ghost buffers. Cleared when no preview is armed.
+    if let Some(preview) = &app.gumball_preview {
+        let mat = preview.kind.matrix();
+        let doc = &app.session.doc;
+        let ghost: Vec<LineEntry> = doc
+            .selection
+            .iter()
+            .filter_map(|id| doc.get(*id))
+            .filter_map(|obj| {
+                let segs = object_wireframe_world(obj);
+                if segs.is_empty() {
+                    return None;
+                }
+                // Transform both endpoints of every segment by the preview
+                // matrix; keep the flat LineList pair layout the ghost pass
+                // (edge pipeline) consumes.
+                let mut pts: Vec<[f32; 3]> = Vec::with_capacity(segs.len() * 2);
+                for [a, b] in segs {
+                    let a = mat.transform_point3(a);
+                    let b = mat.transform_point3(b);
+                    pts.push([a.x as f32, a.y as f32, a.z as f32]);
+                    pts.push([b.x as f32, b.y as f32, b.z as f32]);
+                }
+                Some((pts, GHOST_COLOR, 0.0))
+            })
+            .collect();
+        gpu.renderer.set_ghost_lines(&gpu.device, &ghost);
+    } else {
+        gpu.renderer.clear_ghost_lines();
+    }
+
+    // Camera uniform. Every pane reuses slot 0: each render submits its
+    // own encoder, and queue writes are ordered with submits.
+    let aspect = tw as f32 / th.max(1) as f32;
+    let vp = camera.view_proj(aspect);
+    let eye = camera.eye();
+    let cam = camera_uniform_with_mode(vp, eye, app.mode);
+    gpu.renderer.write_camera(&gpu.device, &gpu.queue, 0, &cam);
+
+    let (target, config, depth_view) = match gpu.panes.get(&surface) {
+        Some(p) => (&p.surface, &p.config, &p.depth_view),
+        None => (&gpu.surface, &gpu.config, &gpu.depth_view),
+    };
+    let frame = match target.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(f)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+        _ => {
+            // Timeout / Occluded / Outdated / Lost / OutOfMemory: reconfigure
+            // and skip this frame.
+            target.configure(&gpu.device, config);
+            return false;
+        }
+    };
+    let view = frame.texture.create_view(&Default::default());
+    let [r, g, b, a] = app.theme.background();
+
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    {
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ijc_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: r as f64,
+                        g: g as f64,
+                        b: b as f64,
+                        a: a as f64,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let mut pass = pass.forget_lifetime();
+        gpu.renderer.paint(&mut pass, 0, app.mode, true);
+    }
+    gpu.queue.submit([encoder.finish()]);
+    frame.present();
+    true
 }
 
 // ---------------------------------------------------------------------------
