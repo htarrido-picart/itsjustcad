@@ -38,6 +38,7 @@
 mod boxsel;
 pub mod cameras;
 pub mod guided;
+pub mod optimize_job;
 pub mod replay;
 pub mod selection;
 pub mod snap;
@@ -288,6 +289,9 @@ pub struct AppHandle {
 
     /// Guided verb run (itsjustcad-ios#121).
     guided: guided::GuidedState,
+
+    /// Background site optimizer searches ([`optimize_job`], #170).
+    optimize_jobs: Mutex<optimize_job::Jobs>,
 
     // async / deck (shared across threads via Arc)
     runtime: tokio::runtime::Runtime,
@@ -805,6 +809,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         underlay_cache: None,
         gumball_preview: None,
         guided: Default::default(),
+        optimize_jobs: Default::default(),
         runtime,
         deck: None,
         deck_config: None,
@@ -5579,7 +5584,9 @@ unsafe fn c_arg<'a>(p: *const c_char, name: &str) -> Result<&'a str, String> {
 /// "current":{"score","yield","ledger","violations"}|null,"beats_current":bool}`
 /// or `{"error":"…"}` (unknown source, bad request, or no feasible layout —
 /// the message names the binding constraint). Pass a candidate's `params` to
-/// [`ijc_site_optimize_apply`]. Runs synchronously (seconds for budget 400).
+/// [`ijc_site_optimize_apply`]. Runs synchronously (seconds for budget 400);
+/// [`optimize_job::ijc_site_optimize_start`] runs the same search in the
+/// background with progress and cancel.
 /// Caller must [`ijc_string_free`] the result.
 ///
 /// # Safety
@@ -7051,6 +7058,87 @@ mod headless_tests {
             assert!(!plain.contains("$INSUNITS"));
             assert!(ijc_export(h, c("dxf profile=cut units=m").as_ptr(), &mut len).is_null());
             assert!(ijc_export(h, c("svg profile=cut").as_ptr(), &mut len).is_null());
+            ijc_free(h);
+        }
+    }
+
+    /// #170: a background search reports progress, can be cancelled, and
+    /// returns exactly the blocking call's result when it completes.
+    #[test]
+    fn site_optimize_job_progress_cancel_and_result() {
+        use optimize_job::*;
+        let h = ijc_init_headless();
+        unsafe {
+            let j = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            let v = j(ijc_run_command_result(h, c("rect 0,0,0 200 150").as_ptr()));
+            let site = c(v["created"][0].as_str().unwrap());
+            let req = c(r#"{"objective":"lots","budget":48,"seed":3}"#);
+            let wait = |id: u64| {
+                let t = std::time::Instant::now();
+                loop {
+                    let p = j(ijc_site_optimize_progress(h, id));
+                    if !["running", "cancelling"].contains(&p["state"].as_str().unwrap()) {
+                        return p;
+                    }
+                    assert!(t.elapsed().as_secs() < 120, "{p}");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+
+            let id = ijc_site_optimize_start(h, site.as_ptr(), req.as_ptr());
+            assert!(id > 0);
+            let p = wait(id);
+            assert_eq!(p["state"], "done", "{p}");
+            assert_eq!(
+                (
+                    p["evaluated"].as_u64(),
+                    p["budget"].as_u64(),
+                    p["fraction"].as_f64()
+                ),
+                (Some(48), Some(48), Some(1.0))
+            );
+            assert_eq!(p["phase"], "search");
+            let got = j(ijc_site_optimize_result(h, id));
+            let blocking = j(ijc_site_optimize_json(h, site.as_ptr(), req.as_ptr()));
+            assert_eq!(got["candidates"], blocking["candidates"], "same search");
+            assert_eq!(got["feasible"], p["feasible"]);
+            assert_eq!(
+                j(ijc_site_optimize_result(h, id)),
+                serde_json::Value::Null,
+                "taken once"
+            );
+            assert_eq!(
+                j(ijc_site_optimize_progress(h, id)),
+                serde_json::Value::Null
+            );
+
+            let big = c(r#"{"budget":5000}"#);
+            let id = ijc_site_optimize_start(h, site.as_ptr(), big.as_ptr());
+            assert!(ijc_site_optimize_cancel(h, id));
+            let p = wait(id);
+            assert_eq!(p["state"], "cancelled", "{p}");
+            assert!(p["evaluated"].as_u64().unwrap() < 5000);
+            assert_eq!(
+                j(ijc_site_optimize_result(h, id))["error"],
+                "siteoptimize: cancelled"
+            );
+
+            let id = ijc_site_optimize_start(h, c("nope").as_ptr(), req.as_ptr());
+            assert_eq!(wait(id)["state"], "failed");
+            assert!(
+                j(ijc_site_optimize_result(h, id))["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no object")
+            );
+            assert_eq!(
+                ijc_site_optimize_start(std::ptr::null_mut(), site.as_ptr(), req.as_ptr()),
+                0
+            );
+            assert!(!ijc_site_optimize_cancel(h, 999));
+
+            // A job still running when the handle is freed is cancelled.
+            ijc_site_optimize_start(h, site.as_ptr(), big.as_ptr());
             ijc_free(h);
         }
     }

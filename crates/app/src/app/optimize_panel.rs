@@ -7,14 +7,15 @@
 //! prices) on top, a full-width **Run**, then the results as deltas vs the
 //! current plan (scored like a candidate), the Pareto scatter, and an **Advanced**
 //! section (budget, seed, locks, street patterns). Run hands the boundary, the
-//! link's settings and its hand edits to a worker thread that calls
-//! [`site_optimize::optimize_with`], so frames keep painting; Cancel drops the
-//! receiver (the search finishes and its result is discarded). Each result
+//! link's settings and its hand edits to a worker thread that runs
+//! [`site_optimize::Prepared::run`], so frames keep painting; a progress bar
+//! follows the search and Cancel stops it at its next chunk of plans. Each result
 //! row's **Apply** runs `siteoptimize apply` with the candidate's params (one
 //! logged op, one undo step), then the inspector switches to `Yield`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use itsjustcad_commands::site_optimize::{
@@ -696,6 +697,34 @@ pub(super) struct Job {
     /// The form the search ran with (picks the shown columns).
     form: OptimizeForm,
     rx: mpsc::Receiver<Result<OptimizeResult, String>>,
+    /// Set by Cancel; the search stops at its next chunk.
+    cancel: Arc<AtomicBool>,
+    /// The search's latest progress report.
+    progress: Arc<Mutex<site_optimize::Progress>>,
+}
+
+impl Job {
+    fn progress(&self) -> site_optimize::Progress {
+        *self.progress.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn cancelling(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// The running row's text: phase, `done / total`, feasible so far, elapsed.
+pub(super) fn progress_text(p: &site_optimize::Progress, elapsed: f64, cancelling: bool) -> String {
+    let phase = match (cancelling, p.phase) {
+        (true, _) => t("optimize.cancelling"),
+        (false, site_optimize::Phase::Search) => t("optimize.running"),
+        (false, site_optimize::Phase::Daylight) => t("optimize.running_daylight"),
+    };
+    let mut s = format!("{phase} {} / {}", p.evaluated, p.budget);
+    if p.phase == site_optimize::Phase::Search {
+        s.push_str(&format!(" · {} {}", p.feasible, t("optimize.feasible")));
+    }
+    format!("{s} · {elapsed:.1} s")
 }
 
 /// The panel state, kept on [`App`].
@@ -707,6 +736,8 @@ pub(super) struct OptimizePanel {
     job: Option<Job>,
     /// Last finished search: (elapsed, rows + summary, or the error).
     result: Option<(Duration, Result<Finished, String>)>,
+    /// The last search was cancelled.
+    cancelled: bool,
     /// The Yield economics block's plan quantities, per (source, generation).
     current_q: Option<(ObjectId, u64, site_optimize::DaylightOpts, Option<Quantities>)>,
 }
@@ -728,7 +759,9 @@ impl OptimizeForm {
 impl OptimizePanel {
     fn open_for(&mut self, source: ObjectId, settings: &subdivision::SubdivisionSettings) {
         if self.source != Some(source) {
+            self.cancel();
             self.job = None;
+            self.cancelled = false;
             self.result = None;
             self.form.seed_from_plan(settings);
         }
@@ -737,27 +770,51 @@ impl OptimizePanel {
 
     /// Start a search off the UI thread; repaints `ctx` when done.
     fn start(&mut self, doc: &itsjustcad_doc::Document, source: ObjectId, ctx: &egui::Context) {
-        let req = OptimizeRequest {
-            location: doc.location.map(location),
-            ..self.form.to_request()
+        let prepared = match site_optimize::prepare_doc(doc, &[source], &self.form.to_request()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.result = Some((Duration::ZERO, Err(e)));
+                return;
+            }
         };
-        let Some((_, site)) = site_optimize::site_boundary(doc, &[source]) else {
-            self.result = Some((
-                Duration::ZERO,
-                Err("siteoptimize needs a closed site boundary curve".into()),
-            ));
-            return;
-        };
-        let (base, edits) = site_optimize::base_plan(doc, source);
         let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(site_optimize::Progress {
+            budget: prepared.req.budget,
+            ..Default::default()
+        }));
         let ctx = ctx.clone();
+        let (flag, latest) = (cancel.clone(), progress.clone());
         std::thread::spawn(move || {
-            // A cancelled job dropped `rx`; the send then fails harmlessly.
-            let _ = tx.send(site_optimize::optimize_with(&site, &base, &edits, &req));
+            let report = |p: &site_optimize::Progress| {
+                *latest.lock().unwrap_or_else(|e| e.into_inner()) = *p;
+                ctx.request_repaint();
+            };
+            let ctl = site_optimize::Control {
+                cancel: Some(&flag),
+                progress: Some(&report),
+            };
+            // A dropped job (the panel moved on) dropped `rx`; the send then
+            // fails harmlessly.
+            let _ = tx.send(prepared.run(ctl));
             ctx.request_repaint();
         });
         self.result = None;
-        self.job = Some(Job { started: Instant::now(), form: self.form.clone(), rx });
+        self.cancelled = false;
+        self.job = Some(Job {
+            started: Instant::now(),
+            form: self.form.clone(),
+            rx,
+            cancel,
+            progress,
+        });
+    }
+
+    /// Stop the running search (at its next chunk of plans).
+    pub(super) fn cancel(&mut self) {
+        if let Some(job) = &self.job {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Collect a finished search, if any.
@@ -771,7 +828,9 @@ impl OptimizePanel {
         let elapsed = job.started.elapsed();
         let finished = got.map(|r| Finished::new(&job.form, &r));
         self.job = None;
-        self.result = Some((elapsed, finished));
+        // A cancelled search shows nothing (the Run row says so).
+        self.cancelled = matches!(&finished, Err(e) if e == site_optimize::CANCELLED);
+        self.result = (!self.cancelled).then_some((elapsed, finished));
     }
 
     /// Run a search for `source` to completion on this thread (previews).
@@ -787,6 +846,28 @@ impl OptimizePanel {
         let r = site_optimize::optimize_doc(doc, &[source], &req)
             .map(|(_, r)| Finished::new(&self.form, &r));
         self.result = Some((started.elapsed(), r));
+    }
+}
+
+#[cfg(test)]
+impl OptimizePanel {
+    /// Show a search for `source` as running at `p` (previews).
+    pub(super) fn fake_running(
+        &mut self,
+        source: ObjectId,
+        p: site_optimize::Progress,
+        cancelling: bool,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        std::mem::forget(tx); // never finishes
+        self.source = Some(source);
+        self.job = Some(Job {
+            started: Instant::now() - Duration::from_millis(3200),
+            form: self.form.clone(),
+            rx,
+            cancel: Arc::new(AtomicBool::new(cancelling)),
+            progress: Arc::new(Mutex::new(p)),
+        });
     }
 }
 
@@ -935,14 +1016,28 @@ impl App {
     fn optimize_run_row(&mut self, ui: &mut egui::Ui, source: ObjectId) {
         match &self.optimize.job {
             Some(job) => {
-                let elapsed = job.started.elapsed().as_secs_f64();
+                let p = job.progress();
+                let cancelling = job.cancelling();
+                let text = progress_text(&p, job.started.elapsed().as_secs_f64(), cancelling);
+                let mut cancel = false;
                 ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("{} {elapsed:.1} s", t("optimize.running")));
-                    if ui.button(t("optimize.cancel")).clicked() {
-                        self.optimize.job = None;
-                    }
+                    // Cancel on the right; the bar takes the rest of the row.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let button = egui::Button::new(t("optimize.cancel"))
+                            .min_size(egui::vec2(0.0, crate::theme::Spacing::HIT_TARGET));
+                        cancel = ui.add_enabled(!cancelling, button).clicked();
+                        ui.add(
+                            egui::ProgressBar::new(p.fraction() as f32)
+                                .desired_height(crate::theme::Spacing::HIT_TARGET)
+                                .show_percentage(),
+                        );
+                    });
                 });
+                ui.add_space(crate::theme::Spacing::XS);
+                ui.weak(text);
+                if cancel {
+                    self.optimize.cancel();
+                }
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
             None => {
@@ -956,6 +1051,10 @@ impl App {
                 if ui.add(run).clicked() {
                     let ctx = ui.ctx().clone();
                     self.optimize.start(&self.session.doc, source, &ctx);
+                }
+                if self.optimize.cancelled {
+                    ui.add_space(crate::theme::Spacing::XS);
+                    ui.weak(t("optimize.cancelled"));
                 }
             }
         }
@@ -1750,6 +1849,57 @@ mod tests {
         let m = Metrics::from_report(&y);
         assert_eq!((m.dwellings, m.density), (Some(8.0), Some(8.0)));
         assert_eq!(m.cell(Col::Dwellings), "8");
+    }
+
+    /// #170: the running row reads phase, done / total, feasible and time;
+    /// Cancel really stops a search (it ends long before its budget) and the
+    /// panel then shows no result, only that it was cancelled.
+    #[test]
+    fn progress_text_and_a_working_cancel() {
+        use site_optimize::{Phase, Progress};
+        let p = Progress {
+            phase: Phase::Search,
+            evaluated: 120,
+            budget: 400,
+            feasible: 35,
+            best: Some(1.0),
+        };
+        assert_eq!(
+            progress_text(&p, 3.21, false),
+            "Searching… 120 / 400 · 35 feasible · 3.2 s"
+        );
+        let d = Progress {
+            phase: Phase::Daylight,
+            evaluated: 10,
+            budget: 60,
+            ..p
+        };
+        assert_eq!(
+            progress_text(&d, 1.0, false),
+            "Measuring daylight… 10 / 60 · 1.0 s"
+        );
+        assert!(progress_text(&p, 1.0, true).starts_with("Stopping…"));
+
+        let mut s = itsjustcad_commands::Session::default();
+        for line in ["rect 0,0,0 200 150", "siteplan last"] {
+            s.run(itsjustcad_commands::parse(line).unwrap()).unwrap();
+        }
+        let source = *s.doc.subdivision_links.keys().next().unwrap();
+        let mut panel = OptimizePanel::default();
+        panel.open_for(source, &s.doc.subdivision_links[&source].settings);
+        panel.form.budget = 5000;
+        panel.start(&s.doc, source, &egui::Context::default());
+        panel.cancel();
+        let t = Instant::now();
+        while panel.job.is_some() {
+            panel.poll();
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "cancel stops the search"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(panel.cancelled && panel.result.is_none());
     }
 
     #[test]

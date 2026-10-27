@@ -1228,7 +1228,88 @@ pub fn optimize_with(
     edits: &PlanEdits,
     req: &OptimizeRequest,
 ) -> Result<OptimizeResult, String> {
+    optimize_ctl(site, base, edits, req, Control::default())
+}
+
+/// The error a cancelled search returns.
+pub const CANCELLED: &str = "siteoptimize: cancelled";
+
+/// Candidates evaluated between two cancel checks / progress reports. Chunks
+/// only split the parallel batches; every genome is still drawn from the one
+/// seeded RNG first, so a completed search is the same whatever the chunking.
+const CHUNK: usize = 16;
+
+/// Which part of the search is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// Sampling and evolving site plans (`evaluated` of `budget`).
+    #[default]
+    Search,
+    /// Measuring facade daylight on the best candidates (`evaluated` of the
+    /// most that may be checked).
+    Daylight,
+}
+
+/// Live progress of a running search.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Progress {
+    pub phase: Phase,
+    /// Plans evaluated so far in this phase.
+    pub evaluated: usize,
+    /// The phase's total.
+    pub budget: usize,
+    /// Feasible plans found so far (search phase).
+    pub feasible: usize,
+    /// Best feasible score so far.
+    pub best: Option<f64>,
+}
+
+impl Progress {
+    /// Done share of the current phase, in [0, 1].
+    pub fn fraction(&self) -> f64 {
+        if self.budget == 0 {
+            0.0
+        } else {
+            (self.evaluated as f64 / self.budget as f64).min(1.0)
+        }
+    }
+}
+
+/// How a caller watches and stops a search: a cancel flag checked between
+/// chunks of [`CHUNK`] plans (a cancelled search returns [`CANCELLED`]), and a
+/// progress callback called after each chunk, from the calling thread.
+#[derive(Clone, Copy, Default)]
+pub struct Control<'a> {
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    pub progress: Option<&'a (dyn Fn(&Progress) + Sync)>,
+}
+
+impl Control<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn report(&self, p: Progress) {
+        if let Some(f) = self.progress {
+            f(&p);
+        }
+    }
+}
+
+/// [`optimize_with`] under a [`Control`]: cancellable, reporting progress.
+pub fn optimize_ctl(
+    site: &Polygon2d,
+    base: &SubdivisionSettings,
+    edits: &PlanEdits,
+    req: &OptimizeRequest,
+    ctl: Control,
+) -> Result<OptimizeResult, String> {
     req.validate()?;
+    if req.wants_daylight() && req.location.is_none() {
+        return Err(NEEDS_LOCATION.into());
+    }
     // The unit-size rule overrides, folded onto the base and every candidate.
     let rule_params: BTreeMap<String, String> = [
         ("dwelling_area", req.dwelling_area),
@@ -1256,29 +1337,62 @@ pub fn optimize_with(
     // Everything locked: one plan is all there is to evaluate.
     let budget = if d == 0 { 1 } else { req.budget };
     let mut rng = Rng(req.seed);
-    let run = |genomes: Vec<Vec<f64>>| -> Vec<Trial> {
-        genomes
-            .into_par_iter()
-            .map(|genome| {
-                let mut params = decode(&dims, &genome, base);
+    let eval_one = |genome: Vec<f64>| -> Trial {
+        let mut params = decode(&dims, &genome, base);
                 params.insert(
                     "floors_cap".into(),
                     req.max_stories.unwrap_or(0).to_string(),
                 );
                 params.extend(rule_params.clone());
-                let eval =
-                    settings_with(base, &params).and_then(|s| evaluate(site, &s, edits, req));
-                Trial {
-                    genome,
-                    params,
-                    eval,
+        // A cancelled search skips the rest of its chunk.
+        let eval = if ctl.cancelled() {
+            Err(CANCELLED.to_string())
+        } else {
+            settings_with(base, &params).and_then(|s| evaluate(site, &s, edits, req))
+        };
+        Trial {
+            genome,
+            params,
+            eval,
+        }
+    };
+    let mut progress = Progress {
+        budget,
+        ..Progress::default()
+    };
+    // Evaluate `genomes` in chunks onto `trials`, checking for a cancel and
+    // reporting progress after each.
+    let mut run = |trials: &mut Vec<Trial>, genomes: Vec<Vec<f64>>| -> Result<(), String> {
+        let mut genomes = genomes.into_iter().peekable();
+        while genomes.peek().is_some() {
+            let chunk: Vec<Trial> = genomes
+                .by_ref()
+                .take(CHUNK)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(&eval_one)
+                .collect();
+            if ctl.cancelled() {
+                return Err(CANCELLED.into());
+            }
+            for t in &chunk {
+                if let Ok(e) = &t.eval
+                    && e.violations.is_empty()
+                {
+                    progress.feasible += 1;
+                    progress.best = Some(progress.best.map_or(e.score, |b| b.max(e.score)));
                 }
-            })
-            .collect()
+            }
+            progress.evaluated += chunk.len();
+            trials.extend(chunk);
+            ctl.report(progress);
+        }
+        Ok(())
     };
 
     let n_init = budget.div_ceil(2);
-    let mut trials = run(latin_hypercube(n_init, d, &mut rng));
+    let mut trials = Vec::with_capacity(budget);
+    run(&mut trials, latin_hypercube(n_init, d, &mut rng))?;
     let (mu, lambda) = (8, ((budget - n_init) / 4).max(4));
     let mut sigma = 0.2;
     while trials.len() < budget {
@@ -1307,20 +1421,12 @@ pub fn optimize_with(
                     .collect()
             })
             .collect();
-        trials.extend(run(children));
+        run(&mut trials, children)?;
         sigma *= 0.8;
     }
 
     let mut current = evaluate(site, base, edits, req).ok();
-    let daylight = match (req.wants_daylight(), req.location) {
-        (false, _) => None,
-        (true, Some(loc)) => Some(loc),
-        (true, None) => {
-            return Err("siteoptimize: daylight needs a location — set one with \
-                        `location <lat> <lon>` (or `sun …`) first"
-                .into())
-        }
-    };
+    let daylight = req.location.filter(|_| req.wants_daylight());
     let opts = req.daylight_opts();
     let day = |p: &BTreeMap<String, String>| {
         let loc = daylight?;
@@ -1330,8 +1436,12 @@ pub fn optimize_with(
         set_daylight(&mut c.quantities, plan_daylight(site, base, edits, &loc, &opts));
         c.score = req.score(&c.report, &c.ledger, &c.quantities);
     }
-    rank(trials, req, daylight.map(|_| &day as DaylightOf)).map(|r| OptimizeResult { current, ..r })
+    rank(trials, req, daylight.map(|_| &day as DaylightOf), ctl)
+        .map(|r| OptimizeResult { current, ..r })
 }
+
+const NEEDS_LOCATION: &str = "siteoptimize: daylight needs a location — set one with \
+                              `location <lat> <lon>` (or `sun …`) first";
 
 /// Rank the feasible trials (score, then [`TIE_BREAK`]), drop layouts whose
 /// yield duplicates a better one, and mark the (score, [`pareto_axis`]) Pareto
@@ -1351,6 +1461,7 @@ fn rank(
     trials: Vec<Trial>,
     req: &OptimizeRequest,
     daylight: Option<DaylightOf>,
+    ctl: Control,
 ) -> Result<OptimizeResult, String> {
     let evaluated = trials.len();
     let mut feasible: Vec<(usize, Trial)> = Vec::new();
@@ -1444,13 +1555,22 @@ fn rank(
         };
         let mut checked: Vec<(BTreeMap<String, String>, Evaluation)> = Vec::new();
         let mut best = 0.0_f64;
+        let mut progress = Progress {
+            phase: Phase::Daylight,
+            budget: limit.min(unique.len()),
+            ..Progress::default()
+        };
         let mut rest = unique.into_iter();
         while checked.len() < limit {
             let batch: Vec<_> = rest.by_ref().take(DAYLIGHT_TOP_K).collect();
             if batch.is_empty() {
                 break;
             }
+            ctl.report(progress);
             let shares: Vec<Option<FacadeDaylight>> = batch.par_iter().map(|(p, _)| day(p)).collect();
+            if ctl.cancelled() {
+                return Err(CANCELLED.into());
+            }
             for ((p, mut e), d) in batch.into_iter().zip(shares) {
                 set_daylight(&mut e.quantities, d);
                 let d = e.quantities.daylight;
@@ -1462,8 +1582,13 @@ fn rank(
                     e.violations.push("max_overheat");
                 }
                 e.score = req.score(&e.report, &e.ledger, &e.quantities);
+                if e.violations.is_empty() {
+                    progress.feasible += 1;
+                    progress.best = Some(progress.best.map_or(e.score, |b| b.max(e.score)));
+                }
                 checked.push((p, e));
             }
+            progress.evaluated = checked.len();
             if checked.iter().filter(|(_, e)| e.violations.is_empty()).count() >= req.top.max(1) {
                 break;
             }
@@ -1685,16 +1810,35 @@ pub fn base_plan(doc: &Document, source: ObjectId) -> (SubdivisionSettings, Plan
     }
 }
 
-/// Optimize the site boundary among `ids` in `doc`.
-pub fn optimize_doc(
+/// Everything a search of a document's site boundary needs, owned, so it can
+/// run off the document (a worker thread, a host job).
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    pub source: ObjectId,
+    pub site: Polygon2d,
+    pub base: SubdivisionSettings,
+    pub edits: PlanEdits,
+    /// The request, with the document's location when it sets none.
+    pub req: OptimizeRequest,
+}
+
+impl Prepared {
+    /// Run the search under `ctl`.
+    pub fn run(&self, ctl: Control) -> Result<OptimizeResult, String> {
+        optimize_ctl(&self.site, &self.base, &self.edits, &self.req, ctl)
+    }
+}
+
+/// The search of the site boundary among `ids` in `doc`, ready to run.
+pub fn prepare_doc(
     doc: &Document,
     ids: &[ObjectId],
     req: &OptimizeRequest,
-) -> Result<(ObjectId, OptimizeResult), String> {
+) -> Result<Prepared, String> {
     let (source, site) = site_boundary(doc, ids)
         .ok_or("siteoptimize needs a closed site boundary curve (draw or select one first)")?;
     let (base, edits) = base_plan(doc, source);
-    let req = &OptimizeRequest {
+    let req = OptimizeRequest {
         location: req.location.or(doc.location.map(|l| Location {
             lat_deg: l.lat_deg,
             lon_deg: l.lon_deg,
@@ -1702,7 +1846,23 @@ pub fn optimize_doc(
         })),
         ..req.clone()
     };
-    Ok((source, optimize_with(&site, &base, &edits, req)?))
+    Ok(Prepared {
+        source,
+        site,
+        base,
+        edits,
+        req,
+    })
+}
+
+/// Optimize the site boundary among `ids` in `doc`.
+pub fn optimize_doc(
+    doc: &Document,
+    ids: &[ObjectId],
+    req: &OptimizeRequest,
+) -> Result<(ObjectId, OptimizeResult), String> {
+    let p = prepare_doc(doc, ids, req)?;
+    Ok((p.source, p.run(Control::default())?))
 }
 
 // ── parks and daylight ──────────────────────────────────────────────────────
@@ -2579,6 +2739,97 @@ mod tests {
         assert!((per_lot.avg - d.total as f64 / r.lot_count as f64).abs() < 1e-9);
         let out = run(&mut s, "lotreport");
         assert!(out.message.contains("**Dwellings**"), "{}", out.message);
+    }
+
+    /// #170: progress after every chunk, a cancel stops the search, and a
+    /// watched search that completes ranks exactly like an unwatched one.
+    #[test]
+    fn progress_and_cancel() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let site = rect(200.0, 150.0);
+        let base = SubdivisionSettings::default();
+        let seen = Mutex::new(Vec::<Progress>::new());
+        let log = |p: &Progress| seen.lock().unwrap().push(*p);
+        let ctl = Control {
+            cancel: None,
+            progress: Some(&log),
+        };
+        let watched = optimize_ctl(&site, &base, &PlanEdits::default(), &req(60), ctl).unwrap();
+        assert_eq!(
+            ranking(&watched),
+            ranking(&optimize(&site, &base, &req(60)).unwrap()),
+            "same result"
+        );
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.len() >= 60 / CHUNK, "{seen:?}");
+        assert!(seen.windows(2).all(|w| w[0].evaluated < w[1].evaluated));
+        let last = seen.last().unwrap();
+        assert_eq!(
+            (last.phase, last.evaluated, last.budget, last.feasible),
+            (Phase::Search, 60, 60, watched.feasible)
+        );
+        assert_eq!(
+            last.best,
+            watched
+                .candidates
+                .iter()
+                .map(|c| c.eval.score)
+                .reduce(f64::max)
+        );
+        assert_eq!(last.fraction(), 1.0);
+
+        // Cancel from the progress callback after the first chunk.
+        let cancel = AtomicBool::new(false);
+        let calls = Mutex::new(0);
+        let stop = |_: &Progress| {
+            *calls.lock().unwrap() += 1;
+            cancel.store(true, Ordering::Relaxed);
+        };
+        let ctl = Control {
+            cancel: Some(&cancel),
+            progress: Some(&stop),
+        };
+        let err = optimize_ctl(&site, &base, &PlanEdits::default(), &req(400), ctl).unwrap_err();
+        assert_eq!(err, CANCELLED);
+        assert_eq!(*calls.lock().unwrap(), 1, "stopped at the next chunk");
+        // Cancelled up front: nothing is evaluated.
+        let ctl = Control {
+            cancel: Some(&cancel),
+            progress: None,
+        };
+        assert_eq!(
+            optimize_ctl(&site, &base, &PlanEdits::default(), &req(400), ctl).unwrap_err(),
+            CANCELLED
+        );
+
+        // The daylight pass reports its own phase.
+        let phases = Mutex::new(Vec::new());
+        let log = |p: &Progress| phases.lock().unwrap().push(p.phase);
+        let madrid = Location {
+            lat_deg: 40.4,
+            lon_deg: -3.7,
+            tz_hours: 1.0,
+        };
+        let sunny = OptimizeRequest {
+            budget: 16,
+            min_daylight: Some(0.05),
+            location: Some(madrid),
+            ..OptimizeRequest::default()
+        };
+        let ctl = Control {
+            cancel: None,
+            progress: Some(&log),
+        };
+        optimize_ctl(
+            &site,
+            &SubdivisionSettings::walkable(),
+            &PlanEdits::default(),
+            &sunny,
+            ctl,
+        )
+        .unwrap();
+        assert!(phases.into_inner().unwrap().contains(&Phase::Daylight));
     }
 
     #[test]
