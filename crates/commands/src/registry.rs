@@ -1038,6 +1038,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "lotremove",
+            usage: "lotremove [selector]",
+            summary: "Remove the subdivision or site plan of the selected boundary (or of a selected lot, road or building): deletes the roads, blocks, lots, setbacks and buildings it generated and drops the link, keeping the boundary curve. One undo step. Example: lotremove selected",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "lotfrontage",
             usage: "lotfrontage [selector] [at=setback|curb]",
             summary: "Report the street frontage length of the selected lot(s), measured along the front SETBACK line by default (at=setback) or along the curb (at=curb, the street edge as drawn). The two differ on cul-de-sac bulbs and curved streets, where the outer curb arc is longer than the inset setback line — the most common reason automated layouts get rejected by reviewers, hence setback is the default. A read-only query (never logged): results go to the report plane as an AnalysisReport keyed 'lotfrontage' (count, min/avg/max, distribution, extreme lots) so `report` can re-show it and the deck can critique. Example: lotfrontage last · lotfrontage at=curb",

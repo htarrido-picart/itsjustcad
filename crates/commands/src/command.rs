@@ -2293,6 +2293,14 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
     },
+    /// Remove the subdivision / site plan of the selected boundary (or of the
+    /// selected lot, road, building …): delete every object it generated and
+    /// drop the link, KEEPING the source boundary curve. `targets` is written
+    /// back as the resolved source ids. Logged; one undo step restores the
+    /// objects and the link.
+    LotRemove {
+        targets: Selector,
+    },
     /// Show or set the sticky `SubdivisionSettings` on the document.
     /// With no `sets`, the exec message reports the current
     /// settings; otherwise each `key=value` updates one field. Logged so saved

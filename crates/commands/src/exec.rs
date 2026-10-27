@@ -6942,6 +6942,61 @@ fn exec_lot_reset(
     ))
 }
 
+/// `lotremove`: delete every object the targeted subdivision links generated
+/// and drop the links, keeping each source boundary. A target is a link source
+/// or one of its produced objects. One `RestoreWithLinks` undo step.
+fn exec_lot_remove(
+    doc: &mut Document,
+    targets: Selector,
+) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    let sel = resolve(doc, &targets)?;
+    let mut sources: Vec<ObjectId> = Vec::new();
+    for id in &sel {
+        let src = if doc.subdivision_links.contains_key(id) {
+            Some(*id)
+        } else {
+            doc.subdivision_links
+                .iter()
+                .find(|(_, l)| l.produced.contains(id))
+                .map(|(s, _)| *s)
+        };
+        if let Some(src) = src
+            && !sources.contains(&src)
+        {
+            sources.push(src);
+        }
+    }
+    if sources.is_empty() {
+        return Err(ExecError::Invalid(
+            "lotremove: select a subdivided boundary or an object it generated".into(),
+        ));
+    }
+    doc.refresh_dim_anchors();
+    let mut links = Vec::new();
+    let mut removed = Vec::new();
+    for src in &sources {
+        let link = doc.subdivision_links.remove(src).expect("source has a link");
+        for child in &link.produced {
+            if let Some(pair) = doc.remove(*child) {
+                removed.push(pair);
+            }
+        }
+        links.push((*src, link));
+    }
+    refresh_fields(doc);
+    doc.generation += 1;
+    let message = format!(
+        "lotremove: removed {} subdivision(s), {} object(s); boundary kept",
+        links.len(),
+        removed.len()
+    );
+    Ok((
+        Command::LotRemove { targets: Selector::Ids { ids: sources } },
+        Inverse::RestoreWithLinks { removed, links },
+        ApplyOutcome { created: Vec::new(), message },
+    ))
+}
+
 /// W1d: toggle a link's `frozen` flag. Frozen bakes the result (recompute is
 /// rejected); unfreeze re-enables it. `prev` carries the old flag for replay.
 fn exec_lot_freeze(
@@ -14310,6 +14365,7 @@ fn apply_forward(
         Command::LotHeight { targets, floors, ids } => exec_lot_height(doc, targets, floors, ids),
         Command::LotSet { targets, edit, ids } => exec_lot_set(doc, targets, edit, ids),
         Command::LotReset { targets, ids } => exec_lot_reset(doc, targets, ids),
+        Command::LotRemove { targets } => exec_lot_remove(doc, targets),
         Command::LotSettings { sets, prev } => exec_lot_settings(doc, sets, prev),
         Command::LotLoading { targets, mode, prev } => exec_lot_loading(doc, targets, mode, prev),
         Command::LotGenerateSite {
@@ -17181,6 +17237,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::LotHeight { .. } => "lotheight",
         Command::LotSet { .. } => "lotset",
         Command::LotReset { .. } => "lotreset",
+        Command::LotRemove { .. } => "lotremove",
         Command::LotSettings { .. } => "lotsettings",
         Command::LotLoading { .. } => "lotloading",
         Command::LotGenerateSite { .. } => "lotgeneratesite",
@@ -30849,6 +30906,37 @@ mod tests {
         }
         let relinked = s.doc.subdivision_links.get(&source).expect("link restored").clone();
         assert_eq!(relinked.produced, lots, "link restored with its produced ids");
+    }
+
+    /// `lotremove` deletes a site plan's generated objects and its link in one
+    /// undo step, keeping the boundary; a produced lot targets its plan too.
+    #[test]
+    fn lotremove_drops_site_plan_keeps_boundary_and_undoes() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 150");
+        let source = s.doc.objects().next().expect("boundary").id;
+        run(&mut s, "siteplan last");
+        let produced = s.doc.subdivision_links[&source].produced.clone();
+        assert!(produced.len() > 5);
+        let before = s.doc.objects().count();
+
+        run(&mut s, &format!("lotremove id:{}", produced[0]));
+        assert!(s.doc.subdivision_links.is_empty(), "link dropped");
+        assert!(s.doc.get(source).is_some(), "boundary kept");
+        assert!(produced.iter().all(|id| s.doc.get(*id).is_none()));
+        assert_eq!(s.doc.objects().count(), before - produced.len());
+
+        run(&mut s, "undo");
+        assert_eq!(s.doc.subdivision_links[&source].produced, produced);
+        assert!(produced.iter().all(|id| s.doc.get(*id).is_some()));
+        run(&mut s, "redo");
+        assert!(s.doc.subdivision_links.is_empty() && s.doc.get(source).is_some());
+
+        run(&mut s, "line 0,0,0 1,0,0");
+        assert!(
+            s.run(parse("lotremove last").unwrap()).is_err(),
+            "not a subdivision"
+        );
     }
 
     /// W1c: LotSetParams edits a link's exposed params (settings updated) then
