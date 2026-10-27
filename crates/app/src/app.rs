@@ -3549,6 +3549,19 @@ impl App {
         }
         let mut fired_g = false;
         for (key, mods) in &pressed {
+            // A selected vertex (#163) takes Esc (clear it / cancel its drag)
+            // and Delete/Backspace (`deletepoint`) before the curve does.
+            if mods.is_none() {
+                if *key == egui::Key::Escape && self.point_edit.escape(&self.session.doc) {
+                    continue;
+                }
+                if matches!(key, egui::Key::Delete | egui::Key::Backspace)
+                    && let Some(cmd) = self.point_edit.delete_command(&self.session.doc)
+                {
+                    self.run_viewport_edit(cmd);
+                    continue;
+                }
+            }
             let line = keymap::keymap(
                 *key,
                 *mods,
@@ -3920,25 +3933,40 @@ impl App {
         // foreground in CAD.
         let mut best_curve: Option<(f32, itsjustcad_doc::ObjectId)> = None; // (screen dist, id)
         let mut best_depth: Option<(f64, itsjustcad_doc::ObjectId)> = None; // (ray t, id)
+        // Fully on-screen curves: a SCREEN-space broad phase (projected AABB
+        // grown by PICK_PX), not the ray-vs-AABB one — that misses a click just
+        // outside a curve lying on its box's edge, e.g. any edge of a flat
+        // polyline seen in Top/Front/Right (#163).
+        let mut on_screen = std::collections::HashSet::new();
+        for &(id, bb, curve) in &pickable {
+            let Some(c) = curve else { continue };
+            if projected_rect(view_proj, rect, bb.min, bb.max)
+                .is_some_and(|r| !r.expand(PICK_PX).contains(pos))
+            {
+                continue;
+            }
+            let pts = curve_screen_pts(c, view_proj, rect);
+            // Any point behind the camera makes the screen polyline unreliable
+            // (a visible span can have no on-screen segment); such a curve
+            // falls back to the AABB depth test below so it stays pickable.
+            if pts.iter().any(|p| p.is_none()) {
+                continue;
+            }
+            on_screen.insert(id);
+            if let Some(d) = crate::boxsel::dist_to_polyline(&pts, pos)
+                && d <= PICK_PX
+                && best_curve.is_none_or(|(bd, _)| d < bd)
+            {
+                best_curve = Some((d, id));
+            }
+        }
         for i in bvh.ray_candidates(origin, dir) {
             let (id, bb, curve) = pickable[i as usize];
+            if curve.is_some() && on_screen.contains(&id) {
+                continue; // on-screen curve decided by screen distance only
+            }
             // Depth along the ray (nearest wins); None when the ray misses the AABB.
             let Some(t) = ray_aabb(origin, dir, bb.min, bb.max) else { continue };
-            if let Some(c) = curve {
-                let pts = curve_screen_pts(c, view_proj, rect);
-                // Any point behind the camera makes the screen polyline unreliable
-                // (a visible span can have no on-screen segment); fall back to the
-                // AABB depth test so a partially-off-screen curve stays pickable.
-                if !pts.iter().any(|p| p.is_none()) {
-                    if let Some(d) = crate::boxsel::dist_to_polyline(&pts, pos)
-                        && d <= PICK_PX
-                        && best_curve.is_none_or(|(bd, _)| d < bd)
-                    {
-                        best_curve = Some((d, id));
-                    }
-                    continue; // on-screen curve decided by screen distance only
-                }
-            }
             if best_depth.is_none_or(|(bt, _)| t < bt) {
                 best_depth = Some((t, id));
             }
@@ -4734,6 +4762,7 @@ impl App {
                         view_proj,
                         &self.session.doc,
                         theme,
+                        &self.snap_settings,
                     );
                     if let Some(cmd) = pe.command {
                         self.run_viewport_edit(cmd);
@@ -10933,7 +10962,7 @@ pub(crate) fn project(view_proj: glam::Mat4, rect: egui::Rect, world: glam::DVec
 
 /// World AABB -> covering screen rect; None when any corner sits behind the
 /// camera (the object is then skipped rather than mis-boxed).
-fn projected_rect(
+pub(crate) fn projected_rect(
     view_proj: glam::Mat4,
     rect: egui::Rect,
     min: glam::DVec3,
@@ -12694,6 +12723,80 @@ mod tests {
                 ),
                 other => panic!("expected a Curve polygon, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_vertex_select_drag_delete() {
+        // #163: click a polyline → its vertices show; click a vertex → it is
+        // selected; press-drag it → it moves with ONE undoable `setpoint`;
+        // Delete removes it; Esc clears the vertex but keeps the curve.
+        run_app_journey(|h| {
+            h.state_mut().show_template_picker = false;
+            // An off-grid line to osnap onto.
+            for line in ["polyline 0,0 10,0 10,10", "line 20.37,5.13,0 25,5,0", "top", "ze"] {
+                h.state_mut().execute_line(line.to_string());
+                h.run_steps(3);
+            }
+            use itsjustcad_doc::Geometry::Curve;
+            use kernel_curve::Curve::Polyline;
+            let doc = &h.state().session.doc;
+            let id = doc
+                .objects()
+                .find(|o| matches!(o.geometry, Curve(Polyline { .. })))
+                .expect("polyline")
+                .id;
+            let pts = |h: &egui_kittest::Harness<'_, App>| {
+                match &h.state().session.doc.get(id).unwrap().geometry {
+                    Curve(Polyline { points, .. }) => points.clone(),
+                    g => panic!("expected a polyline, got {g:?}"),
+                }
+            };
+
+            // Click the curve's middle segment: selects it.
+            let mid = world_to_screen(h, glam::DVec3::new(10.0, 5.0, 0.0));
+            click_at(h, mid);
+            assert!(h.state().session.doc.selection.contains(&id), "curve selected");
+
+            // Click vertex 1: it becomes the selected vertex.
+            let v1 = world_to_screen(h, glam::DVec3::new(10.0, 0.0, 0.0));
+            click_at(h, v1 + egui::vec2(2.0, -2.0));
+            assert_eq!(h.state().point_edit.selected(&h.state().session.doc), Some((id, 1)));
+
+            // Press-drag vertex 1 to (14,-3): one setpoint, no box select.
+            let to = world_to_screen(h, glam::DVec3::new(14.0, -3.0, 0.0));
+            drag(h, v1, to);
+            let p = pts(h)[1];
+            assert!((p - glam::DVec3::new(14.0, -3.0, 0.0)).length() < 0.2, "dragged to {p:?}");
+            assert!(h.state().session.doc.selection.contains(&id), "still selected");
+
+            // One undo restores it.
+            h.state_mut().execute_line("undo".to_string());
+            h.run_steps(2);
+            assert_eq!(pts(h)[1], glam::DVec3::new(10.0, 0.0, 0.0), "undo restored the vertex");
+
+            // Esc clears the vertex, not the curve.
+            click_at(h, mid);
+            click_at(h, v1);
+            assert!(h.state().point_edit.selected(&h.state().session.doc).is_some());
+            h.key_press(egui::Key::Escape);
+            h.run_steps(2);
+            assert_eq!(h.state().point_edit.selected(&h.state().session.doc), None);
+            assert!(h.state().session.doc.selection.contains(&id), "Esc kept the curve");
+
+            // Delete removes the selected vertex.
+            click_at(h, v1);
+            h.key_press(egui::Key::Delete);
+            h.run_steps(2);
+            assert_eq!(pts(h).len(), 2, "deletepoint removed vertex 1");
+
+            // Osnap while dragging: released near the line's (off-grid) end,
+            // the vertex lands exactly on it.
+            let from = world_to_screen(h, glam::DVec3::new(10.0, 10.0, 0.0));
+            let end = glam::DVec3::new(20.37, 5.13, 0.0);
+            drag(h, from, world_to_screen(h, end) + egui::vec2(3.0, -2.0));
+            assert_eq!(pts(h)[1], end, "snapped onto the line's endpoint");
         });
     }
 
