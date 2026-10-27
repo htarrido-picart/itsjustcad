@@ -7,12 +7,14 @@
 //! arcs by the command layer — the enum stays minimal.
 
 mod analysis;
+mod biarc;
 mod build;
 mod curve;
 mod nurbs;
 mod ops;
 
 pub use analysis::{curvature_profile, CurvatureSample};
+pub use biarc::{fit_biarcs, BiarcFit, Seg2};
 pub use build::{helix, interpolate_curve, rebuild};
 pub use curve::{clamped_uniform_knots, Curve};
 pub use nurbs::{insert_knot, nurbs_point};

@@ -996,7 +996,7 @@ fn firstrun_summary(line: &str) -> String {
 /// The filesystem path a side-effecting command targets, if any.
 fn deck_command_path(cmd: &Command) -> Option<&str> {
     match cmd {
-        Command::Export { path }
+        Command::Export { path, .. }
         | Command::Print { path, .. }
         | Command::Import { path }
         | Command::Terrain { path }
@@ -3863,7 +3863,7 @@ use QUESTION:)."
         let (line, cmd, reader) = if kind.eq_ignore_ascii_case("writer") {
             (
                 "export /Users/you/project/out.dxf".to_string(),
-                Command::Export { path: "/Users/you/project/out.dxf".into() },
+                Command::Export { path: "/Users/you/project/out.dxf".into(), cut: None },
                 false,
             )
         } else {

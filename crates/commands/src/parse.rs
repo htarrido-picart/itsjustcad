@@ -1563,8 +1563,18 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             ),
         },
         "export" => {
-            let [path] = take::<1>("export", "an output path (.dxf/.stl/.obj/.gltf/.glb/.svg/.csv)", &args)?;
-            Ok(Command::Export { path: path.to_string() })
+            let Some((path, opts)) = args.split_first() else {
+                return wrong("export", "an output path (.dxf/.stl/.obj/.gltf/.glb/.svg/.csv)", &args);
+            };
+            let cut = crate::cut::parse_export_opts(opts).map_err(|e| {
+                ParseError::Invalid(format!(
+                    "export: {e}. Usage: export <path.dxf> profile=cut [units=mm|in] [layers=a,b] [sel]"
+                ))
+            })?;
+            if cut.is_some() && !path.to_ascii_lowercase().ends_with(".dxf") {
+                return wrong("export", "a .dxf path for profile=cut", &args);
+            }
+            Ok(Command::Export { path: path.to_string(), cut })
         }
         "controlimages" => {
             let [prefix] =
@@ -6972,7 +6982,7 @@ mod tests {
     #[test]
     fn export_parses_and_roundtrips() {
         let cmd = parse("export /tmp/model.dxf").unwrap();
-        assert_eq!(cmd, Command::Export { path: "/tmp/model.dxf".into() });
+        assert_eq!(cmd, Command::Export { path: "/tmp/model.dxf".into(), cut: None });
         assert!(!cmd.is_logged());
         let json = serde_json::to_string(&cmd).unwrap();
         let back: Command = serde_json::from_str(&json).unwrap();

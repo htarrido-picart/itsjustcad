@@ -41,6 +41,9 @@ pub enum ParseError {
     BadTagShape(String),
     #[error("{0}")]
     BadDimAnchor(String),
+    /// Free-form argument error with its own message.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 fn suggest(s: &Option<String>) -> String {

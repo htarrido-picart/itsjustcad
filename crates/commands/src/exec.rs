@@ -14258,9 +14258,16 @@ fn apply_forward(
             ))
         }
         Command::SheetSet(op) => sheetset_apply(doc, op),
-        Command::Export { path } => {
+        Command::Export { path, cut } => {
             let ext = path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
             let (bytes, detail): (Vec<u8>, String) = match ext.as_str() {
+                "dxf" if cut.is_some() => {
+                    let opts = cut.clone().unwrap_or_default();
+                    let ids = opts.targets.as_ref().map(|t| resolve(doc, t)).transpose()?;
+                    let (text, summary) =
+                        crate::cut::export(doc, &opts, ids.as_deref()).map_err(ExecError::Invalid)?;
+                    (text.into_bytes(), summary.describe(opts.units))
+                }
                 "dxf" => {
                     let (text, entities) = crate::dxf::document_dxf(doc);
                     (text.into_bytes(), format!("DXF, {entities} entities"))
@@ -14337,7 +14344,7 @@ fn apply_forward(
             std::fs::write(&path, bytes)
                 .map_err(|e| ExecError::Invalid(format!("cannot write '{path}': {e}")))?;
             Ok((
-                Command::Export { path: path.clone() },
+                Command::Export { path: path.clone(), cut },
                 Inverse::Rename(Vec::new()), // never logged; inverse unused
                 ApplyOutcome {
                     created: Vec::new(),
