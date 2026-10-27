@@ -2216,7 +2216,10 @@ pub unsafe extern "C" fn ijc_gumball_has_preview(h: *mut AppHandle) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Export the current document to `fmt` (a bare extension: `svg`, `dxf`, `obj`,
-/// `stl`, `gltf`/`glb`, `ifc`, `3dm`, `csv`, `jpg`). Writes the byte count to
+/// `stl`, `gltf`/`glb`, `ifc`, `3dm`, `csv`, `jpg`). `dxf` may be followed by
+/// the cut-profile options, space-separated, exactly as on the command line:
+/// `"dxf profile=cut units=mm|in [layers=a,b] [sel|<name>]"` (laser/waterjet/
+/// router file in mm or inches with `$INSUNITS`; see `export`). Writes the byte count to
 /// `*out_len` and returns a heap buffer of the file bytes — or null on error, an
 /// empty result, or an unsupported format. `step`/`stp` are unsupported in this
 /// build (they need the OCCT tier). Mirrors the `Command::Export` dispatch minus
@@ -2244,10 +2247,38 @@ pub unsafe extern "C" fn ijc_export(
         let Ok(fmt) = (unsafe { CStr::from_ptr(fmt) }).to_str() else {
             return std::ptr::null_mut();
         };
-        let fmt = fmt.trim().trim_start_matches('.').to_ascii_lowercase();
+        let mut words = fmt.split_whitespace();
+        let fmt = words
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        let opts: Vec<&str> = words.collect();
 
-        use itsjustcad_commands::{csv, dxf, ifc, mesh_export, raster, rhino3dm, saf, svg};
+        use itsjustcad_commands::{csv, cut, dxf, ifc, mesh_export, raster, rhino3dm, saf, svg};
         let doc = &app.session.doc;
+        if !opts.is_empty() {
+            // Only the DXF cut profile takes options.
+            let Ok(Some(o)) = cut::parse_export_opts(&opts) else {
+                return std::ptr::null_mut();
+            };
+            if fmt != "dxf" {
+                return std::ptr::null_mut();
+            }
+            let ids = match o
+                .targets
+                .as_ref()
+                .map(|t| itsjustcad_commands::resolve_targets(doc, t))
+            {
+                Some(Ok(ids)) => Some(ids),
+                Some(Err(_)) => return std::ptr::null_mut(),
+                None => None,
+            };
+            let Ok((text, _)) = cut::export(doc, &o, ids.as_deref()) else {
+                return std::ptr::null_mut();
+            };
+            return into_byte_buffer(text.into_bytes(), out_len);
+        }
         // Synthetic path: some exporters infer the format from the extension or
         // embed a file name; none of them touch the filesystem here.
         let path = format!("model.{fmt}");
@@ -2276,17 +2307,165 @@ pub unsafe extern "C" fn ijc_export(
                 Err(_) => return std::ptr::null_mut(),
             },
         };
-        if bytes.is_empty() {
-            return std::ptr::null_mut();
+        into_byte_buffer(bytes, out_len)
+    })
+}
+
+/// Hand `bytes` to the host as a leaked boxed slice (null when empty), writing
+/// its length to `out_len`. Freed by [`ijc_bytes_free`].
+fn into_byte_buffer(bytes: Vec<u8>, out_len: *mut usize) -> *mut u8 {
+    if bytes.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let mut boxed = bytes.into_boxed_slice();
+    let len = boxed.len();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    if !out_len.is_null() {
+        // SAFETY: the caller of `ijc_export` guarantees `out_len` is null or a
+        // writable `usize*`.
+        unsafe { *out_len = len };
+    }
+    ptr
+}
+
+/// Run the fabrication preflight (`cutcheck`, see the command) and return its
+/// findings. `request_json` (null/`{}` = defaults):
+/// `{"units":"mm"|"in","thickness":<number in units>,"material":"<SKU or words>",
+///   "layers":["…"],"targets":"sel"|"all"|["<short id>",…]}` — `thickness` or
+/// `material` is required (the rule of thumb needs a thickness). Logged like
+/// the typed command, so markers appear on the 'compliance' layer and undo
+/// removes them. Returns
+/// `{"ok":true,"report":{pack,context,rules:[…]},"markdown":"…","fail":n,"warn":n,
+///   "markers":[short ids],"data_dir":"…"}` or `{"ok":false,"error":"…","data_dir":"…"}`.
+/// `data_dir` is where the host should save `sendcutsend-specs.json` and
+/// `sendcutsend-catalog.json` for `material=` lookups (the core never fetches).
+/// Caller must [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `request_json` must be
+/// null or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_cutcheck_json(
+    h: *mut AppHandle,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let data_dir = itsjustcad_commands::scs::default_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let fail = |e: String| {
+            into_c_string(
+                serde_json::json!({"ok": false, "error": e, "data_dir": data_dir}).to_string(),
+            )
+        };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle".into());
+        };
+        let req: serde_json::Value = if request_json.is_null() {
+            serde_json::json!({})
+        } else {
+            match unsafe { c_arg(request_json, "request_json") }
+                .and_then(|s| serde_json::from_str(s).map_err(|e| format!("bad request: {e}")))
+            {
+                Ok(v) => v,
+                Err(e) => return fail(e),
+            }
+        };
+        let cmd = match cutcheck_command(&app.session.doc, &req) {
+            Ok(c) => c,
+            Err(e) => return fail(e),
+        };
+        apply_pending(&mut app);
+        match app.session.run(cmd) {
+            Ok(out) => {
+                let report = app
+                    .session
+                    .doc
+                    .compliance_reports
+                    .get(itsjustcad_commands::cutcheck::PACK);
+                let count = |v: &str| {
+                    report.map_or(0, |r| r.rules.iter().filter(|o| o.verdict == v).count())
+                };
+                let markers: Vec<String> = out.created.iter().map(|id| id.to_string()).collect();
+                into_c_string(
+                    serde_json::json!({
+                        "ok": true,
+                        "report": report,
+                        "markdown": out.message,
+                        "fail": count("fail"),
+                        "warn": count("warn"),
+                        "markers": markers,
+                        "data_dir": data_dir,
+                    })
+                    .to_string(),
+                )
+            }
+            Err(e) => fail(e.to_string()),
         }
-        let mut boxed = bytes.into_boxed_slice();
-        let len = boxed.len();
-        let ptr = boxed.as_mut_ptr();
-        std::mem::forget(boxed);
-        if !out_len.is_null() {
-            unsafe { *out_len = len };
+    })
+}
+
+/// Build a `Command::CutCheck` from the [`ijc_cutcheck_json`] request.
+fn cutcheck_command(
+    doc: &itsjustcad_doc::Document,
+    req: &serde_json::Value,
+) -> Result<Command, String> {
+    use itsjustcad_commands::{Selector, cut::CutUnit};
+    if !req.is_object() {
+        return Err("request must be a JSON object".into());
+    }
+    let units = match req.get("units").and_then(|v| v.as_str()) {
+        None => CutUnit::Mm,
+        Some(u) => CutUnit::parse(u).ok_or_else(|| format!("units '{u}': only mm or in"))?,
+    };
+    let thickness = match req.get("thickness") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            v.as_f64()
+                .filter(|t| t.is_finite() && *t > 0.0)
+                .ok_or("thickness must be a positive number")?,
+        ),
+    };
+    let material = req
+        .get("material")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let layers = req
+        .get("layers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let targets = match req.get("targets") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s == "sel" || s == "selected" => {
+            Some(Selector::Selected)
         }
-        ptr
+        Some(serde_json::Value::String(s)) if s == "all" => Some(Selector::All),
+        Some(serde_json::Value::Array(a)) => {
+            let ids = a
+                .iter()
+                .map(|v| {
+                    let s = v.as_str().ok_or("targets must be short id strings")?;
+                    object_by_short_id(doc, s).ok_or_else(|| format!("no object '{s}'"))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Some(Selector::Ids { ids })
+        }
+        Some(other) => return Err(format!("bad targets: {other}")),
+    };
+    Ok(Command::CutCheck {
+        targets,
+        layers,
+        units,
+        thickness,
+        material,
+        limits: None,
+        ids: None,
     })
 }
 
@@ -6725,6 +6904,61 @@ mod headless_tests {
             assert!(ijc_open_json(h, json.as_ptr(), json.len()));
             assert_eq!(count(h), 1);
 
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn cutcheck_json_and_cut_profile_export() {
+        let h = ijc_init_headless();
+        unsafe {
+            for l in [
+                "rect 0,0,0 0.05 0.03",
+                "circle 0.01,0.015,0 0.0005",
+                "text 0.02,0.01,0 HI 0.002",
+            ] {
+                take(ijc_run_command_result(h, c(l).as_ptr()));
+            }
+            let r = take(ijc_cutcheck_json(
+                h,
+                c(r#"{"units":"mm","thickness":3}"#).as_ptr(),
+            ));
+            let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v["ok"], true, "{r}");
+            assert_eq!(v["fail"], 1, "{r}");
+            assert_eq!(v["warn"], 1, "{r}");
+            assert_eq!(v["markers"].as_array().unwrap().len(), 2);
+            assert_eq!(v["report"]["pack"], "cutcheck");
+            let md = v["markdown"].as_str().unwrap();
+            assert!(md.contains("| min-hole | FAIL |"), "{r}");
+            assert!(v["data_dir"].as_str().unwrap().ends_with("sendcutsend"), "{r}");
+            // Bad requests are reported, never a crash.
+            let r = take(ijc_cutcheck_json(h, c("{}").as_ptr()));
+            assert!(r.contains(r#""ok":false"#) && r.contains("thickness="), "{r}");
+            let r = take(ijc_cutcheck_json(
+                h,
+                c(r#"{"units":"m","thickness":3}"#).as_ptr(),
+            ));
+            assert!(r.contains("only mm or in"), "{r}");
+            let r = take(ijc_cutcheck_json(std::ptr::null_mut(), std::ptr::null()));
+            assert!(r.contains(r#""ok":false"#), "{r}");
+
+            // The cut profile rides the existing export entry point.
+            let mut len = 0usize;
+            let p = ijc_export(h, c("dxf profile=cut units=mm").as_ptr(), &mut len);
+            assert!(!p.is_null());
+            let text = String::from_utf8(std::slice::from_raw_parts(p, len).to_vec()).unwrap();
+            ijc_bytes_free(p, len);
+            assert!(text.contains("$INSUNITS\n70\n4\n") && text.contains("CIRCLE"));
+            assert!(!text.contains("TEXT"), "text left out");
+            assert!(!text.to_ascii_lowercase().contains("compliance"), "markers left out");
+            // Plain `dxf` is unchanged; meters or options on other formats fail.
+            let p = ijc_export(h, c("dxf").as_ptr(), &mut len);
+            let plain = String::from_utf8(std::slice::from_raw_parts(p, len).to_vec()).unwrap();
+            ijc_bytes_free(p, len);
+            assert!(!plain.contains("$INSUNITS"));
+            assert!(ijc_export(h, c("dxf profile=cut units=m").as_ptr(), &mut len).is_null());
+            assert!(ijc_export(h, c("svg profile=cut").as_ptr(), &mut len).is_null());
             ijc_free(h);
         }
     }

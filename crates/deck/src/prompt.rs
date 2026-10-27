@@ -145,6 +145,20 @@ Rule packs are data, not code: a pack is JSON ({\"name\":..,\"rules\":[{\"id\",\
 ALWAYS state the disclaimer when presenting results: this is an advisory pre-check, not a code review — verify with a licensed professional / AHJ. Guard height, habitable-space, and handrail checks are name-matched only; travel distance is straight-line, not the routed path; ramp cross slope infers the run axis from the mesh AABB; door threshold/reach/maneuvering clearance are param-only or omitted. Never claim a design \"complies\" with any code.
 ";
 
+/// The "Fabrication (SendCutSend-ready)" section (issue #153): teaches the
+/// cutmaterials → cutcheck → fix → cut-export flow so a request like "make
+/// this SendCutSend-ready in 3 mm aluminum" works. The verbs are advertised
+/// through the registry; this is workflow + interpretation guidance.
+pub const CUTCHECK_HELP: &str = "\
+## Fabrication: SendCutSend-ready flat parts (cutcheck -> fix -> cut export)
+For laser/waterjet/router sheet parts (SendCutSend and similar shops). Draw parts 1:1 as closed outlines with holes inside them (a 50 x 30 mm plate is `rect 0,0,0 50mm 30mm`; a 5 mm hole is `circle 10mm,15mm,0 2.5mm`).
+1. Pick the material. `cutmaterials <words>` lists SendCutSend SKUs from the local cache (if it says the data is not found, tell the user how to get it and continue with the rule of thumb). \"3 mm aluminum\" means `material=aluminum thickness=3`: cutcheck picks the nearest sheet (0.125 in, 5052 by default), so you do not need the SKU.
+2. Check: `cutcheck units=mm thickness=3 material=aluminum` (add `sel` or `layers=a,b` to limit the scope; `units=in` for inch parts). Without `material=`, the 50%-of-thickness rule of thumb applies. The reply is a table per check with object ids, worst value vs limit, and where. FAIL rows must be fixed: open-contour → close or join the outline; duplicate/overlap → delete the extra curve; crossing → trim or `curvebool union`; min-hole/bridge/hole-to-edge → enlarge holes, widen webs, move holes in from the edge; part-size → resize. WARN text → text is NOT cut (single-stroke font); remove it or keep it for reference only (text-to-outline does not exist yet). WARN island → the inner piece falls out loose.
+3. Fix with ordinary commands and run `cutcheck` again until there is no FAIL.
+4. Export: `export <name>.dxf profile=cut units=mm` (1:1 in mm or in, $INSUNITS set, never meters; text, dimensions and meshes are left out). It writes a file, so the user confirms it. The bundled `sendcutsend <path.dxf> <thickness> [material] [units]` macro runs the check, then the export.
+Report the material SKU, data date and any fallback the check printed. Never claim SendCutSend accepted the part: they quote on upload.
+";
+
 /// The "Ramp & stair layout" section (issue #18): teaches the model to reach
 /// for the parametric `ramp` / `stair` verbs — which bake code-compliant
 /// geometry — instead of free-handing sloped boxes, and to respect the slope /
@@ -430,6 +444,7 @@ You are NOT geometry-only. Besides drawing, you can reframe the viewport, orbit 
 {ui_verbs}
 {enviro}
 {codecheck}
+{cutcheck}
 {ramp_stair}
 {yield_critique}
 {clarify}
@@ -462,6 +477,7 @@ box 10,0,0 4,4,3
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
         codecheck = CODECHECK_HELP,
+        cutcheck = CUTCHECK_HELP,
         ramp_stair = RAMP_STAIR_HELP,
         yield_critique = YIELD_CRITIQUE_HELP,
         clarify = CLARIFY_HELP,
@@ -569,6 +585,7 @@ Examples:
 {ui_verbs}
 {enviro}
 {codecheck}
+{cutcheck}
 {ramp_stair}
 {yield_critique}
 {clarify}
@@ -608,6 +625,7 @@ box 10,0,0 4,4,3
         ui_verbs = UI_VERB_HELP,
         enviro = ENVIRO_CRITIQUE_HELP,
         codecheck = CODECHECK_HELP,
+        cutcheck = CUTCHECK_HELP,
         ramp_stair = RAMP_STAIR_HELP,
         yield_critique = YIELD_CRITIQUE_HELP,
         clarify = CLARIFY_HELP,
@@ -807,6 +825,15 @@ mod tests {
         assert!(ENVIRO_CRITIQUE_HELP.contains("cooling load"));
         assert!(ENVIRO_CRITIQUE_HELP.contains("glazing"));
         assert!(ENVIRO_CRITIQUE_HELP.contains("overshadows"));
+    }
+
+    #[test]
+    fn prompt_teaches_sendcutsend_workflow() {
+        let p = system_prompt("", &PluginRegistry::new());
+        assert!(p.contains(CUTCHECK_HELP), "CUTCHECK_HELP not injected");
+        for verb in ["cutcheck units=mm thickness=3 material=aluminum", "cutmaterials", "profile=cut", "sendcutsend <path.dxf>"] {
+            assert!(CUTCHECK_HELP.contains(verb), "missing '{verb}'");
+        }
     }
 
     #[test]

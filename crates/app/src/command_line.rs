@@ -155,7 +155,7 @@ impl CommandLine {
     /// startup. Malformed files are reported to the scrollback but never block
     /// startup.
     pub fn load_plugins(&mut self, session: &mut Session) {
-        let (reg, warnings) = PluginRegistry::load_dir(&self.plugin_dir);
+        let (reg, warnings) = PluginRegistry::load_dir_with_bundled(&self.plugin_dir);
         session.plugins = reg;
         for w in warnings {
             self.push_line(format!("plugin load warning: {w}"));

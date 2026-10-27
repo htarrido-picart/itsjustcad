@@ -1,0 +1,15 @@
+{
+  "name": "sendcutsend",
+  "description": "SendCutSend-ready in one step: run cutcheck (SendCutSend specs for the material from ~/.config/itsjustcad/sendcutsend/, else the 50%-of-thickness rule of thumb), then write the cut DXF (1:1, mm by default, $INSUNITS set). Fix any FAIL rows and run it again before uploading. Example: sendcutsend part.dxf 3 aluminum",
+  "category": "Fabrication",
+  "params": [
+    { "name": "path" },
+    { "name": "thickness" },
+    { "name": "material", "default": "" },
+    { "name": "units", "default": "mm" }
+  ],
+  "body": [
+    "cutcheck units={units} thickness={thickness} material={material}",
+    "export {path} profile=cut units={units}"
+  ]
+}
