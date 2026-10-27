@@ -1728,6 +1728,16 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "lotheight" => parse_lotheight(&args),
         "lotset" => parse_lotset(&args),
         "lotreset" => parse_lotreset(&args),
+        "lotremove" => {
+            let targets = match args.as_slice() {
+                [] => Selector::Selected,
+                _ => match selector(&args, "lotremove")? {
+                    (t, []) => t,
+                    _ => return wrong("lotremove", "[selector]", &args),
+                },
+            };
+            Ok(Command::LotRemove { targets })
+        }
         "lotfrontage" => parse_lotfrontage(&args),
         "lotreport" => parse_lotreport(&args),
         "siteoptimize" => parse_siteoptimize(&args),
