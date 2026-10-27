@@ -1189,8 +1189,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "view",
-            usage: "view save <name> | view <name> | view list",
-            summary: "Named views: save the active viewport camera, restore it later, or list saved views. Example: view save entry then view entry",
+            usage: "view save <name> | view <name> | view list | view delete <name>",
+            summary: "Named views: save the active viewport camera, restore it later, list or delete saved views. Example: view save entry then view entry",
             category: Category::View,
         },
         CommandSpec {
