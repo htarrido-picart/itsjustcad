@@ -2110,6 +2110,50 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
             _ => wrong("codecheck", "a pack name and optionally a story name", &args),
         },
         // checkrules list | checkrules load <path>
+        "cutcheck" => {
+            let mut cmd_units = crate::cut::CutUnit::default();
+            let (mut thickness, mut material, mut layers) = (None, None, Vec::new());
+            let mut rest: Vec<&str> = Vec::new();
+            let mut raw_t: Option<&str> = None;
+            for a in &args {
+                match a.split_once('=') {
+                    Some(("units", v)) => {
+                        cmd_units = crate::cut::CutUnit::parse(v).ok_or_else(|| {
+                            ParseError::Invalid(format!("cutcheck: units={v} — only mm or in"))
+                        })?
+                    }
+                    Some(("thickness" | "t", v)) => raw_t = Some(v),
+                    Some(("material" | "sku", v)) if !v.is_empty() => material = Some(v.to_string()),
+                    Some(("material" | "sku", _)) => {}
+                    Some(("layers" | "layer", v)) => {
+                        layers = v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
+                    }
+                    Some((k, _)) => {
+                        return Err(ParseError::Invalid(format!(
+                            "cutcheck: unknown option '{k}='. Usage: cutcheck [sel] units=mm|in thickness=<t> [material=<sku>] [layers=a,b]"
+                        )));
+                    }
+                    None => rest.push(a),
+                }
+            }
+            if let Some(v) = raw_t.filter(|v| !v.is_empty()) {
+                thickness = Some(crate::cut::parse_len(v, cmd_units).map_err(ParseError::Invalid)?);
+            }
+            let targets = crate::cut::parse_selector(&rest)
+                .map_err(|e| ParseError::Invalid(format!("cutcheck: {e}")))?;
+            Ok(Command::CutCheck {
+                targets,
+                layers,
+                units: cmd_units,
+                thickness,
+                material,
+                limits: None,
+                ids: None,
+            })
+        }
+        "cutmaterials" => Ok(Command::CutMaterials {
+            filter: (!args.is_empty()).then(|| args.join(" ")),
+        }),
         "checkrules" => match args.as_slice() {
             ["list"] => Ok(Command::CheckRulesList),
             ["load", path] => Ok(Command::CheckRulesLoad { path: (*path).to_string() }),
