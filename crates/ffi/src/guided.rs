@@ -12,8 +12,8 @@
 //! through the normal [`super::ijc_run_command_result`] path: one command, one
 //! undo step. [`ijc_guided_preview_json`] returns ghost polylines (rubber band
 //! plus, for offset/fillet/chamfer/array/polararray, the outcome computed in a
-//! scratch copy of the document) and arms them for [`super::ijc_render_frame`]
-//! to draw like the gumball's amber ghost.
+//! scratch copy of the document) for the host to draw over the viewport, like
+//! the gumball's amber ghost.
 //!
 //! Every answer call returns the same JSON envelope:
 //! `{"status":"more"|"error"|"done"|"idle", "error":str|null, "command":str|null,
@@ -43,12 +43,10 @@ fn grid_snap(p: DVec3) -> DVec3 {
     (p * 10.0).round() / 10.0
 }
 
-/// Per-handle guided run: the engine plus the ghost the last preview armed.
+/// Per-handle guided run: the engine plus the last result preview.
 #[derive(Default)]
 pub(crate) struct GuidedState {
     tool: GuidedTool,
-    /// Ghost polylines [`super::ijc_render_frame`] draws while a run is active.
-    pub(crate) ghost: Vec<Vec<DVec3>>,
     /// Last result-preview command and its outcome segments (re-used while the
     /// finger moves without changing the command).
     cached: Option<(String, Vec<Vec<DVec3>>)>,
@@ -56,7 +54,6 @@ pub(crate) struct GuidedState {
 
 impl GuidedState {
     fn clear_preview(&mut self) {
-        self.ghost.clear();
         self.cached = None;
     }
 }
@@ -810,9 +807,8 @@ fn result_ghost(doc: &Document, cmd: &str) -> Option<Vec<Vec<DVec3>>> {
 /// rubber-band polylines from the picked points to the cursor, plus — for
 /// offset, fillet, chamfer, array and polararray, once every remaining input
 /// is known or defaulted — the outcome's wireframe, computed by running
-/// `command` in a scratch copy of the document. The ghosts are also armed for
-/// [`super::ijc_render_frame`] (amber, like the gumball) until the next answer,
-/// back or cancel. Caller must [`super::ijc_string_free`] the result.
+/// `command` in a scratch copy of the document. The host draws them over the
+/// viewport. Caller must [`super::ijc_string_free`] the result.
 ///
 /// # Safety
 /// `h` must be null or a live handle; `pending` null or a valid C string.
@@ -851,10 +847,7 @@ pub unsafe extern "C" fn ijc_guided_preview_json(
             };
             ghosts.extend(lines);
         }
-        g.ghost = ghosts;
-        let out: Vec<Vec<Value>> = app
-            .guided
-            .ghost
+        let out: Vec<Vec<Value>> = ghosts
             .iter()
             .map(|l| l.iter().map(|p| v3(*p)).collect())
             .collect();

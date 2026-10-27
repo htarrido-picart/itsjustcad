@@ -286,7 +286,7 @@ pub struct AppHandle {
     /// the pending transform; `ijc_gumball_commit` turns it into a real command.
     gumball_preview: Option<GumballPreview>,
 
-    /// Guided verb run (itsjustcad-ios#121) and its armed preview ghost.
+    /// Guided verb run (itsjustcad-ios#121).
     guided: guided::GuidedState,
 
     // async / deck (shared across threads via Arc)
