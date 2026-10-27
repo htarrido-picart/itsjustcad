@@ -1396,9 +1396,12 @@ pub enum Command {
     /// variants are logged; `List`/`Publish` are query / I/O.
     SheetSet(SheetSetOp),
     /// Export the whole document as DXF R12, SVG, CSV, or 3D mesh format.
-    /// Not logged: export is I/O, not model state.
+    /// Not logged: export is I/O, not model state. `cut` selects the
+    /// fabrication DXF profile (`profile=cut units=mm|in [layers=…] [sel]`).
     Export {
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut: Option<crate::cut::CutOpts>,
     },
     /// Write three control images from the current view for hand-off to a
     /// diffusion / image-editing tool: `<prefix>_depth.png` (near/far depth
@@ -2807,7 +2810,7 @@ impl Command {
     /// command touches the filesystem. `None` for pure ops.
     pub fn side_effect_summary(&self) -> Option<String> {
         match self {
-            Command::Export { path } => Some(format!("export → {path}")),
+            Command::Export { path, .. } => Some(format!("export → {path}")),
             Command::ControlImages { prefix } => {
                 Some(format!("control images → {prefix}_[depth|edge|mask].png"))
             }
@@ -2853,7 +2856,7 @@ mod classify_tests {
     #[test]
     fn fs_touching_commands_are_side_effecting() {
         let cases: Vec<Command> = vec![
-            Command::Export { path: "/tmp/x.dxf".into() },
+            Command::Export { path: "/tmp/x.dxf".into(), cut: None },
             Command::Print { sheet: "S1".into(), path: "/tmp/x.pdf".into() },
             Command::Import { path: "/etc/passwd".into() },
             Command::Terrain { path: "/tmp/t.csv".into() },
@@ -2930,7 +2933,7 @@ mod classify_tests {
     #[test]
     fn write_side_effects_are_not_external_file_readers() {
         let writers: Vec<Command> = vec![
-            Command::Export { path: "/tmp/x.dxf".into() },
+            Command::Export { path: "/tmp/x.dxf".into(), cut: None },
             Command::Print { sheet: "S1".into(), path: "/tmp/x.pdf".into() },
             Command::ControlImages { prefix: "/tmp/ctrl".into() },
             Command::SheetSet(SheetSetOp::Publish { path: Some("/tmp/set.pdf".into()) }),

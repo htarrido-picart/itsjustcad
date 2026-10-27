@@ -46,7 +46,7 @@ impl Tags {
 }
 
 /// DXF layer names: letters, digits and a few punctuation marks only.
-fn dxf_layer(name: &str) -> String {
+pub(crate) fn dxf_layer(name: &str) -> String {
     let clean: String = name
         .chars()
         .map(|c| {

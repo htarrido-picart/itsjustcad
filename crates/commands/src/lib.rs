@@ -9,6 +9,7 @@ pub mod blocklib;
 pub mod checkengine;
 mod command;
 pub mod csv;
+pub mod cut;
 pub mod dwg;
 pub mod dxf;
 pub mod e57;

@@ -413,7 +413,7 @@ mod tests {
         // Not an Underlay → never allowed by the gate exception, even for a
         // file that genuinely lives in the workdir.
         assert!(!allows_underlay_in(&dir, &Command::Import { path: "site.dxf".into() }));
-        assert!(!allows_underlay_in(&dir, &Command::Export { path: "out.dxf".into() }));
+        assert!(!allows_underlay_in(&dir, &Command::Export { path: "out.dxf".into(), cut: None }));
         assert!(!allows_underlay_in(
             &dir,
             &Command::Print { sheet: "S1".into(), path: "out.pdf".into() }
