@@ -22631,6 +22631,33 @@ mod tests {
     }
 
     #[test]
+    fn export_expands_leading_tilde_to_home() {
+        // Injected home (no $HOME mutation: tests run in parallel).
+        let home = std::env::temp_dir().join(format!("ijc-tilde-home-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("Desktop")).unwrap();
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 10 6");
+        let cmd = crate::parse_with_home(
+            "export ~/Desktop/part.dxf profile=cut units=mm",
+            Some(&home),
+        )
+        .unwrap();
+        let out = s.run(cmd).unwrap();
+        assert!(out.message.contains("DXF"), "{}", out.message);
+        let text = std::fs::read_to_string(home.join("Desktop/part.dxf")).unwrap();
+        assert!(text.contains("ENTITIES"));
+
+        // Errors name the resolved path, not the typed `~`.
+        let cmd = crate::parse_with_home("export ~/missing/x.dxf", Some(&home)).unwrap();
+        let err = s.run(cmd).unwrap_err().to_string();
+        assert!(
+            err.contains(&home.join("missing/x.dxf").display().to_string()),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn import_dxf_uses_file_coords_under_non_world_cplane() {
         // A DXF LINE lives at file coords Z=0. Importing under a non-world CPlane
         // (Z-offset) must NOT re-project it up to Z=10 — importers use run_world.

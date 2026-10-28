@@ -22,7 +22,22 @@ use crate::{
 
 /// Hand-rolled `verb arg arg...` parser. Chosen over a combinator library
 /// because error message quality feeds the LLM retry loop.
+///
+/// A leading `~` in any filesystem-path argument is expanded to the home
+/// directory here (see [`crate::paths`]): the typed line stays as typed, the
+/// parsed command carries the resolved path.
 pub fn parse(input: &str) -> Result<Command, ParseError> {
+    parse_with_home(input, dirs::home_dir().as_deref())
+}
+
+/// [`parse`] with an injected home directory for `~` expansion (tests).
+pub fn parse_with_home(input: &str, home: Option<&std::path::Path>) -> Result<Command, ParseError> {
+    let mut cmd = parse_verbatim(input)?;
+    cmd.expand_tilde_paths(home);
+    Ok(cmd)
+}
+
+fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
     let mut tokens = input.split_whitespace();
     let verb = tokens.next().ok_or(ParseError::Empty)?.to_lowercase();
     let args: Vec<&str> = tokens.collect();
