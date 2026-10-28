@@ -71,6 +71,7 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("save", "File", "save [path]"),
     ("open", "File", ""),
     ("template", "File", ""),
+    ("cutexport", "File", ""),
     ("critique", "Tools", "critique [note]"),
     ("feedback", "Help", "feedback bug|idea | title: … | <field>: …"),
     ("reducemotion", "Tools", "reducemotion [on|off]"),

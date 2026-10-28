@@ -405,20 +405,50 @@ impl CommandLine {
     /// the app fills fields the parser cannot (e.g. the viewport camera for
     /// `view save`). Returns true when the document changed.
     pub fn execute_command(&mut self, session: &mut Session, line: &str, cmd: Command) -> bool {
+        self.execute_command_outcome(session, line, cmd).is_ok()
+    }
+
+    /// [`Self::execute_command`] returning the outcome (created ids) or the
+    /// error text, for panels that read what a command made.
+    pub fn execute_command_outcome(
+        &mut self,
+        session: &mut Session,
+        line: &str,
+        cmd: Command,
+    ) -> Result<itsjustcad_commands::ApplyOutcome, String> {
         self.recall.push(line.to_string());
         self.push_line(format!("> {line}"));
         let changes = cmd.is_logged();
         match session.run(cmd) {
             Ok(outcome) => {
-                self.push_line(outcome.message);
+                self.push_line(outcome.message.clone());
                 if changes {
                     self.logged_inputs.push(line.to_string());
                 }
-                true
+                Ok(outcome)
             }
             Err(e) => {
                 self.push_line(format!("error: {e}"));
-                false
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Parse and run a substrate line (no plugins, no `help`), returning the
+    /// outcome — see [`Self::execute_command_outcome`].
+    pub fn execute_outcome(
+        &mut self,
+        session: &mut Session,
+        line: &str,
+    ) -> Result<itsjustcad_commands::ApplyOutcome, String> {
+        let line = line.trim();
+        match parse(line) {
+            Ok(cmd) => self.execute_command_outcome(session, line, cmd),
+            Err(e) => {
+                self.recall.push(line.to_string());
+                self.push_line(format!("> {line}"));
+                self.push_line(format!("error: {e}"));
+                Err(e.to_string())
             }
         }
     }
