@@ -535,19 +535,29 @@ impl CommandLine {
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             submitted = self.input_row_with_hint(ui, last_verb, flow_active, prompt_hint);
             self.suggestion_block(ui, true);
-            egui::ScrollArea::vertical()
-                .id_salt("cmd_history")
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    // Force top-down INSIDE the scroll area so the oldest line is
-                    // at the top (the outer bottom_up would reverse it).
-                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                        for line in &self.history {
-                            render_history_line(ui, line);
-                        }
+            // Explicit (global) scope id: egui derives a widget's auto id from
+            // every ancestor's widget counter, and the input row / preview /
+            // suggestion popup above add or drop widgets on each keystroke. The
+            // scrollback labels kept their rects but changed ids, so egui's
+            // debug `warn_if_rect_changes_id` boxed every line in red while
+            // typing (#194). `push_id` is not enough — it only pins the
+            // stable id, not the counter-derived auto ids beneath it.
+            let scope = egui::UiBuilder::new().id(egui::Id::new("cmd_history_scope"));
+            ui.scope_builder(scope, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("cmd_history")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        // Force top-down INSIDE the scroll area so the oldest line is
+                        // at the top (the outer bottom_up would reverse it).
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            for line in &self.history {
+                                render_history_line(ui, line);
+                            }
+                        });
                     });
-                });
+            });
         });
         submitted
     }
@@ -876,6 +886,48 @@ mod tests {
         // The bare verb ALONE (no args, no trailing space) — it is submitted
         // for execution so a guided command restarts fresh.
         assert_eq!(recall_verb(Some("offset")), Some("offset".to_string()));
+    }
+
+    /// Regression (#194): typing in the Commands segment must not change the
+    /// scrollback labels' widget ids. When it did, egui's debug
+    /// `warn_if_rect_changes_id` painted a red box around every history line
+    /// on each keystroke that added/removed suggestion or preview rows.
+    /// Runs on kittest's CPU harness (no GPU) and looks for egui's 2 px red
+    /// warning stroke in each frame's output shapes.
+    #[test]
+    fn typing_does_not_flag_scrollback_ids_red() {
+        let mut cl = CommandLine::default();
+        cl.push_line("plugins: sendcutsend".to_string());
+        cl.push_line("> rect 0,0,0 200 150".to_string());
+        cl.focus_next_frame = true;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 600.0))
+            .build_ui_state(
+                |ui, cl: &mut CommandLine| {
+                    cl.commands_segment_ui(ui, &[], &[], None, false, None);
+                },
+                cl,
+            );
+        h.run_steps(2);
+        let warned = |h: &egui_kittest::Harness<'_, CommandLine>| {
+            h.output().shapes.iter().any(|c| {
+                matches!(&c.shape, egui::epaint::Shape::Rect(r)
+                    if r.stroke.color == egui::Color32::RED && r.fill == egui::Color32::TRANSPARENT)
+            })
+        };
+        for line in ["rect 0,0,0 200 150", "siteplan last", "sit", "box 0,0"] {
+            h.state_mut().input.clear();
+            h.state_mut().focus_next_frame = true;
+            h.run_steps(2);
+            for ch in line.chars() {
+                h.event(egui::Event::Text(ch.to_string()));
+                h.step();
+                assert!(
+                    !warned(&h),
+                    "red id-change box after typing {ch:?} of {line:?}"
+                );
+            }
+        }
     }
 
     #[test]
