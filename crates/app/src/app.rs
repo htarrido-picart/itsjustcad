@@ -12470,7 +12470,7 @@ mod tests {
                                 feasible: 37,
                                 best: Some(612.0),
                             };
-                            app.optimize.fake_running(source, p, false);
+                            app.optimize.fake_running(source, p);
                         } else if seg == optimize_panel::SEG_OPTIMIZE {
                             app.optimize.form.budget = 40;
                             app.optimize.run_now(&app.session.doc, source);

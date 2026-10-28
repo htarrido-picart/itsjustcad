@@ -1642,7 +1642,11 @@ fn rank(
                 break;
             }
             ctl.report(progress);
-            let shares: Vec<Option<FacadeDaylight>> = batch.par_iter().map(|(p, _)| day(p)).collect();
+            // A cancel skips the batch's not-yet-started ray casts.
+            let shares: Vec<Option<FacadeDaylight>> = batch
+                .par_iter()
+                .map(|(p, _)| if ctl.cancelled() { None } else { day(p) })
+                .collect();
             if ctl.cancelled() {
                 return Err(CANCELLED.into());
             }
