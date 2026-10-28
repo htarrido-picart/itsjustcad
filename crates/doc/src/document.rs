@@ -145,12 +145,20 @@ pub struct StreetEdit {
     /// stays where it was put when other parameters change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub centerline: Option<Vec<glam::DVec2>>,
+    /// Deleted by hand (`streetremove`, or `delete` of its road): the street
+    /// leaves the network on every re-derive until `streetreset all`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
 }
 
 impl StreetEdit {
     /// True when nothing is overridden (the record can be dropped).
     pub fn is_empty(&self) -> bool {
-        self.name.is_none() && self.class.is_none() && self.width.is_none() && self.centerline.is_none()
+        self.name.is_none()
+            && self.class.is_none()
+            && self.width.is_none()
+            && self.centerline.is_none()
+            && !self.removed
     }
 }
 

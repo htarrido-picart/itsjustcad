@@ -1724,6 +1724,7 @@ pub fn parse(input: &str) -> Result<Command, ParseError> {
         "streetmove" => parse_streetmove(&args),
         "streetnode" => parse_streetnode(&args),
         "streetreset" => parse_streetreset(&args),
+        "streetremove" => parse_streetremove(&args),
         "edgerole" => parse_edgerole(&args),
         "lotheight" => parse_lotheight(&args),
         "lotset" => parse_lotset(&args),
@@ -3071,6 +3072,15 @@ fn parse_streetnode(args: &[&str]) -> Result<Command, ParseError> {
         _ => return wrong("streetnode", WANT, args),
     };
     Ok(street_geometry(targets, op))
+}
+
+/// `streetremove [selector]`: drop generated street(s) from the network.
+fn parse_streetremove(args: &[&str]) -> Result<Command, ParseError> {
+    let (targets, rest) = street_targets(args, "streetremove")?;
+    match rest {
+        [] => Ok(street_geometry(targets, crate::lot::StreetOp::Remove)),
+        _ => wrong("streetremove", "[selector]", args),
+    }
 }
 
 /// `streetreset [selector] | all` (#157): `all` resets every street of the

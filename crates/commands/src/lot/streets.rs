@@ -20,7 +20,8 @@ use subdivision::{Polygon2d, Street, StreetGraph, StreetTier, SubdivisionSetting
 /// Two centreline points closer than this (m) are the same graph node.
 pub const NODE_TOL: f64 = 0.01;
 
-/// One street geometry edit (`streetmove` / `streetnode` / `streetreset`).
+/// One street geometry edit (`streetmove` / `streetnode` / `streetremove` /
+/// `streetreset`).
 /// Serialized with an `op` tag (the FFI `ijc_street_edit` JSON uses the same
 /// shape, plus the street id); points are plan `[x, y]`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -36,6 +37,10 @@ pub enum StreetOp {
     Insert { at: DVec2 },
     /// Delete interior node `index` (not an end, not a junction).
     Delete { index: usize },
+    /// Remove the street(s) from the network: blocks either side merge and
+    /// the plan re-cuts. Kept through later param changes; `streetreset all`
+    /// brings them back.
+    Remove,
     /// Clear the street's overrides (geometry, name, class, width) back to the
     /// rule; `all` clears every street of the plan.
     Reset {
@@ -52,6 +57,7 @@ impl StreetOp {
             StreetOp::Node { .. } | StreetOp::Insert { .. } | StreetOp::Delete { .. } => {
                 "streetnode"
             }
+            StreetOp::Remove => "streetremove",
             StreetOp::Reset { .. } => "streetreset",
         }
     }
@@ -75,6 +81,9 @@ pub fn edited_graph(
     edits: &BTreeMap<u32, StreetEdit>,
 ) -> StreetGraph {
     let mut graph = subdivision::generate_streets(site, settings);
+    graph
+        .streets
+        .retain(|s| !edits.get(&s.id).is_some_and(|e| e.removed));
     for s in &mut graph.streets {
         let Some(edit) = edits.get(&s.id) else { continue };
         if let Some(w) = edit.width {
@@ -85,7 +94,7 @@ pub fn edited_graph(
         }
     }
     let default_width = subdivision::streets::generators::effective_road_width(settings);
-    for (id, edit) in edits {
+    for (id, edit) in edits.iter().filter(|(_, e)| !e.removed) {
         let Some(c) = &edit.centerline else { continue };
         if graph.streets.iter().any(|s| s.id == *id) {
             continue;
@@ -262,7 +271,7 @@ pub fn apply_op(
             pts.remove(*index);
             out.insert(t.id, pts);
         }
-        StreetOp::Reset { .. } => {}
+        StreetOp::Remove | StreetOp::Reset { .. } => {}
     }
     Ok(out)
 }
