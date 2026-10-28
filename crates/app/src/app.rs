@@ -2,6 +2,7 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 mod focus_inspector;
+mod cut_export;
 mod optimize_panel;
 
 use itsjustcad_commands::Session;
@@ -936,6 +937,8 @@ pub struct App {
     show_about: bool,
     /// The open feedback review sheet (`feedback` / Help ▸ Report a problem…).
     feedback_sheet: Option<crate::feedback_sheet::FeedbackSheet>,
+    /// The open "Export for cutting…" panel (#175).
+    cut_export: Option<cut_export::CutExportPanel>,
     /// Whether the Help → "Check for Updates…" popup is open.
     show_update: bool,
     /// The in-flight / finished update check, if the user has run one this
@@ -1617,6 +1620,7 @@ impl App {
             reduce_motion: load_reduce_motion(),
             show_about: false,
             feedback_sheet: None,
+            cut_export: None,
             show_update: false,
             update_check: None,
             show_history: false,
@@ -2518,6 +2522,7 @@ impl App {
             Some("template") => {
                 self.show_template_picker = true;
             }
+            Some("cutexport") => self.open_cut_export(),
             // Alpha feedback ticket: open the review sheet pre-filled. Nothing is
             // opened until the user clicks Send via web form in it.
             Some("feedback") => {
@@ -3512,6 +3517,7 @@ impl App {
         let modal = self.show_palette
             || self.show_about
             || self.feedback_sheet.is_some()
+            || self.cut_export.is_some()
             || self.show_update
             || self.show_history
             || self.show_model_setup
@@ -8977,6 +8983,7 @@ impl App {
         let mut open = true;
         let mut run_line: Option<String> = None;
         let mut prefill: Option<String> = None;
+        let mut open_cut = false;
         egui::Window::new(t("plugins.title"))
             // Draggable + collapsible + X-closable — never traps input.
             .collapsible(true)
@@ -9061,6 +9068,13 @@ impl App {
                                 {
                                     prefill = Some(format!("{} ", row.name));
                                 }
+                                // Fabrication: the panel for the bundled
+                                // `sendcutsend` plugin's check + cut DXF.
+                                if row.name == "sendcutsend"
+                                    && ui.button(t("menu.file.export_cut")).clicked()
+                                {
+                                    open_cut = true;
+                                }
                                 if ui
                                     .button(t("plugins.json"))
                                     .on_hover_text(t("plugins.json.tooltip"))
@@ -9094,6 +9108,9 @@ impl App {
             });
         if !open {
             self.show_plugins = false;
+        }
+        if open_cut {
+            self.open_cut_export();
         }
 
         // Read-only JSON source popup (floating, closable).
@@ -9283,6 +9300,7 @@ impl App {
             MenuAction::EditHistory => self.show_history = true,
             MenuAction::ImportDialog => self.import(None),
             MenuAction::ExportDialog => self.export(None),
+            MenuAction::ExportForCutting => self.open_cut_export(),
             MenuAction::NewDocument => self.guarded_nav(ctx, PendingNav::New),
             MenuAction::NewSession => self.new_session(),
             MenuAction::RestartOnboarding => {
@@ -11533,6 +11551,9 @@ impl eframe::App for App {
             }
         }
 
+        // File ▸ Export for cutting… panel (#175).
+        self.cut_export_ui(&ui.ctx().clone());
+
         // Help → "Check for Updates…" popup. Modeless (draggable / X-closable),
         // like About / Model Setup. Polls the shared UpdateState each frame and
         // renders the current phase. HONEST UNSIGNED behaviour: a newer release
@@ -11985,6 +12006,7 @@ impl eframe::App for App {
         let modal_open = self.show_palette
             || self.show_about
             || self.feedback_sheet.is_some()
+            || self.cut_export.is_some()
             || self.show_update
             || self.show_history
             || self.show_model_setup

@@ -279,6 +279,23 @@ pub fn start(handle: &tokio::runtime::Handle, spec: DownloadSpec) -> Download {
     dl
 }
 
+/// GET a small file into memory (the SendCutSend feeds). An HTTP error status
+/// is an error. Shares the app's reqwest client stack with [`start`].
+#[allow(dead_code)] // used by itsjustcad (app crate); invisible to download_model example
+pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("server returned {status}"));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("read error: {e}"))
+}
+
 /// The streaming fetch: resume-aware GET, chunk loop with cancel + speed, then
 /// verify + rename. Errors bubble up as a short message the caller stores.
 async fn run_fetch(

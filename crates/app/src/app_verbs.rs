@@ -273,6 +273,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         "help" => AppVerb::Help(words.next().map(str::to_owned)),
         "render" => AppVerb::Render(words.map(str::to_owned).collect()),
         "template" => AppVerb::GuiOnly("template"),
+        "cutexport" => AppVerb::GuiOnly("cutexport"),
         "critique" => AppVerb::GuiOnly("critique"),
         "feedback" => AppVerb::Feedback(itsjustcad_deck::parse_feedback_line(line)?),
         "basemap" => AppVerb::Basemap(parse_basemap_args(words)),
@@ -529,7 +530,8 @@ mod tests {
     /// can prove `CANONICAL_DECK_APP_VERBS` ∪ denylist == every classify arm,
     /// i.e. no verb is silently dropped from consideration.
     const DECK_APP_VERB_DENYLIST: &[&str] = &[
-        "critique",     // GUI-only
+        "critique",
+        "cutexport",     // GUI-only
         "template",     // GUI-only
         "save",         // fs write — refused on deck plane
         "reducemotion",  // accessibility toggle, not a drawing/view verb the model reframes with
@@ -588,6 +590,7 @@ mod tests {
             "save",
             "help",
             "template",
+            "cutexport",
             "critique",
             "basemap",
             "render",

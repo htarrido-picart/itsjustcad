@@ -91,6 +91,11 @@ pub enum MenuAction {
     /// Pop a native file-save dialog for export, then run `export <path>` through
     /// the substrate. Fired by the File → Export… menu item.
     ExportDialog,
+    /// Open the "Export for cutting…" panel (cutcheck + cut DXF + SendCutSend
+    /// data, #175). Fired by File ▸ Export for cutting… and Plugins ▸ Export for
+    /// cutting… (next to the bundled `sendcutsend` plugin); the `cutexport`
+    /// app verb opens the same panel.
+    ExportForCutting,
     /// Set the app appearance theme from the native View ▸ Appearance items.
     /// `Some(true)` = Dark, `Some(false)` = Light, `None` = follow the OS.
     /// UI/session state (not the op-log): drives the existing theme pin.
@@ -589,6 +594,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 enabled: true,
                 action: MenuAction::ExportDialog,
             },
+            wired_leaf(t, "export_cut", tr("menu.file.export_cut"), MenuAction::ExportForCutting),
             NativeItem::Separator,
             wired_leaf(t, "settings", tr("menu.file.settings"), MenuAction::ModelSetup),
             NativeItem::Separator,
@@ -875,13 +881,19 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
     // use. Kept out of LLM so it reads as its own root-level surface.
     {
         let t = "Plugins";
-        let items = vec![NativeItem::Leaf {
-            id: format!("{t}/manage"),
-            label: tr("menu.plugins.manage").into(),
-            shortcut: None,
-            enabled: true,
-            action: MenuAction::ShowPlugins,
-        }];
+        let items = vec![
+            NativeItem::Leaf {
+                id: format!("{t}/manage"),
+                label: tr("menu.plugins.manage").into(),
+                shortcut: None,
+                enabled: true,
+                action: MenuAction::ShowPlugins,
+            },
+            NativeItem::Separator,
+            // Fabrication: the panel driving the bundled `sendcutsend` plugin's
+            // cutcheck + cut DXF export.
+            wired_leaf(t, "export_cut", tr("menu.file.export_cut"), MenuAction::ExportForCutting),
+        ];
         menus.push(NativeMenu { title: tr(menu_title_key(t)).into(), items });
     }
 
@@ -986,7 +998,7 @@ fn leaf_icon(id: &str, _label: &str) -> Icon {
         "open" => return Icon::Open,
         "save" | "saveas" => return Icon::Save,
         "import" => return Icon::Import,
-        "export" => return Icon::Export,
+        "export" | "export_cut" => return Icon::Export,
         "settings" => return Icon::Model,
         "manage" => return Icon::ToolsCat, // Plugins… — lucide "wrench"
         "close" | "quit" => return Icon::Close,
@@ -1286,6 +1298,9 @@ mod tests {
         // Import/Export route to native dialogs.
         assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.import") && *a == MenuAction::ImportDialog));
         assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.export") && *a == MenuAction::ExportDialog));
+        assert!(ls.iter().any(|(id, l, a)| id == "File/export_cut"
+            && l == tr("menu.file.export_cut")
+            && *a == MenuAction::ExportForCutting));
         // Save As prefills `save ` for a path.
         assert!(ls.iter().any(|(_, l, a)| l == tr("menu.file.save_as") && *a == MenuAction::Insert("save ".into())));
     }
@@ -1444,6 +1459,10 @@ mod tests {
                     && l == tr("menu.plugins.manage")
                     && *a == MenuAction::ShowPlugins),
                 "Plugins ▸ Plugins… must have id Plugins/manage routing ShowPlugins ({style:?})"
+            );
+            assert!(
+                ls.iter().any(|(id, _, a)| id == "Plugins/export_cut" && *a == MenuAction::ExportForCutting),
+                "Plugins ▸ Export for cutting… ({style:?})"
             );
         }
     }
