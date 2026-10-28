@@ -6571,15 +6571,31 @@ fn exec_street_geometry(
         let site = streets::site_polygon(doc, source)
             .ok_or_else(|| err("could not read the site boundary"))?;
         let before = streets::edited_graph(&site, &new_link.settings, &new_link.streets);
-        let changed = streets::apply_op(&before, &street_ids, &op).map_err(|m| err(&m))?;
-        for (id, pts) in &changed {
+        let change = streets::apply_op(&before, &street_ids, &op).map_err(|m| err(&m))?;
+        for (id, pts) in &change.lines {
             new_link.streets.entry(*id).or_default().centerline = Some(pts.clone());
         }
+        for id in &change.removed {
+            new_link.streets.entry(*id).or_default().removed = true;
+        }
         let after = streets::edited_graph(&site, &new_link.settings, &new_link.streets);
-        let changed_ids = changed.keys().copied().collect();
+        if after.is_empty() {
+            return Err(err(
+                "a site plan needs at least one street; to clear the plan, delete its boundary or use lotremove",
+            ));
+        }
+        let changed_ids = change.lines.keys().copied().collect();
         streets::validate(&site, &new_link.settings, &before, &after, &changed_ids)
             .map_err(|m| err(&m))?;
-        summary = format!("{} street(s) edited", changed.len());
+        summary = if change.removed.is_empty() {
+            format!("{} street(s) edited", change.lines.len())
+        } else {
+            format!(
+                "node deleted with {} street(s); {} street(s) edited",
+                change.removed.len(),
+                change.lines.len()
+            )
+        };
     }
     let (new_ids, restored, dropped) = rederive_link(doc, source, new_link, ids, verb)?;
     let message = format!(
@@ -9901,7 +9917,8 @@ fn curve_of<'a>(doc: &'a Document, id: ObjectId, verb: &str) -> Result<&'a Curve
 /// weight 1 and the knot vector is regenerated clamped-uniform, so a curve
 /// with non-uniform knots may shift slightly away from the edit. A live road
 /// centreline routes to the street editor: insert at the nearest point on the
-/// street (the index is ignored), delete an interior node.
+/// street (the index is ignored), delete a node (a junction or end goes with
+/// its streets).
 fn exec_vertex_edit(
     doc: &mut Document,
     target: Selector,
@@ -28859,6 +28876,94 @@ mod tests {
         assert_eq!(plan_state(&s), state);
     }
 
+    /// The street ids of the plan's roads, sorted.
+    fn street_ids(doc: &Document) -> Vec<u32> {
+        let mut v: Vec<u32> = doc.objects().filter_map(|o| o.street.as_ref().map(|s| s.id)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Deleting a junction node (a road's point grip, `deletepoint`, as the
+    /// desktop Delete key and the iOS menu run it) deletes every street
+    /// meeting it; the streets left meeting end to end merge into one and
+    /// the blocks re-cut, as one logged `streetnode delete`. Undo is exact,
+    /// param changes keep it, replay reproduces it, `streetreset all`
+    /// brings the streets back.
+    #[test]
+    fn deleting_a_junction_node_removes_its_streets_and_merges_the_rest() {
+        let count =
+            |s: &Session, layer: &str| plan_geometry(s).iter().filter(|(l, _)| l == layer).count();
+        let (mut s, source) = grid_plan("40");
+        let before = plan_state(&s);
+        assert_eq!(street_ids(&s.doc), vec![0, 1, 2, 3, 4, 5, 6]);
+        let blocks0 = count(&s, crate::lot::BLOCKS_LAYER);
+        let (road1, line1) = road_of(&s.doc, 1);
+        assert_eq!(line1[1], xy(100.0, 75.0), "the junction of streets 0, 1 and 4");
+        let log0 = s.save_log().len();
+
+        let out = s
+            .run(Command::DeletePoint { target: Selector::Ids { ids: vec![road1] }, index: 1 })
+            .unwrap();
+        assert!(out.message.starts_with("streetnode: node deleted with 5 street(s); 2 street(s) edited"), "{}", out.message);
+        let log = s.save_log();
+        assert_eq!(log.len(), log0 + 1, "one logged op");
+        assert!(matches!(&log[log0], Command::StreetGeometry { op: crate::lot::StreetOp::Delete { index: 1 }, .. }));
+        assert_eq!(street_ids(&s.doc), vec![2, 5], "0, 1, 4 gone; 3 and 6 merged on");
+        assert_eq!(road_of(&s.doc, 2).1, vec![xy(50.0, 150.0), xy(50.0, 0.0)]);
+        assert_eq!(road_of(&s.doc, 5).1, vec![xy(150.0, 150.0), xy(150.0, 0.0)]);
+        assert_eq!((blocks0, count(&s, crate::lot::BLOCKS_LAYER)), (8, 3), "blocks merged into three strips");
+        let geometry1 = plan_geometry(&s);
+
+        run(&mut s, "undo");
+        assert_eq!(plan_state(&s), before, "undo restores the plan exactly");
+        run(&mut s, "redo");
+        assert_eq!(plan_geometry(&s), geometry1);
+
+        s.run(Command::LotSetParams {
+            source,
+            params: [("block_depth".to_string(), "45".to_string())].into(),
+            ids: None,
+        })
+        .unwrap();
+        assert!(street_ids(&s.doc).iter().all(|id| ![0, 1, 3, 4, 6].contains(id)), "kept deleted");
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&s.doc.objects().collect::<Vec<_>>()).unwrap(),
+            serde_json::to_string(&replayed.doc.objects().collect::<Vec<_>>()).unwrap(),
+            "byte for byte"
+        );
+        run(&mut s, "streetreset all");
+        let (fresh, _) = grid_plan("45");
+        assert_eq!(plan_geometry(&s), plan_geometry(&fresh), "the streets are back");
+    }
+
+    /// An end node deletes its dead-end street (a boundary end, or one
+    /// stopping inside the site); the last street of a plan is refused.
+    #[test]
+    fn deleting_an_end_node_removes_its_street_but_not_the_last() {
+        let (mut s, _) = grid_plan("40");
+        let (road2, _) = road_of(&s.doc, 2);
+        let out = run(&mut s, &format!("streetnode id:{road2} delete 1"));
+        assert!(out.message.contains("node deleted with 1 street(s)"), "{}", out.message);
+        assert_eq!(street_ids(&s.doc), vec![0, 1, 3, 4, 5, 6], "only the boundary-end street goes");
+
+        let (road5, _) = road_of(&s.doc, 5);
+        run(&mut s, &format!("streetnode id:{road5} 1 to=150,130"));
+        let (road5, line5) = road_of(&s.doc, 5);
+        assert_eq!(line5[1], xy(150.0, 130.0), "a dead end inside the site");
+        run(&mut s, &format!("streetnode id:{road5} delete 1"));
+        assert_eq!(street_ids(&s.doc), vec![0, 1, 3, 4, 6]);
+
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 150");
+        run(&mut s, "siteplan last");
+        let state = plan_state(&s);
+        let (road, _) = road_of(&s.doc, 0);
+        let e = s.run(crate::parse::parse(&format!("streetnode id:{road} delete 0")).unwrap()).unwrap_err();
+        assert!(e.to_string().contains("at least one street"), "{e}");
+        assert_eq!(plan_state(&s), state, "refused: nothing changed");
+    }
+
     #[test]
     fn street_edits_that_break_the_network_are_rejected() {
         let (mut s, _) = grid_plan("40");
@@ -28874,8 +28979,8 @@ mod tests {
         assert!(e.contains("would cross without a shared node"), "{e}");
         let e = fail(&mut s, format!("streetmove id:{road2} delta=-40,0"));
         assert!(e.contains("thinner than the minimum block depth (20.0 m)"), "{e}");
-        let e = fail(&mut s, format!("streetnode id:{road1} delete 0"));
-        assert!(e.contains("not an interior node"), "{e}");
+        let e = fail(&mut s, format!("streetnode id:{road1} delete 5"));
+        assert!(e.contains("street 1 has 2 nodes"), "{e}");
         assert_eq!(plan_state(&s), state, "nothing changed");
     }
 

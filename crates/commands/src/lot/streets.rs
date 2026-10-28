@@ -35,7 +35,11 @@ pub enum StreetOp {
     Node { index: usize, to: DVec2 },
     /// Insert a node on the street at the point nearest `at`.
     Insert { at: DVec2 },
-    /// Delete interior node `index` (not an end, not a junction).
+    /// Delete node `index` (#205). An interior node only one street passes through
+    /// drops out of it (and two street ends meeting alone join through the
+    /// gap). Any other node — a junction, a dead end, a street end on the
+    /// site boundary — is deleted with every street meeting it; a node left
+    /// joining just two street ends then merges them into one street.
     Delete { index: usize },
     /// Remove the street(s) from the network: blocks either side merge and
     /// the plan re-cuts. Kept through later param changes; `streetreset all`
@@ -152,14 +156,21 @@ fn segment_through(pts: &[DVec2], p: DVec2) -> Option<usize> {
     })
 }
 
-/// The new centrelines of every street `op` changes, applied to `targets`
-/// (street ids) of `graph`. `Reset` changes no geometry here (it clears the
-/// stored overrides instead) and returns an empty map.
-pub fn apply_op(
-    graph: &StreetGraph,
-    targets: &[u32],
-    op: &StreetOp,
-) -> Result<BTreeMap<u32, Vec<DVec2>>, String> {
+/// What a geometry edit does to the network: new centrelines by street id,
+/// and the streets it drops.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StreetChange {
+    pub lines: BTreeMap<u32, Vec<DVec2>>,
+    pub removed: BTreeSet<u32>,
+}
+
+/// The change `op` makes, applied to `targets` (street ids) of `graph`.
+/// `Remove` / `Reset` change no geometry here (they mark or clear the stored
+/// overrides instead) and return an empty change.
+pub fn apply_op(graph: &StreetGraph, targets: &[u32], op: &StreetOp) -> Result<StreetChange, String> {
+    if let StreetOp::Delete { index } = op {
+        return delete_node(&graph.streets, street(graph, one(targets)?)?, *index);
+    }
     let mut out = BTreeMap::new();
     match op {
         StreetOp::Move { delta } => {
@@ -246,32 +257,120 @@ pub fn apply_op(
             pts.insert(k + 1, q);
             out.insert(t.id, pts);
         }
-        StreetOp::Delete { index } => {
-            let t = street(graph, one(targets)?)?;
-            let n = t.centerline.len();
-            if *index == 0 || *index + 1 >= n {
-                return Err(format!(
-                    "node {index} is not an interior node of street {} (1..{})",
-                    t.id,
-                    n.saturating_sub(2)
-                ));
-            }
-            let p = t.centerline[*index];
-            if let Some(o) = graph
-                .streets
-                .iter()
-                .find(|s| s.id != t.id && dist_to_polyline(p, &s.centerline) < NODE_TOL)
-            {
-                return Err(format!(
-                    "node {index} of street {} is a junction with street {}",
-                    t.id, o.id
-                ));
-            }
+        StreetOp::Delete { .. } | StreetOp::Remove | StreetOp::Reset { .. } => {}
+    }
+    Ok(StreetChange { lines: out, removed: BTreeSet::new() })
+}
+
+/// Ids of the streets meeting `p`: a centreline node at it, or a segment
+/// through it.
+fn streets_at(streets: &[Street], p: DVec2) -> Vec<u32> {
+    streets
+        .iter()
+        .filter(|s| dist_to_polyline(p, &s.centerline) < NODE_TOL)
+        .map(|s| s.id)
+        .collect()
+}
+
+/// How many ends of `pts` sit at `p` (2 for a closed loop starting there).
+fn ends_at(pts: &[DVec2], p: DVec2) -> usize {
+    [pts[0], pts[pts.len() - 1]].iter().filter(|q| q.distance(p) < NODE_TOL).count()
+}
+
+/// `a` and `b` (each with one end at `q`) joined into one centreline through
+/// `q`. The node at `q` is dropped when `drop` is set, or when it is
+/// straight through (on the line between its neighbours).
+fn join(a: &[DVec2], b: &[DVec2], q: DVec2, drop: bool) -> Vec<DVec2> {
+    let mut a = a.to_vec();
+    if a[0].distance(q) < NODE_TOL {
+        a.reverse();
+    }
+    let mut b = b.to_vec();
+    if b[0].distance(q) >= NODE_TOL {
+        b.reverse();
+    }
+    a.pop();
+    let straight = seg_project(q, a[a.len() - 1], b[1]).0 < NODE_TOL;
+    if !(drop || straight) {
+        a.push(q);
+    }
+    a.extend_from_slice(&b[1..]);
+    a
+}
+
+/// `streetnode delete` of node `index` of street `t`: see [`StreetOp::Delete`].
+fn delete_node(streets: &[Street], t: &Street, index: usize) -> Result<StreetChange, String> {
+    let n = t.centerline.len();
+    let Some(&p) = t.centerline.get(index) else {
+        return Err(format!("street {} has {n} nodes (index 0..{})", t.id, n.saturating_sub(1)));
+    };
+    let find = |id: u32| streets.iter().find(|s| s.id == id).expect("listed street");
+    let at = streets_at(streets, p);
+    // Network degree: an end counts once, a street passing through twice.
+    let degree: usize = at
+        .iter()
+        .map(|id| match ends_at(&find(*id).centerline, p) {
+            1 => 1,
+            _ => 2,
+        })
+        .sum();
+    let mut out = StreetChange::default();
+    match (degree, at.as_slice()) {
+        (2, [_]) => {
             let mut pts = t.centerline.clone();
-            pts.remove(*index);
-            out.insert(t.id, pts);
+            if ends_at(&pts, p) == 2 {
+                // A closed loop's start: re-close it on the next node.
+                pts.pop();
+                pts.remove(0);
+                pts.push(pts[0]);
+            } else {
+                pts.remove(index);
+            }
+            if pts.len() < if ends_at(&t.centerline, p) == 2 { 4 } else { 2 } {
+                return Err(format!("street {} would have too few nodes", t.id));
+            }
+            out.lines.insert(t.id, pts);
         }
-        StreetOp::Remove | StreetOp::Reset { .. } => {}
+        (2, [a, b]) => {
+            let (a, b) = (find(*a), find(*b));
+            out.lines.insert(a.id, join(&a.centerline, &b.centerline, p, true));
+            out.removed.insert(b.id);
+        }
+        _ => {
+            out.removed.extend(at.iter().copied());
+            let mut work: Vec<Street> =
+                streets.iter().filter(|s| !out.removed.contains(&s.id)).cloned().collect();
+            // The nodes the deleted streets passed: remaining street ends on them.
+            let gone: Vec<&Street> = at.iter().map(|id| find(*id)).collect();
+            let mut far: Vec<DVec2> = Vec::new();
+            for c in work.iter().map(|s| &s.centerline) {
+                for q in [c[0], c[c.len() - 1]] {
+                    if gone.iter().any(|g| dist_to_polyline(q, &g.centerline) < NODE_TOL)
+                        && !far.iter().any(|f| f.distance(q) < NODE_TOL)
+                    {
+                        far.push(q);
+                    }
+                }
+            }
+            for q in far {
+                let mut ids = streets_at(&work, q);
+                ids.sort_unstable();
+                let [a, b] = ids[..] else { continue };
+                let (ia, ib) = (
+                    work.iter().position(|s| s.id == a).expect("listed"),
+                    work.iter().position(|s| s.id == b).expect("listed"),
+                );
+                if ends_at(&work[ia].centerline, q) != 1 || ends_at(&work[ib].centerline, q) != 1 {
+                    continue;
+                }
+                let merged = join(&work[ia].centerline, &work[ib].centerline, q, false);
+                work[ia].centerline = merged.clone();
+                work.remove(ib);
+                out.lines.remove(&b);
+                out.lines.insert(a, merged);
+                out.removed.insert(b);
+            }
+        }
     }
     Ok(out)
 }
@@ -521,6 +620,7 @@ mod tests {
         let g = graph(&[&[(100.0, 0.0), (100.0, 150.0)], &[(0.0, 75.0), (100.0, 75.0)], &[(100.0, 75.0), (200.0, 75.0)]]);
         let to = DVec2::new(110.0, 75.0);
         let out = apply_op(&g, &[1], &StreetOp::Node { index: 1, to }).unwrap();
+        let out = out.lines;
         assert_eq!(out[&1][1], to);
         assert_eq!(out[&2][0], to);
         assert_eq!(out[&0], vec![DVec2::new(100.0, 0.0), to, DVec2::new(100.0, 150.0)]);
@@ -529,7 +629,7 @@ mod tests {
     #[test]
     fn moving_a_street_carries_the_ends_resting_on_it() {
         let g = graph(&[&[(100.0, 0.0), (100.0, 150.0)], &[(0.0, 75.0), (100.0, 75.0)], &[(50.0, 75.0), (50.0, 150.0)]]);
-        let out = apply_op(&g, &[1], &StreetOp::Move { delta: DVec2::new(0.0, 10.0) }).unwrap();
+        let out = apply_op(&g, &[1], &StreetOp::Move { delta: DVec2::new(0.0, 10.0) }).unwrap().lines;
         assert_eq!(out[&1], vec![DVec2::new(0.0, 85.0), DVec2::new(100.0, 85.0)]);
         assert_eq!(out[&2][0], DVec2::new(50.0, 85.0), "the stub on it follows");
         assert!(!out.contains_key(&0), "the street it rests on stays");
@@ -538,14 +638,41 @@ mod tests {
     #[test]
     fn insert_and_delete_nodes() {
         let g = graph(&[&[(0.0, 0.0), (100.0, 0.0)]]);
-        let out = apply_op(&g, &[0], &StreetOp::Insert { at: DVec2::new(40.0, 3.0) }).unwrap();
+        let out = apply_op(&g, &[0], &StreetOp::Insert { at: DVec2::new(40.0, 3.0) }).unwrap().lines;
         assert_eq!(out[&0][1], DVec2::new(40.0, 0.0), "projected onto the street");
         let g2 = graph(&[&[(0.0, 0.0), (40.0, 0.0), (100.0, 0.0)]]);
-        assert_eq!(apply_op(&g2, &[0], &StreetOp::Delete { index: 1 }).unwrap()[&0].len(), 2);
-        assert!(apply_op(&g2, &[0], &StreetOp::Delete { index: 0 }).is_err(), "an end");
-        let g3 = graph(&[&[(0.0, 0.0), (40.0, 0.0), (100.0, 0.0)], &[(40.0, 0.0), (40.0, 50.0)]]);
-        let e = apply_op(&g3, &[0], &StreetOp::Delete { index: 1 }).unwrap_err();
-        assert!(e.contains("junction with street 1"), "{e}");
+        assert_eq!(apply_op(&g2, &[0], &StreetOp::Delete { index: 1 }).unwrap().lines[&0].len(), 2);
+        let end = apply_op(&g2, &[0], &StreetOp::Delete { index: 0 }).unwrap();
+        assert_eq!(end.removed, BTreeSet::from([0]), "a dead end takes its street");
+        assert!(apply_op(&g2, &[0], &StreetOp::Delete { index: 3 }).is_err(), "no such node");
+    }
+
+    /// A junction goes with every street meeting it; a node left joining
+    /// just two street ends merges them into one street.
+    #[test]
+    fn deleting_a_junction_drops_its_streets_and_merges_what_is_left() {
+        let g = graph(&[&[(0.0, 0.0), (40.0, 0.0), (100.0, 0.0)], &[(40.0, 0.0), (40.0, 50.0)]]);
+        let t = apply_op(&g, &[0], &StreetOp::Delete { index: 1 }).unwrap();
+        assert_eq!(t.removed, BTreeSet::from([0, 1]));
+        assert!(t.lines.is_empty());
+
+        let g = graph(&[
+            &[(100.0, 0.0), (100.0, 150.0)],
+            &[(0.0, 75.0), (100.0, 75.0)],
+            &[(50.0, 75.0), (50.0, 150.0)],
+            &[(50.0, 0.0), (50.0, 75.0)],
+            &[(100.0, 75.0), (200.0, 75.0)],
+        ]);
+        let out = apply_op(&g, &[1], &StreetOp::Delete { index: 1 }).unwrap();
+        assert_eq!(out.removed, BTreeSet::from([0, 1, 3, 4]));
+        assert_eq!(out.lines[&2], vec![DVec2::new(50.0, 150.0), DVec2::new(50.0, 0.0)], "2 and 3 run through");
+        assert_eq!(out.lines.len(), 1);
+
+        // Two street ends meeting alone join through the gap.
+        let g = graph(&[&[(0.0, 0.0), (50.0, 0.0)], &[(50.0, 0.0), (100.0, 10.0)]]);
+        let out = apply_op(&g, &[0], &StreetOp::Delete { index: 1 }).unwrap();
+        assert_eq!(out.lines[&0], vec![DVec2::new(0.0, 0.0), DVec2::new(100.0, 10.0)]);
+        assert_eq!(out.removed, BTreeSet::from([1]));
     }
 
     #[test]
