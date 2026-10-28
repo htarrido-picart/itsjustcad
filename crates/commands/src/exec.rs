@@ -103,6 +103,10 @@ struct AppliedOp {
     /// Forward op with ids filled in — this is what gets saved and replayed.
     op: Command,
     inverse: Inverse,
+    /// Undo/redo this entry together with the one before it (#192): an
+    /// automatic follow-up such as the app's auto `lotrefresh` after a
+    /// boundary edit. Session-only; never saved or replayed.
+    chained: bool,
 }
 
 enum Inverse {
@@ -366,6 +370,8 @@ pub struct Session {
     pub doc: Document,
     log: Vec<AppliedOp>,
     cursor: usize,
+    /// Count of NEW logged edits (not undo/redo). See [`Session::edit_count`].
+    edits: u64,
     /// Runtime plugin macros. Not part of the op-log or file format — plugins
     /// expand to ordinary logged commands at invoke time, so replay never
     /// touches this. Held here so the deck prompt, help and autosuggest can all
@@ -720,6 +726,7 @@ impl Default for Session {
             doc,
             log: Vec::new(),
             cursor: 0,
+            edits: 0,
             plugins: crate::plugin::PluginRegistry::default(),
             check_packs: BTreeMap::from([
                 ("demo".to_string(), crate::checkengine::demo_pack()),
@@ -878,9 +885,14 @@ impl Session {
                     let op = freeze_selected(op, &selection);
                     self.log.truncate(self.cursor);
                     if !(at_tip && self.coalesce_lot_refresh(&op, &inverse)) {
-                        self.log.push(AppliedOp { op, inverse });
+                        self.log.push(AppliedOp {
+                            op,
+                            inverse,
+                            chained: false,
+                        });
                     }
                     self.cursor = self.log.len();
+                    self.edits += 1;
                 }
                 Ok(outcome)
             }
@@ -913,7 +925,10 @@ impl Session {
         let Some(prev) = self.log.last_mut() else { return false };
         // Same-source lotrefresh only: LotSetParams reuses the LotRefreshed
         // inverse but is a distinct user action, so it never merges.
-        if !matches!(&prev.op, Command::LotRefresh { source: s, .. } if s == source) {
+        // Never into an auto follow-up (#192): that would fold a user
+        // refresh into the edit it is chained to.
+        if prev.chained || !matches!(&prev.op, Command::LotRefresh { source: s, .. } if s == source)
+        {
             return false;
         }
         let Inverse::LotRefreshed { created: prev_created, .. } = &mut prev.inverse else {
@@ -924,7 +939,37 @@ impl Session {
         true
     }
 
+    /// Run `cmd` as an automatic follow-up of the previous logged edit: when
+    /// it logs a new entry, that entry undoes and redoes together with the
+    /// one before it, so the edit and its follow-up are ONE undo step (#192).
+    pub fn run_chained(&mut self, cmd: Command) -> Result<ApplyOutcome, ExecError> {
+        let cursor = self.cursor;
+        let out = self.run(cmd)?;
+        if cursor > 0 && self.cursor == cursor + 1 && self.log.len() == cursor + 1 {
+            self.log[cursor].chained = true;
+        }
+        Ok(out)
+    }
+
+    /// Number of new logged edits run so far (undo/redo/jumps do not count).
+    /// Lets a host tell a fresh edit from history navigation.
+    pub fn edit_count(&self) -> u64 {
+        self.edits
+    }
+
+    /// Undo one step: the entry before the cursor plus any entries chained to
+    /// it (see [`Session::run_chained`]). Reports the head (user) op.
     fn undo(&mut self) -> Result<ApplyOutcome, ExecError> {
+        loop {
+            let chained = self.cursor > 1 && self.log[self.cursor - 1].chained;
+            let out = self.undo_one()?;
+            if !chained {
+                return Ok(out);
+            }
+        }
+    }
+
+    fn undo_one(&mut self) -> Result<ApplyOutcome, ExecError> {
         self.ensure_history()?; // rebuild inverses if fast-opened
         if self.cursor == 0 {
             return Err(ExecError::NothingToUndo);
@@ -1431,14 +1476,29 @@ impl Session {
         })
     }
 
+    /// Redo one step: the entry at the cursor plus the entries chained after
+    /// it (see [`Session::run_chained`]). Reports the head (user) op.
     fn redo(&mut self) -> Result<ApplyOutcome, ExecError> {
+        let outcome = self.redo_one()?;
+        while self.log.get(self.cursor).is_some_and(|a| a.chained) {
+            self.redo_one()?;
+        }
+        Ok(outcome)
+    }
+
+    fn redo_one(&mut self) -> Result<ApplyOutcome, ExecError> {
         self.ensure_history()?; // rebuild inverses if fast-opened
         if self.cursor >= self.log.len() {
             return Err(ExecError::NothingToRedo);
         }
         let op = self.log[self.cursor].op.clone();
+        let chained = self.log[self.cursor].chained;
         let (op, inverse, outcome) = apply_forward(&mut self.doc, op)?;
-        self.log[self.cursor] = AppliedOp { op, inverse };
+        self.log[self.cursor] = AppliedOp {
+            op,
+            inverse,
+            chained,
+        };
         self.cursor += 1;
         Ok(outcome)
     }
@@ -31060,6 +31120,50 @@ mod tests {
             ids: None,
         })
         .expect("lotsubdivide ok");
+    }
+
+    /// #192: a `run_chained` follow-up undoes and redoes with the edit before
+    /// it as ONE step, and a later user `lotrefresh` never folds into it.
+    #[test]
+    fn run_chained_follow_up_undoes_and_redoes_with_its_edit() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 150");
+        run(&mut s, "siteplan last");
+        let source = *s.doc.subdivision_links.keys().next().unwrap();
+        let state = |s: &Session| {
+            let b = s.doc.get(source).unwrap().geometry.clone();
+            (b, s.doc.subdivision_links[&source].produced.clone())
+        };
+        let (b0, p0) = state(&s);
+        let base = s.undo_len();
+        s.run(Command::SetPoint {
+            target: Selector::Ids { ids: vec![source] },
+            index: 2,
+            position: DVec3::new(240.0, 180.0, 0.0),
+        })
+        .unwrap();
+        s.run_chained(Command::LotRefresh { source, ids: None })
+            .unwrap();
+        let (b1, p1) = state(&s);
+        assert_eq!(s.undo_len(), base + 2, "two log entries");
+
+        let out = run(&mut s, "undo");
+        assert!(out.message.contains("setpoint"), "{}", out.message);
+        assert_eq!(s.undo_cursor(), base, "one undo stepped over both");
+        assert_eq!(state(&s), (b0, p0));
+
+        run(&mut s, "redo");
+        assert_eq!(s.undo_cursor(), base + 2, "one redo re-applied both");
+        assert_eq!(state(&s), (b1.clone(), p1));
+
+        s.run(Command::LotRefresh { source, ids: None }).unwrap();
+        assert_eq!(
+            s.undo_len(),
+            base + 3,
+            "user refresh not coalesced into the chain"
+        );
+        run(&mut s, "undo");
+        assert_eq!(state(&s).0, b1, "user refresh undone alone");
     }
 
     /// Issue #24: back-to-back `lotrefresh` ops on the SAME source coalesce
