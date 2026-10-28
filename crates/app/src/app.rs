@@ -898,6 +898,9 @@ pub struct App {
     /// Auto-recompute: the `doc.generation` at the last signature scan. Lets the
     /// per-frame check early-out on idle frames (no mutation since last scan).
     subdiv_last_generation: u64,
+    /// Auto-recompute: `Session::edit_count` at the last scan. A boundary
+    /// change seen without a new edit came from undo/redo and never fires.
+    subdiv_seen_edits: u64,
     /// Plugins popup: whether the Plugins window (cards + search) is open.
     show_plugins: bool,
     /// Plugins popup: case-insensitive search filter over the plugin cards.
@@ -1306,6 +1309,28 @@ fn subdivisions_to_refresh(
     to_refresh
 }
 
+/// Session-level core of [`App::auto_refresh_subdivisions`]: re-derive the
+/// non-frozen subdivisions whose boundary changed (see
+/// [`subdivisions_to_refresh`]). Each refresh is chained to the edit that
+/// moved the boundary, so both undo/redo as ONE step (#192). A change with no
+/// new edit since the last scan (`seen_edits`) came from undo/redo, which
+/// already restored the plan: it only re-latches the cache, never fires (a
+/// refresh there would also truncate the redo tail).
+fn auto_refresh_session(
+    session: &mut itsjustcad_commands::Session,
+    cache: &mut std::collections::HashMap<itsjustcad_doc::ObjectId, u64>,
+    seen_edits: &mut u64,
+) {
+    let to_refresh = subdivisions_to_refresh(&session.doc, cache);
+    if session.edit_count() != *seen_edits {
+        for source in to_refresh {
+            let _ = session
+                .run_chained(itsjustcad_commands::Command::LotRefresh { source, ids: None });
+        }
+    }
+    *seen_edits = session.edit_count();
+}
+
 /// Non-frozen links that just became stale because a generated road was moved
 /// or reshaped by hand (#143 phase 4), with the edited-road count. Hand road
 /// edits never auto-regenerate: a re-derive would replace them. `seen` holds
@@ -1579,6 +1604,7 @@ impl App {
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
             subdiv_last_generation: 0,
+            subdiv_seen_edits: 0,
             blocklib_cache: None,
             show_plugins: std::env::var("ITSJUSTCAD_PLUGINS_POPUP").is_ok(),
             plugins_search: String::new(),
@@ -8735,13 +8761,11 @@ impl App {
         }
         self.subdiv_last_generation = generation;
 
-        let to_refresh =
-            subdivisions_to_refresh(&self.session.doc, &mut self.subdiv_sig_cache);
-        for source in to_refresh {
-            let _ = self
-                .session
-                .run(itsjustcad_commands::Command::LotRefresh { source, ids: None });
-        }
+        auto_refresh_session(
+            &mut self.session,
+            &mut self.subdiv_sig_cache,
+            &mut self.subdiv_seen_edits,
+        );
         for (source, n) in newly_stale_road_links(&self.session.doc, &mut self.subdiv_stale_roads) {
             self.command_line.push_line(format!(
                 "site plan {source} is stale: {n} generated road(s) edited by hand. Use \
@@ -13096,6 +13120,49 @@ mod tests {
         doc.subdivision_links.get_mut(&block).unwrap().frozen = true;
         doc.get_mut(block).unwrap().geometry = Geometry::Curve(square(80.0));
         assert!(subdivisions_to_refresh(&doc, &mut cache).is_empty());
+    }
+
+    /// #192: dragging a site boundary vertex (`setpoint`) plus its auto
+    /// `lotrefresh` is ONE undo step: one undo restores both the boundary and
+    /// the plan, one redo re-applies both, and neither re-fires a refresh
+    /// (which would truncate the redo tail).
+    #[test]
+    fn boundary_vertex_edit_and_auto_refresh_undo_as_one_step() {
+        use itsjustcad_commands::{Command, Selector, Session};
+        let mut s = Session::default();
+        for line in ["rect 0,0,0 200 150", "siteplan last"] {
+            s.run(itsjustcad_commands::parse(line).unwrap()).unwrap();
+        }
+        let source = *s.doc.subdivision_links.keys().next().unwrap();
+        let (mut cache, mut seen) = (Default::default(), 0u64);
+        let mut tick = |s: &mut Session| auto_refresh_session(s, &mut cache, &mut seen);
+        tick(&mut s); // first observation seeds the cache
+        let boundary = |s: &Session| s.doc.get(source).unwrap().geometry.clone();
+        let produced = |s: &Session| s.doc.subdivision_links[&source].produced.clone();
+        let (b0, p0) = (boundary(&s), produced(&s));
+
+        s.run(Command::SetPoint {
+            target: Selector::Ids { ids: vec![source] },
+            index: 2,
+            position: glam::DVec3::new(240.0, 180.0, 0.0),
+        })
+        .unwrap();
+        tick(&mut s);
+        let (b1, p1) = (boundary(&s), produced(&s));
+        assert_ne!(p1, p0, "the vertex edit re-derived the plan");
+
+        s.run(itsjustcad_commands::parse("undo").unwrap()).unwrap();
+        tick(&mut s);
+        assert_eq!(boundary(&s), b0, "one undo restored the boundary vertex");
+        assert_eq!(produced(&s), p0, "one undo restored the plan");
+        assert!(p0.iter().all(|id| s.doc.get(*id).is_some()));
+        assert_eq!(s.undo_len() - s.undo_cursor(), 2, "redo tail kept (no re-fire)");
+
+        s.run(itsjustcad_commands::parse("redo").unwrap()).unwrap();
+        tick(&mut s);
+        assert_eq!(boundary(&s), b1, "one redo re-applied the vertex");
+        assert_eq!(produced(&s), p1, "one redo re-applied the plan");
+        assert_eq!(s.undo_cursor(), s.undo_len(), "no extra refresh after redo");
     }
 
     /// A hand-rotated generated road never triggers a refresh; it reports the
