@@ -4202,7 +4202,8 @@ pub unsafe extern "C" fn ijc_street_graph_json(
 /// Edit the centreline of a generated street of site `source` (#157). `json`
 /// is `{"op":"move","street":id,"delta":[x,y]}`, `{"op":"node","street":id,
 /// "index":i,"to":[x,y]}`, `{"op":"insert","street":id,"at":[x,y]}`,
-/// `{"op":"delete","street":id,"index":i}`, `{"op":"remove","street":id}`
+/// `{"op":"delete","street":id,"index":i}` (a junction or end node goes with
+/// every street meeting it), `{"op":"remove","street":id}`
 /// (drop the street) or `{"op":"reset","street":id}` /
 /// `{"op":"reset","all":true}`. Runs `streetmove` / `streetnode` /
 /// `streetremove` / `streetreset` as one undoable op that re-derives the plan; an edit that
