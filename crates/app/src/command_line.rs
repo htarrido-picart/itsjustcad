@@ -177,6 +177,12 @@ impl CommandLine {
         self.suggest_for.clear(); // force a suggestion rebuild
     }
 
+    /// The printed scrollback (tests).
+    #[cfg(test)]
+    pub fn scrollback(&self) -> &[String] {
+        &self.history
+    }
+
     pub fn push_line(&mut self, line: impl Into<String>) {
         self.history.push(line.into());
         if self.history.len() > 500 {
