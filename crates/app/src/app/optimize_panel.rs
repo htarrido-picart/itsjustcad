@@ -1171,7 +1171,17 @@ impl App {
                         for row in &f.rows {
                             // A labelled button, not a bare check mark: the
                             // grid sizes the column to the (translated) text.
-                            if ui.small_button(t("optimize.apply")).clicked() {
+                            // `small_button` keeps the theme's tight side
+                            // padding; give the label room to breathe.
+                            let pad_x = crate::theme::Spacing::S + crate::theme::Spacing::XS;
+                            let applied = ui
+                                .scope(|ui| {
+                                    ui.spacing_mut().button_padding.x = pad_x;
+                                    ui.small_button(t("optimize.apply"))
+                                })
+                                .inner
+                                .clicked();
+                            if applied {
                                 apply = Some(row.clone());
                             }
                             let rank = format!("{}{}", row.rank, if row.pareto { " ◆" } else { "" });
