@@ -27,6 +27,7 @@ pub mod osnap;
 pub mod mesh_export;
 pub mod mesh_import;
 mod parse;
+pub mod paths;
 pub mod pat;
 pub mod pdf;
 pub mod plugin;
@@ -52,7 +53,7 @@ pub use error::{ExecError, ParseError};
 pub use exec::{
     resolve_targets, trim_preview, trim_removed_piece, ApplyOutcome, ImportSummary, Session, MAIN_BRANCH,
 };
-pub use parse::parse;
+pub use parse::{parse, parse_with_home};
 pub use plugin::{Plugin, PluginError, PluginParam, PluginRegistry};
 pub use registry::{registry, Category, CommandSpec, SELECTOR_HELP};
 

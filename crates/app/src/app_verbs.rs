@@ -269,7 +269,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             words.next().map(str::to_ascii_lowercase),
             words.next().map(str::to_ascii_lowercase),
         ),
-        "save" => AppVerb::Save(words.next().map(str::to_owned)),
+        "save" => AppVerb::Save(words.next().map(itsjustcad_commands::paths::expand_tilde)),
         "help" => AppVerb::Help(words.next().map(str::to_owned)),
         "render" => AppVerb::Render(words.map(str::to_owned).collect()),
         "template" => AppVerb::GuiOnly("template"),
