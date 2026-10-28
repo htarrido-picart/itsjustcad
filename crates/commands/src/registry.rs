@@ -1008,6 +1008,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "streetremove",
+            usage: "streetremove [selector]",
+            summary: "Remove generated street(s) from a siteplan / lotgeneratesite network: the blocks either side merge and the plan regenerates (lots, setbacks, buildings). Deleting a generated road runs this. Later param changes keep the street removed; streetreset all brings it back. One undo step. Example: streetremove selected",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "streetreset",
             usage: "streetreset [selector] | all",
             summary: "Reset generated street(s) to the rule (#157): clear the hand-edited centreline and the streetset name / class / width, then regenerate the plan. all resets every street of the plan (select any of its objects, or the only site plan in the document). One undo step. Example: streetreset all",

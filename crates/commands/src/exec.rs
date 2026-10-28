@@ -6474,9 +6474,9 @@ fn exec_street_set(
     ))
 }
 
-/// `streetmove` / `streetnode` / `streetreset` (#157): edit the centreline of
-/// the targeted generated street(s), store the result as per-street overrides
-/// on their site link, validate the edited network, then re-derive the link.
+/// `streetmove` / `streetnode` / `streetremove` / `streetreset` (#157): edit
+/// the centreline of the targeted generated street(s) (or drop them), store
+/// the result as per-street overrides on their site link, validate the edited network, then re-derive the link.
 /// One undo step (`LotRefreshed`).
 fn exec_street_geometry(
     doc: &mut Document,
@@ -6545,6 +6545,28 @@ fn exec_street_geometry(
             return Err(err("no street overrides to reset"));
         }
         summary = format!("{n} street(s) reset to the rule");
+    } else if op == StreetOp::Remove {
+        let site = streets::site_polygon(doc, source)
+            .ok_or_else(|| err("could not read the site boundary"))?;
+        let before = streets::edited_graph(&site, &new_link.settings, &new_link.streets);
+        for id in &street_ids {
+            new_link.streets.entry(*id).or_default().removed = true;
+        }
+        let after = streets::edited_graph(&site, &new_link.settings, &new_link.streets);
+        if after.is_empty() {
+            return Err(err(
+                "a site plan needs at least one street; to clear the plan, delete its boundary or use lotremove",
+            ));
+        }
+        streets::validate(
+            &site,
+            &new_link.settings,
+            &before,
+            &after,
+            &Default::default(),
+        )
+        .map_err(|m| err(&m))?;
+        summary = format!("{} street(s) removed", street_ids.len());
     } else {
         let site = streets::site_polygon(doc, source)
             .ok_or_else(|| err("could not read the site boundary"))?;
@@ -13542,6 +13564,17 @@ fn apply_forward(
         }
         Command::Delete { targets } => {
             let ids = resolve(doc, &targets)?;
+            // Deleting the generated roads of a live site plan removes those
+            // streets from its network and re-derives the plan, like a move
+            // of them runs `streetmove` (logged as `streetremove`).
+            if !ids.is_empty() && crate::lot::streets::live_roads_source(doc, &ids).is_some() {
+                return exec_street_geometry(
+                    doc,
+                    Selector::Ids { ids },
+                    crate::lot::StreetOp::Remove,
+                    None,
+                );
+            }
             // Capture each associative dim's last live referent position before
             // any object vanishes, so a surviving dim degrades to an up-to-date
             // fallback rather than the stale creation-time point. Pure function
@@ -28710,6 +28743,120 @@ mod tests {
         let (fresh, _) = grid_plan("45");
         assert_eq!(plan_geometry(&s), plan_geometry(&fresh));
         assert!(s.run(crate::parse::parse("streetreset all").unwrap()).is_err(), "nothing left");
+    }
+
+    /// Deleting a generated road of a live plan removes that street from the
+    /// network and regenerates the plan (blocks merge, lots re-cut) as one
+    /// logged `streetremove`; undo restores it, param changes keep it,
+    /// replay reproduces it and `streetreset all` brings the street back.
+    #[test]
+    fn deleting_a_generated_road_removes_the_street_and_regenerates() {
+        let count =
+            |s: &Session, layer: &str| plan_geometry(s).iter().filter(|(l, _)| l == layer).count();
+        let (mut s, source) = grid_plan("40");
+        let before = plan_state(&s);
+        let blocks0 = count(&s, crate::lot::BLOCKS_LAYER);
+        let (road, _) = road_of(&s.doc, 1);
+        let log0 = s.save_log().len();
+
+        let out = s
+            .run(Command::Delete {
+                targets: Selector::Ids { ids: vec![road] },
+            })
+            .unwrap();
+        assert!(
+            out.message.starts_with("streetremove: 1 street(s) removed"),
+            "{}",
+            out.message
+        );
+        let log = s.save_log();
+        assert_eq!(log.len(), log0 + 1, "one logged op");
+        assert!(matches!(
+            &log[log0],
+            Command::StreetGeometry {
+                op: crate::lot::StreetOp::Remove,
+                ..
+            }
+        ));
+        assert!(
+            s.doc
+                .objects()
+                .all(|o| o.street.as_ref().is_none_or(|i| i.id != 1)),
+            "street 1 gone"
+        );
+        assert!(s.doc.subdivision_links[&source].streets[&1].removed);
+        assert!(
+            count(&s, crate::lot::BLOCKS_LAYER) < blocks0,
+            "blocks either side merged"
+        );
+        let geometry1 = plan_geometry(&s);
+
+        run(&mut s, "undo");
+        assert_eq!(plan_state(&s), before, "undo restores the plan exactly");
+        run(&mut s, "redo");
+        assert_eq!(plan_geometry(&s), geometry1);
+
+        s.run(Command::LotSetParams {
+            source,
+            params: [("block_depth".to_string(), "45".to_string())].into(),
+            ids: None,
+        })
+        .unwrap();
+        assert!(
+            s.doc
+                .objects()
+                .all(|o| o.street.as_ref().is_none_or(|i| i.id != 1)),
+            "kept removed"
+        );
+
+        let replayed = Session::replay(s.save_log()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&s.doc.objects().collect::<Vec<_>>()).unwrap(),
+            serde_json::to_string(&replayed.doc.objects().collect::<Vec<_>>()).unwrap(),
+            "byte for byte"
+        );
+
+        run(&mut s, "streetreset all");
+        let (fresh, _) = grid_plan("45");
+        assert_eq!(
+            plan_geometry(&s),
+            plan_geometry(&fresh),
+            "the street is back"
+        );
+
+        // The text form, and a frozen plan's road is a plain delete.
+        assert_eq!(
+            crate::parse::parse("streetremove").unwrap(),
+            Command::StreetGeometry {
+                targets: Selector::Selected,
+                op: crate::lot::StreetOp::Remove,
+                ids: None
+            }
+        );
+        assert!(crate::parse::parse("streetremove last bogus").is_err());
+        let (mut s, source) = grid_plan("40");
+        s.doc.subdivision_links.get_mut(&source).unwrap().frozen = true;
+        let (road, _) = road_of(&s.doc, 1);
+        let out = s
+            .run(Command::Delete {
+                targets: Selector::Ids { ids: vec![road] },
+            })
+            .unwrap();
+        assert_eq!(out.message, "deleted 1 object(s)");
+
+        // The last street of a plan stays: deleting it is refused, unchanged.
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 200 150");
+        run(&mut s, "siteplan last");
+        let state = plan_state(&s);
+        let (road, _) = road_of(&s.doc, 0);
+        let e = s
+            .run(Command::Delete {
+                targets: Selector::Ids { ids: vec![road] },
+            })
+            .unwrap_err();
+        assert!(e.to_string().contains("at least one street"), "{e}");
+        assert_eq!(plan_state(&s), state);
     }
 
     #[test]

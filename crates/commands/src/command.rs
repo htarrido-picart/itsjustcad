@@ -2229,7 +2229,8 @@ pub enum Command {
         ids: Option<Vec<ObjectId>>,
     },
     /// Edit the centreline of generated street(s) (#157): `streetmove`,
-    /// `streetnode` (move / insert / delete a node) or `streetreset`. The new
+    /// `streetnode` (move / insert / delete a node), `streetremove` (drop the
+    /// street; a `delete` of live roads runs it) or `streetreset`. The new
     /// centrelines are stored on the site link as per-street overrides and the
     /// link is re-derived, so blocks, lots, setbacks and buildings regenerate
     /// around the edited network and later param changes keep the hand
