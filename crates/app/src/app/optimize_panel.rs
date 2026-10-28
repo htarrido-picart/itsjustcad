@@ -9,7 +9,8 @@
 //! section (budget, seed, locks, street patterns). Run hands the boundary, the
 //! link's settings and its hand edits to a worker thread that runs
 //! [`site_optimize::Prepared::run`], so frames keep painting; a progress bar
-//! follows the search and Cancel stops it at its next chunk of plans. Each result
+//! follows the search and Cancel returns the panel to Run at once (the worker
+//! stops before its next plan, its result dropped). Each result
 //! row's **Apply** runs `siteoptimize apply` with the candidate's params (one
 //! logged op, one undo step), then the inspector switches to `Yield`.
 
@@ -709,7 +710,8 @@ pub(super) struct Job {
     /// The form the search ran with (picks the shown columns).
     form: OptimizeForm,
     rx: mpsc::Receiver<Result<OptimizeResult, String>>,
-    /// Set by Cancel; the search stops at its next chunk.
+    /// Set by Cancel; the worker stops at its next plan and its result is
+    /// dropped (the panel already let go of the job).
     cancel: Arc<AtomicBool>,
     /// The search's latest progress report.
     progress: Arc<Mutex<site_optimize::Progress>>,
@@ -719,18 +721,13 @@ impl Job {
     fn progress(&self) -> site_optimize::Progress {
         *self.progress.lock().unwrap_or_else(|e| e.into_inner())
     }
-
-    fn cancelling(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
-    }
 }
 
 /// The running row's text: phase, `done / total`, feasible so far, elapsed.
-pub(super) fn progress_text(p: &site_optimize::Progress, elapsed: f64, cancelling: bool) -> String {
-    let phase = match (cancelling, p.phase) {
-        (true, _) => t("optimize.cancelling"),
-        (false, site_optimize::Phase::Search) => t("optimize.running"),
-        (false, site_optimize::Phase::Daylight) => t("optimize.running_daylight"),
+pub(super) fn progress_text(p: &site_optimize::Progress, elapsed: f64) -> String {
+    let phase = match p.phase {
+        site_optimize::Phase::Search => t("optimize.running"),
+        site_optimize::Phase::Daylight => t("optimize.running_daylight"),
     };
     let mut s = format!("{phase} {} / {}", p.evaluated, p.budget);
     if p.phase == site_optimize::Phase::Search {
@@ -822,10 +819,16 @@ impl OptimizePanel {
         });
     }
 
-    /// Stop the running search (at its next chunk of plans).
+    /// Stop the running search. The panel lets go of the job at once (back to
+    /// Run, nothing applied); the worker sees the flag before its next plan
+    /// and exits, its result unread. Waiting for the worker instead kept the
+    /// panel on "Stopping…" until in-flight plans finished — over a second
+    /// each on a large site in a debug build.
     pub(super) fn cancel(&mut self) {
-        if let Some(job) = &self.job {
+        if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
+            self.cancelled = true;
+            self.result = None;
         }
     }
 
@@ -864,12 +867,7 @@ impl OptimizePanel {
 #[cfg(test)]
 impl OptimizePanel {
     /// Show a search for `source` as running at `p` (previews).
-    pub(super) fn fake_running(
-        &mut self,
-        source: ObjectId,
-        p: site_optimize::Progress,
-        cancelling: bool,
-    ) {
+    pub(super) fn fake_running(&mut self, source: ObjectId, p: site_optimize::Progress) {
         let (tx, rx) = mpsc::channel();
         std::mem::forget(tx); // never finishes
         self.source = Some(source);
@@ -877,7 +875,7 @@ impl OptimizePanel {
             started: Instant::now() - Duration::from_millis(3200),
             form: self.form.clone(),
             rx,
-            cancel: Arc::new(AtomicBool::new(cancelling)),
+            cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(Mutex::new(p)),
         });
     }
@@ -1047,15 +1045,14 @@ impl App {
         match &self.optimize.job {
             Some(job) => {
                 let p = job.progress();
-                let cancelling = job.cancelling();
-                let text = progress_text(&p, job.started.elapsed().as_secs_f64(), cancelling);
+                let text = progress_text(&p, job.started.elapsed().as_secs_f64());
                 let mut cancel = false;
                 ui.horizontal(|ui| {
                     // Cancel on the right; the bar takes the rest of the row.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let button = egui::Button::new(t("optimize.cancel"))
                             .min_size(egui::vec2(0.0, crate::theme::Spacing::HIT_TARGET));
-                        cancel = ui.add_enabled(!cancelling, button).clicked();
+                        cancel = ui.add(button).clicked();
                         ui.add(
                             egui::ProgressBar::new(p.fraction() as f32)
                                 .desired_height(crate::theme::Spacing::HIT_TARGET)
@@ -1172,11 +1169,9 @@ impl App {
                             ui.end_row();
                         }
                         for row in &f.rows {
-                            if ui
-                                .small_button("✔")
-                                .on_hover_text(t("optimize.apply"))
-                                .clicked()
-                            {
+                            // A labelled button, not a bare check mark: the
+                            // grid sizes the column to the (translated) text.
+                            if ui.small_button(t("optimize.apply")).clicked() {
                                 apply = Some(row.clone());
                             }
                             let rank = format!("{}{}", row.rank, if row.pareto { " ◆" } else { "" });
@@ -1922,8 +1917,9 @@ mod tests {
     }
 
     /// #170: the running row reads phase, done / total, feasible and time;
-    /// Cancel really stops a search (it ends long before its budget) and the
-    /// panel then shows no result, only that it was cancelled.
+    /// Cancel returns the panel to Run within 200 ms (time-to-cancel) with no
+    /// result, only that it was cancelled, and the worker really stops (it
+    /// ends long before its budget).
     #[test]
     fn progress_text_and_a_working_cancel() {
         use site_optimize::{Phase, Progress};
@@ -1935,7 +1931,7 @@ mod tests {
             best: Some(1.0),
         };
         assert_eq!(
-            progress_text(&p, 3.21, false),
+            progress_text(&p, 3.21),
             "Searching… 120 / 400 · 35 feasible · 3.2 s"
         );
         let d = Progress {
@@ -1945,10 +1941,9 @@ mod tests {
             ..p
         };
         assert_eq!(
-            progress_text(&d, 1.0, false),
+            progress_text(&d, 1.0),
             "Measuring daylight… 10 / 60 · 1.0 s"
         );
-        assert!(progress_text(&p, 1.0, true).starts_with("Stopping…"));
 
         let mut s = itsjustcad_commands::Session::default();
         for line in ["rect 0,0,0 200 150", "siteplan last"] {
@@ -1959,17 +1954,36 @@ mod tests {
         panel.open_for(source, &s.doc.subdivision_links[&source].settings);
         panel.form.budget = 5000;
         panel.start(&s.doc, source, &egui::Context::default());
-        panel.cancel();
+        let job = panel.job.as_ref().unwrap();
+        let (flag, progress) = (job.cancel.clone(), job.progress.clone());
+        // Mid-search: wait for the first chunk.
         let t = Instant::now();
-        while panel.job.is_some() {
-            panel.poll();
-            assert!(
-                t.elapsed() < Duration::from_secs(60),
-                "cancel stops the search"
-            );
+        while progress.lock().unwrap().evaluated == 0 {
+            assert!(t.elapsed() < Duration::from_secs(60), "search started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Time-to-cancel: the panel is back to Run (no job, no result) right
+        // away — it used to wait for in-flight plans (1.1 s measured on a
+        // 1000 x 800 m site, debug build).
+        let t = Instant::now();
+        panel.cancel();
+        panel.poll();
+        let time_to_cancel = t.elapsed();
+        assert!(panel.job.is_none() && panel.cancelled && panel.result.is_none());
+        assert!(
+            time_to_cancel < Duration::from_millis(200),
+            "cancel took {time_to_cancel:?}"
+        );
+        // The worker really stops (drops its handles) long before its budget.
+        let t = Instant::now();
+        while Arc::strong_count(&flag) > 1 {
+            assert!(t.elapsed() < Duration::from_secs(60), "worker exits");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(panel.cancelled && panel.result.is_none());
+        assert!(
+            progress.lock().unwrap().evaluated < 5000,
+            "cancel stops the search"
+        );
     }
 
     #[test]

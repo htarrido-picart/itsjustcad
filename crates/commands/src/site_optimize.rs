@@ -89,8 +89,8 @@ pub struct OptimizeRequest {
     pub objective: Objective,
     /// Metric weights for [`Objective::Weighted`].
     pub weights: BTreeMap<String, f64>,
-    /// Number of site plans evaluated (default 400: on a ~80 ha walkable
-    /// site, seeds then agree within ~1 % in ~7 s).
+    /// Number of site plans evaluated (default 100, a quick first pass; on a
+    /// ~80 ha walkable site, budget=400 makes seeds agree within ~1 % in ~7 s).
     pub budget: usize,
     /// Search seed (not the layout `seed` param, which is searched).
     pub seed: u64,
@@ -446,7 +446,7 @@ impl Default for OptimizeRequest {
         OptimizeRequest {
             objective: Objective::Value,
             weights: BTreeMap::new(),
-            budget: 400,
+            budget: 100,
             seed: 1,
             top: 5,
             lock: Vec::new(),
@@ -1642,7 +1642,11 @@ fn rank(
                 break;
             }
             ctl.report(progress);
-            let shares: Vec<Option<FacadeDaylight>> = batch.par_iter().map(|(p, _)| day(p)).collect();
+            // A cancel skips the batch's not-yet-started ray casts.
+            let shares: Vec<Option<FacadeDaylight>> = batch
+                .par_iter()
+                .map(|(p, _)| if ctl.cancelled() { None } else { day(p) })
+                .collect();
             if ctl.cancelled() {
                 return Err(CANCELLED.into());
             }

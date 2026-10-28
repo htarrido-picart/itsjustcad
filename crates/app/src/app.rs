@@ -12466,6 +12466,7 @@ mod tests {
             ("yield", optimize_panel::SEG_YIELD),
             ("optimize", optimize_panel::SEG_OPTIMIZE),
             (running, optimize_panel::SEG_OPTIMIZE),
+            ("cancelled", optimize_panel::SEG_OPTIMIZE),
             ("climate", optimize_panel::SEG_OPTIMIZE),
             ("climate_yield", optimize_panel::SEG_YIELD),
         ] {
@@ -12485,7 +12486,7 @@ mod tests {
                             app.execute_line(format!("climate {epw}"));
                             app.optimize.form.constraints[12] = (true, 95.0); // max overheating
                         }
-                        if name == running {
+                        if name == running || name == "cancelled" {
                             use itsjustcad_commands::site_optimize::{Phase, Progress};
                             let p = Progress {
                                 phase: Phase::Search,
@@ -12494,7 +12495,10 @@ mod tests {
                                 feasible: 37,
                                 best: Some(612.0),
                             };
-                            app.optimize.fake_running(source, p, false);
+                            app.optimize.fake_running(source, p);
+                            if name == "cancelled" {
+                                app.optimize.cancel();
+                            }
                         } else if seg == optimize_panel::SEG_OPTIMIZE {
                             app.optimize.form.budget = 40;
                             app.optimize.run_now(&app.session.doc, source);
