@@ -648,6 +648,9 @@ impl CutSummary {
                 .map(|(k, n)| format!("{n} {k}"))
                 .collect();
             s.push_str(&format!("; left out {} (not cuttable)", parts.join(", ")));
+            if self.skipped.contains_key(SkipKind::Text.label()) {
+                s.push_str("; outline text with `textoutline <sel>` to cut it");
+            }
         }
         if self.fallback_spans > 0 {
             s.push_str(&format!(
@@ -1108,6 +1111,54 @@ pub(crate) mod tests {
         assert_eq!(f(&p.entities[0].1, 70), 1.0);
         assert_eq!(p.entities[0].2.len(), 4);
         assert!(!text.contains("TEXT") && !text.contains("DIMENSION"));
+    }
+
+    /// #172 acceptance: the 2 mm "PART-1" label, outlined, exports as closed
+    /// glyph polylines and no TEXT; cutcheck keeps checking the glyphs (their
+    /// strokes are thinner than 3 mm stock allows); undo brings the text back.
+    #[test]
+    fn outlined_label_exports_closed_glyphs_and_undo_restores_text() {
+        let mut s = plate();
+        let path = tmp("plate-outlined.dxf");
+        let export = format!("export {} profile=cut units=mm", path.display());
+        assert!(run(&mut s, &export).contains("textoutline"));
+
+        let out = run(&mut s, "textoutline all");
+        let contours = s.doc.len() - 2;
+        assert!(
+            out.contains(&format!("{contours} closed contour(s)")),
+            "{out}"
+        );
+        // P, A, R, T, -, 1: P/A/R have a counter each.
+        assert_eq!(contours, 9, "{out}");
+        let msg = run(&mut s, &export);
+        assert!(
+            msg.contains(" 0 open") && !msg.contains("left out"),
+            "{msg}"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("TEXT"), "{text}");
+        let p = parse_dxf(&text);
+        let polys: Vec<_> = p.entities.iter().filter(|e| e.0 == "POLYLINE").collect();
+        assert_eq!(polys.len(), 1 + contours);
+        assert!(polys.iter().all(|e| f(&e.1, 70) == 1.0), "all closed");
+        assert_eq!(p.entities.len(), polys.len() + 1, "plus the circle");
+
+        let check = run(&mut s, "cutcheck thickness=3");
+        for ok in ["open-contour", "crossing", "duplicate", "overlap", "text"] {
+            assert!(check.contains(&format!("| {ok} | PASS")), "{ok}: {check}");
+        }
+        assert!(check.contains("| min-hole | FAIL"), "{check}");
+
+        run(&mut s, "undo"); // cutcheck
+        run(&mut s, "undo"); // textoutline
+        assert_eq!(s.doc.len(), 3);
+        assert!(s.doc.objects().any(|o| matches!(
+            &o.geometry,
+            Geometry::Annotation(Annotation::Text { text, .. }) if text == "PART-1"
+        )));
+        run(&mut s, "redo");
+        assert_eq!(s.doc.len(), 2 + contours);
     }
 
     #[test]
