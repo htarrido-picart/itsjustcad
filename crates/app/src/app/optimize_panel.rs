@@ -902,6 +902,30 @@ impl Finished {
     }
 }
 
+/// The `climate` line that sets `path` as the document's climate file
+/// (`None` → `climate off`), exactly as the user would type it. The parser
+/// takes the rest of the line as the path (args joined by single spaces), so
+/// a path whose whitespace would not survive that is refused (`None`) rather
+/// than silently mangled.
+pub(crate) fn climate_line(path: Option<&std::path::Path>) -> Option<String> {
+    let Some(path) = path else {
+        return Some("climate off".into());
+    };
+    let s = path.to_str()?;
+    let line = format!("climate {s}");
+    match itsjustcad_commands::parse(&line) {
+        Ok(itsjustcad_commands::Command::Climate { path: Some(p), .. }) if p == s => Some(line),
+        _ => None,
+    }
+}
+
+/// Ask for an EPW file (`None` when cancelled).
+fn pick_epw() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("EnergyPlus weather (EPW)", &["epw", "EPW"])
+        .pick_file()
+}
+
 /// A climate as the panel names it: `city (file)`.
 fn climate_name(c: &itsjustcad_doc::Climate) -> String {
     format!("{} ({})", c.city, c.source)
@@ -1316,6 +1340,10 @@ impl App {
     fn optimize_daylight(&mut self, ui: &mut egui::Ui, source: ObjectId) {
         let busy = self.optimize.job.is_some();
         let climate = self.session.doc.climate.as_ref().map(climate_name);
+        let no_dialog = self.headless_no_dialog();
+        // Set (`Some(Some(path))`) or remove (`Some(None)`) the climate file,
+        // once the form's borrow ends.
+        let mut climate_change: Option<Option<std::path::PathBuf>> = None;
         let form = &mut self.optimize.form;
         let on = form.constraints[11].0 || form.constraints[12].0;
         egui::CollapsingHeader::new(t("optimize.daylight"))
@@ -1337,6 +1365,31 @@ impl App {
                             ui.weak(t("optimize.daylight.no_climate"));
                         }
                     }
+                    ui.add_space(crate::theme::Spacing::XS);
+                    ui.horizontal(|ui| {
+                        // Buttons keep side padding around their labels.
+                        ui.spacing_mut().button_padding.x =
+                            crate::theme::Spacing::S + crate::theme::Spacing::XS;
+                        let pick = if climate.is_some() {
+                            t("optimize.daylight.change_epw")
+                        } else {
+                            t("optimize.daylight.choose_epw")
+                        };
+                        if ui
+                            .button(pick)
+                            .on_hover_text(t("optimize.daylight.epw_hint"))
+                            .clicked()
+                            && !no_dialog
+                            && let Some(p) = pick_epw()
+                        {
+                            climate_change = Some(Some(p));
+                        }
+                        if climate.is_some()
+                            && ui.button(t("optimize.daylight.remove_epw")).clicked()
+                        {
+                            climate_change = Some(None);
+                        }
+                    });
                     ui.add_space(crate::theme::Spacing::XS);
                     egui::Grid::new(("optimize_daylight_grid", source))
                         .num_columns(2)
@@ -1378,6 +1431,9 @@ impl App {
                         });
                 });
             });
+        if let Some(path) = climate_change {
+            self.set_climate_file(path.as_deref());
+        }
     }
 
     /// The Yield segment's `Economics` block for a site plan: the current

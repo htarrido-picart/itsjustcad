@@ -3750,6 +3750,44 @@ impl App {
             })
     }
 
+    /// Set (`Some`) or remove (`None`) the document's climate file through the
+    /// logged `climate` command — undoable and in history, as if typed. False
+    /// when it did not take (the error is in the command log).
+    fn set_climate_file(&mut self, path: Option<&std::path::Path>) -> bool {
+        let Some(line) = optimize_panel::climate_line(path) else {
+            self.command_line.push_line(format!(
+                "climate: cannot use {} (its whitespace does not survive the command line) — rename it",
+                path.map(|p| p.display().to_string()).unwrap_or_default()
+            ));
+            return false;
+        };
+        let edits = self.session.edit_count();
+        self.execute_line(line);
+        self.session.edit_count() != edits
+    }
+
+    /// Split an OS drop into the first `.epw` (the climate file), the
+    /// importable files, and whether any image came along (the chat deck's).
+    fn split_dropped(
+        paths: Vec<std::path::PathBuf>,
+    ) -> (Option<std::path::PathBuf>, Vec<std::path::PathBuf>, bool) {
+        let ext = |p: &std::path::Path| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default()
+        };
+        let has_image = paths
+            .iter()
+            .any(|p| matches!(ext(p).as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif"));
+        let epw = paths.iter().find(|p| ext(p) == "epw").cloned();
+        let importable = paths
+            .into_iter()
+            .filter(|p| Self::is_importable(p))
+            .collect();
+        (epw, importable, has_image)
+    }
+
     /// Handle OS drag-and-drop: import the first supported file dropped this
     /// frame. Imports are serial (DXF runs as a batched job that owns
     /// `import_job`), so a drop while one is in flight is refused rather than
@@ -3761,21 +3799,29 @@ impl App {
         }
         let all_paths: Vec<std::path::PathBuf> =
             dropped.into_iter().filter_map(|f| f.path).collect();
+        self.handle_dropped_paths(all_paths);
+    }
+
+    /// [`Self::handle_dropped_files`] past the egui input: a `.epw` becomes the
+    /// climate file (the logged `climate` command, not an import); the first
+    /// importable file is imported.
+    fn handle_dropped_paths(&mut self, all_paths: Vec<std::path::PathBuf>) {
         // Images are the chat deck's job (dropped onto the chat → vision
         // attachment, handled in `deck_pane`); don't claim them here or warn.
-        let has_image = all_paths.iter().any(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif"))
-        });
-        let paths: Vec<std::path::PathBuf> = all_paths
-            .into_iter()
-            .filter(|p| Self::is_importable(p))
-            .collect();
+        let (epw, paths, has_image) = Self::split_dropped(all_paths);
+        if let Some(epw) = &epw
+            && self.set_climate_file(Some(epw))
+        {
+            let name = epw
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            self.command_line.push_line(format!("climate: {name}"));
+        }
         let Some(first) = paths.first().cloned() else {
-            // Stay silent for an image-only drop — the chat deck attaches it.
-            if !has_image {
+            // Stay silent for an image-only or climate-only drop — the chat
+            // deck attaches images; the EPW was handled above.
+            if !has_image && epw.is_none() {
                 self.command_line
                     .push_line("drop ignored: not an importable file (dxf/dwg/ifc/obj/stl/…)");
             }
@@ -12469,6 +12515,7 @@ mod tests {
             ("cancelled", optimize_panel::SEG_OPTIMIZE),
             ("climate", optimize_panel::SEG_OPTIMIZE),
             ("climate_yield", optimize_panel::SEG_YIELD),
+            ("noclimate", optimize_panel::SEG_OPTIMIZE),
         ] {
             for dark in [false, true] {
                 // Tall, so the whole panel (results included) fits unscrolled.
@@ -12485,6 +12532,10 @@ mod tests {
                             );
                             app.execute_line(format!("climate {epw}"));
                             app.optimize.form.constraints[12] = (true, 95.0); // max overheating
+                        }
+                        if name == "noclimate" {
+                            // Daylight open, no climate file: the picker.
+                            app.optimize.form.constraints[12] = (true, 95.0);
                         }
                         if name == running || name == "cancelled" {
                             use itsjustcad_commands::site_optimize::{Phase, Progress};
@@ -12745,6 +12796,66 @@ mod tests {
             modifiers: m,
         });
         harness.run_steps(2);
+    }
+
+    /// Drop `paths` on the window (a real OS drop event) and settle.
+    #[cfg(test)]
+    fn drop_files(harness: &mut egui_kittest::Harness<'_, App>, paths: &[std::path::PathBuf]) {
+        harness.input_mut().dropped_files = paths
+            .iter()
+            .map(|p| egui::DroppedFile {
+                path: Some(p.clone()),
+                ..Default::default()
+            })
+            .collect();
+        harness.run_steps(2);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_drop_epw_sets_climate() {
+        let epw = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../commands/tests/fixtures/guayaquil_synthetic.epw"
+        ));
+        run_app_journey(|h| {
+            // A non-importable, non-EPW drop is still just refused.
+            drop_files(h, &[std::path::PathBuf::from("/tmp/notes.txt")]);
+            assert!(h.state().session.doc.climate.is_none());
+            assert!(
+                h.state()
+                    .command_line
+                    .scrollback()
+                    .iter()
+                    .any(|l| l.starts_with("drop ignored"))
+            );
+
+            drop_files(h, std::slice::from_ref(&epw));
+            let app = h.state();
+            let c = app
+                .session
+                .doc
+                .climate
+                .as_ref()
+                .expect("dropped EPW is the climate");
+            assert_eq!(c.source, "guayaquil_synthetic.epw");
+            assert!(app.import_job.is_none(), "not an import");
+            let lines = app.command_line.scrollback();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l == &format!("> climate {}", epw.display())),
+                "typed-equivalent command logged"
+            );
+            assert_eq!(
+                lines.last().map(String::as_str),
+                Some("climate: guayaquil_synthetic.epw")
+            );
+
+            // Logged like typing it: one undo removes it.
+            h.state_mut().execute_line("undo".into());
+            assert!(h.state().session.doc.climate.is_none(), "undoable");
+        });
     }
 
     #[test]
@@ -14440,6 +14551,51 @@ mod tests {
         for bad in ["notes.txt", "image.png", "noext", "archive.zip"] {
             assert!(!App::is_importable(Path::new(bad)), "{bad} must not import");
         }
+    }
+
+    #[test]
+    fn climate_line_is_the_typed_command() {
+        use itsjustcad_commands::{Command, parse};
+        use std::path::Path;
+        assert_eq!(
+            optimize_panel::climate_line(None).as_deref(),
+            Some("climate off")
+        );
+        // Spaces survive (the parser takes the rest of the line).
+        for p in ["/data/site.epw", "/My Files/Guayaquil 2024.epw"] {
+            let line = optimize_panel::climate_line(Some(Path::new(p))).unwrap();
+            assert_eq!(line, format!("climate {p}"));
+            assert!(matches!(parse(&line), Ok(Command::Climate { path: Some(q), .. }) if q == p));
+        }
+        // Whitespace the parser would collapse is refused, never mangled.
+        for p in ["/a  b.epw", "/a\tb.epw", "/a/b.epw "] {
+            assert_eq!(
+                optimize_panel::climate_line(Some(Path::new(p))),
+                None,
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_epw_is_climate_not_import() {
+        use std::path::PathBuf;
+        let p = |s: &str| PathBuf::from(s);
+        let (epw, imp, img) =
+            App::split_dropped(vec![p("/x/plan.dxf"), p("/x/Site.EPW"), p("/x/b.epw")]);
+        assert_eq!(epw, Some(p("/x/Site.EPW")), "first .epw, any case");
+        assert_eq!(
+            imp,
+            vec![p("/x/plan.dxf")],
+            "EPW never reaches the import job"
+        );
+        assert!(!img);
+        // Non-EPW drops are unchanged: importables imported, images flagged,
+        // the rest ignored.
+        let (epw, imp, img) = App::split_dropped(vec![p("/x/a.png"), p("/x/n.txt"), p("/x/m.obj")]);
+        assert_eq!((epw, imp, img), (None, vec![p("/x/m.obj")], true));
+        let (epw, imp, img) = App::split_dropped(vec![p("/x/n.txt")]);
+        assert_eq!((epw, imp.len(), img), (None, 0, false));
     }
 
     // ── Cross-platform symbol-font fallback (GitHub issue #26) ──────────────
