@@ -1169,11 +1169,9 @@ impl App {
                             ui.end_row();
                         }
                         for row in &f.rows {
-                            if ui
-                                .small_button("✔")
-                                .on_hover_text(t("optimize.apply"))
-                                .clicked()
-                            {
+                            // A labelled button, not a bare check mark: the
+                            // grid sizes the column to the (translated) text.
+                            if ui.small_button(t("optimize.apply")).clicked() {
                                 apply = Some(row.clone());
                             }
                             let rank = format!("{}{}", row.rank, if row.pareto { " ◆" } else { "" });
