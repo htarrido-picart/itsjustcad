@@ -227,7 +227,7 @@ const RULES: &[(&str, Severity, &str)] = &[
     (
         "text",
         Severity::Warn,
-        "text is single-stroke, not outlined — it is left out of the cut file (outline it, see #172, or remove it)",
+        "text is single-stroke, not outlined — it is left out of the cut file (outline it with `textoutline <sel>`, or remove it)",
     ),
     (
         "annotation",
@@ -937,6 +937,29 @@ mod tests {
 
     fn short(s: &Session, nth: usize) -> String {
         s.doc.objects().nth(nth).unwrap().id.short()
+    }
+
+    /// #172: a 60 × 30 mm plate with an 8 mm "IJC 08" label. Before outlining
+    /// the label is a "text" WARN; after `textoutline` it is cut as closed
+    /// glyph contours, and the counters of 0 and 8 fall out as islands.
+    #[test]
+    fn outlined_text_cuts_as_closed_contours_with_island_counters() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 0.06 0.03");
+        run(&mut s, "text 0.005,0.01,0 IJC 08 0.008");
+        let msg = run(&mut s, "cutcheck thickness=1");
+        assert_eq!(failing(&s), ["text"], "{msg}");
+
+        let out = run(&mut s, "textoutline all");
+        assert!(out.contains("1 text object(s)"), "{out}");
+        let msg = run(&mut s, "cutcheck thickness=1");
+        // No text, open, crossing or duplicate finding: the glyphs are closed
+        // holes in the plate. The counters (one in 0, two in 8) are islands,
+        // and as loose parts they are also below the minimum part size.
+        assert_eq!(failing(&s), ["part-size", "island"], "{msg}");
+        assert_eq!(rule(&s, "island").objects.len(), 3, "{msg}");
+        assert_eq!(rule(&s, "island").verdict, "warn");
+        assert_eq!(rule(&s, "part-size").objects, rule(&s, "island").objects);
     }
 
     #[test]

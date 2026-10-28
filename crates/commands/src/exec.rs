@@ -12465,6 +12465,77 @@ fn apply_forward(
                 },
             ))
         }
+        Command::TextOutline { ids: replay_ids, targets } => {
+            let sel = resolve(doc, &targets)?;
+            if sel.is_empty() {
+                return Err(ExecError::Invalid("textoutline: nothing selected".into()));
+            }
+            // Outline every text/field first so a bad glyph leaves the doc untouched.
+            let mut jobs: Vec<(ObjectId, Vec<Curve>)> = Vec::new();
+            let mut missing: Vec<char> = Vec::new();
+            for id in &sel {
+                let Geometry::Annotation(
+                    Annotation::Text { pos, text, height }
+                    | Annotation::Field { pos, text, height, .. },
+                ) = &doc.get(*id).expect("resolved").geometry
+                else {
+                    continue;
+                };
+                let (glyphs, miss) = crate::textoutline::outline_text(text, *pos, *height)
+                    .map_err(|e| ExecError::Invalid(format!("textoutline: {e}")))?;
+                missing.extend(miss);
+                let curves: Vec<Curve> = glyphs
+                    .into_iter()
+                    .flatten()
+                    .map(|points| Curve::Polyline { points, closed: true })
+                    .collect();
+                jobs.push((*id, curves));
+            }
+            if jobs.is_empty() {
+                return Err(ExecError::Invalid(
+                    "textoutline: selection has no text to outline".into(),
+                ));
+            }
+            let total: usize = jobs.iter().map(|j| j.1.len()).sum();
+            let created: Vec<ObjectId> = match replay_ids {
+                Some(ids) if ids.len() == total => ids,
+                _ => (0..total).map(|_| ObjectId::new()).collect(),
+            };
+            let mut consumed = Vec::with_capacity(jobs.len());
+            let mut next = created.iter();
+            for (id, curves) in jobs {
+                let (obj, index) = doc.remove(id).expect("resolved");
+                for c in curves {
+                    doc.insert(SceneObject {
+                        visible: true,
+                        id: *next.next().expect("created ids cover all contours"),
+                        name: obj.name.clone(),
+                        layer: obj.layer.clone(),
+                        color: obj.color,
+                        material: obj.material,
+                        lineweight_mm: obj.lineweight_mm,
+                        edge_tags: None,
+                        street: None,
+                        geometry: Geometry::Curve(c),
+                    });
+                }
+                consumed.push((obj, index));
+            }
+            let mut message = format!(
+                "outlined {} text object(s) -> {total} closed contour(s) (font Hack)",
+                consumed.len()
+            );
+            if !missing.is_empty() {
+                missing.dedup();
+                let m: String = missing.into_iter().collect();
+                message.push_str(&format!("; no glyph for {m:?}, left out"));
+            }
+            Ok((
+                Command::TextOutline { ids: Some(created.clone()), targets },
+                Inverse::Replace { created: created.clone(), consumed },
+                ApplyOutcome { message, created },
+            ))
+        }
         Command::Stretch { targets, min, max, delta } => {
             let ids = resolve(doc, &targets)?;
             // Snapshot BEFORE mutating, and only for objects that actually
@@ -17258,6 +17329,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::ToOrigin { .. } => "tozero",
         Command::Flatten { .. } => "flatten",
         Command::Explode { .. } => "explode",
+        Command::TextOutline { .. } => "textoutline",
         Command::Stretch { .. } => "stretch",
         Command::SelSimilar { .. } => "selsimilar",
         Command::SelDup { .. } => "seldup",
@@ -20838,6 +20910,22 @@ mod tests {
         let a: Vec<_> = s.doc.objects().collect();
         let b: Vec<_> = replayed.doc.objects().collect();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn textoutline_replay_stable_and_args() {
+        let mut s = Session::default();
+        run(&mut s, "text 0,0,0 IJC 08 0.01");
+        run(&mut s, "line 0,0 1,0");
+        let out = run(&mut s, "textoutline all font=Hack");
+        assert!(out.message.contains("1 text object(s)"), "{}", out.message);
+        let replayed = Session::replay(s.save_log()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+        assert!(parse("textoutline sel font=comic").is_err());
+        let err = s.run(parse("textoutline last").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("no text"), "{err}");
     }
 
     #[test]

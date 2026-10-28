@@ -29,3 +29,8 @@ rayon.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 e57 = "0.11.13"
 laz = "0.13"
+# Text to outline (#172): TrueType outline reader (MIT OR Apache-2.0) and the
+# Hack Regular font egui already ships (MIT + Bitstream Vera License).
+# Both are already in the lockfile through eframe; keep versions in step.
+skrifa = "0.42"
+epaint_default_fonts = "0.35"

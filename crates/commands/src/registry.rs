@@ -523,6 +523,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Curve,
         },
         CommandSpec {
+            name: "textoutline",
+            usage: "textoutline <selector> [font=hack]",
+            summary: "Text to outline for cutting: replace each text/field in the selection with closed polylines tracing its glyphs in the Hack outline font (cap height = text height), on the same layer, one undo step. Counters (inside of o, 8) stay as nested contours, so `cutcheck` reports them as islands. Then `export <f>.dxf profile=cut` cuts the lettering. Example: textoutline sel",
+            category: Category::Curve,
+        },
+        CommandSpec {
             name: "constrain",
             usage: "constrain <kind> <selector> [selector] [value]",
             summary: "Add a sketch constraint over lines/circles and re-solve immediately. Kinds: coincident, horizontal, vertical, distance, length, angle (deg), parallel, perpendicular, equal, radius, fixed, tangent, midpoint, on. Endpoint pairs resolve nearest-first. Example: constrain horizontal last · constrain length name:l1 5 · constrain perpendicular name:l1 name:l2",

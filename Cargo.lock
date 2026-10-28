@@ -2765,6 +2765,7 @@ version = "0.7.0"
 dependencies = [
  "dirs",
  "e57",
+ "epaint_default_fonts",
  "glam 0.30.10",
  "image",
  "itsjustcad-constraints",
@@ -2777,6 +2778,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "skrifa",
  "subdivision",
  "thiserror 2.0.20",
  "uuid",

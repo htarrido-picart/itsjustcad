@@ -1040,6 +1040,18 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
             expect_empty("explode", rest, &args)?;
             Ok(Command::Explode { ids: None, targets: sel })
         }
+        "textoutline" => {
+            let (sel, rest) = selector(&args, "textoutline")?;
+            let font_ok = |a: &&str| {
+                a.strip_prefix("font=").is_some_and(|f| {
+                    crate::textoutline::FONTS.contains(&f.to_ascii_lowercase().as_str())
+                })
+            };
+            if !rest.iter().all(font_ok) {
+                return wrong("textoutline", "a selector and optional font=hack", &args);
+            }
+            Ok(Command::TextOutline { ids: None, targets: sel })
+        }
         "stretch" => {
             let (sel, rest) = selector(&args, "stretch")?;
             let [min, max, delta] = take::<3>(

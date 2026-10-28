@@ -877,6 +877,16 @@ pub enum Command {
         ids: Option<Vec<ObjectId>>,
         targets: Selector,
     },
+    /// Text to outline (#172): replace each text/field annotation in the
+    /// selection with closed polylines tracing its glyphs in an outline font
+    /// (Hack), on the same layer, so the cut DXF profile can cut it. Counters
+    /// ("o", "8") stay separate nested contours. `ids` caches the created
+    /// contour ids so op-log replay reproduces them.
+    TextOutline {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+        targets: Selector,
+    },
     /// Stretch: the command-substrate half of AutoCAD's STRETCH. For each object
     /// in the selection, every mutable vertex whose position falls inside the
     /// [`min`, `max`] AABB (inclusive) is shifted by `delta`; vertices outside
