@@ -191,6 +191,21 @@ pub fn role_button(
     resp
 }
 
+/// Add `button` stretched to `size` with its label centered on both axes.
+///
+/// egui places a button's label by the *parent* layout's alignment, so a button
+/// drawn wider or taller than its text in a top-down, left-aligned panel shows
+/// the text in the top-left. A centered-and-justified child layout pins it to
+/// the middle whatever the parent; every stretched button goes through here.
+pub fn sized_button(ui: &mut egui::Ui, size: egui::Vec2, button: egui::Button<'_>) -> egui::Response {
+    ui.add_sized(size, button)
+}
+
+/// [`sized_button`] spanning the full available width at height `h`.
+pub fn full_width_button(ui: &mut egui::Ui, h: f32, button: egui::Button<'_>) -> egui::Response {
+    sized_button(ui, egui::vec2(ui.available_width(), h), button)
+}
+
 // ── Segmented control ────────────────────────────────────────────────────
 
 /// A real segmented control: equal-width segments, all one type, single
@@ -493,6 +508,41 @@ mod tests {
 
     fn roles() -> ColorRoles {
         theme::roles_from([0.13, 0.14, 0.16, 1.0], [0.0, 0.63, 0.95, 1.0])
+    }
+
+    // ── Centered button labels ──────────────────────────────────────────
+
+    /// Lay out one button in a default (top-down, left-aligned) panel and
+    /// return its rect plus the painted label's rect.
+    fn button_and_label(add: impl FnOnce(&mut egui::Ui) -> egui::Response) -> (egui::Rect, egui::Rect) {
+        let ctx = egui::Context::default();
+        let mut add = Some(add);
+        let mut rect = egui::Rect::NOTHING;
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            rect = (add.take().unwrap())(ui).rect;
+        });
+        let label = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some(t.galley.rect.translate(t.pos.to_vec2())),
+                _ => None,
+            })
+            .expect("button label painted");
+        (rect, label)
+    }
+
+    #[test]
+    fn wide_button_label_is_centered() {
+        let size = egui::vec2(300.0, 40.0);
+        // The bug: a plain stretched button follows the left/top-aligned parent.
+        let (b, l) = button_and_label(|ui| ui.add(egui::Button::new("Run Check").min_size(size)));
+        assert!(l.center().x < b.center().x - 50.0, "plain wide button label hugs the left");
+        // The fix: the shared helper centers it on both axes.
+        let (b, l) = button_and_label(|ui| sized_button(ui, size, egui::Button::new("Run Check")));
+        assert!(b.width() >= size.x && b.height() >= size.y, "button keeps its size: {b:?}");
+        assert!((l.center().x - b.center().x).abs() <= 1.0, "label centered horizontally: {l:?} in {b:?}");
+        assert!((l.center().y - b.center().y).abs() <= 1.0, "label centered vertically: {l:?} in {b:?}");
     }
 
     // ── Button roles ─────────────────────────────────────────────────────

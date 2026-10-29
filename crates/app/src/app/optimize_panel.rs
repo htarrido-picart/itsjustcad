@@ -1344,12 +1344,10 @@ impl App {
                 let text = egui::RichText::new(t("optimize.run"))
                     .strong()
                     .color(ui.visuals().strong_text_color());
-                let run = egui::Button::new(text)
-                    .fill(fill)
-                    .min_size(egui::vec2(ui.available_width(), crate::theme::Spacing::HIT_TARGET));
+                let run = egui::Button::new(text).fill(fill);
                 let other = self.optimize.running_source().is_some();
                 let mut start = false;
-                if ui.add(run).clicked() {
+                if crate::widgets::full_width_button(ui, crate::theme::Spacing::HIT_TARGET, run).clicked() {
                     // One search per document: another site's search runs,
                     // so ask before stopping it.
                     if other {

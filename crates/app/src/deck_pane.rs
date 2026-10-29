@@ -1165,9 +1165,10 @@ fn commands_card(ui: &mut egui::Ui, commands: &[ExecutedCommand]) -> bool {
     } else {
         (format!("✓ {} command(s) drawn  ›", commands.len()), OK_COLOR)
     };
-    ui.add(
-        egui::Button::new(egui::RichText::new(text).color(color))
-            .min_size(egui::vec2(ui.available_width(), 30.0)),
+    crate::widgets::full_width_button(
+        ui,
+        30.0,
+        egui::Button::new(egui::RichText::new(text).color(color)),
     )
     .on_hover_text("show the drafted commands")
     .clicked()
