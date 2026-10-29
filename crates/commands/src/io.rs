@@ -52,6 +52,11 @@ struct FileFormat {
     /// without runs stay byte-identical. Older builds ignore it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     optimize_runs: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The last cutting preset used (#209): metadata, not replayed. Read
+    /// leniently (see [`crate::cut_preset::from_header`]); omitted while
+    /// unset. Older builds ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_export: Option<serde_json::Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +83,7 @@ pub fn to_json(session: &Session) -> String {
         branches,
         branch,
         optimize_runs: crate::optimize_runs::to_header(&session.optimize_runs()),
+        cut_export: crate::cut_preset::to_header(session.cut_preset()),
     };
     serde_json::to_string_pretty(&file).expect("op-log serializes")
 }
@@ -94,6 +100,7 @@ pub fn from_json(json: &str) -> Result<Session, IoError> {
     );
     session.set_doc_uuid(file.uuid);
     session.set_optimize_runs(crate::optimize_runs::from_header(file.optimize_runs));
+    session.cut_preset = crate::cut_preset::from_header(file.cut_export);
     Ok(session)
 }
 
@@ -188,6 +195,7 @@ pub fn load_file(path: &std::path::Path) -> Result<Session, IoError> {
         session.set_branches(file.branches, branch);
         session.set_doc_uuid(file.uuid);
         session.set_optimize_runs(crate::optimize_runs::from_header(file.optimize_runs));
+        session.cut_preset = crate::cut_preset::from_header(file.cut_export);
         return Ok(session);
     }
 
@@ -195,6 +203,7 @@ pub fn load_file(path: &std::path::Path) -> Result<Session, IoError> {
     session.set_branches(file.branches, branch);
     session.set_doc_uuid(file.uuid);
     session.set_optimize_runs(crate::optimize_runs::from_header(file.optimize_runs));
+    session.cut_preset = crate::cut_preset::from_header(file.cut_export);
     Ok(session)
 }
 

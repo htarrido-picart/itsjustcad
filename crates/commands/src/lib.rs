@@ -10,6 +10,7 @@ pub mod checkengine;
 mod command;
 pub mod csv;
 pub mod cut;
+pub mod cut_preset;
 pub mod cutcheck;
 pub mod dwg;
 pub mod dxf;

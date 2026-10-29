@@ -413,6 +413,9 @@ pub struct Session {
     /// boundary. Document metadata saved in the file header (see
     /// [`crate::optimize_runs`]): never logged, so never an undo step.
     optimize_runs: BTreeMap<ObjectId, crate::optimize_runs::SavedRun>,
+    /// The last cutting preset used (#209), saved in the file header (see
+    /// [`crate::cut_preset`]); `None` until one is chosen (= SendCutSend).
+    pub(crate) cut_preset: Option<crate::cut_preset::CutPreset>,
     /// Bumped when the metadata above changes, so a host can tell the
     /// document needs saving although the op-log did not move.
     meta_rev: u64,
@@ -747,6 +750,7 @@ impl Default for Session {
             last_import: None,
             last_site_optimize: None,
             optimize_runs: BTreeMap::new(),
+            cut_preset: None,
             meta_rev: 0,
         }
     }
@@ -786,8 +790,18 @@ impl Session {
                 self.run(Command::CodeCheck { pack, story, rules: Some(rules), ids })
             }
             Command::CheckRulesList => Ok(self.checkrules_list()),
-            Command::CutCheck { targets, layers, units, thickness, material, limits: None, ids } => {
+            Command::CutCheck {
+                preset,
+                targets,
+                layers,
+                units,
+                thickness,
+                material,
+                limits: None,
+                ids,
+            } => {
                 let limits = crate::cutcheck::resolve_limits(
+                    preset,
                     units,
                     thickness,
                     material.as_deref(),
@@ -799,6 +813,7 @@ impl Session {
                     None => None,
                 };
                 self.run(Command::CutCheck {
+                    preset,
                     targets,
                     layers,
                     units,
@@ -1003,8 +1018,22 @@ impl Session {
         self.optimize_runs = runs;
     }
 
+    /// The document's last cutting preset (#209), `None` when never chosen.
+    pub fn cut_preset(&self) -> Option<crate::cut_preset::CutPreset> {
+        self.cut_preset
+    }
+
+    /// Remember `preset` as the document's cutting preset. Not logged (no
+    /// undo step); bumps [`Session::meta_revision`] when it changes.
+    pub fn set_cut_preset(&mut self, preset: crate::cut_preset::CutPreset) {
+        if self.cut_preset != Some(preset) {
+            self.cut_preset = Some(preset);
+            self.meta_rev += 1;
+        }
+    }
+
     /// Changes to the document metadata that is not in the op-log (saved
-    /// optimizer runs). A host saving the file records it next to its
+    /// optimizer runs, the cutting preset). A host saving the file records it next to its
     /// op-log cursor to tell whether the document is dirty.
     pub fn meta_revision(&self) -> u64 {
         self.meta_rev
@@ -5411,6 +5440,7 @@ fn place_markers(
 #[allow(clippy::too_many_arguments)]
 fn exec_cutcheck(
     doc: &mut Document,
+    preset: crate::cut_preset::CutPreset,
     targets: Option<Selector>,
     layers: Vec<String>,
     units: crate::cut::CutUnit,
@@ -5450,6 +5480,7 @@ fn exec_cutcheck(
     doc.generation += 1;
     Ok((
         Command::CutCheck {
+            preset,
             targets,
             layers,
             units,
@@ -14677,8 +14708,8 @@ fn apply_forward(
         Command::CodeCheck { pack, story, rules, ids } => {
             exec_codecheck(doc, pack, story, rules, ids)
         }
-        Command::CutCheck { targets, layers, units, thickness, material, limits, ids } => {
-            exec_cutcheck(doc, targets, layers, units, thickness, material, limits, ids)
+        Command::CutCheck { preset, targets, layers, units, thickness, material, limits, ids } => {
+            exec_cutcheck(doc, preset, targets, layers, units, thickness, material, limits, ids)
         }
         Command::CutMaterials { .. } => Err(ExecError::Invalid(
             "cutmaterials is session-level; this is a bug".into(),

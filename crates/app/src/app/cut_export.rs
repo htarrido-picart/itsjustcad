@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! "Export for cutting…" (#175, desktop host of #153): check the drawing
-//! against SendCutSend's limits (or the rule of thumb), then export a cut DXF
-//! in mm or inches. Mirrors the iOS sheet (itsjustcad-ios `CutExportSheet`):
-//! units, scope, material or thickness, the SendCutSend data, **Run Check**
+//! "Export for SendCutSend…" (#175, #209; desktop host of #153): check the
+//! drawing against SendCutSend's limits (or the rule of thumb), then export a
+//! cut DXF in mm or inches. Mirrors the iOS sheet (itsjustcad-ios
+//! `CutExportSheet`): the preset (SendCutSend, or Generic
+//! laser/waterjet/router: rule of thumb, no SendCutSend data or link, kept
+//! per document), units, scope, material or thickness, the SendCutSend data, **Run Check**
 //! (`cutcheck …`, FAIL then WARN rows that select their markers), and
 //! **Export DXF…** (`export <path> profile=cut …`, confirmed first while FAIL
 //! rows remain). Both lines run through the command line, so they are logged.
@@ -20,6 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use egui::{Margin, RichText};
 use itsjustcad_commands::cut::CutUnit;
+use itsjustcad_commands::cut_preset::CutPreset;
 use itsjustcad_commands::scs::{self, ScsData};
 use itsjustcad_commands::{Command, Session, checkengine::COMPLIANCE_LAYER, cutcheck};
 use itsjustcad_doc::{ComplianceReport, Document, ObjectId};
@@ -49,9 +52,11 @@ pub enum CutScope {
 }
 
 /// What the panel's form holds. `thickness` is in `units`; a SKU in
-/// `material` carries its own thickness, so the thickness goes only without one.
+/// `material` carries its own thickness, so the thickness goes only without
+/// one. The generic preset never sends a material.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CutForm {
+    pub preset: CutPreset,
     pub units: CutUnit,
     pub scope: CutScope,
     pub layers: Vec<String>,
@@ -70,8 +75,12 @@ impl CutForm {
         if self.scope == CutScope::Layers && self.layers.is_empty() {
             return Some("cut.blocker.layers");
         }
-        if self.material.is_none() && !self.thickness.is_some_and(|t| t > 0.0) {
-            return Some("cut.blocker.material");
+        if self.material_to_send().is_none() && !self.thickness.is_some_and(|t| t > 0.0) {
+            return Some(if self.preset.is_scs() {
+                "cut.blocker.material"
+            } else {
+                "cut.blocker.thickness"
+            });
         }
         None
     }
@@ -81,8 +90,12 @@ impl CutForm {
         !(self.scope == CutScope::Layers && self.layers.is_empty())
     }
 
+    fn material_to_send(&self) -> Option<&str> {
+        self.material.as_deref().filter(|_| self.preset.is_scs())
+    }
+
     fn thickness_to_send(&self) -> Option<f64> {
-        self.material.is_none().then_some(self.thickness).flatten()
+        self.material_to_send().is_none().then_some(self.thickness).flatten()
     }
 
     /// The `cutcheck` line.
@@ -91,11 +104,14 @@ impl CutForm {
         if self.scope == CutScope::Selection {
             parts.push("sel".into());
         }
+        if !self.preset.is_scs() {
+            parts.push(format!("preset={}", self.preset.label()));
+        }
         parts.push(format!("units={}", self.units.label()));
         if let Some(t) = self.thickness_to_send() {
             parts.push(format!("thickness={}", fmt_num(t)));
         }
-        if let Some(m) = &self.material {
+        if let Some(m) = self.material_to_send() {
             parts.push(format!("material={m}"));
         }
         if self.scope == CutScope::Layers {
@@ -384,6 +400,13 @@ impl CutExportPanel {
         }
     }
 
+    /// Start on `preset` (the document's last one).
+    pub fn with_preset(mut self, preset: CutPreset) -> Self {
+        self.form.preset = preset;
+        self.checked_form.preset = preset;
+        self
+    }
+
     /// Put back the selection the scope means before the core reads it.
     fn restore_scope(&self, doc: &mut Document) {
         if self.form.scope == CutScope::Selection {
@@ -537,6 +560,27 @@ impl CutExportPanel {
         updating: bool,
         action: &mut Option<PanelAction>,
     ) {
+        // Preset.
+        section(ui, t("cut.preset"), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (p, key) in [
+                    (CutPreset::Scs, "cut.preset.scs"),
+                    (CutPreset::Generic, "cut.preset.generic"),
+                ] {
+                    ui.selectable_value(&mut self.form.preset, p, t(key));
+                }
+            });
+        });
+        let scs = self.form.preset.is_scs();
+        footer(
+            ui,
+            t(if scs {
+                "cut.preset.footer.scs"
+            } else {
+                "cut.preset.footer.generic"
+            }),
+        );
+
         // Units.
         section(ui, t("cut.units"), |ui| {
             ui.horizontal(|ui| {
@@ -582,6 +626,70 @@ impl CutExportPanel {
             _ => {}
         }
 
+        if scs {
+            self.scs_ui(ui, roles, updating, action);
+        } else {
+            // Generic: the rule of thumb needs only a thickness.
+            section(ui, t("cut.material"), |ui| self.thickness_row(ui));
+        }
+
+        // Run Check.
+        ui.add_space(Spacing::M);
+        let blocker = self.form.blocker();
+        if prominent(ui, roles, t("cut.check"), blocker.is_none()).clicked() {
+            *action = Some(PanelAction::Check);
+        }
+        if let Some(b) = blocker {
+            footer(ui, t(b));
+        }
+
+        // Findings.
+        if let Some(r) = self.result.clone() {
+            self.findings_ui(ui, roles, &r, action);
+        }
+
+        // Export.
+        ui.add_space(Spacing::M);
+        if self.confirm_export {
+            self.confirm_ui(ui, roles, action);
+        } else if prominent(ui, roles, t("cut.export"), self.form.can_export()).clicked() {
+            if self.result.as_ref().is_some_and(CutResult::needs_confirm) {
+                self.confirm_export = true;
+            } else {
+                *action = Some(PanelAction::Export);
+            }
+        }
+        if let Some(e) = &self.export_error {
+            ui.add_space(Spacing::XS);
+            ui.label(RichText::new(e).color(to_color32(roles.destructive)));
+        }
+        if let Some(p) = &self.exported {
+            ui.add_space(Spacing::XS);
+            ui.label(t("cut.export.done").replace("{path}", &p.display().to_string()));
+            // Only SendCutSend takes the file online.
+            if self.form.preset.is_scs() && ui.link(t("cut.open_scs")).clicked() {
+                *action = Some(PanelAction::OpenSite);
+            }
+        }
+        footer(
+            ui,
+            t(if self.form.units == CutUnit::Mm {
+                "cut.export.footer.mm"
+            } else {
+                "cut.export.footer.in"
+            }),
+        );
+        ui.add_space(Spacing::S);
+    }
+
+    /// The SendCutSend preset's material picker and data section.
+    fn scs_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        roles: &ColorRoles,
+        updating: bool,
+        action: &mut Option<PanelAction>,
+    ) {
         // Material or thickness.
         section(ui, t("cut.material"), |ui| self.material_ui(ui));
         footer(
@@ -642,53 +750,6 @@ impl CutExportPanel {
         } else {
             footer(ui, t("cut.data.offline"));
         }
-
-        // Run Check.
-        ui.add_space(Spacing::M);
-        let blocker = self.form.blocker();
-        if prominent(ui, roles, t("cut.check"), blocker.is_none()).clicked() {
-            *action = Some(PanelAction::Check);
-        }
-        if let Some(b) = blocker {
-            footer(ui, t(b));
-        }
-
-        // Findings.
-        if let Some(r) = self.result.clone() {
-            self.findings_ui(ui, roles, &r, action);
-        }
-
-        // Export.
-        ui.add_space(Spacing::M);
-        if self.confirm_export {
-            self.confirm_ui(ui, roles, action);
-        } else if prominent(ui, roles, t("cut.export"), self.form.can_export()).clicked() {
-            if self.result.as_ref().is_some_and(CutResult::needs_confirm) {
-                self.confirm_export = true;
-            } else {
-                *action = Some(PanelAction::Export);
-            }
-        }
-        if let Some(e) = &self.export_error {
-            ui.add_space(Spacing::XS);
-            ui.label(RichText::new(e).color(to_color32(roles.destructive)));
-        }
-        if let Some(p) = &self.exported {
-            ui.add_space(Spacing::XS);
-            ui.label(t("cut.export.done").replace("{path}", &p.display().to_string()));
-            if ui.link(t("cut.open_scs")).clicked() {
-                *action = Some(PanelAction::OpenSite);
-            }
-        }
-        footer(
-            ui,
-            t(if self.form.units == CutUnit::Mm {
-                "cut.export.footer.mm"
-            } else {
-                "cut.export.footer.in"
-            }),
-        );
-        ui.add_space(Spacing::S);
     }
 
     fn material_ui(&mut self, ui: &mut egui::Ui) {
@@ -771,23 +832,27 @@ impl CutExportPanel {
             }
         }
         if self.form.material.is_none() {
-            ui.horizontal(|ui| {
-                ui.label(t("cut.thickness"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(self.form.units.label());
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut self.thickness_text)
-                            .hint_text("3")
-                            .desired_width(72.0)
-                            .horizontal_align(egui::Align::Max),
-                    );
-                    if r.changed() {
-                        self.form.thickness =
-                            self.thickness_text.trim().replace(',', ".").parse().ok();
-                    }
-                });
-            });
+            self.thickness_row(ui);
         }
+    }
+
+    /// "Thickness ……… [3] mm".
+    fn thickness_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(t("cut.thickness"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(self.form.units.label());
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.thickness_text)
+                        .hint_text("3")
+                        .desired_width(72.0)
+                        .horizontal_align(egui::Align::Max),
+                );
+                if r.changed() {
+                    self.form.thickness = self.thickness_text.trim().replace(',', ".").parse().ok();
+                }
+            });
+        });
     }
 
     fn findings_ui(
@@ -1008,9 +1073,19 @@ fn finding_row(
 }
 
 impl App {
-    /// Open (or re-open) the panel on the current document.
+    /// Open (or re-open) the panel on the current document, on `preset` or
+    /// the document's last one (#209).
+    pub(super) fn open_cut_export_with(&mut self, preset: Option<CutPreset>) {
+        if let Some(p) = preset {
+            self.session.set_cut_preset(p);
+        }
+        let preset = self.session.cut_preset().unwrap_or_default();
+        self.cut_export =
+            Some(CutExportPanel::new(&self.session.doc, scs::default_dir()).with_preset(preset));
+    }
+
     pub(super) fn open_cut_export(&mut self) {
-        self.cut_export = Some(CutExportPanel::new(&self.session.doc, scs::default_dir()));
+        self.open_cut_export_with(None);
     }
 
     /// Draw the panel and act on its request.
@@ -1021,6 +1096,10 @@ impl App {
         };
         let mut open = true;
         let action = panel.ui(ctx, &roles, &mut open);
+        // The preset is document metadata: a switch dirties the document.
+        if self.session.cut_preset().unwrap_or_default() != panel.form.preset {
+            self.session.set_cut_preset(panel.form.preset);
+        }
         match action {
             Some(PanelAction::Check) => panel.run_check(&mut self.command_line, &mut self.session),
             Some(PanelAction::Focus(ids)) => {
@@ -1111,6 +1190,58 @@ mod tests {
         ] {
             itsjustcad_commands::parse(&line).unwrap_or_else(|e| panic!("{line}: {e}"));
         }
+    }
+
+    #[test]
+    fn generic_preset_sends_the_rule_of_thumb_only() {
+        let mut f = CutForm {
+            preset: CutPreset::Generic,
+            material: Some("AL5052-0.125".into()),
+            ..CutForm::default()
+        };
+        // A SKU picked under SendCutSend is never sent: thickness only.
+        assert_eq!(f.blocker(), Some("cut.blocker.thickness"));
+        f.thickness = Some(3.0);
+        assert_eq!(f.blocker(), None);
+        assert_eq!(f.check_line(), "cutcheck preset=generic units=mm thickness=3");
+        itsjustcad_commands::parse(&f.check_line()).unwrap();
+        f.preset = CutPreset::Scs;
+        assert_eq!(f.check_line(), "cutcheck units=mm material=AL5052-0.125");
+        // The export is the same DXF for both presets.
+        assert_eq!(
+            f.export_line(Path::new("x.dxf")),
+            CutForm { preset: CutPreset::Generic, ..f.clone() }.export_line(Path::new("x.dxf"))
+        );
+    }
+
+    /// Generic: no material picker, no SendCutSend data, no link after the
+    /// export; the check reports the rule of thumb. SendCutSend is the default.
+    #[test]
+    fn generic_preset_hides_sendcutsend() {
+        let mut s = plate();
+        let mut cl = CommandLine::default();
+        let p = CutExportPanel::new(&s.doc, None);
+        assert_eq!(p.form.preset, CutPreset::Scs);
+        assert_eq!(p.form.units, CutUnit::Mm);
+        let mut p = p.with_preset(CutPreset::Generic);
+        p.form.thickness = Some(3.0);
+        p.run_check(&mut cl, &mut s);
+        let r = p.result.clone().unwrap();
+        assert!(r.limits_source().unwrap().starts_with("rule of thumb"), "{r:?}");
+        p.exported = Some(PathBuf::from("/tmp/x.dxf"));
+        let mut h = harness(p, false, false);
+        h.run_steps(2);
+        assert!(h.state().0.result.is_some(), "with_preset keeps the result");
+        assert!(h.query_by_label(t("cut.data")).is_none());
+        assert!(h.query_by_label(t("cut.material.none")).is_none(), "no picker");
+        assert!(h.query_by_label(t("cut.open_scs")).is_none());
+        assert!(h.query_by_label(t("cut.preset.footer.generic")).is_some());
+        // Switching back shows SendCutSend's sections (and drops the result).
+        click(&mut h, t("cut.preset.scs"));
+        h.run_steps(2);
+        assert_eq!(h.state().0.form.preset, CutPreset::Scs);
+        assert!(h.state().0.result.is_none());
+        assert!(h.query_by_label(t("cut.data")).is_some());
     }
 
     #[test]
@@ -1427,6 +1558,8 @@ mod tests {
         assert!(rect.width() >= WIDTH - 1.0, "{rect:?}");
         // Click the first finding row: its markers come back as a Focus.
         let title = h.state().0.result.as_ref().unwrap().findings[0].title();
+        h.get_by_label(&title).scroll_to_me();
+        h.run_steps(2);
         h.get_by_label(&title).click();
         h.run_steps(2);
         assert!(
@@ -1437,7 +1570,8 @@ mod tests {
     }
 
     /// Screenshots of the panel, cropped to the window, light + dark, before
-    /// and after Check, and with SendCutSend data (the fixture feeds):
+    /// and after Check, with SendCutSend data (the fixture feeds), and on the
+    /// generic preset after Check:
     ///
     ///   IJC_SHOT_DIR=/tmp/shots cargo test -p itsjustcad cut_export_shots -- --ignored
     #[test]
@@ -1458,7 +1592,7 @@ mod tests {
         }
         let empty = std::env::temp_dir().join(format!("ijc-cut175-empty-{}", std::process::id()));
         for dark in [false, true] {
-            for stage in ["before", "after", "data"] {
+            for stage in ["before", "after", "data", "generic"] {
                 let mut s = plate();
                 run(&mut s, "circle 0.04,0.015,0 0.0005"); // a 1 mm hole: a FAIL row
                 let mut cl = CommandLine::default();
@@ -1468,6 +1602,9 @@ mod tests {
                     empty.clone()
                 };
                 let mut p = CutExportPanel::new(&s.doc, Some(src));
+                if stage == "generic" {
+                    p = p.with_preset(CutPreset::Generic);
+                }
                 if stage == "data" {
                     p.materials_open = true;
                 } else {
@@ -1476,7 +1613,7 @@ mod tests {
                 }
                 let mut h = harness(p, dark, true);
                 h.run_steps(3);
-                if stage == "after" {
+                if stage == "after" || stage == "generic" {
                     h.state_mut().0.run_check(&mut cl, &mut s);
                     h.run_steps(2);
                     // Show a focused row (the click is covered by
@@ -1498,7 +1635,7 @@ mod tests {
                 let theme = if dark { "dark" } else { "light" };
                 image::imageops::crop_imm(&img, x, y, w, hh)
                     .to_image()
-                    .save(dir.join(format!("cut175-{stage}-{theme}.png")))
+                    .save(dir.join(format!("cut209-{stage}-{theme}.png")))
                     .unwrap();
                 std::mem::forget(h);
             }

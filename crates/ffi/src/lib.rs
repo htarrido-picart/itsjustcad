@@ -2357,9 +2357,11 @@ fn into_byte_buffer(bytes: Vec<u8>, out_len: *mut usize) -> *mut u8 {
 
 /// Run the fabrication preflight (`cutcheck`, see the command) and return its
 /// findings. `request_json` (null/`{}` = defaults):
-/// `{"units":"mm"|"in","thickness":<number in units>,"material":"<SKU or words>",
-///   "layers":["…"],"targets":"sel"|"all"|["<short id>",…]}` — `thickness` or
-/// `material` is required (the rule of thumb needs a thickness). Logged like
+/// `{"preset":"scs"|"generic","units":"mm"|"in","thickness":<number in units>,
+///   "material":"<SKU or words>","layers":["…"],"targets":"sel"|"all"|["<short id>",…]}`
+/// — `thickness` or `material` is required (the rule of thumb needs a
+/// thickness). `preset` defaults to `scs` (SendCutSend); `generic` uses the
+/// rule of thumb only and refuses `material` (#209). Logged like
 /// the typed command, so markers appear on the 'compliance' layer and undo
 /// removes them. Returns
 /// `{"ok":true,"report":{pack,context,rules:[…]},"markdown":"…","fail":n,"warn":n,
@@ -2437,10 +2439,14 @@ fn cutcheck_command(
     doc: &itsjustcad_doc::Document,
     req: &serde_json::Value,
 ) -> Result<Command, String> {
-    use itsjustcad_commands::{Selector, cut::CutUnit};
+    use itsjustcad_commands::{Selector, cut::CutUnit, cut_preset::CutPreset};
     if !req.is_object() {
         return Err("request must be a JSON object".into());
     }
+    let preset = match req.get("preset").and_then(|v| v.as_str()) {
+        None => CutPreset::Scs,
+        Some(p) => CutPreset::parse(p).ok_or_else(|| format!("preset '{p}': only scs or generic"))?,
+    };
     let units = match req.get("units").and_then(|v| v.as_str()) {
         None => CutUnit::Mm,
         Some(u) => CutUnit::parse(u).ok_or_else(|| format!("units '{u}': only mm or in"))?,
@@ -2485,6 +2491,7 @@ fn cutcheck_command(
         Some(other) => return Err(format!("bad targets: {other}")),
     };
     Ok(Command::CutCheck {
+        preset,
         targets,
         layers,
         units,
@@ -2492,6 +2499,46 @@ fn cutcheck_command(
         material,
         limits: None,
         ids: None,
+    })
+}
+
+/// The document's last cutting preset (#209): `"scs"` (SendCutSend, also when
+/// none was chosen yet or the handle is null/invalid) or `"generic"`. Free
+/// with [`ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_cut_preset(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let p = (unsafe { handle_ref(h) }).and_then(|app| app.session.cut_preset());
+        into_c_string(p.unwrap_or_default().label().to_string())
+    })
+}
+
+/// Remember `preset` (`"scs"` or `"generic"`) as the document's cutting
+/// preset (#209). File metadata saved in the header, not an undo step, and
+/// the doc generation does not move: when the preset changed, the host
+/// marks the document dirty itself. Returns false for an unknown preset or
+/// a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `preset` must be null
+/// or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_set_cut_preset(h: *mut AppHandle, preset: *const c_char) -> bool {
+    guard_ffi(false, || {
+        let Some(p) = (unsafe { c_arg(preset, "preset") })
+            .ok()
+            .and_then(itsjustcad_commands::cut_preset::CutPreset::parse)
+        else {
+            return false;
+        };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        app.session.set_cut_preset(p);
+        true
     })
 }
 
@@ -7074,6 +7121,29 @@ mod headless_tests {
     }
 
     #[test]
+    fn cut_preset_get_set_round_trips_through_the_file() {
+        let h = ijc_init_headless();
+        unsafe {
+            assert_eq!(take(ijc_cut_preset(h)), "scs", "unset reads as SendCutSend");
+            assert!(!take(ijc_save_json(h)).contains("cut_export"));
+            assert!(ijc_set_cut_preset(h, c("generic").as_ptr()));
+            assert!(!ijc_set_cut_preset(h, c("plasma").as_ptr()));
+            assert!(!ijc_set_cut_preset(h, std::ptr::null()));
+            assert!(!ijc_set_cut_preset(std::ptr::null_mut(), c("scs").as_ptr()));
+            assert_eq!(take(ijc_cut_preset(h)), "generic");
+            assert_eq!(ijc_undo_len(h), 0, "not an undo step");
+            let saved = take(ijc_save_json(h));
+            assert!(saved.contains("cut_export"), "{saved}");
+            let h2 = ijc_init_headless();
+            assert!(ijc_open_json(h2, saved.as_ptr(), saved.len()));
+            assert_eq!(take(ijc_cut_preset(h2)), "generic");
+            assert_eq!(take(ijc_cut_preset(std::ptr::null_mut())), "scs");
+            ijc_free(h2);
+            ijc_free(h);
+        }
+    }
+
+    #[test]
     fn cutcheck_json_and_cut_profile_export() {
         let h = ijc_init_headless();
         unsafe {
@@ -7107,6 +7177,19 @@ mod headless_tests {
             assert!(r.contains("only mm or in"), "{r}");
             let r = take(ijc_cutcheck_json(std::ptr::null_mut(), std::ptr::null()));
             assert!(r.contains(r#""ok":false"#), "{r}");
+            // The generic preset (#209): rule of thumb, never a material.
+            let r = take(ijc_cutcheck_json(
+                h,
+                c(r#"{"preset":"generic","thickness":3}"#).as_ptr(),
+            ));
+            assert!(r.contains(r#""ok":true"#) && r.contains("rule of thumb"), "{r}");
+            let r = take(ijc_cutcheck_json(
+                h,
+                c(r#"{"preset":"generic","material":"AL5052-0.125"}"#).as_ptr(),
+            ));
+            assert!(r.contains(r#""ok":false"#) && r.contains("preset=generic"), "{r}");
+            let r = take(ijc_cutcheck_json(h, c(r#"{"preset":"plasma"}"#).as_ptr()));
+            assert!(r.contains("only scs or generic"), "{r}");
 
             // The cut profile rides the existing export entry point.
             let mut len = 0usize;

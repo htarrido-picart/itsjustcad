@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::checkengine::{Marker, Severity};
 use crate::cut::{Contour, CutGeometry, CutUnit, SkipKind};
+use crate::cut_preset::CutPreset;
 use crate::scs;
 
 /// Report key in `Document::compliance_reports` (and `report cutcheck`).
@@ -69,9 +70,10 @@ impl CutLimits {
 }
 
 /// Resolve limits for `cutcheck`. `thickness` is in file units; `dir` is the
-/// SendCutSend cache (consulted only with `material`). Never passes silently:
-/// every fallback is recorded in `notes`.
+/// SendCutSend cache (consulted only with `material`, never by the generic
+/// preset). Never passes silently: every fallback is recorded in `notes`.
 pub fn resolve_limits(
+    preset: CutPreset,
     units: CutUnit,
     thickness: Option<f64>,
     material: Option<&str>,
@@ -81,6 +83,12 @@ pub fn resolve_limits(
     let need_t = |why: &str| -> Result<f64, String> {
         t_m.ok_or_else(|| format!("cutcheck needs thickness=<t> ({}){why}", units.label()))
     };
+    if preset == CutPreset::Generic {
+        if material.is_some_and(|m| !m.trim().is_empty()) {
+            return Err("material= is SendCutSend data — preset=generic takes thickness= only".into());
+        }
+        return Ok(CutLimits::rule_of_thumb(need_t("")?));
+    }
     let Some(query) = material.map(str::trim).filter(|q| !q.is_empty()) else {
         return Ok(CutLimits::rule_of_thumb(need_t(" or material=<sku>")?));
     };
@@ -1186,5 +1194,31 @@ mod tests {
         assert!(failing(&s).is_empty());
         run(&mut s, "cutcheck thickness=3");
         assert_eq!(failing(&s), ["open-contour"]);
+    }
+
+    #[test]
+    fn generic_preset_uses_the_rule_of_thumb_and_no_data() {
+        let mut s = Session::default();
+        run(&mut s, "rect 0,0,0 0.05 0.03");
+        run(&mut s, "circle 0.01,0.015,0 0.0005"); // 1 mm hole < 1.5 mm
+        run(&mut s, "cutcheck preset=generic thickness=3");
+        let ctx = &s.doc.compliance_reports[PACK].context;
+        assert!(ctx.contains("limits: rule of thumb"), "{ctx}");
+        assert_eq!(failing(&s), ["min-hole"]);
+        // Logged with its preset; the default (scs) stays out of the op.
+        let ops = s.save_log();
+        let json = serde_json::to_string(&ops).unwrap();
+        assert!(json.contains(r#""preset":"generic""#), "{json}");
+        run(&mut s, "cutcheck preset=scs thickness=3");
+        let last = serde_json::to_string(s.save_log().last().unwrap()).unwrap();
+        assert!(!last.contains("preset"), "{last}");
+        // SendCutSend data is never read, so a material is refused, not
+        // silently dropped (also when the request skips the parser).
+        assert!(parse("cutcheck preset=generic material=AL5052-0.125").is_err());
+        assert!(parse("cutcheck preset=plasma thickness=3").is_err());
+        let e = resolve_limits(CutPreset::Generic, CutUnit::Mm, Some(3.0), Some("al"), None);
+        assert!(e.unwrap_err().contains("preset=generic"));
+        let e = resolve_limits(CutPreset::Generic, CutUnit::Mm, None, None, None);
+        assert!(e.unwrap_err().contains("thickness"));
     }
 }
