@@ -1026,6 +1026,10 @@ pub struct App {
     /// unsaved-changes guard compares this to `session.history().1` — see
     /// [`crate::widgets::is_dirty`]. UI/session state, never in the op-log.
     saved_cursor: usize,
+    /// `Session::meta_revision` at the last save/open: saved optimizer runs
+    /// (#201) are file metadata outside the op-log, so they dirty the
+    /// document without moving the cursor.
+    saved_meta: u64,
     /// A pending destructive navigation (New/Open/Quit) parked behind the
     /// unsaved-changes alert. `Some` while the alert is up; taken when the user
     /// picks Discard.
@@ -1690,6 +1694,7 @@ impl App {
             #[cfg(not(target_os = "linux"))]
             native_menu_tried: false,
             saved_cursor: 0,
+            saved_meta: 0,
             // Dev hook: ITSJUSTCAD_UNSAVED_ALERT=1 parks a New behind the
             // unsaved-changes guard on startup so ITSJUSTCAD_SHOT frames can
             // capture the alert without a click (pair with ITSJUSTCAD_RUN to
@@ -1712,12 +1717,14 @@ impl App {
     /// [`crate::widgets::is_dirty`] over the op-log cursor.
     pub(crate) fn is_dirty(&self) -> bool {
         crate::widgets::is_dirty(self.session.history().1, self.saved_cursor)
+            || self.session.meta_revision() != self.saved_meta
     }
 
     /// Mark the document clean at its current op-log cursor (called after a
     /// successful save/open, and on a fresh New).
     fn mark_saved(&mut self) {
         self.saved_cursor = self.session.history().1;
+        self.saved_meta = self.session.meta_revision();
     }
 
     /// Route a destructive navigation (New/Open/Quit) through the unsaved-changes
@@ -1951,11 +1958,12 @@ impl App {
         preset::preset_for(self.cad_origin).aliases
     }
 
-    fn run_startup_script(&mut self) {
+    fn run_startup_script(&mut self, ctx: &egui::Context) {
         if let Some(script) = self.startup_script.take() {
             for cmd in script.split(';') {
                 self.execute_line(cmd.to_string());
             }
+            self.optimize_dev_hook(ctx);
         }
         if let Some(prompt) = self.deck_script.take() {
             // Reveal the Deck tab so the scripted conversation is visible in
@@ -4248,6 +4256,7 @@ impl App {
         match journal::load(&path) {
             Ok(session) => {
                 self.session = session;
+                self.optimize.close_document();
                 self.uploaded_generation = None;
                 // The recovered ops now live in THIS session's journal (next
                 // sync writes them); the crashed one has served its purpose.
@@ -4267,6 +4276,7 @@ impl App {
     /// fresh one; the chat/deck session is untouched.
     fn new_document(&mut self) {
         self.session = Session::default();
+        self.optimize.close_document();
         self.uploaded_generation = None;
         self.journaled_generation = None;
         self.deck_pane.set_sandbox_root(None);
@@ -4274,6 +4284,7 @@ impl App {
         self.external_change = None;
         // A fresh document is clean at cursor 0.
         self.saved_cursor = 0;
+        self.saved_meta = 0;
         self.command_line.push_line("new document");
     }
 
@@ -4302,6 +4313,7 @@ impl App {
         match itsjustcad_commands::io::load_file(&path) {
             Ok(session) => {
                 self.session = session;
+                self.optimize.close_document();
                 self.uploaded_generation = None;
                 // A freshly-opened document is clean at its loaded op-log cursor.
                 self.mark_saved();
@@ -4345,6 +4357,7 @@ impl App {
             Some(p) if p.exists() => match itsjustcad_commands::io::load_file(p) {
                 Ok(session) => {
                     self.session = session;
+                    self.optimize.close_document();
                     self.uploaded_generation = None;
                     self.mark_saved();
                     self.deck_pane
@@ -7018,6 +7031,14 @@ impl App {
 
     /// Bottom strip: cursor coords, active layer, counts, snap state, view.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let mut open_opt = None;
+        self.status_bar_row(ui, &mut open_opt);
+        if let Some(source) = open_opt {
+            self.open_optimize(source);
+        }
+    }
+
+    fn status_bar_row(&mut self, ui: &mut egui::Ui, open_opt: &mut Option<itsjustcad_doc::ObjectId>) {
         let doc = &self.session.doc;
         let cam = &self.cameras[self.effective_camera_index(self.active_pane)];
         ui.horizontal(|ui| {
@@ -7047,6 +7068,28 @@ impl App {
             ui.separator();
             ui.label(crate::statusbar::format_counts(doc.selection.len(), doc.len()));
             ui.separator();
+            // The running optimizer search (#201): click opens its site.
+            if let Some((p, _)) = self.optimize.running_progress() {
+                let mut open = false;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = crate::theme::Spacing::XS;
+                    ui.add(egui::Spinner::new().size(12.0));
+                    let label = format!(
+                        "{} {:.0} %",
+                        crate::i18n::t("optimize.status"),
+                        p.fraction() * 100.0
+                    );
+                    open = ui
+                        .add(egui::Button::new(label).frame(false))
+                        .on_hover_text(crate::i18n::t("optimize.status_tip"))
+                        .clicked();
+                });
+                if open {
+                    *open_opt = self.optimize.running_source();
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                ui.separator();
+            }
             // Clickable osnap chip: shows the live readout (which kind is hit /
             // grid / idle) and, when master snap is off, an OFF marker. Clicking
             // opens the modeless osnap popup (checkbox per kind). This is the
@@ -11248,7 +11291,10 @@ impl eframe::App for App {
                 ui.ctx().set_theme(want);
             }
         }
-        self.run_startup_script();
+        self.run_startup_script(ui.ctx());
+        // The document's optimizer search (#201) finishes wherever the user is.
+        self.optimize.poll(&mut self.session);
+        self.optimize_notice(ui.ctx());
         // ITSJUSTCAD_TYPE: pre-fill command input (dev hook for autosuggest
         // screenshots). When ITSJUSTCAD_DECK=chat forces the Chat segment, route
         // the prefill into the chat composer instead so the slash preview/palette
@@ -12568,13 +12614,14 @@ mod tests {
                                 feasible: 37,
                                 best: Some(612.0),
                             };
-                            app.optimize.fake_running(source, p);
+                            app.optimize.fake_running(&app.session.doc, source, p);
                             if name == "cancelled" {
                                 app.optimize.cancel();
                             }
                         } else if seg == optimize_panel::SEG_OPTIMIZE {
                             app.optimize.form.budget = 40;
-                            app.optimize.run_now(&app.session.doc, source);
+                            app.optimize.run_now(&mut app.session, source);
+                            app.optimize.notice = None;
                         }
                     },
                     6,

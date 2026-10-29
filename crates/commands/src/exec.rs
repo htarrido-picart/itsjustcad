@@ -409,6 +409,13 @@ pub struct Session {
     /// The last `siteoptimize` result and its site boundary, for `siteoptimize
     /// apply <rank>`. Session-only: the applied op logs its resolved params.
     pub(crate) last_site_optimize: Option<(ObjectId, crate::site_optimize::OptimizeResult)>,
+    /// The latest optimizer run of each site plan (#201), keyed by its
+    /// boundary. Document metadata saved in the file header (see
+    /// [`crate::optimize_runs`]): never logged, so never an undo step.
+    optimize_runs: BTreeMap<ObjectId, crate::optimize_runs::SavedRun>,
+    /// Bumped when the metadata above changes, so a host can tell the
+    /// document needs saving although the op-log did not move.
+    meta_rev: u64,
 }
 
 /// Structured result of an import, beyond the human message. Drives the app's
@@ -739,6 +746,8 @@ impl Default for Session {
             doc_uuid: None,
             last_import: None,
             last_site_optimize: None,
+            optimize_runs: BTreeMap::new(),
+            meta_rev: 0,
         }
     }
 }
@@ -893,6 +902,7 @@ impl Session {
                     }
                     self.cursor = self.log.len();
                     self.edits += 1;
+                    self.prune_optimize_runs();
                 }
                 Ok(outcome)
             }
@@ -949,6 +959,64 @@ impl Session {
             self.log[cursor].chained = true;
         }
         Ok(out)
+    }
+
+    /// The saved optimizer run of the site plan on `source` (#201), while
+    /// that site plan exists.
+    pub fn optimize_run(&self, source: ObjectId) -> Option<&crate::optimize_runs::SavedRun> {
+        self.optimize_runs
+            .get(&source)
+            .filter(|_| crate::optimize_runs::has_site_plan(&self.doc, source))
+    }
+
+    /// Save `run` as the latest run of the site plan on `source`, replacing
+    /// the previous one. Not logged (no undo step); bumps
+    /// [`Session::meta_revision`]. Refused (false) when `source` has no site
+    /// plan.
+    pub fn set_optimize_run(
+        &mut self,
+        source: ObjectId,
+        run: crate::optimize_runs::SavedRun,
+    ) -> bool {
+        if !crate::optimize_runs::has_site_plan(&self.doc, source) {
+            return false;
+        }
+        self.optimize_runs.insert(source, run);
+        self.meta_rev += 1;
+        true
+    }
+
+    /// Every saved run whose site plan exists (the file header's).
+    pub fn optimize_runs(&self) -> BTreeMap<ObjectId, crate::optimize_runs::SavedRun> {
+        self.optimize_runs
+            .iter()
+            .filter(|(id, _)| crate::optimize_runs::has_site_plan(&self.doc, **id))
+            .map(|(id, r)| (*id, r.clone()))
+            .collect()
+    }
+
+    /// Seed the saved runs from a loaded file header.
+    pub fn set_optimize_runs(
+        &mut self,
+        runs: BTreeMap<ObjectId, crate::optimize_runs::SavedRun>,
+    ) {
+        self.optimize_runs = runs;
+    }
+
+    /// Changes to the document metadata that is not in the op-log (saved
+    /// optimizer runs). A host saving the file records it next to its
+    /// op-log cursor to tell whether the document is dirty.
+    pub fn meta_revision(&self) -> u64 {
+        self.meta_rev
+    }
+
+    /// A new edit that deleted a site plan (or its boundary) drops its run.
+    fn prune_optimize_runs(&mut self) {
+        if !self.optimize_runs.is_empty() {
+            let doc = &self.doc;
+            self.optimize_runs
+                .retain(|id, _| crate::optimize_runs::has_site_plan(doc, *id));
+        }
     }
 
     /// Number of new logged edits run so far (undo/redo/jumps do not count).

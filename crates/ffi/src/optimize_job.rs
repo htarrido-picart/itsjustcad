@@ -12,10 +12,16 @@
 //!   request from the document and starts the search; returns the job id.
 //! - [`ijc_site_optimize_progress`] reads `{"job","state","phase","evaluated",
 //!   "budget","feasible","best","fraction","elapsed_s"}`.
-//! - [`ijc_site_optimize_cancel`] stops it at the next chunk of plans.
+//! - [`ijc_site_optimize_cancel`] stops it at the next chunk of plans and
+//!   discards it (a user Cancel).
+//! - [`ijc_site_optimize_stop`] stops it at the next chunk of plans and keeps
+//!   the best plans found so far, marked `"stopped_early":true` (#201: a
+//!   system stop, e.g. the iOS background time running out).
 //! - [`ijc_site_optimize_result`] takes the finished result (the same JSON as
-//!   `ijc_site_optimize_json`, or `{"error"}`; a cancelled job's error is
-//!   `"siteoptimize: cancelled"`) and forgets the job.
+//!   `ijc_site_optimize_json`, plus `"saved"`, or `{"error"}`; a cancelled
+//!   job's error is `"siteoptimize: cancelled"`) and forgets the job. A
+//!   result (full or stopped early) is saved in the document as its site
+//!   plan's latest run (#201), read back by [`ijc_site_optimize_saved_json`].
 //!
 //! Freeing the handle cancels every running job. A completed job's result is
 //! the blocking call's result: cancel and progress never change the search.
@@ -26,29 +32,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use itsjustcad_commands::site_optimize::{self, Control, OptimizeRequest, Progress};
+use itsjustcad_commands::optimize_runs::{self, SavedRun};
+use itsjustcad_commands::site_optimize::{
+    self, Control, OptimizeRequest, OptimizeResult, Prepared, Progress,
+};
 use serde_json::{Value, json};
 
-use super::{AppHandle, c_arg, guard_ffi, handle_ref, into_c_string, object_by_short_id};
+use super::{
+    AppHandle, c_arg, guard_ffi, handle_mut, handle_ref, into_c_string, object_by_short_id,
+};
 
 /// One search.
 struct Job {
     cancel: AtomicBool,
+    /// Stop and keep the plans found so far (#201).
+    stop: AtomicBool,
     started: Instant,
+    /// What the search plans (saved with its result); `None` when it failed
+    /// to start.
+    prepared: Option<Prepared>,
     state: Mutex<JobState>,
 }
 
 #[derive(Default)]
 struct JobState {
     progress: Progress,
-    /// `Some` once the search ended: the result JSON or the error.
-    result: Option<Result<Value, String>>,
+    /// `Some` once the search ended: the result or the error.
+    result: Option<Result<OptimizeResult, String>>,
     /// Elapsed seconds when it ended.
     elapsed: Option<f64>,
 }
 
 impl Job {
-    fn finish(&self, result: Result<Value, String>) {
+    fn finish(&self, result: Result<OptimizeResult, String>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.result = Some(result);
         st.elapsed = Some(self.started.elapsed().as_secs_f64());
@@ -58,6 +74,7 @@ impl Job {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let state = match &st.result {
             None if self.cancel.load(Ordering::Relaxed) => "cancelling",
+            None if self.stop.load(Ordering::Relaxed) => "stopping",
             None => "running",
             Some(Ok(_)) => "done",
             Some(Err(e)) if e == site_optimize::CANCELLED => "cancelled",
@@ -136,7 +153,9 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
         })();
         let job = Arc::new(Job {
             cancel: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
             started: Instant::now(),
+            prepared: prepared.as_ref().ok().cloned(),
             state: Default::default(),
         });
         let id = {
@@ -155,11 +174,12 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
                     };
                     let ctl = Control {
                         cancel: Some(&job.cancel),
+                        stop: Some(&job.stop),
                         progress: Some(&report),
                     };
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.run(ctl)))
                         .unwrap_or_else(|_| Err("siteoptimize: the search failed".into()));
-                    job.finish(out.map(|r| r.to_json()));
+                    job.finish(out);
                 });
             }
         }
@@ -167,8 +187,8 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
     })
 }
 
-/// A job's progress: `{"job","state":"running"|"cancelling"|"done"|"failed"|
-/// "cancelled","phase":"search"|"daylight","evaluated","budget","feasible",
+/// A job's progress: `{"job","state":"running"|"cancelling"|"stopping"|"done"|
+/// "failed"|"cancelled","phase":"search"|"daylight","evaluated","budget","feasible",
 /// "best":score|null,"fraction":0..1,"elapsed_s"}` (`evaluated` of `budget`
 /// in the current phase). `null` for an unknown job or a null/invalid handle.
 /// Free with [`super::ijc_string_free`].
@@ -201,10 +221,39 @@ pub unsafe extern "C" fn ijc_site_optimize_cancel(h: *mut AppHandle, job_id: u64
     })
 }
 
+/// Ask a running job to stop and keep what it found (#201): it ends at its
+/// next chunk of plans and its result is the best plans evaluated so far,
+/// ranked as usual, with `"stopped_early":true` (or
+/// `{"error":"siteoptimize: stopped before any plan was evaluated"}`). For a
+/// system stop (background time running out), not a user Cancel. A daylight
+/// search stopped before any layout's daylight was measured still measures
+/// one batch (10 layouts) first. Returns whether the job is known (true for
+/// one already finished: a no-op).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`super::ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_site_optimize_stop(h: *mut AppHandle, job_id: u64) -> bool {
+    guard_ffi(false, || {
+        (unsafe { handle_ref(h) })
+            .and_then(|app| job(app, job_id))
+            .map(|j| j.stop.store(true, Ordering::Relaxed))
+            .is_some()
+    })
+}
+
 /// Take a finished job's result — the [`super::ijc_site_optimize_json`]
-/// result, or `{"error":"…"}` — and forget the job. `null` while it is still
-/// running, for an unknown (or already taken) job, or a null/invalid handle.
-/// Free with [`super::ijc_string_free`].
+/// result plus `"saved":bool`, or `{"error":"…"}` — and forget the job.
+/// `null` while it is still running, for an unknown (or already taken) job,
+/// or a null/invalid handle. Free with [`super::ijc_string_free`].
+///
+/// A result (complete, or `"stopped_early":true` after
+/// [`ijc_site_optimize_stop`]) is saved in the document as the latest run of
+/// its site plan, replacing the previous one (`"saved":true`; read it back
+/// with [`ijc_site_optimize_saved_json`]). Saving is document metadata, not
+/// an undo step: the host should mark the document edited so it gets saved.
+/// Nothing is saved (`"saved":false`) when the boundary no longer has a
+/// site plan. Cancelled and failed jobs save nothing.
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`super::ijc_init`].
@@ -212,23 +261,71 @@ pub unsafe extern "C" fn ijc_site_optimize_cancel(h: *mut AppHandle, job_id: u64
 pub unsafe extern "C" fn ijc_site_optimize_result(h: *mut AppHandle, job_id: u64) -> *mut c_char {
     guard_ffi(std::ptr::null_mut(), || {
         let null = || into_c_string("null".into());
-        let Some(app) = (unsafe { handle_ref(h) }) else {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return null();
         };
-        let mut jobs = jobs(app);
-        let Some(j) = jobs.jobs.get(&job_id).cloned() else {
-            return null();
+        let (j, result, elapsed) = {
+            let mut jobs = jobs(&app);
+            let Some(j) = jobs.jobs.get(&job_id).cloned() else {
+                return null();
+            };
+            let mut st = j.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(result) = st.result.take() else {
+                return null();
+            };
+            let elapsed = st.elapsed.unwrap_or(0.0);
+            drop(st);
+            jobs.jobs.remove(&job_id);
+            (j, result, elapsed)
         };
-        let Some(result) = j
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .result
-            .take()
-        else {
-            return null();
+        let out = match (result, &j.prepared) {
+            (Ok(r), Some(p)) => {
+                let mut v = r.to_json();
+                let saved = app
+                    .session
+                    .set_optimize_run(p.source, SavedRun::new(p, r, elapsed));
+                v["saved"] = saved.into();
+                v
+            }
+            (Ok(r), None) => r.to_json(),
+            (Err(e), _) => json!({ "error": e }),
         };
-        jobs.jobs.remove(&job_id);
-        into_c_string(result.unwrap_or_else(|e| json!({ "error": e })).to_string())
+        into_c_string(out.to_string())
+    })
+}
+
+/// The saved latest optimizer run of the site plan on `source` (short id,
+/// #201), or `null` when it has none (never run, its site plan deleted, an
+/// unknown source, a file from an older build, or a null/invalid handle):
+///
+/// `{"version":1,"request":{the request, as ijc_site_optimize_json takes it},
+/// "result":{the ijc_site_optimize_json result, with "stopped_early"},
+/// "stopped_early":bool,"finished_at":unix seconds,"elapsed_s":seconds,
+/// "evaluated":n,"feasible":n,"budget":n,"fingerprint":"16 hex digits",
+/// "stale":bool}`
+///
+/// `stale` is true when the plan (boundary, settings or hand edits) changed
+/// since the run: show "Plan changed since this run"; Apply
+/// ([`super::ijc_site_optimize_apply`] with a row's `params`) still works.
+/// Free with [`super::ijc_string_free`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`super::ijc_init`]; `source` must
+/// be null or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_site_optimize_saved_json(
+    h: *mut AppHandle,
+    source: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let v = (|| {
+            let app = unsafe { handle_ref(h) }?;
+            let source = unsafe { c_arg(source, "source") }.ok()?;
+            let doc = &app.session.doc;
+            let id = object_by_short_id(doc, source)?;
+            let run = app.session.optimize_run(id)?;
+            Some(run.to_json(optimize_runs::is_stale(doc, id, run)))
+        })();
+        into_c_string(v.unwrap_or(Value::Null).to_string())
     })
 }

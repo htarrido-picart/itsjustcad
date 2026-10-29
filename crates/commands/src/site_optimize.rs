@@ -285,7 +285,9 @@ pub struct Quantities {
     /// Where the daylight sun hours came from, when daylight was measured.
     #[serde(default)]
     pub daylight_source: Option<DaylightSource>,
-    /// Each lot's walk to the nearest park along the streets, m.
+    /// Each lot's walk to the nearest park along the streets, m (infinite
+    /// with no park in reach; stored as `null`).
+    #[serde(deserialize_with = "de_walks")]
     pub park_walk: Vec<f64>,
 }
 
@@ -728,11 +730,61 @@ fn metric(r: &YieldReport, l: &Ledger, q: &Quantities, key: &str) -> f64 {
     }
 }
 
+/// The `&'static str` names a stored result carries (violations, Pareto
+/// axes), interned on load; an unknown name reads `"unknown"`.
+const STATIC_NAMES: &[&str] = &[
+    "min_park_access",
+    "min_lot_area",
+    "min_lot_width",
+    "min_frontage",
+    "min_open",
+    "max_far",
+    "max_coverage",
+    "max_lot_area",
+    "max_depth_ratio",
+    "max_block_perimeter",
+    "min_dwellings",
+    "min_density",
+    "street_access",
+    "min_daylight",
+    "max_overheat",
+    "open",
+    "net_area",
+    "gfa",
+    "lots",
+    "dwellings",
+    "unknown",
+];
+
+/// A `&'static str` behind an alias: serde's derive would otherwise borrow
+/// it from the input (`'de: 'static`), and stored results load from owned
+/// JSON.
+pub type Name = &'static str;
+
+fn intern(s: &str) -> &'static str {
+    STATIC_NAMES.iter().copied().find(|n| *n == s).unwrap_or("unknown")
+}
+
+/// JSON writes a non-finite walk as `null`; read it back as infinite.
+fn de_walks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
+    Vec::<Option<f64>>::deserialize(d)
+        .map(|v| v.into_iter().map(|w| w.unwrap_or(f64::INFINITY)).collect())
+}
+
+fn de_static_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<&'static str, D::Error> {
+    String::deserialize(d).map(|s| intern(&s))
+}
+
+fn de_static_strs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<&'static str>, D::Error> {
+    Vec::<String>::deserialize(d).map(|v| v.iter().map(|s| intern(s)).collect())
+}
+
 /// One evaluated site plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evaluation {
     pub report: YieldReport,
     /// Hard constraints this plan breaks (empty = feasible).
+    #[serde(deserialize_with = "de_static_strs")]
     pub violations: Vec<&'static str>,
     /// Σ of the broken checks' excess (shares of lots, relative overshoot);
     /// 0 when feasible. Guides the search toward feasibility.
@@ -933,7 +985,7 @@ pub fn evaluate(
 }
 
 /// One ranked, feasible candidate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
     pub rank: usize,
     /// The searched params as `lotsetparams` tokens (what `apply` folds).
@@ -941,8 +993,8 @@ pub struct Candidate {
     pub eval: Evaluation,
 }
 
-/// The outcome of a search.
-#[derive(Debug, Clone)]
+/// The outcome of a search. Serde (#201) stores it with a saved run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizeResult {
     pub objective: Objective,
     /// The top-N ranked candidates plus any Pareto member ranked lower.
@@ -951,7 +1003,8 @@ pub struct OptimizeResult {
     pub pareto: Vec<usize>,
     /// The front's second metric (`open`, `net_area`, `gfa` or `lots`): the
     /// first that varies across candidates and is not the objective.
-    pub pareto_axis: &'static str,
+    #[serde(deserialize_with = "de_static_str")]
+    pub pareto_axis: Name,
     pub evaluated: usize,
     pub feasible: usize,
     /// The plan the search started from (the boundary's site plan, or the
@@ -959,6 +1012,10 @@ pub struct OptimizeResult {
     pub current: Option<Evaluation>,
     /// How daylight was measured, when the search measured it.
     pub daylight: Option<DaylightInfo>,
+    /// The search was stopped (#201, [`Control::stop`]) before its budget:
+    /// the best plans among those evaluated so far.
+    #[serde(default)]
+    pub stopped_early: bool,
 }
 
 /// Which sun hours a search's daylight used: clear-sky geometry or the site's
@@ -1307,6 +1364,9 @@ pub fn optimize_with(
 /// The error a cancelled search returns.
 pub const CANCELLED: &str = "siteoptimize: cancelled";
 
+/// The error a search stopped before it evaluated any plan returns.
+pub const STOPPED_EMPTY: &str = "siteoptimize: stopped before any plan was evaluated";
+
 /// Candidates evaluated between two cancel checks / progress reports. Chunks
 /// only split the parallel batches; every genome is still drawn from the one
 /// seeded RNG first, so a completed search is the same whatever the chunking.
@@ -1350,11 +1410,16 @@ impl Progress {
 }
 
 /// How a caller watches and stops a search: a cancel flag checked between
-/// chunks of [`CHUNK`] plans (a cancelled search returns [`CANCELLED`]), and a
-/// progress callback called after each chunk, from the calling thread.
+/// chunks of [`CHUNK`] plans (a cancelled search returns [`CANCELLED`]), a
+/// stop flag (#201: the search ends at the next chunk and ranks the plans
+/// found so far, marked [`OptimizeResult::stopped_early`]), and a progress
+/// callback called after each chunk, from the calling thread.
 #[derive(Clone, Copy, Default)]
 pub struct Control<'a> {
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Stop and keep: a system stop (time limit, app suspended), not a
+    /// user cancel. Cancel wins when both are set.
+    pub stop: Option<&'a std::sync::atomic::AtomicBool>,
     pub progress: Option<&'a (dyn Fn(&Progress) + Sync)>,
 }
 
@@ -1362,6 +1427,16 @@ impl Control<'_> {
     fn cancelled(&self) -> bool {
         self.cancel
             .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Cancelled, or stopped: the search should end now.
+    fn halted(&self) -> bool {
+        self.cancelled() || self.stopped()
     }
 
     fn report(&self, p: Progress) {
@@ -1417,8 +1492,8 @@ pub fn optimize_ctl(
                     req.max_stories.unwrap_or(0).to_string(),
                 );
                 params.extend(rule_params.clone());
-        // A cancelled search skips the rest of its chunk.
-        let eval = if ctl.cancelled() {
+        // A cancelled or stopped search skips the rest of its chunk.
+        let eval = if ctl.halted() {
             Err(CANCELLED.to_string())
         } else {
             settings_with(base, &params).and_then(|s| evaluate(site, &s, edits, req))
@@ -1434,8 +1509,9 @@ pub fn optimize_ctl(
         ..Progress::default()
     };
     // Evaluate `genomes` in chunks onto `trials`, checking for a cancel and
-    // reporting progress after each.
-    let mut run = |trials: &mut Vec<Trial>, genomes: Vec<Vec<f64>>| -> Result<(), String> {
+    // reporting progress after each. `Ok(true)` once stopped: the chunk's
+    // skipped plans are dropped, the evaluated ones kept.
+    let mut run = |trials: &mut Vec<Trial>, genomes: Vec<Vec<f64>>| -> Result<bool, String> {
         let mut genomes = genomes.into_iter().peekable();
         while genomes.peek().is_some() {
             let chunk: Vec<Trial> = genomes
@@ -1448,6 +1524,15 @@ pub fn optimize_ctl(
             if ctl.cancelled() {
                 return Err(CANCELLED.into());
             }
+            let stopped = ctl.stopped();
+            let chunk: Vec<Trial> = if stopped {
+                chunk
+                    .into_iter()
+                    .filter(|t| !matches!(&t.eval, Err(e) if e == CANCELLED))
+                    .collect()
+            } else {
+                chunk
+            };
             for t in &chunk {
                 if let Ok(e) = &t.eval
                     && e.violations.is_empty()
@@ -1459,16 +1544,19 @@ pub fn optimize_ctl(
             progress.evaluated += chunk.len();
             trials.extend(chunk);
             ctl.report(progress);
+            if stopped {
+                return Ok(true);
+            }
         }
-        Ok(())
+        Ok(false)
     };
 
     let n_init = budget.div_ceil(2);
     let mut trials = Vec::with_capacity(budget);
-    run(&mut trials, latin_hypercube(n_init, d, &mut rng))?;
+    let mut stopped = run(&mut trials, latin_hypercube(n_init, d, &mut rng))?;
     let (mu, lambda) = (8, ((budget - n_init) / 4).max(4));
     let mut sigma = 0.2;
-    while trials.len() < budget {
+    while !stopped && trials.len() < budget {
         let mut order: Vec<usize> = (0..trials.len()).collect();
         order.sort_by(|&a, &b| {
             let (fa, fb) = (trials[a].fitness(), trials[b].fitness());
@@ -1494,8 +1582,11 @@ pub fn optimize_ctl(
                     .collect()
             })
             .collect();
-        run(&mut trials, children)?;
+        stopped = run(&mut trials, children)?;
         sigma *= 0.8;
+    }
+    if stopped && trials.is_empty() {
+        return Err(STOPPED_EMPTY.into());
     }
 
     let mut current = evaluate(site, base, edits, req).ok();
@@ -1510,8 +1601,12 @@ pub fn optimize_ctl(
         c.score = req.score(&c.report, &c.ledger, &c.quantities);
     }
     let info = daylight.map(|loc| DaylightInfo::of(&opts, &loc));
-    rank(trials, req, daylight.map(|_| &day as DaylightOf), ctl)
-        .map(|r| OptimizeResult { current, daylight: info, ..r })
+    rank(trials, req, daylight.map(|_| &day as DaylightOf), ctl).map(|r| OptimizeResult {
+        current,
+        daylight: info,
+        stopped_early: stopped || r.stopped_early,
+        ..r
+    })
 }
 
 const NEEDS_LOCATION: &str = "siteoptimize: daylight needs a location — set one with \
@@ -1555,6 +1650,7 @@ fn rank(
         }
     }
     let n_feasible = feasible.len();
+    let mut stopped_early = false;
     if feasible.is_empty() {
         let Some((name, n)) = broken
             .iter()
@@ -1637,6 +1733,13 @@ fn rank(
         };
         let mut rest = unique.into_iter();
         while checked.len() < limit {
+            // Stopped: keep the layouts already measured. Stopped before
+            // any was measured, measure one batch: a ranking without
+            // daylight would ignore the request's daylight terms.
+            if ctl.stopped() && !checked.is_empty() {
+                stopped_early = true;
+                break;
+            }
             let batch: Vec<_> = rest.by_ref().take(DAYLIGHT_TOP_K).collect();
             if batch.is_empty() {
                 break;
@@ -1728,6 +1831,7 @@ fn rank(
         feasible: n_feasible,
         current: None,
         daylight: None,
+        stopped_early,
     })
 }
 
@@ -1801,7 +1905,7 @@ impl OptimizeResult {
 
     /// `{"candidates":[{"rank","score","params":{…},"yield":{…},"ledger":{…}}],"pareto":[…],
     /// "pareto_axis","evaluated","feasible","current":{"score","yield","ledger","violations"}|null,
-    /// "beats_current"}`.
+    /// "beats_current","daylight_source","stopped_early"}`.
     /// Params are typed (numbers / enum tokens) per the subdivision schema.
     pub fn to_json(&self) -> serde_json::Value {
         let fields = crate::subdiv_params::subdivision_fields();
@@ -1844,6 +1948,7 @@ impl OptimizeResult {
             })),
             "beats_current": self.beats_current(),
             "daylight_source": self.daylight,
+            "stopped_early": self.stopped_early,
         })
     }
 }
@@ -2843,6 +2948,7 @@ mod tests {
         let log = |p: &Progress| seen.lock().unwrap().push(*p);
         let ctl = Control {
             cancel: None,
+            stop: None,
             progress: Some(&log),
         };
         let watched = optimize_ctl(&site, &base, &PlanEdits::default(), &req(60), ctl).unwrap();
@@ -2878,6 +2984,7 @@ mod tests {
         };
         let ctl = Control {
             cancel: Some(&cancel),
+            stop: None,
             progress: Some(&stop),
         };
         let err = optimize_ctl(&site, &base, &PlanEdits::default(), &req(400), ctl).unwrap_err();
@@ -2886,6 +2993,7 @@ mod tests {
         // Cancelled up front: nothing is evaluated.
         let ctl = Control {
             cancel: Some(&cancel),
+            stop: None,
             progress: None,
         };
         assert_eq!(
@@ -2909,6 +3017,7 @@ mod tests {
         };
         let ctl = Control {
             cancel: None,
+            stop: None,
             progress: Some(&log),
         };
         optimize_ctl(
@@ -3165,5 +3274,62 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("run `siteoptimize` first"), "{err}");
+    }
+
+    /// #201: a stop keeps the plans found so far, ranked and marked stopped
+    /// early; a stop before any plan is an error; the result round-trips
+    /// through serde (saved runs).
+    #[test]
+    fn stop_keeps_partial_results() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let site = rect(200.0, 150.0);
+        let base = SubdivisionSettings::default();
+        let stop = AtomicBool::new(false);
+        let after_two = |p: &Progress| {
+            if p.evaluated >= 2 * CHUNK {
+                stop.store(true, Ordering::Relaxed);
+            }
+        };
+        let ctl = Control {
+            stop: Some(&stop),
+            progress: Some(&after_two),
+            ..Control::default()
+        };
+        let r = optimize_ctl(&site, &base, &PlanEdits::default(), &req(400), ctl).unwrap();
+        assert!(r.stopped_early);
+        assert_eq!(r.evaluated, 2 * CHUNK, "stopped at the next chunk");
+        assert!(!r.candidates.is_empty());
+        assert_eq!(r.to_json()["stopped_early"], true);
+        let full = optimize_ctl(&site, &base, &PlanEdits::default(), &req(32), Control::default())
+            .unwrap();
+        assert!(!full.stopped_early);
+        assert_eq!(full.to_json()["stopped_early"], false);
+
+        // Serde round trip keeps the result, interned names included.
+        let v = serde_json::to_value(&r).unwrap();
+        let back: OptimizeResult = serde_json::from_value(v.clone())
+            .unwrap_or_else(|e| panic!("{e}: {}", serde_json::to_string(&v).unwrap()));
+        assert_eq!(back.to_json(), r.to_json());
+
+        // Stopped up front: nothing to rank.
+        let ctl = Control {
+            stop: Some(&stop),
+            ..Control::default()
+        };
+        assert_eq!(
+            optimize_ctl(&site, &base, &PlanEdits::default(), &req(400), ctl).unwrap_err(),
+            STOPPED_EMPTY
+        );
+        // Cancel wins over stop.
+        let cancel = AtomicBool::new(true);
+        let ctl = Control {
+            cancel: Some(&cancel),
+            stop: Some(&stop),
+            progress: None,
+        };
+        assert_eq!(
+            optimize_ctl(&site, &base, &PlanEdits::default(), &req(400), ctl).unwrap_err(),
+            CANCELLED
+        );
     }
 }
