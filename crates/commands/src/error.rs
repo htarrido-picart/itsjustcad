@@ -73,4 +73,7 @@ pub enum ExecError {
         op: String,
         source: Box<ExecError>,
     },
+    /// A replay stopped by its [`crate::ReplayControl`] cancel flag (#217).
+    #[error("cancelled")]
+    Cancelled,
 }

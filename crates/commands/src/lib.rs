@@ -54,7 +54,7 @@ pub use command::{
 };
 pub use error::{ExecError, ParseError};
 pub use exec::{
-    resolve_targets, trim_preview, trim_removed_piece, ApplyOutcome, ImportSummary, Session, MAIN_BRANCH,
+    resolve_targets, trim_preview, trim_removed_piece, ApplyOutcome, ImportSummary, ReplayControl, Session, MAIN_BRANCH,
 };
 pub use parse::{parse, parse_with_home};
 pub use plugin::{Plugin, PluginError, PluginParam, PluginRegistry};

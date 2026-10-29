@@ -38,6 +38,7 @@
 mod boxsel;
 pub mod cameras;
 pub mod guided;
+pub mod open_job;
 pub mod optimize_job;
 pub mod replay;
 pub mod selection;
@@ -292,6 +293,9 @@ pub struct AppHandle {
 
     /// Background site optimizer searches ([`optimize_job`], #170).
     optimize_jobs: Mutex<optimize_job::Jobs>,
+
+    /// Background document opens ([`open_job`], #217).
+    open_jobs: Mutex<open_job::Jobs>,
 
     // async / deck (shared across threads via Arc)
     runtime: tokio::runtime::Runtime,
@@ -810,6 +814,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         gumball_preview: None,
         guided: Default::default(),
         optimize_jobs: Default::default(),
+        open_jobs: Default::default(),
         runtime,
         deck: None,
         deck_config: None,
@@ -1034,17 +1039,47 @@ pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: u
         };
         match io::from_json(json) {
             Ok(session) => {
-                app.session = session;
-                app.guided = Default::default();
-                if let Ok(mut hist) = app.history.lock() {
-                    hist.clear();
-                }
-                frame_camera(&mut app);
-                app.last_gen = None; // force re-snapshot next frame
+                install_session(&mut app, session);
                 true
             }
             Err(_) => false,
         }
+    })
+}
+
+/// Make an opened `session` the handle's document: clear the guided run and
+/// the deck history, frame the camera and force a re-snapshot next frame
+/// ([`ijc_open_json`], [`open_job::ijc_open_take`]).
+fn install_session(app: &mut AppHandle, session: Session) {
+    app.session = session;
+    app.guided = Default::default();
+    if let Ok(mut hist) = app.history.lock() {
+        hist.clear();
+    }
+    frame_camera(app);
+    app.last_gen = None; // force re-snapshot next frame
+}
+
+/// A checkpoint of the current document (#217): its snapshot plus the op
+/// count it reflects, as JSON
+/// (`{"mydrafter_checkpoint":3,"core":"<core version>","op_count":n,
+/// "ops_hash":"<16 hex>","doc":{…}}`). Write it next to the
+/// [`ijc_save_json`] output and pass it back to [`open_job::ijc_open_start`]
+/// to skip replaying the ops it covers. Treat it as opaque: a checkpoint from
+/// another core version, a corrupt one, or one that does not match the log
+/// is ignored on open (full replay). Returns an empty (non-null) string for a
+/// null/invalid handle. Caller must [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_checkpoint_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return into_c_string(String::new());
+        };
+        into_c_string(io::checkpoint_json(&app.session))
     })
 }
 
