@@ -2186,6 +2186,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
         // checkrules list | checkrules load <path>
         "cutcheck" => {
             let mut cmd_units = crate::cut::CutUnit::default();
+            let mut preset = crate::cut_preset::CutPreset::default();
             let (mut thickness, mut material, mut layers) = (None, None, Vec::new());
             let mut rest: Vec<&str> = Vec::new();
             let mut raw_t: Option<&str> = None;
@@ -2196,6 +2197,11 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                             ParseError::Invalid(format!("cutcheck: units={v} — only mm or in"))
                         })?
                     }
+                    Some(("preset", v)) => {
+                        preset = crate::cut_preset::CutPreset::parse(v).ok_or_else(|| {
+                            ParseError::Invalid(format!("cutcheck: preset={v} — only scs or generic"))
+                        })?
+                    }
                     Some(("thickness" | "t", v)) => raw_t = Some(v),
                     Some(("material" | "sku", v)) if !v.is_empty() => material = Some(v.to_string()),
                     Some(("material" | "sku", _)) => {}
@@ -2204,7 +2210,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                     }
                     Some((k, _)) => {
                         return Err(ParseError::Invalid(format!(
-                            "cutcheck: unknown option '{k}='. Usage: cutcheck [sel] units=mm|in thickness=<t> [material=<sku>] [layers=a,b]"
+                            "cutcheck: unknown option '{k}='. Usage: cutcheck [sel] [preset=scs|generic] units=mm|in thickness=<t> [material=<sku>] [layers=a,b]"
                         )));
                     }
                     None => rest.push(a),
@@ -2213,9 +2219,15 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
             if let Some(v) = raw_t.filter(|v| !v.is_empty()) {
                 thickness = Some(crate::cut::parse_len(v, cmd_units).map_err(ParseError::Invalid)?);
             }
+            if preset == crate::cut_preset::CutPreset::Generic && material.is_some() {
+                return Err(ParseError::Invalid(
+                    "cutcheck: material= is SendCutSend data — preset=generic takes thickness= only".into(),
+                ));
+            }
             let targets = crate::cut::parse_selector(&rest)
                 .map_err(|e| ParseError::Invalid(format!("cutcheck: {e}")))?;
             Ok(Command::CutCheck {
+                preset,
                 targets,
                 layers,
                 units: cmd_units,

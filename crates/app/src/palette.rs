@@ -71,11 +71,20 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("save", "File", "save [path]"),
     ("open", "File", ""),
     ("template", "File", ""),
-    ("cutexport", "File", ""),
+    ("cutexport", "File", "cutexport [preset=scs|generic]"),
     ("critique", "Tools", "critique [note]"),
     ("feedback", "Help", "feedback bug|idea | title: … | <field>: …"),
     ("reducemotion", "Tools", "reducemotion [on|off]"),
 ];
+
+/// The palette summary of an app verb that opens a titled panel: its menu
+/// title, so the palette reads like the menu (#209).
+fn app_verb_summary(name: &str) -> String {
+    match name {
+        "cutexport" => crate::i18n::t("menu.file.export_cut").to_string(),
+        _ => String::new(),
+    }
+}
 
 /// Build the full palette candidate set: every registry verb (name / category /
 /// usage / summary) followed by the app-level verbs. Deduplicated by name — a
@@ -99,7 +108,7 @@ pub fn entries() -> Vec<PaletteEntry> {
                 name: name.to_string(),
                 category: group.to_string(),
                 usage: usage.to_string(),
-                summary: String::new(),
+                summary: app_verb_summary(name),
             });
         }
     }

@@ -937,7 +937,7 @@ pub struct App {
     show_about: bool,
     /// The open feedback review sheet (`feedback` / Help ▸ Report a problem…).
     feedback_sheet: Option<crate::feedback_sheet::FeedbackSheet>,
-    /// The open "Export for cutting…" panel (#175).
+    /// The open "Export for SendCutSend…" panel (#175, #209).
     cut_export: Option<cut_export::CutExportPanel>,
     /// Whether the Help → "Check for Updates…" popup is open.
     show_update: bool,
@@ -2530,7 +2530,12 @@ impl App {
             Some("template") => {
                 self.show_template_picker = true;
             }
-            Some("cutexport") => self.open_cut_export(),
+            // `cutexport [preset=scs|generic]` (#209).
+            Some("cutexport") => self.open_cut_export_with(
+                words
+                    .find_map(|w| w.strip_prefix("preset="))
+                    .and_then(itsjustcad_commands::cut_preset::CutPreset::parse),
+            ),
             // Alpha feedback ticket: open the review sheet pre-filled. Nothing is
             // opened until the user clicks Send via web form in it.
             Some("feedback") => {
@@ -11597,7 +11602,7 @@ impl eframe::App for App {
             }
         }
 
-        // File ▸ Export for cutting… panel (#175).
+        // File ▸ Export for SendCutSend… panel (#175, #209).
         self.cut_export_ui(&ui.ctx().clone());
 
         // Help → "Check for Updates…" popup. Modeless (draggable / X-closable),

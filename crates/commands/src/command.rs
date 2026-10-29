@@ -1693,7 +1693,10 @@ pub enum Command {
     /// else the rule of thumb), resolves `targets` to ids, and embeds both in
     /// the logged op so replay never reads disk or the live selection.
     /// Markers land on the 'compliance' layer; `ids` are written back.
+    /// `preset` generic (#209) never reads SendCutSend data: rule of thumb.
     CutCheck {
+        #[serde(default, skip_serializing_if = "crate::cut_preset::CutPreset::is_scs")]
+        preset: crate::cut_preset::CutPreset,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         targets: Option<Selector>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

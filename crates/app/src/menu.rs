@@ -91,10 +91,10 @@ pub enum MenuAction {
     /// Pop a native file-save dialog for export, then run `export <path>` through
     /// the substrate. Fired by the File → Export… menu item.
     ExportDialog,
-    /// Open the "Export for cutting…" panel (cutcheck + cut DXF + SendCutSend
-    /// data, #175). Fired by File ▸ Export for cutting… and Plugins ▸ Export for
-    /// cutting… (next to the bundled `sendcutsend` plugin); the `cutexport`
-    /// app verb opens the same panel.
+    /// Open the "Export for SendCutSend…" panel (cutcheck + cut DXF +
+    /// SendCutSend data, #175, #209). Fired by File ▸ Export for SendCutSend…
+    /// and Plugins ▸ Export for SendCutSend… (next to the bundled
+    /// `sendcutsend` plugin); the `cutexport` app verb opens the same panel.
     ExportForCutting,
     /// Set the app appearance theme from the native View ▸ Appearance items.
     /// `Some(true)` = Dark, `Some(false)` = Light, `None` = follow the OS.
@@ -1462,7 +1462,7 @@ mod tests {
             );
             assert!(
                 ls.iter().any(|(id, _, a)| id == "Plugins/export_cut" && *a == MenuAction::ExportForCutting),
-                "Plugins ▸ Export for cutting… ({style:?})"
+                "Plugins ▸ Export for SendCutSend… ({style:?})"
             );
         }
     }
