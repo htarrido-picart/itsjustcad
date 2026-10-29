@@ -23,6 +23,7 @@ use itsjustcad_commands::site_optimize::{
     self, DaylightPeriod, Economics, Ledger, Objective, OptimizeRequest, OptimizeResult, Quantities,
     SEARCHED,
 };
+use itsjustcad_commands::optimize_runs::{self, SavedRun};
 use itsjustcad_commands::{subdiv_params, Command};
 use itsjustcad_doc::{ObjectId, SubdivKind};
 
@@ -704,17 +705,23 @@ pub(super) struct Finished {
     daylight: Option<site_optimize::DaylightInfo>,
 }
 
-/// A search running on a worker thread.
+/// A search running on a worker thread: the document's one run (#201).
 pub(super) struct Job {
+    /// The site plan searched.
+    source: ObjectId,
     started: Instant,
     /// The form the search ran with (picks the shown columns).
     form: OptimizeForm,
+    /// What the search plans, saved with its result.
+    prepared: site_optimize::Prepared,
     rx: mpsc::Receiver<Result<OptimizeResult, String>>,
     /// Set by Cancel; the worker stops at its next plan and its result is
     /// dropped (the panel already let go of the job).
     cancel: Arc<AtomicBool>,
     /// The search's latest progress report.
     progress: Arc<Mutex<site_optimize::Progress>>,
+    /// No idle sleep while it runs (the display may sleep).
+    _awake: crate::keep_awake::KeepAwake,
 }
 
 impl Job {
@@ -736,17 +743,39 @@ pub(super) fn progress_text(p: &site_optimize::Progress, elapsed: f64) -> String
     format!("{s} · {elapsed:.1} s")
 }
 
-/// The panel state, kept on [`App`].
+/// A finished run's notice, shown wherever the user is (#201). It never
+/// applies anything; clicking it opens the site's Optimize.
+pub(super) struct Notice {
+    pub(super) source: ObjectId,
+    pub(super) text: String,
+    pub(super) at: Instant,
+}
+
+/// How long a notice stays up.
+pub(super) const NOTICE_FOR: Duration = Duration::from_secs(8);
+
+/// The panel state, kept on [`App`]. One search runs per document (#201):
+/// opening another site plan's Optimize, selecting or editing never stops
+/// it; only Cancel, deleting its site plan, or closing/replacing the
+/// document does. Results are the site plan's saved run
+/// ([`itsjustcad_commands::Session::optimize_run`]).
 #[derive(Default)]
 pub(super) struct OptimizePanel {
     /// The site plan boundary the form is open for.
     source: Option<ObjectId>,
     pub(super) form: OptimizeForm,
     job: Option<Job>,
-    /// Last finished search: (elapsed, rows + summary, or the error).
-    result: Option<(Duration, Result<Finished, String>)>,
-    /// The last search was cancelled.
-    cancelled: bool,
+    /// Run was pressed for this site while another site's search runs: ask
+    /// "Stop the running search?" first.
+    confirm_stop: Option<ObjectId>,
+    /// The last search of this site failed.
+    error: Option<(ObjectId, String)>,
+    /// The last search of this site was cancelled.
+    cancelled: Option<ObjectId>,
+    /// The shown saved run, ready to draw: (source, finished_at, view).
+    shown: Option<(ObjectId, u64, Finished)>,
+    /// The finish notice.
+    pub(super) notice: Option<Notice>,
     /// The Yield economics block's plan quantities, per (source, generation).
     current_q: Option<(ObjectId, u64, site_optimize::DaylightOpts, Option<Quantities>)>,
 }
@@ -765,24 +794,103 @@ impl OptimizeForm {
     }
 }
 
+impl OptimizeForm {
+    /// The form a saved run's `req` came from (its unchecked constraints keep
+    /// the plan's seeded values), so a reopened panel shows what ran.
+    pub(super) fn from_request(
+        req: &OptimizeRequest,
+        settings: &subdivision::SubdivisionSettings,
+    ) -> OptimizeForm {
+        let mut f = OptimizeForm::default();
+        f.seed_from_plan(settings);
+        f.objective = req.objective;
+        f.budget = req.budget;
+        f.seed = req.seed;
+        f.economics = req.economics;
+        f.daylight_period = req.daylight_period;
+        f.daylight_hours = req.daylight_hours;
+        f.overheat_hours = req.overheat_hours;
+        f.use_climate = req.use_climate;
+        f.locks = req.lock.iter().cloned().collect();
+        f.patterns = req.patterns.iter().cloned().collect();
+        if req.objective == Objective::Weighted {
+            for ((k, _), w) in METRICS.iter().zip(f.weights.iter_mut()) {
+                *w = req.weights.get(*k).copied().unwrap_or(0.0);
+            }
+        }
+        for (c, slot) in Constraint::ALL.into_iter().zip(f.constraints.iter_mut()) {
+            let v = match c {
+                Constraint::MinLotArea => req.min_lot_area,
+                Constraint::MinLotWidth => req.min_lot_width,
+                Constraint::MinFrontage => req.min_frontage,
+                Constraint::MinOpen => req.min_open,
+                Constraint::MaxFar => req.max_far,
+                Constraint::MaxCoverage => req.max_coverage,
+                Constraint::MaxLotArea => req.max_lot_area,
+                Constraint::MaxDepthRatio => req.max_depth_ratio,
+                Constraint::MaxBlockPerimeter => req.max_block_perimeter,
+                Constraint::MaxStories => req.max_stories.map(|n| n as f64),
+                Constraint::MinParkAccess => req.min_park_access,
+                Constraint::MinDaylight => req.min_daylight,
+                Constraint::MaxOverheat => req.max_overheat,
+                Constraint::MinDwellings => req.min_dwellings,
+                Constraint::MinDensity => req.min_density,
+            };
+            *slot = match v {
+                Some(v) => (true, if c.is_percent() { v * 100.0 } else { v }),
+                None => (false, slot.1),
+            };
+        }
+        if let (Some(a), Some(e)) = (req.dwelling_area, req.dwelling_efficiency) {
+            (f.dwelling_area, f.dwelling_efficiency) = (a, e);
+        }
+        f
+    }
+}
+
 impl OptimizePanel {
-    fn open_for(&mut self, source: ObjectId, settings: &subdivision::SubdivisionSettings) {
+    /// Show the form for `source`: the running search's form, else the saved
+    /// run's, else the current form seeded from the plan. Never stops a run.
+    fn open_for(
+        &mut self,
+        source: ObjectId,
+        settings: &subdivision::SubdivisionSettings,
+        saved: Option<&SavedRun>,
+    ) {
         if self.source != Some(source) {
-            self.cancel();
-            self.job = None;
-            self.cancelled = false;
-            self.result = None;
-            self.form.seed_from_plan(settings);
+            self.confirm_stop = None;
+            match (&self.job, saved) {
+                (Some(job), _) if job.source == source => self.form = job.form.clone(),
+                (_, Some(run)) => self.form = OptimizeForm::from_request(&run.request, settings),
+                _ => self.form.seed_from_plan(settings),
+            }
         }
         self.source = Some(source);
     }
 
-    /// Start a search off the UI thread; repaints `ctx` when done.
+    /// The site plan being searched, if a search runs.
+    pub(super) fn running_source(&self) -> Option<ObjectId> {
+        self.job.as_ref().map(|j| j.source)
+    }
+
+    /// The running search's progress and elapsed seconds.
+    pub(super) fn running_progress(&self) -> Option<(site_optimize::Progress, f64)> {
+        self.job
+            .as_ref()
+            .map(|j| (j.progress(), j.started.elapsed().as_secs_f64()))
+    }
+
+    /// Start a search of `source` off the UI thread (stopping any running
+    /// one); repaints `ctx` when done.
     fn start(&mut self, doc: &itsjustcad_doc::Document, source: ObjectId, ctx: &egui::Context) {
+        self.cancel();
+        self.confirm_stop = None;
+        self.cancelled = None;
+        self.error = None;
         let prepared = match site_optimize::prepare_doc(doc, &[source], &self.form.to_request()) {
             Ok(p) => p,
             Err(e) => {
-                self.result = Some((Duration::ZERO, Err(e)));
+                self.error = Some((source, e));
                 return;
             }
         };
@@ -794,6 +902,7 @@ impl OptimizePanel {
         }));
         let ctx = ctx.clone();
         let (flag, latest) = (cancel.clone(), progress.clone());
+        let worker = prepared.clone();
         std::thread::spawn(move || {
             let report = |p: &site_optimize::Progress| {
                 *latest.lock().unwrap_or_else(|e| e.into_inner()) = *p;
@@ -802,20 +911,22 @@ impl OptimizePanel {
             let ctl = site_optimize::Control {
                 cancel: Some(&flag),
                 progress: Some(&report),
+                ..Default::default()
             };
-            // A dropped job (the panel moved on) dropped `rx`; the send then
-            // fails harmlessly.
-            let _ = tx.send(prepared.run(ctl));
+            // A dropped job (cancelled) dropped `rx`; the send then fails
+            // harmlessly.
+            let _ = tx.send(worker.run(ctl));
             ctx.request_repaint();
         });
-        self.result = None;
-        self.cancelled = false;
         self.job = Some(Job {
+            source,
             started: Instant::now(),
             form: self.form.clone(),
+            prepared,
             rx,
             cancel,
             progress,
+            _awake: crate::keep_awake::KeepAwake::new("ItsJustCAD site plan optimizer"),
         });
     }
 
@@ -827,56 +938,114 @@ impl OptimizePanel {
     pub(super) fn cancel(&mut self) {
         if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
-            self.cancelled = true;
-            self.result = None;
+            self.cancelled = Some(job.source);
         }
     }
 
-    /// Collect a finished search, if any.
-    fn poll(&mut self) {
+    /// The document closed or was replaced: stop the search, forget it all.
+    pub(super) fn close_document(&mut self) {
+        self.cancel();
+        *self = OptimizePanel {
+            form: std::mem::take(&mut self.form),
+            ..OptimizePanel::default()
+        };
+    }
+
+    /// Collect a finished search, if any, into `session` as its site plan's
+    /// saved run, and raise the finish notice. A search whose site plan was
+    /// deleted is stopped. Called every frame, wherever the user is.
+    pub(super) fn poll(&mut self, session: &mut itsjustcad_commands::Session) {
         let Some(job) = &self.job else { return };
+        if !optimize_runs::has_site_plan(&session.doc, job.source) {
+            self.cancel();
+            self.cancelled = None;
+            return;
+        }
         let got = match job.rx.try_recv() {
             Ok(r) => r,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => Err("siteoptimize: the search stopped".into()),
         };
-        let elapsed = job.started.elapsed();
-        let finished = got.map(|r| Finished::new(&job.form, &r));
-        self.job = None;
-        // A cancelled search shows nothing (the Run row says so).
-        self.cancelled = matches!(&finished, Err(e) if e == site_optimize::CANCELLED);
-        self.result = (!self.cancelled).then_some((elapsed, finished));
+        let Some(job) = self.job.take() else { return };
+        let elapsed = job.started.elapsed().as_secs_f64();
+        let text = match got {
+            Ok(r) => {
+                let n = r.candidates.len();
+                session.set_optimize_run(job.source, SavedRun::new(&job.prepared, r, elapsed));
+                format!("{} {n} {}", t("optimize.done"), t("optimize.plans"))
+            }
+            // A cancelled search shows nothing (the Run row says so).
+            Err(e) if e == site_optimize::CANCELLED => {
+                self.cancelled = Some(job.source);
+                return;
+            }
+            Err(e) => {
+                self.error = Some((job.source, e));
+                t("optimize.failed").to_string()
+            }
+        };
+        self.notice = Some(Notice {
+            source: job.source,
+            text,
+            at: Instant::now(),
+        });
     }
 
-    /// Run a search for `source` to completion on this thread (previews).
-    #[cfg(test)]
-    pub(super) fn run_now(&mut self, doc: &itsjustcad_doc::Document, source: ObjectId) {
-        let link = doc.subdivision_links.get(&source).expect("a site plan");
-        self.open_for(source, &link.settings);
-        let req = OptimizeRequest {
-            location: doc.location.map(location),
-            ..self.form.to_request()
-        };
+    /// The saved run of `source`, built for drawing (cached per run).
+    fn shown(&mut self, source: ObjectId, run: Option<&SavedRun>, settings: &subdivision::SubdivisionSettings) -> Option<&Finished> {
+        let run = run?;
+        let fresh = matches!(&self.shown, Some((s, at, _)) if *s == source && *at == run.finished_at);
+        if !fresh {
+            let form = OptimizeForm::from_request(&run.request, settings);
+            self.shown = Some((source, run.finished_at, Finished::new(&form, &run.result)));
+        }
+        self.shown.as_ref().map(|(_, _, f)| f)
+    }
+
+    /// Run a search for `source` to completion on this thread, save it and
+    /// post the notice (previews, the dev hook).
+    pub(super) fn run_now(&mut self, session: &mut itsjustcad_commands::Session, source: ObjectId) {
+        let link = session.doc.subdivision_links.get(&source).expect("a site plan").clone();
+        self.open_for(source, &link.settings, None);
         let started = Instant::now();
-        let r = site_optimize::optimize_doc(doc, &[source], &req)
-            .map(|(_, r)| Finished::new(&self.form, &r));
-        self.result = Some((started.elapsed(), r));
+        match site_optimize::prepare_doc(&session.doc, &[source], &self.form.to_request())
+            .and_then(|p| Ok((p.run(Default::default())?, p)))
+        {
+            Ok((r, p)) => {
+                let n = r.candidates.len();
+                session.set_optimize_run(source, SavedRun::new(&p, r, started.elapsed().as_secs_f64()));
+                self.notice = Some(Notice {
+                    source,
+                    text: format!("{} {n} {}", t("optimize.done"), t("optimize.plans")),
+                    at: Instant::now(),
+                });
+            }
+            Err(e) => self.error = Some((source, e)),
+        }
     }
 }
 
 #[cfg(test)]
 impl OptimizePanel {
     /// Show a search for `source` as running at `p` (previews).
-    pub(super) fn fake_running(&mut self, source: ObjectId, p: site_optimize::Progress) {
+    pub(super) fn fake_running(
+        &mut self,
+        doc: &itsjustcad_doc::Document,
+        source: ObjectId,
+        p: site_optimize::Progress,
+    ) {
         let (tx, rx) = mpsc::channel();
         std::mem::forget(tx); // never finishes
         self.source = Some(source);
         self.job = Some(Job {
+            source,
             started: Instant::now() - Duration::from_millis(3200),
             form: self.form.clone(),
+            prepared: site_optimize::prepare_doc(doc, &[source], &self.form.to_request()).unwrap(),
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(Mutex::new(p)),
+            _awake: crate::keep_awake::KeepAwake::new("preview"),
         });
     }
 }
@@ -952,6 +1121,85 @@ fn location(l: itsjustcad_doc::GeoLocation) -> site_optimize::Location {
 const GRID_SPACING: egui::Vec2 = egui::vec2(crate::theme::Spacing::S, 6.0);
 
 impl App {
+    /// Show `source`'s Optimize: select its boundary, open the Parameters
+    /// tab on the Optimize segment.
+    pub(super) fn open_optimize(&mut self, source: ObjectId) {
+        if self.session.doc.get(source).is_none() {
+            return;
+        }
+        self.session.doc.selection = [source].into();
+        self.parametric_selected = None;
+        self.focus_site_override = None;
+        self.subdiv_segment = SEG_OPTIMIZE;
+        self.panel_tabs.show(crate::tabstrip::PanelTab::Parameters);
+    }
+
+    /// The finish notice (#201), bottom right above the status bar, for
+    /// [`NOTICE_FOR`]. Clicking it opens the site's Optimize; it never
+    /// applies a plan.
+    pub(super) fn optimize_notice(&mut self, ctx: &egui::Context) {
+        let Some(n) = &self.optimize.notice else { return };
+        let left = NOTICE_FOR.saturating_sub(n.at.elapsed());
+        if left.is_zero() {
+            self.optimize.notice = None;
+            return;
+        }
+        ctx.request_repaint_after(left);
+        let (source, text) = (n.source, n.text.clone());
+        let pad = crate::theme::Spacing::M;
+        let (mut open, mut close) = (false, false);
+        egui::Area::new(egui::Id::new("optimize_notice"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-pad, -(pad + 28.0)))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::symmetric(pad as i8, crate::theme::Spacing::S as i8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = crate::theme::Spacing::M;
+                            open = ui
+                                .add(egui::Label::new(egui::RichText::new(&text).strong()).sense(egui::Sense::click()))
+                                .on_hover_text(t("optimize.status_tip"))
+                                .clicked();
+                            close = ui.add(egui::Button::new("×").frame(false)).clicked();
+                        });
+                    });
+            });
+        if open {
+            self.open_optimize(source);
+        }
+        if open || close {
+            self.optimize.notice = None;
+        }
+    }
+
+    /// Dev hook `ITSJUSTCAD_OPTIMIZE` (screenshots): `run` starts a long
+    /// search of the first site plan and leaves its panel (the status-bar
+    /// indicator shows); `done` runs a short one to completion (the notice).
+    pub(super) fn optimize_dev_hook(&mut self, ctx: &egui::Context) {
+        let Ok(mode) = std::env::var("ITSJUSTCAD_OPTIMIZE") else { return };
+        let Some(source) = self
+            .session
+            .doc
+            .subdivision_links
+            .iter()
+            .find(|(_, l)| l.kind == SubdivKind::SitePlan)
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        let settings = self.session.doc.subdivision_links[&source].settings.clone();
+        self.optimize.open_for(source, &settings, None);
+        if mode == "done" {
+            self.optimize.form.budget = 40;
+            self.optimize.run_now(&mut self.session, source);
+        } else {
+            self.optimize.form.budget = 5000;
+            self.optimize.start(&self.session.doc, source, ctx);
+            self.session.doc.selection.clear();
+        }
+    }
+
     /// The `Optimize` segment of a `SitePlan` link's inspector.
     pub(super) fn optimize_panel(
         &mut self,
@@ -959,8 +1207,8 @@ impl App {
         source: ObjectId,
         link: &itsjustcad_doc::SubdivLink,
     ) {
-        self.optimize.open_for(source, &link.settings);
-        self.optimize.poll();
+        let saved = self.session.optimize_run(source);
+        self.optimize.open_for(source, &link.settings, saved);
         self.refresh_subdiv_yield(source, link);
         let base = self
             .subdiv_yield
@@ -977,7 +1225,7 @@ impl App {
                 ui.add_space(crate::theme::Spacing::SM);
                 self.optimize_run_row(ui, source);
                 ui.add_space(crate::theme::Spacing::S);
-                self.optimize_results(ui, source, base);
+                self.optimize_results(ui, source, base, &link.settings);
                 ui.add_space(crate::theme::Spacing::S);
                 self.optimize_advanced(ui, source);
             });
@@ -985,7 +1233,7 @@ impl App {
 
     /// Objective (+ weights) and the constraint list.
     fn optimize_form(&mut self, ui: &mut egui::Ui, source: ObjectId) {
-        let busy = self.optimize.job.is_some();
+        let busy = self.optimize.running_source() == Some(source);
         let form = &mut self.optimize.form;
         ui.add_enabled_ui(!busy, |ui| {
             egui::Grid::new(("optimize_objective_grid", source))
@@ -1066,7 +1314,7 @@ impl App {
 
     /// Full-width Run, or spinner + elapsed + Cancel while a search runs.
     fn optimize_run_row(&mut self, ui: &mut egui::Ui, source: ObjectId) {
-        match &self.optimize.job {
+        match self.optimize.job.as_ref().filter(|j| j.source == source) {
             Some(job) => {
                 let p = job.progress();
                 let text = progress_text(&p, job.started.elapsed().as_secs_f64());
@@ -1099,11 +1347,39 @@ impl App {
                 let run = egui::Button::new(text)
                     .fill(fill)
                     .min_size(egui::vec2(ui.available_width(), crate::theme::Spacing::HIT_TARGET));
+                let other = self.optimize.running_source().is_some();
+                let mut start = false;
                 if ui.add(run).clicked() {
+                    // One search per document: another site's search runs,
+                    // so ask before stopping it.
+                    if other {
+                        self.optimize.confirm_stop = Some(source);
+                    } else {
+                        start = true;
+                    }
+                }
+                if other && self.optimize.confirm_stop == Some(source) {
+                    ui.add_space(crate::theme::Spacing::S);
+                    ui.label(t("optimize.stop_confirm"));
+                    ui.add_space(crate::theme::Spacing::XS);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = crate::theme::Spacing::S;
+                        let h = crate::theme::Spacing::HIT_TARGET;
+                        if ui.add(egui::Button::new(t("optimize.stop_and_run")).min_size(egui::vec2(0.0, h))).clicked() {
+                            start = true;
+                        }
+                        if ui.add(egui::Button::new(t("optimize.keep_running")).min_size(egui::vec2(0.0, h))).clicked() {
+                            self.optimize.confirm_stop = None;
+                        }
+                    });
+                } else if other {
+                    ui.add_space(crate::theme::Spacing::XS);
+                    ui.weak(t("optimize.other_running"));
+                }
+                if start {
                     let ctx = ui.ctx().clone();
                     self.optimize.start(&self.session.doc, source, &ctx);
-                }
-                if self.optimize.cancelled {
+                } else if self.optimize.cancelled == Some(source) {
                     ui.add_space(crate::theme::Spacing::XS);
                     ui.weak(t("optimize.cancelled"));
                 }
@@ -1113,16 +1389,31 @@ impl App {
 
     /// Results table (deltas vs `base`, the current plan), then the scatter.
     /// Apply comes first so a narrow panel never clips it.
-    fn optimize_results(&mut self, ui: &mut egui::Ui, source: ObjectId, base: Option<Metrics>) {
-        let Some((elapsed, result)) = &self.optimize.result else {
+    fn optimize_results(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: ObjectId,
+        base: Option<Metrics>,
+        settings: &subdivision::SubdivisionSettings,
+    ) {
+        if let Some((s, e)) = &self.optimize.error
+            && *s == source
+        {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+            ui.add_space(crate::theme::Spacing::S);
+        }
+        let saved = self.session.optimize_run(source);
+        let Some((elapsed, stopped, stale)) = saved.map(|r| {
+            (
+                r.elapsed_s,
+                r.result.stopped_early,
+                optimize_runs::is_stale(&self.session.doc, source, r),
+            )
+        }) else {
             return;
         };
-        let f = match result {
-            Ok(f) => f,
-            Err(e) => {
-                ui.colored_label(ui.visuals().error_fg_color, e);
-                return;
-            }
+        let Some(f) = self.optimize.shown(source, saved, settings) else {
+            return;
         };
         ui.weak(format!(
             "{} {} · {} {} · {:.1} s",
@@ -1130,8 +1421,18 @@ impl App {
             t("optimize.evaluated"),
             f.feasible,
             t("optimize.feasible"),
-            elapsed.as_secs_f64()
+            elapsed
         ));
+        // A stopped run and a changed plan say so; Apply still works.
+        if stopped {
+            ui.add_space(crate::theme::Spacing::XS);
+            ui.weak(t("optimize.stopped_early"));
+        }
+        if stale {
+            ui.add_space(crate::theme::Spacing::XS);
+            ui.colored_label(ui.visuals().warn_fg_color, t("optimize.stale"));
+        }
+        ui.add_space(crate::theme::Spacing::XS);
         // Deltas are against the current plan as the search scored it; the
         // document's yield stands in when it could not be planned.
         let base = f.current.as_ref().map(|c| c.metrics).or(base);
@@ -1255,7 +1556,7 @@ impl App {
     /// id follows the objective, so switching to `value` opens it). Develop
     /// (the default) prices built floor area; otherwise serviced lots.
     fn optimize_economics(&mut self, ui: &mut egui::Ui, source: ObjectId) {
-        let busy = self.optimize.job.is_some();
+        let busy = self.optimize.running_source() == Some(source);
         let no_location = self.session.doc.location.is_none();
         let form = &mut self.optimize.form;
         let daylight_on = form.constraints[11].0 || form.constraints[12].0;
@@ -1338,7 +1639,7 @@ impl App {
     /// hours a facade needs, and the overheating threshold. Open when a
     /// daylight constraint is on.
     fn optimize_daylight(&mut self, ui: &mut egui::Ui, source: ObjectId) {
-        let busy = self.optimize.job.is_some();
+        let busy = self.optimize.running_source() == Some(source);
         let climate = self.session.doc.climate.as_ref().map(climate_name);
         let no_dialog = self.headless_no_dialog();
         // Set (`Some(Some(path))`) or remove (`Some(None)`) the climate file,
@@ -1532,7 +1833,7 @@ impl App {
 
     /// Collapsed-by-default budget, seed, locked parameters, street patterns.
     fn optimize_advanced(&mut self, ui: &mut egui::Ui, source: ObjectId) {
-        let busy = self.optimize.job.is_some();
+        let busy = self.optimize.running_source() == Some(source);
         let form = &mut self.optimize.form;
         egui::CollapsingHeader::new(t("optimize.advanced"))
             .id_salt(("optimize_advanced", source))
@@ -2017,7 +2318,7 @@ mod tests {
         }
         let source = *s.doc.subdivision_links.keys().next().unwrap();
         let mut panel = OptimizePanel::default();
-        panel.open_for(source, &s.doc.subdivision_links[&source].settings);
+        panel.open_for(source, &s.doc.subdivision_links[&source].settings, None);
         panel.form.budget = 5000;
         panel.start(&s.doc, source, &egui::Context::default());
         let job = panel.job.as_ref().unwrap();
@@ -2033,9 +2334,10 @@ mod tests {
         // 1000 x 800 m site, debug build).
         let t = Instant::now();
         panel.cancel();
-        panel.poll();
+        panel.poll(&mut s);
         let time_to_cancel = t.elapsed();
-        assert!(panel.job.is_none() && panel.cancelled && panel.result.is_none());
+        assert!(panel.job.is_none() && panel.cancelled == Some(source));
+        assert!(s.optimize_run(source).is_none(), "a cancel saves nothing");
         assert!(
             time_to_cancel < Duration::from_millis(200),
             "cancel took {time_to_cancel:?}"
@@ -2050,6 +2352,84 @@ mod tests {
             progress.lock().unwrap().evaluated < 5000,
             "cancel stops the search"
         );
+    }
+
+    /// #201: the form a saved request came from maps back to that request.
+    #[test]
+    fn form_from_request_round_trips() {
+        let settings = subdivision::SubdivisionSettings::default();
+        let mut f = OptimizeForm {
+            objective: Objective::Weighted,
+            weights: [1.0, 0.0, 0.0, 0.5, 2.0, 0.0],
+            budget: 40,
+            seed: 7,
+            ..OptimizeForm::default()
+        };
+        f.seed_from_plan(&settings);
+        f.constraints[3] = (true, 15.0); // percent
+        f.constraints[9] = (true, 4.0); // max stories
+        f.constraints[5] = (false, 50.0);
+        f.locks.insert("typology".into());
+        f.dwelling_area = 120.0;
+        let req = f.to_request();
+        assert_eq!(OptimizeForm::from_request(&req, &settings).to_request(), req);
+    }
+
+    /// #201: one run per document. Opening another site's Optimize keeps
+    /// it; a finished run is saved with a notice; deleting its site plan or
+    /// closing the document stops it.
+    #[test]
+    fn one_run_per_document() {
+        let mut s = itsjustcad_commands::Session::default();
+        for line in [
+            "rect 0,0,0 200 150",
+            "lotsettings depth=20",
+            "siteplan last",
+            "rect 400,0,0 200 150",
+            "siteplan last",
+        ] {
+            s.run(itsjustcad_commands::parse(line).unwrap()).unwrap();
+        }
+        let ids: Vec<ObjectId> = s.doc.subdivision_links.keys().copied().collect();
+        let (a, b) = (ids[0], ids[1]);
+        let settings = s.doc.subdivision_links[&a].settings.clone();
+        let ctx = egui::Context::default();
+        let mut panel = OptimizePanel::default();
+        panel.open_for(a, &settings, None);
+        panel.form.budget = 16;
+        panel.start(&s.doc, a, &ctx);
+        panel.open_for(b, &settings, None);
+        assert_eq!(panel.running_source(), Some(a), "opening another site keeps it");
+        let t = Instant::now();
+        while panel.running_source().is_some() {
+            assert!(t.elapsed() < Duration::from_secs(60));
+            panel.poll(&mut s);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let run = s.optimize_run(a).expect("saved");
+        assert!(s.optimize_run(b).is_none());
+        let n = panel.notice.as_ref().expect("finish notice");
+        assert_eq!(n.source, a);
+        assert!(n.text.contains(&run.result.candidates.len().to_string()), "{}", n.text);
+        // Reopened, the form is the run's.
+        panel.open_for(a, &settings, Some(run));
+        assert_eq!(panel.form.budget, 16);
+
+        // Deleting the site plan stops its run.
+        panel.form.budget = 5000;
+        panel.start(&s.doc, b, &ctx);
+        s.run(Command::LotRemove {
+            targets: itsjustcad_commands::Selector::Ids { ids: vec![b] },
+        })
+        .unwrap();
+        panel.poll(&mut s);
+        assert_eq!(panel.running_source(), None);
+        // Closing the document stops it too.
+        panel.start(&s.doc, a, &ctx);
+        assert_eq!(panel.running_source(), Some(a));
+        panel.close_document();
+        assert_eq!(panel.running_source(), None);
+        assert!(panel.notice.is_none());
     }
 
     #[test]

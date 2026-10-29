@@ -46,6 +46,12 @@ struct FileFormat {
     /// whenever there are no branches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// The latest optimizer run of each site plan (#201), keyed by boundary
+    /// id: metadata, not replayed. Read leniently (see
+    /// [`crate::optimize_runs::from_header`]); omitted when empty so files
+    /// without runs stay byte-identical. Older builds ignore it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    optimize_runs: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +77,7 @@ pub fn to_json(session: &Session) -> String {
         ops: session.save_log(),
         branches,
         branch,
+        optimize_runs: crate::optimize_runs::to_header(&session.optimize_runs()),
     };
     serde_json::to_string_pretty(&file).expect("op-log serializes")
 }
@@ -86,6 +93,7 @@ pub fn from_json(json: &str) -> Result<Session, IoError> {
         file.branch.unwrap_or_else(|| crate::exec::MAIN_BRANCH.to_string()),
     );
     session.set_doc_uuid(file.uuid);
+    session.set_optimize_runs(crate::optimize_runs::from_header(file.optimize_runs));
     Ok(session)
 }
 
@@ -179,12 +187,14 @@ pub fn load_file(path: &std::path::Path) -> Result<Session, IoError> {
         let mut session = Session::from_snapshot(cp.doc, file.ops);
         session.set_branches(file.branches, branch);
         session.set_doc_uuid(file.uuid);
+        session.set_optimize_runs(crate::optimize_runs::from_header(file.optimize_runs));
         return Ok(session);
     }
 
     let mut session = Session::replay(file.ops)?;
     session.set_branches(file.branches, branch);
     session.set_doc_uuid(file.uuid);
+    session.set_optimize_runs(crate::optimize_runs::from_header(file.optimize_runs));
     Ok(session)
 }
 

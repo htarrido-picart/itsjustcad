@@ -7248,6 +7248,79 @@ mod headless_tests {
         }
     }
 
+    /// #201: a stopped job keeps its best plans so far; a result is saved as
+    /// the site plan's latest run, read back with its stale state; a cancel
+    /// saves nothing; deleting the site plan drops the run.
+    #[test]
+    fn site_optimize_stop_keeps_partial_and_saves_the_run() {
+        use optimize_job::*;
+        let h = ijc_init_headless();
+        unsafe {
+            let j = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            let run = |l: &str| j(ijc_run_command_result(h, c(l).as_ptr()));
+            let v = run("rect 0,0,0 200 150");
+            let site = c(v["created"][0].as_str().unwrap());
+            run("lotsettings depth=20");
+            assert_eq!(run("siteplan last")["ok"], true);
+            let saved = || j(ijc_site_optimize_saved_json(h, site.as_ptr()));
+            assert_eq!(saved(), serde_json::Value::Null, "never run");
+            let wait = |id: u64| {
+                let t = std::time::Instant::now();
+                loop {
+                    let p = j(ijc_site_optimize_progress(h, id));
+                    let s = p["state"].as_str().unwrap();
+                    if !["running", "cancelling", "stopping"].contains(&s) {
+                        return p;
+                    }
+                    assert!(t.elapsed().as_secs() < 120, "{p}");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+
+            let big = c(r#"{"objective":"lots","budget":5000}"#);
+            let id = ijc_site_optimize_start(h, site.as_ptr(), big.as_ptr());
+            while j(ijc_site_optimize_progress(h, id))["evaluated"].as_u64() == Some(0) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(ijc_site_optimize_stop(h, id));
+            assert_eq!(wait(id)["state"], "done");
+            let got = j(ijc_site_optimize_result(h, id));
+            assert_eq!(got["stopped_early"], true, "{got}");
+            assert_eq!(got["saved"], true);
+            assert!(got["evaluated"].as_u64().unwrap() < 5000);
+            assert!(!got["candidates"].as_array().unwrap().is_empty());
+
+            let s = saved();
+            assert_eq!(s["version"], 1);
+            assert_eq!((s["stopped_early"].clone(), s["stale"].clone()), (true.into(), false.into()));
+            assert_eq!(s["result"]["candidates"], got["candidates"]);
+            assert_eq!(s["budget"], 5000);
+            assert_eq!(s["request"]["objective"], "lots");
+            assert!(s["finished_at"].as_u64().unwrap() > 0);
+            assert_eq!(s["fingerprint"].as_str().unwrap().len(), 16);
+
+            // A cancelled run keeps the saved one.
+            let id = ijc_site_optimize_start(h, site.as_ptr(), big.as_ptr());
+            ijc_site_optimize_cancel(h, id);
+            wait(id);
+            assert!(j(ijc_site_optimize_result(h, id))["error"].is_string());
+            assert_eq!(saved()["fingerprint"], s["fingerprint"]);
+
+            // A plan edit marks it stale; Apply still works.
+            let p = &got["candidates"][0];
+            let r = j(ijc_site_optimize_apply(h, site.as_ptr(), c(&p.to_string()).as_ptr()));
+            assert_eq!(r["ok"], true, "{r}");
+            assert_eq!(saved()["stale"], true);
+
+            // Deleting the site plan drops it.
+            let r = run(&format!("lotremove id:{}", v["created"][0].as_str().unwrap()));
+            assert_eq!(r["ok"], true, "{r}");
+            assert_eq!(saved(), serde_json::Value::Null);
+            assert!(!ijc_site_optimize_stop(h, 999));
+            ijc_free(h);
+        }
+    }
+
     #[test]
     fn site_optimize_json_then_apply_is_one_undo_step() {
         let h = ijc_init_headless();

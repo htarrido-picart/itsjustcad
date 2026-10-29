@@ -24,6 +24,7 @@ mod headless;
 mod i18n;
 mod icons;
 mod journal;
+mod keep_awake;
 mod keybindings;
 mod keybindings_editor;
 mod keymap;
