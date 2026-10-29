@@ -906,10 +906,8 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
 /// A full-width accent button.
 fn prominent(ui: &mut egui::Ui, roles: &ColorRoles, label: &str, enabled: bool) -> egui::Response {
     let text = RichText::new(label).strong().color(egui::Color32::WHITE);
-    let b = egui::Button::new(text)
-        .fill(to_color32(roles.primary))
-        .min_size(egui::vec2(ui.available_width(), 32.0));
-    ui.add_enabled(enabled, b)
+    let b = egui::Button::new(text).fill(to_color32(roles.primary));
+    ui.add_enabled_ui(enabled, |ui| crate::widgets::full_width_button(ui, 32.0, b)).inner
 }
 
 /// One picker row; `true` when clicked.
