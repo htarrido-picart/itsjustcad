@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Command, ExecError, Session};
+use crate::{Command, ExecError, ReplayControl, Session};
 
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -15,7 +15,14 @@ pub const FORMAT_VERSION: u32 = 1;
 /// checkpoint holds the old Mesh snapshot; opening it against the new replay
 /// path would diverge (and trip `ensure_history`'s debug_assert). Bumping the
 /// version invalidates those stale sidecars → clean full replay.
-pub const CHECKPOINT_VERSION: u32 = 2;
+///
+/// v3 (#217): adds the writing core version and a hash of the ops the
+/// snapshot reflects, so a snapshot older than its log can seed a tail replay.
+pub const CHECKPOINT_VERSION: u32 = 3;
+
+/// The core build a checkpoint was written by. A checkpoint from any other
+/// build is ignored: replay output may differ between builds.
+pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// File format: the effective forward op-log plus, optionally, design-option
 /// branches. Loading replays `ops` through the same `apply` path used live,
@@ -83,30 +90,107 @@ pub fn to_json(session: &Session) -> String {
 }
 
 pub fn from_json(json: &str) -> Result<Session, IoError> {
-    let file: FileFormat = serde_json::from_str(json)?;
+    open_json(json, None, ReplayControl::default()).map(|o| o.session)
+}
+
+/// An opened document ([`open_json`]).
+pub struct Opened {
+    pub session: Session,
+    /// Whether a checkpoint seeded it (snapshot + tail replay) rather than a
+    /// full replay.
+    pub from_checkpoint: bool,
+}
+
+/// [`from_json`] with an optional checkpoint ([`checkpoint_json`]) and replay
+/// hooks (#217). A usable checkpoint seeds the session and only the ops newer
+/// than it are replayed; one from another format or core version, one that
+/// fails to parse, or one that does not match the log's first ops is ignored
+/// silently (full replay). `ctl` sees the ops actually replayed.
+pub fn open_json(
+    json: &str,
+    checkpoint: Option<&str>,
+    ctl: ReplayControl<'_>,
+) -> Result<Opened, IoError> {
+    open_file(serde_json::from_str(json)?, checkpoint, ctl)
+}
+
+fn open_file(
+    file: FileFormat,
+    checkpoint: Option<&str>,
+    ctl: ReplayControl<'_>,
+) -> Result<Opened, IoError> {
     if file.itsjustcad != FORMAT_VERSION {
         return Err(IoError::BadVersion(file.itsjustcad));
     }
-    let mut session = Session::replay(file.ops)?;
+    let cp = checkpoint.and_then(|text| usable_checkpoint(text, &file.ops));
+    let from_checkpoint = cp.is_some();
+    let mut session = match cp {
+        Some(cp) => match Session::from_snapshot_tail(cp.doc, file.ops.clone(), cp.op_count, ctl) {
+            Ok(s) => s,
+            Err(ExecError::Cancelled) => return Err(ExecError::Cancelled.into()),
+            // A tail that fails on the snapshot: fall back to the full replay.
+            Err(_) => return open_file(file, None, ctl),
+        },
+        None => Session::replay_with(file.ops, ctl)?,
+    };
     session.set_branches(
         file.branches,
         file.branch.unwrap_or_else(|| crate::exec::MAIN_BRANCH.to_string()),
     );
     session.set_doc_uuid(file.uuid);
     session.set_optimize_runs(crate::optimize_runs::from_header(file.optimize_runs));
-    Ok(session)
+    Ok(Opened { session, from_checkpoint })
 }
 
 /// Checkpoint sidecar: a serialized `Document` snapshot plus the op count it
 /// corresponds to. Optional fast-open cache — the op-log stays the source of
 /// truth, so a missing, stale, or corrupt checkpoint just falls back to replay.
+///
+/// `{"mydrafter_checkpoint":3,"core":"<core version>","op_count":n,
+/// "ops_hash":"<16 hex digits>","doc":{…}}`
 #[derive(Serialize, Deserialize)]
 struct Checkpoint {
     mydrafter_checkpoint: u32,
-    /// Number of forward ops the snapshot reflects; must match the op-log's
-    /// length for the snapshot to be trusted.
+    /// [`CORE_VERSION`] of the build that wrote it; must match this build.
+    core: String,
+    /// Number of forward ops the snapshot reflects. The op-log may be longer:
+    /// its newer ops are replayed on top of the snapshot (#217).
     op_count: usize,
+    /// [`ops_hash`] of the first `op_count` ops: the snapshot is used only for
+    /// a log that starts with exactly those ops.
+    ops_hash: String,
     doc: itsjustcad_doc::Document,
+}
+
+/// A stable hash (FNV-1a 64, hex) of `ops` as JSON, streamed without
+/// building the string.
+fn ops_hash(ops: &[Command]) -> String {
+    struct Fnv(u64);
+    impl std::io::Write for Fnv {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            for &b in buf {
+                self.0 = (self.0 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+    serde_json::to_writer(&mut h, ops).expect("op-log serializes");
+    format!("{:016x}", h.0)
+}
+
+/// The checkpoint in `text` when it can seed `ops`: this format and core
+/// version, parsed, at most `ops.len()` ops, and the same first ops.
+fn usable_checkpoint(text: &str, ops: &[Command]) -> Option<Checkpoint> {
+    let cp: Checkpoint = serde_json::from_str(text).ok()?;
+    (cp.mydrafter_checkpoint == CHECKPOINT_VERSION
+        && cp.core == CORE_VERSION
+        && cp.op_count <= ops.len()
+        && cp.ops_hash == ops_hash(&ops[..cp.op_count]))
+    .then_some(cp)
 }
 
 /// Sidecar path for a document: `<file>.checkpoint`.
@@ -116,11 +200,15 @@ fn checkpoint_path(path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
-/// Serialize the session's document snapshot for the checkpoint sidecar.
-fn checkpoint_json(session: &Session) -> String {
+/// Serialize the session's document snapshot for a checkpoint (the
+/// `<file>.checkpoint` sidecar, or a host's own sidecar via the FFI, #217).
+pub fn checkpoint_json(session: &Session) -> String {
+    let ops = session.save_log();
     let cp = Checkpoint {
         mydrafter_checkpoint: CHECKPOINT_VERSION,
-        op_count: session.save_log().len(),
+        core: CORE_VERSION.to_string(),
+        op_count: ops.len(),
+        ops_hash: ops_hash(&ops),
         doc: session.doc.clone(),
     };
     serde_json::to_string(&cp).expect("document snapshot serializes")
@@ -165,37 +253,15 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Load a document. If a `<file>.checkpoint` exists whose `op_count` matches the
-/// op-log, seed the session directly from the snapshot and skip replay;
-/// otherwise (no sidecar, version/count mismatch, or any parse error) fall back
-/// to a full op-log replay. Correctness is guaranteed by a `debug_assert` in
+/// Load a document. If a usable `<file>.checkpoint` exists, seed the session
+/// from its snapshot and replay only the ops newer than it (none when its
+/// `op_count` matches); otherwise (no sidecar, format/core version mismatch,
+/// a different log, or any parse error) fall back to a full op-log replay. Correctness is guaranteed by a `debug_assert` in
 /// [`Session::from_snapshot`]'s lazy history rebuild and by the round-trip test.
 pub fn load_file(path: &std::path::Path) -> Result<Session, IoError> {
     let json = std::fs::read_to_string(path)?;
-    let file: FileFormat = serde_json::from_str(&json)?;
-    if file.itsjustcad != FORMAT_VERSION {
-        return Err(IoError::BadVersion(file.itsjustcad));
-    }
-
-    let branch = file.branch.unwrap_or_else(|| crate::exec::MAIN_BRANCH.to_string());
-
-    if let Ok(text) = std::fs::read_to_string(checkpoint_path(path))
-        && let Ok(cp) = serde_json::from_str::<Checkpoint>(&text)
-        && cp.mydrafter_checkpoint == CHECKPOINT_VERSION
-        && cp.op_count == file.ops.len()
-    {
-        let mut session = Session::from_snapshot(cp.doc, file.ops);
-        session.set_branches(file.branches, branch);
-        session.set_doc_uuid(file.uuid);
-        session.set_optimize_runs(crate::optimize_runs::from_header(file.optimize_runs));
-        return Ok(session);
-    }
-
-    let mut session = Session::replay(file.ops)?;
-    session.set_branches(file.branches, branch);
-    session.set_doc_uuid(file.uuid);
-    session.set_optimize_runs(crate::optimize_runs::from_header(file.optimize_runs));
-    Ok(session)
+    let checkpoint = std::fs::read_to_string(checkpoint_path(path)).ok();
+    open_json(&json, checkpoint.as_deref(), ReplayControl::default()).map(|o| o.session)
 }
 
 #[cfg(test)]
@@ -708,5 +774,143 @@ mod tests {
         let json = to_json(&s);
         assert!(!json.contains("branches"), "no branch fields emitted: {json}");
         assert!(!json.contains("\"branch\""));
+    }
+
+    // ── checkpoints with tail replay (#217) ─────────────────────────────────
+
+    fn run_lines(s: &mut Session, lines: &[&str]) {
+        for line in lines {
+            s.run(parse(line).unwrap()).unwrap();
+        }
+    }
+
+    fn open(json: &str, cp: Option<&str>) -> Opened {
+        open_json(json, cp, ReplayControl::default()).unwrap()
+    }
+
+    #[test]
+    fn checkpoint_exact_match_skips_replay() {
+        let s = built_session();
+        let cp = checkpoint_json(&s);
+        let total = std::sync::Mutex::new(None);
+        let report = |_: usize, t: usize| *total.lock().unwrap() = Some(t);
+        let ctl = ReplayControl { progress: Some(&report), ..Default::default() };
+        let o = open_json(&to_json(&s), Some(&cp), ctl).unwrap();
+        assert!(o.from_checkpoint);
+        assert_eq!(*total.lock().unwrap(), Some(0), "no op replayed");
+        assert_eq!(o.session.doc, s.doc);
+        assert_eq!(to_json(&o.session), to_json(&s));
+    }
+
+    #[test]
+    fn checkpoint_behind_the_log_replays_only_the_tail() {
+        let mut s = built_session();
+        let cp = checkpoint_json(&s);
+        let n = s.save_log().len();
+        run_lines(&mut s, &["circle 20,0,0 1", "extrude last 2", "box 30,0,0 2,2,2"]);
+        let replayed = std::sync::Mutex::new(Vec::new());
+        let report = |d: usize, t: usize| replayed.lock().unwrap().push((d, t));
+        let ctl = ReplayControl { progress: Some(&report), ..Default::default() };
+        let mut o = open_json(&to_json(&s), Some(&cp), ctl).unwrap();
+        assert!(o.from_checkpoint);
+        let tail = s.save_log().len() - n;
+        assert_eq!(replayed.lock().unwrap().last(), Some(&(tail, tail)), "tail only");
+        assert_eq!(o.session.doc, s.doc, "snapshot + tail == full replay");
+        assert_eq!(o.session.save_log(), s.save_log());
+        assert_eq!(o.session.undo_cursor(), s.undo_cursor());
+
+        // The deferred history covers the snapshot's ops and the tail: undo
+        // the whole tail and one snapshot op, like the live session.
+        let mut live = s;
+        for _ in 0..=tail {
+            o.session.run(Command::Undo).unwrap();
+            live.run(Command::Undo).unwrap();
+        }
+        assert_eq!(objects_of(&o.session), objects_of(&live));
+    }
+
+    #[test]
+    fn checkpoint_from_another_version_is_ignored() {
+        let mut s = built_session();
+        let cp = checkpoint_json(&s);
+        run_lines(&mut s, &["box 20,0,0 1,1,1"]);
+        let json = to_json(&s);
+        let mut v: serde_json::Value = serde_json::from_str(&cp).unwrap();
+        v["core"] = "0.0.0-other".into();
+        let o = open(&json, Some(&v.to_string()));
+        assert!(!o.from_checkpoint, "core version mismatch");
+        assert_eq!(o.session.doc, s.doc);
+        let mut v: serde_json::Value = serde_json::from_str(&cp).unwrap();
+        v["mydrafter_checkpoint"] = (CHECKPOINT_VERSION - 1).into();
+        let o = open(&json, Some(&v.to_string()));
+        assert!(!o.from_checkpoint, "format mismatch");
+        assert_eq!(o.session.doc, s.doc);
+    }
+
+    #[test]
+    fn corrupt_checkpoint_falls_back_to_full_replay() {
+        let s = built_session();
+        let json = to_json(&s);
+        let cp = checkpoint_json(&s);
+        for bad in ["", "not json", &cp[..cp.len() / 2], "{\"mydrafter_checkpoint\":3}"] {
+            let o = open(&json, Some(bad));
+            assert!(!o.from_checkpoint, "{bad:.40}");
+            assert_eq!(o.session.doc, s.doc);
+        }
+    }
+
+    #[test]
+    fn checkpoint_of_another_log_falls_back_to_full_replay() {
+        // Longer than the log.
+        let mut s = built_session();
+        run_lines(&mut s, &["box 20,0,0 1,1,1"]);
+        let cp = checkpoint_json(&s);
+        let short = built_session();
+        let o = open(&to_json(&short), Some(&cp));
+        assert!(!o.from_checkpoint, "op_count > log");
+        assert_eq!(o.session.doc, short.doc);
+
+        // Same length or longer, but the log diverged after an undo: the
+        // snapshot's ops are not the log's first ops.
+        let mut s = built_session();
+        let cp = checkpoint_json(&s);
+        s.run(Command::Undo).unwrap();
+        run_lines(&mut s, &["box 40,0,0 1,1,1", "box 50,0,0 1,1,1"]);
+        let o = open(&to_json(&s), Some(&cp));
+        assert!(!o.from_checkpoint, "diverged log");
+        assert_eq!(o.session.doc, Session::replay(s.save_log()).unwrap().doc);
+    }
+
+    #[test]
+    fn load_file_replays_the_tail_after_its_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("itsjustcad_tail_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scene.mydrafter");
+        let mut s = built_session();
+        save_file(&s, &path).unwrap();
+        // The op-log moves on; the sidecar stays behind.
+        run_lines(&mut s, &["box 20,0,0 1,1,1", "box 30,0,0 1,1,1"]);
+        write_atomic(&path, to_json(&s).as_bytes()).unwrap();
+        let loaded = load_file(&path).unwrap();
+        assert_eq!(loaded.doc, s.doc);
+        assert_eq!(loaded.undo_cursor(), s.undo_cursor());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replay_cancels_between_ops() {
+        let s = built_session();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let report = |d: usize, _: usize| {
+            if d == 2 {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let ctl = ReplayControl { cancel: Some(&cancel), progress: Some(&report) };
+        let err = open_json(&to_json(&s), None, ctl).err().unwrap();
+        assert!(matches!(err, IoError::Replay(ExecError::Cancelled)), "{err}");
+        // The default control is plain replay.
+        let full = Session::replay_with(s.save_log(), ReplayControl::default()).unwrap();
+        assert_eq!(full.doc, s.doc);
     }
 }

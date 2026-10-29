@@ -387,6 +387,10 @@ pub struct Session {
     /// forward ops whose inverses have not yet been materialized. `None` once
     /// the history is live. Never part of the file format.
     pending_log: Option<Vec<Command>>,
+    /// True only while [`Session::from_snapshot_tail`] replays the newer ops
+    /// of a fast-open (#217): logged ops then append to `pending_log` instead
+    /// of materializing the history. Never part of the file format.
+    defer_history: bool,
     /// Named design-option branches: each is a saved effective op-log. Persisted
     /// in the file (see `crate::io`). The branch you are on is `current_branch`;
     /// its stored log is refreshed on switch/save so divergence is detectable.
@@ -741,6 +745,7 @@ impl Default for Session {
                 ("ada2010".to_string(), crate::checkengine::ada_pack()),
             ]),
             pending_log: None,
+            defer_history: false,
             branches: BTreeMap::new(),
             current_branch: MAIN_BRANCH.to_string(),
             doc_uuid: None,
@@ -874,7 +879,7 @@ impl Session {
                 let logged = cmd.is_logged();
                 // A new logged edit truncates the redo tail, so the undo history
                 // must be live first (rebuild it if this was a fast-open).
-                if logged {
+                if logged && !self.defer_history {
                     self.ensure_history()?;
                 }
                 // Resolve typed CPlane-space points to WORLD before the op is
@@ -892,15 +897,24 @@ impl Session {
                 let (op, inverse, outcome) = apply_forward(&mut self.doc, cmd)?;
                 if logged {
                     let op = freeze_selected(op, &selection);
-                    self.log.truncate(self.cursor);
-                    if !(at_tip && self.coalesce_lot_refresh(&op, &inverse)) {
-                        self.log.push(AppliedOp {
-                            op,
-                            inverse,
-                            chained: false,
-                        });
+                    if self.defer_history
+                        && let Some(pending) = self.pending_log.as_mut()
+                    {
+                        // Fast-open tail replay (#217): keep the history
+                        // deferred; `ensure_history` rebuilds it from the
+                        // whole forward log when it is first needed.
+                        pending.push(op);
+                    } else {
+                        self.log.truncate(self.cursor);
+                        if !(at_tip && self.coalesce_lot_refresh(&op, &inverse)) {
+                            self.log.push(AppliedOp {
+                                op,
+                                inverse,
+                                chained: false,
+                            });
+                        }
+                        self.cursor = self.log.len();
                     }
-                    self.cursor = self.log.len();
                     self.edits += 1;
                     self.prune_optimize_runs();
                 }
@@ -3077,12 +3091,48 @@ impl Session {
         Ok(())
     }
 
+    /// Fast-open from a snapshot of the first `op_count` ops of `log`, then
+    /// replay only the newer ops `log[op_count..]` on top of it (#217). `doc`
+    /// must equal what `replay(log[..op_count])?.doc` would produce; callers
+    /// check that the snapshot belongs to this log first. The history stays
+    /// deferred as with [`Session::from_snapshot`]. `ctl` reports and can
+    /// cancel the tail replay (`done` of the tail's `total` ops).
+    pub fn from_snapshot_tail(
+        doc: Document,
+        mut log: Vec<Command>,
+        op_count: usize,
+        ctl: ReplayControl<'_>,
+    ) -> Result<Self, ExecError> {
+        let tail = log.split_off(op_count.min(log.len()));
+        let mut session = Session::from_snapshot(doc, log);
+        session.defer_history = true;
+        let out = session.run_all(tail, ctl);
+        session.defer_history = false;
+        out.map(|()| session)
+    }
+
     /// Rebuild a session by replaying a saved log through the same `apply`
     /// path used live. Ids stored in the log are reused, so the result is
     /// identical to the session that saved it.
     pub fn replay(log: Vec<Command>) -> Result<Self, ExecError> {
+        Self::replay_with(log, ReplayControl::default())
+    }
+
+    /// [`Session::replay`] with progress and cancel hooks (#217): `ctl`
+    /// reports `done` of `total` ops and stops with [`ExecError::Cancelled`]
+    /// between ops once its cancel flag is set. The default control is
+    /// exactly `replay`.
+    pub fn replay_with(log: Vec<Command>, ctl: ReplayControl<'_>) -> Result<Self, ExecError> {
         let mut session = Session::default();
-        for cmd in log {
+        session.run_all(log, ctl)?;
+        Ok(session)
+    }
+
+    /// Run the logged ops of a saved log in order (see [`Session::replay`]).
+    fn run_all(&mut self, log: Vec<Command>, ctl: ReplayControl<'_>) -> Result<(), ExecError> {
+        let total = log.len();
+        for (done, cmd) in log.into_iter().enumerate() {
+            ctl.step(done, total)?;
             // Security: the app only ever appends *logged* ops to the saved log
             // (`is_logged` == true). A non-logged op in a loaded file therefore
             // means the file was hand-crafted/tampered — replaying it would run
@@ -3093,9 +3143,41 @@ impl Session {
             if !cmd.is_logged() {
                 continue;
             }
-            session.run(cmd)?;
+            self.run(cmd)?;
         }
-        Ok(session)
+        ctl.report(total, total);
+        Ok(())
+    }
+}
+
+/// Progress and cancel hooks for a long replay ([`Session::replay_with`],
+/// [`Session::from_snapshot_tail`]; #217), checked between ops. The default
+/// does nothing.
+#[derive(Clone, Copy, Default)]
+pub struct ReplayControl<'a> {
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Called with `(done, total)` before each op and once at the end, from
+    /// the replaying thread.
+    pub progress: Option<&'a (dyn Fn(usize, usize) + Sync)>,
+}
+
+impl ReplayControl<'_> {
+    fn report(&self, done: usize, total: usize) {
+        if let Some(p) = self.progress {
+            p(done, total);
+        }
+    }
+
+    /// Report progress, or stop with [`ExecError::Cancelled`] when cancelled.
+    fn step(&self, done: usize, total: usize) -> Result<(), ExecError> {
+        if self
+            .cancel
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(ExecError::Cancelled);
+        }
+        self.report(done, total);
+        Ok(())
     }
 }
 
