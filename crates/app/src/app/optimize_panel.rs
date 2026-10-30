@@ -1322,9 +1322,8 @@ impl App {
                 ui.horizontal(|ui| {
                     // Cancel on the right; the bar takes the rest of the row.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let button = egui::Button::new(t("optimize.cancel"))
-                            .min_size(egui::vec2(0.0, crate::theme::Spacing::HIT_TARGET));
-                        cancel = ui.add(button).clicked();
+                        let h = crate::theme::Spacing::HIT_TARGET;
+                        cancel = crate::widgets::fit_button(ui, h, t("optimize.cancel")).clicked();
                         ui.add(
                             egui::ProgressBar::new(p.fraction() as f32)
                                 .desired_height(crate::theme::Spacing::HIT_TARGET)
@@ -1363,10 +1362,10 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = crate::theme::Spacing::S;
                         let h = crate::theme::Spacing::HIT_TARGET;
-                        if ui.add(egui::Button::new(t("optimize.stop_and_run")).min_size(egui::vec2(0.0, h))).clicked() {
+                        if crate::widgets::fit_button(ui, h, t("optimize.stop_and_run")).clicked() {
                             start = true;
                         }
-                        if ui.add(egui::Button::new(t("optimize.keep_running")).min_size(egui::vec2(0.0, h))).clicked() {
+                        if crate::widgets::fit_button(ui, h, t("optimize.keep_running")).clicked() {
                             self.optimize.confirm_stop = None;
                         }
                     });

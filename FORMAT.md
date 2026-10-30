@@ -42,6 +42,9 @@ never replayed and are not undo steps. Each value carries its own `version`
 (currently **1** for both). They are read leniently: an entry this build cannot
 read (a newer `version`, an unknown preset, a bad shape or id) loads as unset
 instead of failing the open — an unreadable `cut_export` means SendCutSend.
+Any `version` from 1 up to the one the build knows is read. An unreadable
+value is **not kept**: re-saving the file in that build drops it, so a run or
+preset saved by a newer build is lost when an older build saves over it.
 Both are omitted while unset, so files without them stay byte-identical, and
 older builds ignore them.
 

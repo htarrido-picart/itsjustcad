@@ -7,6 +7,16 @@ use crate::{Command, ExecError, ReplayControl, Session};
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Whether a leniently read header value (`optimize_runs` entries,
+/// `cut_export`) carries a `version` this build reads: `1..=current`. A
+/// newer or missing version is unreadable; callers drop the value, and it
+/// is not written back on save (see FORMAT.md).
+pub(crate) fn header_version_ok(v: &serde_json::Value, current: u32) -> bool {
+    v.get("version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|n| (1..=u64::from(current)).contains(&n))
+}
+
 /// Checkpoint sidecar version. Bumped independently of the op-log format; a
 /// stale or unrecognized checkpoint is simply ignored (full replay).
 ///
@@ -275,6 +285,17 @@ pub fn load_file(path: &std::path::Path) -> Result<Session, IoError> {
 mod tests {
     use super::*;
     use crate::parse;
+
+    #[test]
+    fn header_versions_read_one_to_current() {
+        let ok = |v: serde_json::Value| header_version_ok(&v, 2);
+        assert!(ok(serde_json::json!({"version": 1})), "older");
+        assert!(ok(serde_json::json!({"version": 2})), "current");
+        assert!(!ok(serde_json::json!({"version": 3})), "newer");
+        assert!(!ok(serde_json::json!({"version": 0})));
+        assert!(!ok(serde_json::json!({"version": "1"})));
+        assert!(!ok(serde_json::json!({})));
+    }
 
     #[test]
     fn save_load_save_byte_identical() {

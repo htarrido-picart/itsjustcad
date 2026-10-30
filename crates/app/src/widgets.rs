@@ -206,6 +206,14 @@ pub fn full_width_button(ui: &mut egui::Ui, h: f32, button: egui::Button<'_>) ->
     sized_button(ui, egui::vec2(ui.available_width(), h), button)
 }
 
+/// [`sized_button`] as wide as `label` plus the button padding, at height `h`.
+pub fn fit_button(ui: &mut egui::Ui, h: f32, label: &str) -> egui::Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text_w = ui.painter().layout_no_wrap(label.to_owned(), font, egui::Color32::PLACEHOLDER).size().x;
+    let w = text_w + ui.spacing().button_padding.x * 2.0;
+    sized_button(ui, egui::vec2(w, h), egui::Button::new(label))
+}
+
 // ── Segmented control ────────────────────────────────────────────────────
 
 /// A real segmented control: equal-width segments, all one type, single
@@ -541,6 +549,16 @@ mod tests {
         // The fix: the shared helper centers it on both axes.
         let (b, l) = button_and_label(|ui| sized_button(ui, size, egui::Button::new("Run Check")));
         assert!(b.width() >= size.x && b.height() >= size.y, "button keeps its size: {b:?}");
+        assert!((l.center().x - b.center().x).abs() <= 1.0, "label centered horizontally: {l:?} in {b:?}");
+        assert!((l.center().y - b.center().y).abs() <= 1.0, "label centered vertically: {l:?} in {b:?}");
+    }
+
+    #[test]
+    fn fit_button_keeps_plain_width_and_centers_label() {
+        let (plain, _) = button_and_label(|ui| ui.add(egui::Button::new("Run Check").min_size(egui::vec2(0.0, 40.0))));
+        let (b, l) = button_and_label(|ui| fit_button(ui, 40.0, "Run Check"));
+        assert!((b.width() - plain.width()).abs() <= 1.0, "same padding: {b:?} vs {plain:?}");
+        assert!(b.height() >= 40.0, "{b:?}");
         assert!((l.center().x - b.center().x).abs() <= 1.0, "label centered horizontally: {l:?} in {b:?}");
         assert!((l.center().y - b.center().y).abs() <= 1.0, "label centered vertically: {l:?} in {b:?}");
     }

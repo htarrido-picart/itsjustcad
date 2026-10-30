@@ -62,11 +62,7 @@ pub fn to_header(preset: Option<CutPreset>) -> Option<Value> {
 
 /// Read the header leniently: anything unreadable is unset.
 pub fn from_header(v: Option<Value>) -> Option<CutPreset> {
-    let v = v?;
-    let version = v.get("version")?.as_u64()?;
-    if version == 0 || version > u64::from(CUT_EXPORT_VERSION) {
-        return None;
-    }
+    let v = v.filter(|v| crate::io::header_version_ok(v, CUT_EXPORT_VERSION))?;
     CutPreset::parse(v.get("preset")?.as_str()?)
 }
 
@@ -109,6 +105,8 @@ mod tests {
             let json = base.replacen('{', &format!(r#"{{"cut_export":{header},"#), 1);
             let s = io::from_json(&json).unwrap_or_else(|e| panic!("{header}: {e}"));
             assert_eq!(s.cut_preset(), None, "{header}");
+            // Not kept: re-saving in this build drops it (FORMAT.md).
+            assert!(!io::to_json(&s).contains("cut_export"), "{header}");
         }
         assert_eq!(CutPreset::parse("SendCutSend"), Some(CutPreset::Scs));
         assert_eq!(CutPreset::default(), CutPreset::Scs);
