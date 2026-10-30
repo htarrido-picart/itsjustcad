@@ -21,6 +21,7 @@ mod filewatch;
 mod gumball;
 mod hardware;
 mod headless;
+mod history_rebuild;
 mod i18n;
 mod icons;
 mod journal;

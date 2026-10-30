@@ -76,4 +76,8 @@ pub enum ExecError {
     /// A replay stopped by its [`crate::ReplayControl`] cancel flag (#217).
     #[error("cancelled")]
     Cancelled,
+    /// Undo past a fast-open boundary while its history is still being
+    /// rebuilt in the background (#224); retry once it is installed.
+    #[error("Preparing undo history…")]
+    HistoryPending,
 }

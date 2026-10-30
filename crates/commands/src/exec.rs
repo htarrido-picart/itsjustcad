@@ -384,9 +384,26 @@ pub struct Session {
     /// grown by `checkrules load` and the default checks dir.
     pub check_packs: BTreeMap<String, crate::checkengine::CheckPack>,
     /// Set only after a checkpoint fast-open ([`Session::from_snapshot`]): the
-    /// forward ops whose inverses have not yet been materialized. `None` once
-    /// the history is live. Never part of the file format.
+    /// forward ops whose inverses have not yet been materialized. They sit
+    /// BEFORE `log` (#224): new edits go to `log` with their inverses, and the
+    /// prefix is rebuilt only to undo past it. `None` once the history is live.
+    /// Never part of the file format.
     pending_log: Option<Vec<Command>>,
+    /// Identifies this session's `pending_log` for a background rebuild
+    /// ([`HistoryJob`]), so a stale rebuild is never installed.
+    pending_token: u64,
+    /// When true, undoing past the fast-open boundary is refused with
+    /// [`ExecError::HistoryPending`] until a background rebuild is installed
+    /// ([`Session::install_history`]); when false (the default) it rebuilds
+    /// synchronously. Never part of the file format.
+    background_history: bool,
+    /// Set when an undo was refused for want of the history; see
+    /// [`Session::history_requested`].
+    history_requested: bool,
+    /// Debug builds only: the document as fast-opened, to check the rebuilt
+    /// prefix against it.
+    #[cfg(debug_assertions)]
+    open_doc: Option<Box<Document>>,
     /// True only while [`Session::from_snapshot_tail`] replays the newer ops
     /// of a fast-open (#217): logged ops then append to `pending_log` instead
     /// of materializing the history. Never part of the file format.
@@ -748,6 +765,11 @@ impl Default for Session {
                 ("ada2010".to_string(), crate::checkengine::ada_pack()),
             ]),
             pending_log: None,
+            pending_token: 0,
+            background_history: false,
+            history_requested: false,
+            #[cfg(debug_assertions)]
+            open_doc: None,
             defer_history: false,
             branches: BTreeMap::new(),
             current_branch: MAIN_BRANCH.to_string(),
@@ -892,11 +914,8 @@ impl Session {
             }
             cmd => {
                 let logged = cmd.is_logged();
-                // A new logged edit truncates the redo tail, so the undo history
-                // must be live first (rebuild it if this was a fast-open).
-                if logged && !self.defer_history {
-                    self.ensure_history()?;
-                }
+                // After a fast-open the new edit goes on top of the
+                // non-materialized prefix (#224): no history rebuild here.
                 // Resolve typed CPlane-space points to WORLD before the op is
                 // built and logged, so the log carries world coords (replay
                 // stability). No-op when the CPlane is world XY. Redo replays the
@@ -1081,7 +1100,14 @@ impl Session {
     }
 
     fn undo_one(&mut self) -> Result<ApplyOutcome, ExecError> {
-        self.ensure_history()?; // rebuild inverses if fast-opened
+        // Undoing past the fast-open boundary needs the prefix's inverses.
+        if self.cursor == 0 && self.pending_log.is_some() {
+            if self.background_history {
+                self.history_requested = true;
+                return Err(ExecError::HistoryPending);
+            }
+            self.ensure_history()?;
+        }
         if self.cursor == 0 {
             return Err(ExecError::NothingToUndo);
         }
@@ -1598,7 +1624,6 @@ impl Session {
     }
 
     fn redo_one(&mut self) -> Result<ApplyOutcome, ExecError> {
-        self.ensure_history()?; // rebuild inverses if fast-opened
         if self.cursor >= self.log.len() {
             return Err(ExecError::NothingToRedo);
         }
@@ -1616,43 +1641,45 @@ impl Session {
 
     /// Read-only view for the history panel: one describe() entry per logged
     /// op (oldest first) plus the cursor. Step N = state after the first N ops.
-    /// After a fast-open the inverses are not yet materialized, so this reads
-    /// the pending forward log (cursor sits at its end).
+    /// After a fast-open the non-materialized prefix comes first.
     pub fn history(&self) -> (Vec<String>, usize) {
-        if let Some(pending) = &self.pending_log {
-            return (
-                pending.iter().map(|op| describe(op).to_string()).collect(),
-                pending.len(),
-            );
-        }
+        let prefix = self.pending_log.as_deref().unwrap_or_default();
         (
-            self.log.iter().map(|a| describe(&a.op).to_string()).collect(),
-            self.cursor,
+            prefix
+                .iter()
+                .map(|op| describe(op).to_string())
+                .chain(self.log.iter().map(|a| describe(&a.op).to_string()))
+                .collect(),
+            self.undo_cursor(),
         )
+    }
+
+    fn prefix_len(&self) -> usize {
+        self.pending_log.as_ref().map_or(0, Vec::len)
     }
 
     /// The op-log cursor alone: `history().1` without describing every op.
     /// Undo lowers it by one, redo raises it, a new logged op leaves it at the
     /// tip. Hosts tag their own rows with it to mirror undo state.
     pub fn undo_cursor(&self) -> usize {
-        self.pending_log.as_ref().map_or(self.cursor, Vec::len)
+        self.prefix_len() + self.cursor
     }
 
     /// The op-log length: ops past `undo_cursor()` are redoable.
     pub fn undo_len(&self) -> usize {
-        self.pending_log.as_ref().map_or(self.log.len(), Vec::len)
+        self.prefix_len() + self.log.len()
     }
 
     /// Move the cursor to `step` by running undo/redo through `run` — no new
     /// mutation path, so the log stays consistent. Returns ops executed.
     pub fn jump_to(&mut self, step: usize) -> Result<usize, ExecError> {
-        let step = step.min(self.log.len());
+        let step = step.min(self.undo_len());
         let mut moved = 0usize;
-        while self.cursor > step {
+        while self.undo_cursor() > step {
             self.run(Command::Undo)?;
             moved += 1;
         }
-        while self.cursor < step {
+        while self.undo_cursor() < step {
             self.run(Command::Redo)?;
             moved += 1;
         }
@@ -3070,13 +3097,14 @@ impl Session {
     }
 
     /// Effective forward log (up to the undo cursor) — this is the file format.
-    /// After a fast-open the inverses are still pending, so the untouched
-    /// forward log is returned directly (its cursor sits at the end).
+    /// After a fast-open it is the non-materialized prefix plus the new ops.
     pub fn save_log(&self) -> Vec<Command> {
-        if let Some(pending) = &self.pending_log {
-            return pending.clone();
-        }
-        self.log[..self.cursor].iter().map(|a| a.op.clone()).collect()
+        let prefix = self.pending_log.as_deref().unwrap_or_default();
+        prefix
+            .iter()
+            .cloned()
+            .chain(self.log[..self.cursor].iter().map(|a| a.op.clone()))
+            .collect()
     }
 
     /// Fast-open from a checkpoint: seed the document directly from a snapshot
@@ -3086,37 +3114,88 @@ impl Session {
     /// after confirming the checkpoint's op count matches `log`.
     ///
     /// Inverses (needed for undo) are *not* materialized here — that would
-    /// require the very replay we are skipping. They are rebuilt lazily the
-    /// first time the undo history is touched (undo/redo/amend), via
-    /// [`ensure_history`]. The common open→view→save path never pays for it.
+    /// require the very replay we are skipping. New edits stack on top with
+    /// their own inverses (#224); the prefix's are rebuilt only to undo past
+    /// it, synchronously or by a background [`HistoryJob`].
     pub fn from_snapshot(doc: Document, log: Vec<Command>) -> Self {
-        Session {
+        static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut s = Session {
             doc,
             log: Vec::new(),
             cursor: 0,
             plugins: crate::plugin::PluginRegistry::default(),
             pending_log: Some(log),
+            pending_token: NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ..Session::default()
-        }
+        };
+        s.record_open_doc();
+        s
     }
 
-    /// Materialize the op-log with inverses if this session was fast-opened from
-    /// a checkpoint. Replays the pending log against a scratch session to
-    /// recover each op's inverse, then adopts that history and its cursor.
-    /// A no-op once the history is present. Returns any replay error.
+    #[cfg(debug_assertions)]
+    fn record_open_doc(&mut self) {
+        self.open_doc = Some(Box::new(self.doc.clone()));
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn record_open_doc(&mut self) {}
+
+    /// Whether the fast-open prefix still lacks its inverses: undoing past it
+    /// needs a rebuild ([`Session::history_job`]).
+    pub fn history_pending(&self) -> bool {
+        self.pending_log.is_some()
+    }
+
+    /// Refuse undo past the fast-open boundary until a background rebuild is
+    /// installed (`true`), or rebuild synchronously there (`false`, default).
+    pub fn set_background_history(&mut self, on: bool) {
+        self.background_history = on;
+    }
+
+    /// Whether an undo was refused with [`ExecError::HistoryPending`] since the
+    /// last call (which clears it): a host starts its rebuild on this.
+    pub fn history_requested(&mut self) -> bool {
+        std::mem::take(&mut self.history_requested)
+    }
+
+    /// A copy of the non-materialized prefix to rebuild off this session
+    /// (#224), or `None` when the history is live.
+    pub fn history_job(&self) -> Option<HistoryJob> {
+        self.pending_log.as_ref().map(|prefix| HistoryJob {
+            token: self.pending_token,
+            prefix: prefix.clone(),
+        })
+    }
+
+    /// Install a rebuilt prefix history below the new edits. Returns false
+    /// (and changes nothing) when it is stale: the history is already live or
+    /// the session was replaced since [`Session::history_job`].
+    pub fn install_history(&mut self, rebuilt: RebuiltHistory) -> bool {
+        if self.pending_log.is_none() || rebuilt.token != self.pending_token {
+            return false;
+        }
+        // The snapshot doc is authoritative; the replay only supplies the
+        // inverses. Checked against the document as opened.
+        #[cfg(debug_assertions)]
+        if let Some(open) = self.open_doc.take() {
+            assert_eq!(*open, rebuilt.doc, "checkpoint snapshot diverged from op-log replay");
+        }
+        let mut log = rebuilt.log;
+        self.cursor += log.len();
+        log.append(&mut self.log);
+        self.log = log;
+        self.pending_log = None;
+        true
+    }
+
+    /// Rebuild the fast-open prefix history synchronously. A no-op once the
+    /// history is live. Returns any replay error (the prefix is kept).
     fn ensure_history(&mut self) -> Result<(), ExecError> {
-        let Some(log) = self.pending_log.take() else {
+        let Some(job) = self.history_job() else {
             return Ok(());
         };
-        let rebuilt = Session::replay(log)?;
-        // The snapshot doc is authoritative (it may carry live-only state like
-        // the selection); the replay only supplies the log/inverses/cursor.
-        debug_assert_eq!(
-            self.doc, rebuilt.doc,
-            "checkpoint snapshot diverged from op-log replay"
-        );
-        self.log = rebuilt.log;
-        self.cursor = rebuilt.cursor;
+        let rebuilt = job.run(ReplayControl::default())?;
+        self.install_history(rebuilt);
         Ok(())
     }
 
@@ -3137,6 +3216,7 @@ impl Session {
         session.defer_history = true;
         let out = session.run_all(tail, ctl);
         session.defer_history = false;
+        session.record_open_doc();
         out.map(|()| session)
     }
 
@@ -3176,6 +3256,53 @@ impl Session {
         }
         ctl.report(total, total);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// History rebuilds run on this thread (tests assert none happen).
+    pub(crate) static HISTORY_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A fast-open prefix to rebuild off the session ([`Session::history_job`],
+/// #224), e.g. on a worker thread.
+pub struct HistoryJob {
+    token: u64,
+    prefix: Vec<Command>,
+}
+
+/// The inverses rebuilt by [`HistoryJob::run`], for
+/// [`Session::install_history`].
+pub struct RebuiltHistory {
+    token: u64,
+    log: Vec<AppliedOp>,
+    #[cfg(debug_assertions)]
+    doc: Document,
+}
+
+impl HistoryJob {
+    /// Ops to replay.
+    pub fn len(&self) -> usize {
+        self.prefix.len()
+    }
+
+    /// Whether there is nothing to replay.
+    pub fn is_empty(&self) -> bool {
+        self.prefix.is_empty()
+    }
+
+    /// Replay the prefix into a scratch session; `ctl` reports and can cancel.
+    pub fn run(self, ctl: ReplayControl<'_>) -> Result<RebuiltHistory, ExecError> {
+        #[cfg(test)]
+        HISTORY_REBUILDS.with(|n| n.set(n.get() + 1));
+        let s = Session::replay_with(self.prefix, ctl)?;
+        Ok(RebuiltHistory {
+            token: self.token,
+            log: s.log,
+            #[cfg(debug_assertions)]
+            doc: s.doc,
+        })
     }
 }
 

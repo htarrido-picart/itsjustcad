@@ -38,6 +38,7 @@
 mod boxsel;
 pub mod cameras;
 pub mod guided;
+pub mod history_job;
 pub mod open_job;
 pub mod optimize_job;
 pub mod replay;
@@ -296,6 +297,9 @@ pub struct AppHandle {
 
     /// Background document opens ([`open_job`], #217).
     open_jobs: Mutex<open_job::Jobs>,
+
+    /// Background undo-history rebuilds after a fast open ([`history_job`], #224).
+    history_jobs: Mutex<history_job::Jobs>,
 
     // async / deck (shared across threads via Arc)
     runtime: tokio::runtime::Runtime,
@@ -815,6 +819,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         guided: Default::default(),
         optimize_jobs: Default::default(),
         open_jobs: Default::default(),
+        history_jobs: Default::default(),
         runtime,
         deck: None,
         deck_config: None,
@@ -1050,7 +1055,10 @@ pub unsafe extern "C" fn ijc_open_json(h: *mut AppHandle, ptr: *const u8, len: u
 /// Make an opened `session` the handle's document: clear the guided run and
 /// the deck history, frame the camera and force a re-snapshot next frame
 /// ([`ijc_open_json`], [`open_job::ijc_open_take`]).
-fn install_session(app: &mut AppHandle, session: Session) {
+fn install_session(app: &mut AppHandle, mut session: Session) {
+    // Undo past a fast-open boundary waits for [`history_job`], never blocks.
+    session.set_background_history(true);
+    history_job::jobs(app).cancel_all();
     app.session = session;
     app.guided = Default::default();
     if let Ok(mut hist) = app.history.lock() {

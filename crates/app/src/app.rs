@@ -889,6 +889,8 @@ pub struct App {
     focus_site_override: Option<itsjustcad_commands::lot::Focus>,
     /// Site plan optimizer form / running search / results (#145).
     optimize: optimize_panel::OptimizePanel,
+    /// Background undo-history rebuild after a fast open (#224).
+    history_rebuild: crate::history_rebuild::HistoryRebuild,
     /// Auto-recompute: per-source signature of the last-observed source block
     /// geometry. A change (after the first observation) fires a `lotrefresh` so
     /// non-frozen subdivisions track edits to their boundary block.
@@ -1608,6 +1610,7 @@ impl App {
             subdiv_yield: None,
             focus_site_override: None,
             optimize: Default::default(),
+            history_rebuild: Default::default(),
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
             subdiv_last_generation: 0,
@@ -11300,6 +11303,15 @@ impl eframe::App for App {
         // The document's optimizer search (#201) finishes wherever the user is.
         self.optimize.poll(&mut self.session);
         self.optimize_notice(ui.ctx());
+        // A refused undo past a fast-open boundary rebuilds its history off
+        // the UI thread (#224); install it when done.
+        let (line, running) = self.history_rebuild.poll(&mut self.session);
+        if let Some(line) = line {
+            self.command_line.push_line(line);
+        }
+        if running {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
         // ITSJUSTCAD_TYPE: pre-fill command input (dev hook for autosuggest
         // screenshots). When ITSJUSTCAD_DECK=chat forces the Chat segment, route
         // the prefill into the chat composer instead so the slash preview/palette
