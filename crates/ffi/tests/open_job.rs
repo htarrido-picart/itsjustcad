@@ -160,6 +160,23 @@ fn cancel_stops_the_replay_and_leaves_the_document() {
     unsafe { ijc_free(h) };
 }
 
+/// #237: a cancel that lands after the replay finished still discards it.
+#[test]
+fn late_cancel_does_not_install_the_document() {
+    let h = ijc_init_headless();
+    run(h, "box 100,100,0 1,1,1");
+    let before = digest(h);
+    let id = start(h, &io::to_json(&boxes(3)), None);
+    assert_eq!(wait(h, id).pop().unwrap()["state"], "done");
+    assert!(unsafe { ijc_open_cancel(h, id) });
+    assert_eq!(progress(h, id)["state"], "cancelled");
+    let out = take_json(unsafe { ijc_open_take(h, id) });
+    assert_eq!(out["error"], "open: cancelled", "{out}");
+    assert_eq!(digest(h), before, "current document untouched");
+    assert_eq!(unsafe { ijc_undo_len(h) }, 1);
+    unsafe { ijc_free(h) };
+}
+
 #[test]
 fn bad_input_fails_the_job() {
     let h = ijc_init_headless();

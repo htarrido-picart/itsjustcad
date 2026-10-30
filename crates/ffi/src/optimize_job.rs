@@ -26,8 +26,10 @@
 //!   result (full or stopped early) is saved in the document as its site
 //!   plan's latest run (#201), read back by [`ijc_site_optimize_saved_json`].
 //!
-//! Freeing the handle cancels every running job. A completed job's result is
-//! the blocking call's result: cancel and progress never change the search.
+//! Freeing the handle cancels every running job; replacing the document
+//! ([`super::ijc_open_json`], [`super::ijc_new_document`], …) cancels them
+//! too, against the document they ran on (#237). A completed job's result is
+//! the blocking call's result: progress never changes the search.
 
 use std::collections::BTreeMap;
 use std::ffi::c_char;
@@ -89,6 +91,7 @@ impl Job {
             None if self.cancel.load(Ordering::Relaxed) => "cancelling",
             None if self.stop.load(Ordering::Relaxed) => "stopping",
             None => "running",
+            Some(Ok(_)) if self.cancel.load(Ordering::Relaxed) => "cancelled",
             Some(Ok(_)) => "done",
             Some(Err(e)) if e == site_optimize::CANCELLED => "cancelled",
             Some(Err(_)) => "failed",
@@ -151,6 +154,17 @@ impl Job {
 pub(crate) struct Jobs {
     next: u64,
     jobs: BTreeMap<u64, Arc<Job>>,
+}
+
+/// Cancel every job of the handle and put back the runs their checkpoints
+/// replaced, before the document is replaced (#237): a later checkpoint,
+/// cancel or result of these jobs never touches the next document.
+pub(crate) fn cancel_all(app: &mut AppHandle) {
+    let all: Vec<Arc<Job>> = jobs(app).jobs.values().cloned().collect();
+    for j in all {
+        j.cancel.store(true, Ordering::Relaxed);
+        j.restore_prior(app);
+    }
 }
 
 impl Drop for Jobs {
@@ -271,8 +285,9 @@ pub unsafe extern "C" fn ijc_site_optimize_progress(h: *mut AppHandle, job_id: u
 
 /// Ask a running job to stop; it ends at its next chunk of plans and its
 /// result becomes `{"error":"siteoptimize: cancelled"}`. The run saved before
-/// the job is put back over any checkpoint (#219). Returns whether the job is
-/// known (true for one already finished: a no-op).
+/// the job is put back over any checkpoint (#219). A job that already
+/// finished is discarded the same way (#237). Returns whether the job is
+/// known.
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`super::ijc_init`].
@@ -284,8 +299,7 @@ pub unsafe extern "C" fn ijc_site_optimize_cancel(h: *mut AppHandle, job_id: u64
         };
         j.cancel.store(true, Ordering::Relaxed);
         // Busy handle: the result's take puts the run back instead.
-        let done = matches!(j.state().result, Some(Ok(_)));
-        if !done && let Some(mut app) = unsafe { handle_mut(h) } {
+        if let Some(mut app) = unsafe { handle_mut(h) } {
             j.restore_prior(&mut app);
         }
         true
@@ -348,8 +362,9 @@ pub unsafe extern "C" fn ijc_site_optimize_checkpoint(h: *mut AppHandle, job_id:
 /// with [`ijc_site_optimize_saved_json`]). Saving is document metadata, not
 /// an undo step: the host should mark the document edited so it gets saved.
 /// Nothing is saved (`"saved":false`) when the boundary no longer has a
-/// site plan. Cancelled and failed jobs save nothing, and put back the run
-/// saved before the job over any checkpoint (#219).
+/// site plan. Cancelled (even after they finished, #237) and failed jobs
+/// save nothing, and put back the run saved before the job over any
+/// checkpoint (#219).
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`super::ijc_init`].
@@ -373,6 +388,10 @@ pub unsafe extern "C" fn ijc_site_optimize_result(h: *mut AppHandle, job_id: u64
             drop(st);
             jobs.jobs.remove(&job_id);
             (j, result, elapsed)
+        };
+        let result = match result {
+            Ok(_) if j.cancel.load(Ordering::Relaxed) => Err(site_optimize::CANCELLED.into()),
+            r => r,
         };
         let out = match (result, &j.prepared) {
             (Ok(r), Some(p)) => {

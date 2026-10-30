@@ -59,6 +59,7 @@ impl Job {
         let state = match &st.result {
             None if self.cancel.load(Ordering::Relaxed) => "cancelling",
             None => "running",
+            Some(Ok(_)) if self.cancel.load(Ordering::Relaxed) => "cancelled",
             Some(Ok(_)) => "done",
             Some(Err(e)) if e == CANCELLED => "cancelled",
             Some(Err(_)) => "failed",
@@ -191,8 +192,8 @@ pub unsafe extern "C" fn ijc_open_progress(h: *mut AppHandle, job_id: u64) -> *m
 
 /// Ask a running job to stop; it ends before its next op and
 /// [`ijc_open_take`] then returns `{"error":"open: cancelled"}`. The current
-/// document is never touched. Returns whether the job is known (true for one
-/// already finished: a no-op).
+/// document is never touched, even when the job already finished (#237).
+/// Returns whether the job is known.
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`super::ijc_init`].
@@ -233,14 +234,15 @@ pub unsafe extern "C" fn ijc_open_take(h: *mut AppHandle, job_id: u64) -> *mut c
                 return null();
             };
             jobs.jobs.remove(&job_id);
-            result
+            (result, j.cancel.load(Ordering::Relaxed))
         };
         let out = match result {
-            Ok(opened) => {
+            (Ok(_), true) => json!({ "error": CANCELLED }),
+            (Ok(opened), false) => {
                 super::install_session(&mut app, opened.session);
                 json!({ "ok": true, "from_checkpoint": opened.from_checkpoint })
             }
-            Err(e) => json!({ "error": e }),
+            (Err(e), _) => json!({ "error": e }),
         };
         into_c_string(out.to_string())
     })
