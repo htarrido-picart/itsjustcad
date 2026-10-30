@@ -546,6 +546,35 @@ mod tests {
     }
 
     #[test]
+    fn pre_preset_cutcheck_loads_as_sendcutsend_and_resaves_byte_identical() {
+        // A cut_check logged before #209 has no `preset`: it loads as
+        // SendCutSend, which is never written back, so the file is unchanged.
+        let json = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "rectangle",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "width": 0.05, "height": 0.03},
+                {"cmd": "cut_check", "units": "mm", "thickness": 3.0,
+                 "limits": {"thickness": 0.003, "min_hole": 0.0015,
+                            "min_bridge": 0.0015, "min_hole_to_edge": 0.0015,
+                            "min_part": [0.0127, 0.0127],
+                            "max_part": [1.1176, 0.6096],
+                            "source": "rule of thumb"}}
+            ]
+        }"#;
+        let s = from_json(json).unwrap();
+        let log = s.save_log();
+        let Some(Command::CutCheck { preset, .. }) = log.last() else {
+            panic!("cut_check replays into the log: {log:?}");
+        };
+        assert!(preset.is_scs());
+        let json1 = to_json(&s);
+        assert!(json1.contains("cut_check") && !json1.contains("preset"), "{json1}");
+        assert_eq!(to_json(&from_json(&json1).unwrap()), json1, "byte-identical");
+    }
+
+    #[test]
     fn save_load_preserves_underlay() {
         // The height is carried on the logged op, so no image file is needed.
         let mut s = Session::default();
