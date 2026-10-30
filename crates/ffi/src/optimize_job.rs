@@ -31,10 +31,9 @@
 //! too, against the document they ran on (#237). A completed job's result is
 //! the blocking call's result: progress never changes the search.
 
-use std::collections::BTreeMap;
 use std::ffi::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use itsjustcad_commands::optimize_runs::{self, SavedRun};
@@ -43,12 +42,13 @@ use itsjustcad_commands::site_optimize::{
 };
 use serde_json::{Value, json};
 
+use super::job::{self, Cancellable, lock, run_guarded, state_name};
 use super::{
     AppHandle, c_arg, guard_ffi, handle_mut, handle_ref, into_c_string, object_by_short_id,
 };
 
 /// One search.
-struct Job {
+pub(crate) struct Job {
     cancel: AtomicBool,
     /// Stop and keep the plans found so far (#201).
     stop: AtomicBool,
@@ -80,21 +80,17 @@ struct JobState {
 
 impl Job {
     fn finish(&self, result: Result<OptimizeResult, String>) {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state();
         st.result = Some(result);
         st.elapsed = Some(self.started.elapsed().as_secs_f64());
     }
 
     fn progress_json(&self, id: u64) -> Value {
-        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let state = match &st.result {
-            None if self.cancel.load(Ordering::Relaxed) => "cancelling",
-            None if self.stop.load(Ordering::Relaxed) => "stopping",
-            None => "running",
-            Some(Ok(_)) if self.cancel.load(Ordering::Relaxed) => "cancelled",
-            Some(Ok(_)) => "done",
-            Some(Err(e)) if e == site_optimize::CANCELLED => "cancelled",
-            Some(Err(_)) => "failed",
+        let st = self.state();
+        let cancel = self.is_cancelled();
+        let state = match st.result {
+            None if !cancel && self.stop.load(Ordering::Relaxed) => "stopping",
+            _ => state_name(&st.result, cancel, true, site_optimize::CANCELLED),
         };
         let p = st.progress;
         json!({
@@ -111,8 +107,8 @@ impl Job {
         })
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, JobState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    fn state(&self) -> MutexGuard<'_, JobState> {
+        lock(&self.state)
     }
 
     /// Save a ranked checkpoint as the site plan's latest run, remembering
@@ -123,7 +119,7 @@ impl Job {
         let Some((r, elapsed)) = st.checkpoint.take() else {
             return;
         };
-        if st.result.is_some() || self.cancel.load(Ordering::Relaxed) {
+        if st.result.is_some() || self.is_cancelled() {
             return;
         }
         let prior = app.session.optimize_run(p.source).cloned();
@@ -149,39 +145,32 @@ impl Job {
     }
 }
 
-/// The jobs of one handle.
-#[derive(Default)]
-pub(crate) struct Jobs {
-    next: u64,
-    jobs: BTreeMap<u64, Arc<Job>>,
+impl Cancellable for Job {
+    fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
 }
+
+/// The jobs of one handle.
+pub(crate) type Jobs = job::Jobs<Job>;
 
 /// Cancel every job of the handle and put back the runs their checkpoints
 /// replaced, before the document is replaced (#237): a later checkpoint,
 /// cancel or result of these jobs never touches the next document.
 pub(crate) fn cancel_all(app: &mut AppHandle) {
-    let all: Vec<Arc<Job>> = jobs(app).jobs.values().cloned().collect();
+    let all: Vec<Arc<Job>> = jobs(app).iter().map(|(_, j)| j.clone()).collect();
     for j in all {
-        j.cancel.store(true, Ordering::Relaxed);
+        j.cancel();
         j.restore_prior(app);
     }
 }
 
-impl Drop for Jobs {
-    /// A freed handle stops its searches (their threads end at the next chunk).
-    fn drop(&mut self) {
-        for j in self.jobs.values() {
-            j.cancel.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-fn jobs(app: &AppHandle) -> std::sync::MutexGuard<'_, Jobs> {
-    app.optimize_jobs.lock().unwrap_or_else(|e| e.into_inner())
+fn jobs(app: &AppHandle) -> MutexGuard<'_, Jobs> {
+    lock(&app.optimize_jobs)
 }
 
 fn job(app: &AppHandle, id: u64) -> Option<Arc<Job>> {
-    jobs(app).jobs.get(&id).cloned()
+    jobs(app).get(id)
 }
 
 /// Start a [`super::ijc_site_optimize_json`] search of the site boundary
@@ -224,13 +213,7 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
             prepared: prepared.as_ref().ok().cloned(),
             state: Default::default(),
         });
-        let id = {
-            let mut jobs = jobs(app);
-            jobs.next += 1;
-            let id = jobs.next;
-            jobs.jobs.insert(id, job.clone());
-            id
-        };
+        let id = jobs(app).insert(job.clone());
         match prepared {
             Err(e) => job.finish(Err(e)),
             Ok(p) => {
@@ -248,8 +231,7 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
                         checkpoint: Some(&job.checkpoint),
                         on_checkpoint: Some(&keep),
                     };
-                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.run(ctl)))
-                        .unwrap_or_else(|_| Err("siteoptimize: the search failed".into()));
+                    let out = run_guarded("siteoptimize: the search failed", || p.run(ctl));
                     job.finish(out);
                 });
             }
@@ -297,7 +279,7 @@ pub unsafe extern "C" fn ijc_site_optimize_cancel(h: *mut AppHandle, job_id: u64
         let Some(j) = (unsafe { handle_ref(h) }).and_then(|app| job(app, job_id)) else {
             return false;
         };
-        j.cancel.store(true, Ordering::Relaxed);
+        j.cancel();
         // Busy handle: the result's take puts the run back instead.
         if let Some(mut app) = unsafe { handle_mut(h) } {
             j.restore_prior(&mut app);
@@ -375,22 +357,15 @@ pub unsafe extern "C" fn ijc_site_optimize_result(h: *mut AppHandle, job_id: u64
         let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return null();
         };
-        let (j, result, elapsed) = {
-            let mut jobs = jobs(&app);
-            let Some(j) = jobs.jobs.get(&job_id).cloned() else {
-                return null();
-            };
-            let mut st = j.state.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(result) = st.result.take() else {
-                return null();
-            };
-            let elapsed = st.elapsed.unwrap_or(0.0);
-            drop(st);
-            jobs.jobs.remove(&job_id);
-            (j, result, elapsed)
+        let take = |j: &Job| {
+            let mut st = j.state();
+            Some((st.result.take()?, st.elapsed.unwrap_or(0.0)))
+        };
+        let Some((j, (result, elapsed))) = jobs(&app).take(job_id, take) else {
+            return null();
         };
         let result = match result {
-            Ok(_) if j.cancel.load(Ordering::Relaxed) => Err(site_optimize::CANCELLED.into()),
+            Ok(_) if j.is_cancelled() => Err(site_optimize::CANCELLED.into()),
             r => r,
         };
         let out = match (result, &j.prepared) {

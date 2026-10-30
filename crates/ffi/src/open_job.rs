@@ -20,76 +20,31 @@
 //! safe while it runs, and the current document is untouched until
 //! [`ijc_open_take`]. Freeing the handle cancels every running job.
 
-use std::collections::BTreeMap;
 use std::ffi::c_char;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, MutexGuard};
 
-use itsjustcad_commands::{ExecError, ReplayControl, io};
+use itsjustcad_commands::{ExecError, io};
 use serde_json::{Value, json};
 
+use super::job::{self, Cancellable, ReplayJob};
 use super::{AppHandle, MAX_JSON_LEN, guard_ffi, handle_mut, handle_ref, into_c_string};
 
 /// The error of a cancelled job.
 const CANCELLED: &str = "open: cancelled";
 
-/// One open.
-#[derive(Default)]
-struct Job {
-    cancel: AtomicBool,
-    state: Mutex<JobState>,
-}
-
-#[derive(Default)]
-struct JobState {
-    /// Ops replayed of `total` (the tail only, when a checkpoint is used).
-    done: usize,
-    total: usize,
-    /// `Some` once the open ended: the opened document or the error.
-    result: Option<Result<io::Opened, String>>,
-}
-
-impl Job {
-    fn state(&self) -> std::sync::MutexGuard<'_, JobState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn progress_json(&self, id: u64) -> Value {
-        let st = self.state();
-        let state = match &st.result {
-            None if self.cancel.load(Ordering::Relaxed) => "cancelling",
-            None => "running",
-            Some(Ok(_)) if self.cancel.load(Ordering::Relaxed) => "cancelled",
-            Some(Ok(_)) => "done",
-            Some(Err(e)) if e == CANCELLED => "cancelled",
-            Some(Err(_)) => "failed",
-        };
-        json!({ "job": id, "state": state, "done": st.done, "total": st.total })
-    }
-}
+/// One open (`done` of `total` counts the tail only, when a checkpoint is
+/// used).
+type Job = ReplayJob<io::Opened>;
 
 /// The open jobs of one handle.
-#[derive(Default)]
-pub(crate) struct Jobs {
-    next: u64,
-    jobs: BTreeMap<u64, Arc<Job>>,
-}
+pub(crate) type Jobs = job::Jobs<Job>;
 
-impl Drop for Jobs {
-    /// A freed handle stops its opens (their threads end at the next op).
-    fn drop(&mut self) {
-        for j in self.jobs.values() {
-            j.cancel.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-fn jobs(app: &AppHandle) -> std::sync::MutexGuard<'_, Jobs> {
-    app.open_jobs.lock().unwrap_or_else(|e| e.into_inner())
+fn jobs(app: &AppHandle) -> MutexGuard<'_, Jobs> {
+    job::lock(&app.open_jobs)
 }
 
 fn job(app: &AppHandle, id: u64) -> Option<Arc<Job>> {
-    jobs(app).jobs.get(&id).cloned()
+    jobs(app).get(id)
 }
 
 /// A host buffer as an owned UTF-8 string.
@@ -135,38 +90,16 @@ pub unsafe extern "C" fn ijc_open_start(
         // A bad checkpoint is ignored like a stale one.
         let checkpoint = unsafe { copy_utf8(cp_ptr, cp_len, "checkpoint") }.ok();
         let job = Arc::new(Job::default());
-        let id = {
-            let mut jobs = jobs(app);
-            jobs.next += 1;
-            let id = jobs.next;
-            jobs.jobs.insert(id, job.clone());
-            id
-        };
+        let id = jobs(app).insert(job.clone());
         match json {
             Err(e) => job.state().result = Some(Err(e)),
-            Ok(json) => {
-                std::thread::spawn(move || {
-                    let report = |done: usize, total: usize| {
-                        let mut st = job.state();
-                        st.done = done;
-                        st.total = total;
-                    };
-                    let ctl = ReplayControl {
-                        cancel: Some(&job.cancel),
-                        progress: Some(&report),
-                    };
-                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        io::open_json(&json, checkpoint.as_deref(), ctl)
-                    }));
-                    let out = match out {
-                        Ok(Ok(opened)) => Ok(opened),
-                        Ok(Err(io::IoError::Replay(ExecError::Cancelled))) => Err(CANCELLED.into()),
-                        Ok(Err(e)) => Err(format!("open: {e}")),
-                        Err(_) => Err("open: the replay failed".into()),
-                    };
-                    job.state().result = Some(out);
-                });
-            }
+            Ok(json) => job.spawn("open: the replay failed", move |ctl| {
+                match io::open_json(&json, checkpoint.as_deref(), ctl) {
+                    Ok(opened) => Ok(opened),
+                    Err(io::IoError::Replay(ExecError::Cancelled)) => Err(CANCELLED.into()),
+                    Err(e) => Err(format!("open: {e}")),
+                }
+            }),
         }
         id
     })
@@ -185,7 +118,7 @@ pub unsafe extern "C" fn ijc_open_progress(h: *mut AppHandle, job_id: u64) -> *m
     guard_ffi(std::ptr::null_mut(), || {
         let v = (unsafe { handle_ref(h) })
             .and_then(|app| job(app, job_id))
-            .map_or(Value::Null, |j| j.progress_json(job_id));
+            .map_or(Value::Null, |j| j.progress_json(job_id, true, CANCELLED));
         into_c_string(v.to_string())
     })
 }
@@ -202,7 +135,7 @@ pub unsafe extern "C" fn ijc_open_cancel(h: *mut AppHandle, job_id: u64) -> bool
     guard_ffi(false, || {
         (unsafe { handle_ref(h) })
             .and_then(|app| job(app, job_id))
-            .map(|j| j.cancel.store(true, Ordering::Relaxed))
+            .map(|j| j.cancel())
             .is_some()
     })
 }
@@ -225,18 +158,10 @@ pub unsafe extern "C" fn ijc_open_take(h: *mut AppHandle, job_id: u64) -> *mut c
         let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return null();
         };
-        let result = {
-            let mut jobs = jobs(&app);
-            let Some(j) = jobs.jobs.get(&job_id).cloned() else {
-                return null();
-            };
-            let Some(result) = j.state().result.take() else {
-                return null();
-            };
-            jobs.jobs.remove(&job_id);
-            (result, j.cancel.load(Ordering::Relaxed))
+        let Some((j, result)) = jobs(&app).take(job_id, |j| j.state().result.take()) else {
+            return null();
         };
-        let out = match result {
+        let out = match (result, j.is_cancelled()) {
             (Ok(_), true) => json!({ "error": CANCELLED }),
             (Ok(opened), false) => {
                 super::install_session(&mut app, opened.session);

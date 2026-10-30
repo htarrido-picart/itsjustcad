@@ -39,6 +39,7 @@ mod boxsel;
 pub mod cameras;
 pub mod guided;
 pub mod history_job;
+mod job;
 pub mod open_job;
 pub mod optimize_job;
 pub mod replay;
