@@ -680,16 +680,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn rebuilds() -> usize {
+        crate::exec::HISTORY_REBUILDS.with(std::cell::Cell::get)
+    }
+
     #[test]
     fn undo_works_after_fast_open() {
-        // Fast-open defers inverse materialization; the first undo must rebuild
-        // the history and behave exactly like a replayed session's undo.
+        // Fast-open defers inverse materialization; undoing past the open
+        // boundary rebuilds the history and behaves exactly like a replayed
+        // session's undo.
         let s = built_session();
         let before = objects_of(&s);
         let mut fast = Session::from_snapshot(s.doc.clone(), s.save_log());
 
-        // A brand-new edit, then undo it — exercises ensure_history on the edit
-        // path and the undo path.
         fast.run(parse("box 20,20,0 1,1,1").unwrap()).unwrap();
         assert_eq!(fast.doc.len(), before.len() + 1);
         fast.run(Command::Undo).unwrap();
@@ -697,7 +700,10 @@ mod tests {
 
         // Undoing further walks back into the pre-open history: undo the last
         // pre-open op (a `sun`) and compare to a replay that stops one op short.
+        let n0 = rebuilds();
         fast.run(Command::Undo).unwrap();
+        assert_eq!(rebuilds(), n0 + 1, "undo past the boundary rebuilds once");
+        assert!(!fast.history_pending());
         let mut short_log = s.save_log();
         short_log.pop();
         let expected = Session::replay(short_log).unwrap();
@@ -705,6 +711,143 @@ mod tests {
         fast.run(Command::Redo).unwrap();
         assert_eq!(objects_of(&fast), before, "redo restores opened state");
         assert_eq!(fast.doc.sun, s.doc.sun);
+    }
+
+    #[test]
+    fn fast_open_edit_does_not_replay() {
+        // #224: the first edit after a fast open stacks on the prefix.
+        let s = built_session();
+        let mut fast = Session::from_snapshot(s.doc.clone(), s.save_log());
+        let n0 = rebuilds();
+        fast.run(parse("location 40.7 -74.0 10").unwrap()).unwrap();
+        fast.run(parse("box 20,20,0 1,1,1").unwrap()).unwrap();
+        assert_eq!(rebuilds(), n0, "no history replay on edit");
+        assert!(fast.history_pending());
+        assert_eq!(fast.undo_len(), s.save_log().len() + 2);
+        assert_eq!(fast.undo_cursor(), fast.undo_len());
+        assert_eq!(fast.history().0.len(), fast.undo_len());
+    }
+
+    #[test]
+    fn undo_redo_within_new_edits_needs_no_rebuild() {
+        let s = built_session();
+        let before = objects_of(&s);
+        let mut fast = Session::from_snapshot(s.doc.clone(), s.save_log());
+        fast.set_background_history(true);
+        let n0 = rebuilds();
+        fast.run(parse("box 20,20,0 1,1,1").unwrap()).unwrap();
+        let one = objects_of(&fast);
+        fast.run(parse("box 30,20,0 1,1,1").unwrap()).unwrap();
+        let two = objects_of(&fast);
+        fast.run(Command::Undo).unwrap();
+        assert_eq!(objects_of(&fast), one);
+        fast.run(Command::Undo).unwrap();
+        assert_eq!(objects_of(&fast), before);
+        assert_eq!(fast.undo_cursor(), s.save_log().len());
+        fast.run(Command::Redo).unwrap();
+        fast.run(Command::Redo).unwrap();
+        assert_eq!(objects_of(&fast), two);
+        assert_eq!(fast.run(Command::Redo).unwrap_err(), ExecError::NothingToRedo);
+        // jump_to within the new edits works on effective steps.
+        fast.jump_to(s.save_log().len()).unwrap();
+        assert_eq!(objects_of(&fast), before);
+        assert_eq!(rebuilds(), n0);
+        assert!(fast.history_pending());
+    }
+
+    #[test]
+    fn background_rebuild_refuses_then_installs_under_new_edits() {
+        let s = built_session();
+        let log = s.save_log();
+        let before = objects_of(&s);
+        let mut fast = Session::from_snapshot(s.doc.clone(), log.clone());
+        fast.set_background_history(true);
+        fast.run(parse("box 20,20,0 1,1,1").unwrap()).unwrap();
+        fast.run(Command::Undo).unwrap();
+        let err = fast.run(Command::Undo).unwrap_err();
+        assert_eq!(err, ExecError::HistoryPending);
+        assert_eq!(err.to_string(), "Preparing undo history…");
+        assert_eq!(objects_of(&fast), before, "refused undo changes nothing");
+
+        // The job copies the prefix; an edit lands while it "runs".
+        let job = fast.history_job().unwrap();
+        assert_eq!(job.len(), log.len());
+        fast.run(parse("box 40,20,0 1,1,1").unwrap()).unwrap();
+        let after_edit = objects_of(&fast);
+        let rebuilt = job.run(ReplayControl::default()).unwrap();
+        assert!(fast.install_history(rebuilt));
+        assert!(!fast.history_pending());
+        assert_eq!(objects_of(&fast), after_edit, "install keeps the document");
+        assert_eq!(fast.undo_len(), log.len() + 1);
+        assert_eq!(fast.undo_cursor(), log.len() + 1);
+
+        // Undo the new edit, then every pre-open op, matching replays.
+        fast.run(Command::Undo).unwrap();
+        assert_eq!(objects_of(&fast), before);
+        for k in (0..log.len()).rev() {
+            fast.run(Command::Undo).unwrap();
+            let want = Session::replay(log[..k].to_vec()).unwrap();
+            assert_eq!(objects_of(&fast), objects_of(&want), "state after {k} ops");
+        }
+        assert_eq!(fast.run(Command::Undo).unwrap_err(), ExecError::NothingToUndo);
+    }
+
+    #[test]
+    fn tail_open_then_edit_undoes_into_the_prefix() {
+        // Checkpoint behind the log: the replayed tail is part of the prefix.
+        let mut s = built_session();
+        let cp = checkpoint_json(&s);
+        s.run(parse("box 50,0,0 1,1,1").unwrap()).unwrap();
+        let log = s.save_log();
+        let mut fast = open_json(&to_json(&s), Some(&cp), ReplayControl::default())
+            .unwrap()
+            .session;
+        assert!(fast.history_pending());
+        fast.run(parse("box 60,0,0 1,1,1").unwrap()).unwrap();
+        fast.run(Command::Undo).unwrap();
+        fast.run(Command::Undo).unwrap();
+        let want = Session::replay(log[..log.len() - 1].to_vec()).unwrap();
+        assert_eq!(objects_of(&fast), objects_of(&want));
+    }
+
+    #[test]
+    fn stale_history_is_not_installed() {
+        let s = built_session();
+        let mut fast = Session::from_snapshot(s.doc.clone(), s.save_log());
+        let job = fast.history_job().unwrap();
+        // Amend replaces the session: the old prefix's rebuild is stale.
+        fast.amend(0, parse("box 0,0,0 6,6,3").unwrap()).unwrap();
+        assert!(!fast.history_pending());
+        let len = fast.undo_len();
+        assert!(!fast.install_history(job.run(ReplayControl::default()).unwrap()));
+        assert_eq!(fast.undo_len(), len);
+        // Another session's rebuild is stale too.
+        let other = Session::from_snapshot(s.doc.clone(), s.save_log());
+        let mut fast2 = Session::from_snapshot(s.doc.clone(), s.save_log());
+        let job = other.history_job().unwrap();
+        assert!(!fast2.install_history(job.run(ReplayControl::default()).unwrap()));
+        assert!(fast2.history_pending());
+    }
+
+    #[test]
+    fn save_after_fast_open_and_edits_round_trips() {
+        let s = built_session();
+        let mut fast = Session::from_snapshot(s.doc.clone(), s.save_log());
+        fast.run(parse("box 20,20,0 1,1,1").unwrap()).unwrap();
+        fast.run(parse("box 30,20,0 1,1,1").unwrap()).unwrap();
+        fast.run(Command::Undo).unwrap();
+        fast.run(parse("circle 5,5,0 1").unwrap()).unwrap();
+        assert_eq!(fast.save_log().len(), s.save_log().len() + 2);
+        assert_eq!(&fast.save_log()[..s.save_log().len()], &s.save_log()[..]);
+        let json = to_json(&fast);
+        let back = from_json(&json).unwrap();
+        assert_eq!(objects_of(&back), objects_of(&fast));
+        assert_eq!(to_json(&back), json, "save is byte-identical");
+        // A checkpoint taken now opens to the same document too.
+        let cp = checkpoint_json(&fast);
+        let opened = open_json(&json, Some(&cp), ReplayControl::default()).unwrap();
+        assert!(opened.from_checkpoint);
+        assert_eq!(objects_of(&opened.session), objects_of(&fast));
     }
 
     #[test]
