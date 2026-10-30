@@ -17,6 +17,9 @@
 //! - [`ijc_site_optimize_stop`] stops it at the next chunk of plans and keeps
 //!   the best plans found so far, marked `"stopped_early":true` (#201: a
 //!   system stop, e.g. the iOS background time running out).
+//! - [`ijc_site_optimize_checkpoint`] saves the best plans so far as the site
+//!   plan's latest run without stopping (#219: the app is going to the
+//!   background and may be killed there).
 //! - [`ijc_site_optimize_result`] takes the finished result (the same JSON as
 //!   `ijc_site_optimize_json`, plus `"saved"`, or `{"error"}`; a cancelled
 //!   job's error is `"siteoptimize: cancelled"`) and forgets the job. A
@@ -47,6 +50,8 @@ struct Job {
     cancel: AtomicBool,
     /// Stop and keep the plans found so far (#201).
     stop: AtomicBool,
+    /// Save the plans found so far and keep going (#219).
+    checkpoint: AtomicBool,
     started: Instant,
     /// What the search plans (saved with its result); `None` when it failed
     /// to start.
@@ -61,6 +66,14 @@ struct JobState {
     result: Option<Result<OptimizeResult, String>>,
     /// Elapsed seconds when it ended.
     elapsed: Option<f64>,
+    /// A checkpoint the search ranked (#219), with its elapsed seconds; saved
+    /// by the next progress poll.
+    checkpoint: Option<(OptimizeResult, f64)>,
+    /// When the last checkpoint was saved, Unix seconds.
+    checkpoint_at: Option<u64>,
+    /// The site plan's saved run before the first checkpoint replaced it
+    /// (`Some(None)`: it had none); put back on cancel or failure.
+    prior: Option<Option<SavedRun>>,
 }
 
 impl Job {
@@ -91,7 +104,45 @@ impl Job {
             "best": p.best,
             "fraction": p.fraction(),
             "elapsed_s": st.elapsed.unwrap_or_else(|| self.started.elapsed().as_secs_f64()),
+            "checkpoint_at": st.checkpoint_at,
         })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, JobState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Save a ranked checkpoint as the site plan's latest run, remembering
+    /// the run it replaces. Dropped once the job is cancelled or ended.
+    fn save_checkpoint(&self, app: &mut AppHandle) {
+        let Some(p) = &self.prepared else { return };
+        let mut st = self.state();
+        let Some((r, elapsed)) = st.checkpoint.take() else {
+            return;
+        };
+        if st.result.is_some() || self.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let prior = app.session.optimize_run(p.source).cloned();
+        let run = SavedRun::new(p, r, elapsed);
+        let at = run.finished_at;
+        if app.session.set_optimize_run(p.source, run) {
+            st.prior.get_or_insert(prior);
+            st.checkpoint_at = Some(at);
+        }
+    }
+
+    /// Put back the run the checkpoints replaced (a cancel or a failure).
+    fn restore_prior(&self, app: &mut AppHandle) {
+        let (Some(p), Some(prior)) = (&self.prepared, self.state().prior.take()) else {
+            return;
+        };
+        match prior {
+            Some(run) => {
+                app.session.set_optimize_run(p.source, run);
+            }
+            None => app.session.clear_optimize_run(p.source),
+        }
     }
 }
 
@@ -154,6 +205,7 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
         let job = Arc::new(Job {
             cancel: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            checkpoint: AtomicBool::new(false),
             started: Instant::now(),
             prepared: prepared.as_ref().ok().cloned(),
             state: Default::default(),
@@ -170,12 +222,17 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
             Ok(p) => {
                 std::thread::spawn(move || {
                     let report = |pr: &Progress| {
-                        job.state.lock().unwrap_or_else(|e| e.into_inner()).progress = *pr;
+                        job.state().progress = *pr;
+                    };
+                    let keep = |r: OptimizeResult| {
+                        job.state().checkpoint = Some((r, job.started.elapsed().as_secs_f64()));
                     };
                     let ctl = Control {
                         cancel: Some(&job.cancel),
                         stop: Some(&job.stop),
                         progress: Some(&report),
+                        checkpoint: Some(&job.checkpoint),
+                        on_checkpoint: Some(&keep),
                     };
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.run(ctl)))
                         .unwrap_or_else(|_| Err("siteoptimize: the search failed".into()));
@@ -189,15 +246,22 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
 
 /// A job's progress: `{"job","state":"running"|"cancelling"|"stopping"|"done"|
 /// "failed"|"cancelled","phase":"search"|"daylight","evaluated","budget","feasible",
-/// "best":score|null,"fraction":0..1,"elapsed_s"}` (`evaluated` of `budget`
-/// in the current phase). `null` for an unknown job or a null/invalid handle.
-/// Free with [`super::ijc_string_free`].
+/// "best":score|null,"fraction":0..1,"elapsed_s","checkpoint_at":unix
+/// seconds|null}` (`evaluated` of `budget` in the current phase). A checkpoint
+/// ranked since the last poll is saved first ([`ijc_site_optimize_checkpoint`]).
+/// `null` for an unknown job or a null/invalid handle. Free with
+/// [`super::ijc_string_free`].
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`super::ijc_init`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_site_optimize_progress(h: *mut AppHandle, job_id: u64) -> *mut c_char {
     guard_ffi(std::ptr::null_mut(), || {
+        if let Some(mut app) = unsafe { handle_mut(h) }
+            && let Some(j) = job(&app, job_id)
+        {
+            j.save_checkpoint(&mut app);
+        }
         let v = (unsafe { handle_ref(h) })
             .and_then(|app| job(app, job_id))
             .map_or(Value::Null, |j| j.progress_json(job_id));
@@ -206,18 +270,25 @@ pub unsafe extern "C" fn ijc_site_optimize_progress(h: *mut AppHandle, job_id: u
 }
 
 /// Ask a running job to stop; it ends at its next chunk of plans and its
-/// result becomes `{"error":"siteoptimize: cancelled"}`. Returns whether the
-/// job is known (true for one already finished: a no-op).
+/// result becomes `{"error":"siteoptimize: cancelled"}`. The run saved before
+/// the job is put back over any checkpoint (#219). Returns whether the job is
+/// known (true for one already finished: a no-op).
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`super::ijc_init`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_site_optimize_cancel(h: *mut AppHandle, job_id: u64) -> bool {
     guard_ffi(false, || {
-        (unsafe { handle_ref(h) })
-            .and_then(|app| job(app, job_id))
-            .map(|j| j.cancel.store(true, Ordering::Relaxed))
-            .is_some()
+        let Some(j) = (unsafe { handle_ref(h) }).and_then(|app| job(app, job_id)) else {
+            return false;
+        };
+        j.cancel.store(true, Ordering::Relaxed);
+        // Busy handle: the result's take puts the run back instead.
+        let done = matches!(j.state().result, Some(Ok(_)));
+        if !done && let Some(mut app) = unsafe { handle_mut(h) } {
+            j.restore_prior(&mut app);
+        }
+        true
     })
 }
 
@@ -242,6 +313,30 @@ pub unsafe extern "C" fn ijc_site_optimize_stop(h: *mut AppHandle, job_id: u64) 
     })
 }
 
+/// Ask a running job to save its best plans so far without stopping (#219):
+/// at its next chunk with a feasible plan it ranks them as
+/// [`ijc_site_optimize_stop`] would, and the next
+/// [`ijc_site_optimize_progress`] saves them as the site plan's latest run
+/// (`"stopped_early":true`) and reports when in `"checkpoint_at"`; the host
+/// should then mark the document edited so it gets saved. The search goes
+/// on: its result replaces the checkpoint, and a cancel or a failure puts
+/// back the run saved before the job. Returns whether the job is running
+/// (true when a request is already pending; false for an unknown or finished
+/// job).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`super::ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_site_optimize_checkpoint(h: *mut AppHandle, job_id: u64) -> bool {
+    guard_ffi(false, || {
+        (unsafe { handle_ref(h) })
+            .and_then(|app| job(app, job_id))
+            .filter(|j| j.state().result.is_none())
+            .map(|j| j.checkpoint.store(true, Ordering::Relaxed))
+            .is_some()
+    })
+}
+
 /// Take a finished job's result — the [`super::ijc_site_optimize_json`]
 /// result plus `"saved":bool`, or `{"error":"…"}` — and forget the job.
 /// `null` while it is still running, for an unknown (or already taken) job,
@@ -253,7 +348,8 @@ pub unsafe extern "C" fn ijc_site_optimize_stop(h: *mut AppHandle, job_id: u64) 
 /// with [`ijc_site_optimize_saved_json`]). Saving is document metadata, not
 /// an undo step: the host should mark the document edited so it gets saved.
 /// Nothing is saved (`"saved":false`) when the boundary no longer has a
-/// site plan. Cancelled and failed jobs save nothing.
+/// site plan. Cancelled and failed jobs save nothing, and put back the run
+/// saved before the job over any checkpoint (#219).
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`super::ijc_init`].
@@ -288,7 +384,10 @@ pub unsafe extern "C" fn ijc_site_optimize_result(h: *mut AppHandle, job_id: u64
                 v
             }
             (Ok(r), None) => r.to_json(),
-            (Err(e), _) => json!({ "error": e }),
+            (Err(e), _) => {
+                j.restore_prior(&mut app);
+                json!({ "error": e })
+            }
         };
         into_c_string(out.to_string())
     })

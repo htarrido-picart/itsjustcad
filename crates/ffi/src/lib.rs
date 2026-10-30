@@ -7447,6 +7447,100 @@ mod headless_tests {
         }
     }
 
+    /// #219: a checkpoint saves the best plans so far as the latest run while
+    /// the job keeps going; its result replaces it; a cancel puts back the run
+    /// saved before the job (or none).
+    #[test]
+    fn site_optimize_checkpoint_saves_and_cancel_restores() {
+        use optimize_job::*;
+        let h = ijc_init_headless();
+        unsafe {
+            let j = |s: *mut c_char| serde_json::from_str::<serde_json::Value>(&take(s)).unwrap();
+            let run = |l: &str| j(ijc_run_command_result(h, c(l).as_ptr()));
+            let v = run("rect 0,0,0 200 150");
+            let site = c(v["created"][0].as_str().unwrap());
+            run("lotsettings depth=20");
+            assert_eq!(run("siteplan last")["ok"], true);
+            let saved = || j(ijc_site_optimize_saved_json(h, site.as_ptr()));
+            let progress = |id: u64| j(ijc_site_optimize_progress(h, id));
+            let wait = |id: u64| {
+                let t = std::time::Instant::now();
+                loop {
+                    let p = progress(id);
+                    let s = p["state"].as_str().unwrap();
+                    if !["running", "cancelling", "stopping"].contains(&s) {
+                        return p;
+                    }
+                    assert!(t.elapsed().as_secs() < 120, "{p}");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+            let big = c(r#"{"objective":"lots","budget":5000}"#);
+            let start = || ijc_site_optimize_start(h, site.as_ptr(), big.as_ptr());
+            // Request a checkpoint and poll until it is saved.
+            let checkpoint = |id: u64| {
+                assert!(ijc_site_optimize_checkpoint(h, id));
+                let t = std::time::Instant::now();
+                loop {
+                    let p = progress(id);
+                    if p["checkpoint_at"].is_u64() {
+                        assert_eq!(p["state"], "running", "{p}");
+                        return p;
+                    }
+                    assert!(t.elapsed().as_secs() < 120, "{p}");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+
+            // Over no saved run: the cancel removes it.
+            let id = start();
+            assert!(progress(id)["checkpoint_at"].is_null());
+            let p = checkpoint(id);
+            let s = saved();
+            assert_eq!(s["stopped_early"], true, "{s}");
+            assert!(!s["result"]["candidates"].as_array().unwrap().is_empty());
+            assert!(s["result"]["evaluated"].as_u64().unwrap() < 5000);
+            // The job goes on.
+            let t = std::time::Instant::now();
+            while progress(id)["evaluated"].as_u64() <= p["evaluated"].as_u64() {
+                assert!(t.elapsed().as_secs() < 120);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(ijc_site_optimize_cancel(h, id));
+            assert_eq!(saved(), serde_json::Value::Null, "nothing saved before");
+            wait(id);
+            assert!(!ijc_site_optimize_checkpoint(h, id), "ended");
+            assert!(j(ijc_site_optimize_result(h, id))["error"].is_string());
+            assert_eq!(saved(), serde_json::Value::Null);
+
+            // The job's result replaces its checkpoint.
+            let id = start();
+            let cp = checkpoint(id)["checkpoint_at"].clone();
+            let at_checkpoint = saved()["result"]["evaluated"].as_u64().unwrap();
+            assert!(ijc_site_optimize_stop(h, id));
+            wait(id);
+            let got = j(ijc_site_optimize_result(h, id));
+            assert_eq!(got["saved"], true, "{got}");
+            let before = saved();
+            assert_eq!(before["result"]["evaluated"], got["evaluated"]);
+            assert!(got["evaluated"].as_u64().unwrap() >= at_checkpoint);
+            assert!(cp.as_u64().unwrap() > 0);
+
+            // Over a saved run: two checkpoints, then a cancel puts it back.
+            let id = start();
+            checkpoint(id);
+            checkpoint(id);
+            assert_ne!(saved(), before, "the checkpoint replaced it");
+            assert!(ijc_site_optimize_cancel(h, id));
+            assert_eq!(saved(), before);
+            wait(id);
+            j(ijc_site_optimize_result(h, id));
+            assert_eq!(saved(), before);
+            assert!(!ijc_site_optimize_checkpoint(h, 999));
+            ijc_free(h);
+        }
+    }
+
     #[test]
     fn site_optimize_json_then_apply_is_one_undo_step() {
         let h = ijc_init_headless();

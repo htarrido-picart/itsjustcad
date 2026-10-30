@@ -1034,6 +1034,15 @@ impl Session {
         true
     }
 
+    /// Drop the saved run of the site plan on `source` (#219: a cancelled
+    /// run that checkpointed over none). Not logged; bumps
+    /// [`Session::meta_revision`].
+    pub fn clear_optimize_run(&mut self, source: ObjectId) {
+        if self.optimize_runs.remove(&source).is_some() {
+            self.meta_rev += 1;
+        }
+    }
+
     /// Every saved run whose site plan exists (the file header's).
     pub fn optimize_runs(&self) -> BTreeMap<ObjectId, crate::optimize_runs::SavedRun> {
         self.optimize_runs
