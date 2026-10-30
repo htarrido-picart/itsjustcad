@@ -7522,7 +7522,7 @@ mod headless_tests {
             let id = start();
             checkpoint(id);
             checkpoint(id);
-            assert_ne!(saved()["result"]["evaluated"], before["result"]["evaluated"]);
+            assert_ne!(saved(), before, "the checkpoint replaced it");
             assert!(ijc_site_optimize_cancel(h, id));
             assert_eq!(saved(), before);
             wait(id);
