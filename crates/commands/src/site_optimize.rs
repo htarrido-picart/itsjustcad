@@ -1288,6 +1288,7 @@ fn latin_hypercube(n: usize, d: usize, rng: &mut Rng) -> Vec<Vec<f64>> {
     pts
 }
 
+#[derive(Clone)]
 struct Trial {
     genome: Vec<f64>,
     params: BTreeMap<String, String>,
@@ -1421,9 +1422,32 @@ pub struct Control<'a> {
     /// user cancel. Cancel wins when both are set.
     pub stop: Option<&'a std::sync::atomic::AtomicBool>,
     pub progress: Option<&'a (dyn Fn(&Progress) + Sync)>,
+    /// Checkpoint request (#219): at the next chunk with a feasible plan, the
+    /// search ranks the plans found so far as a stop would, hands them to
+    /// `on_checkpoint` (marked stopped early), clears the flag and keeps going.
+    pub checkpoint: Option<&'a std::sync::atomic::AtomicBool>,
+    pub on_checkpoint: Option<&'a (dyn Fn(OptimizeResult) + Sync)>,
 }
 
 impl Control<'_> {
+    fn checkpoint_due(&self) -> bool {
+        self.on_checkpoint.is_some()
+            && self
+                .checkpoint
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Clear the checkpoint request and hand over `r` (`None`: nothing could
+    /// be ranked, the request is dropped).
+    fn emit_checkpoint(&self, r: Option<OptimizeResult>) {
+        if let Some(c) = self.checkpoint {
+            c.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let (Some(f), Some(r)) = (self.on_checkpoint, r) {
+            f(r);
+        }
+    }
+
     fn cancelled(&self) -> bool {
         self.cancel
             .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
@@ -1485,7 +1509,57 @@ pub fn optimize_ctl(
     // Everything locked: one plan is all there is to evaluate.
     let budget = if d == 0 { 1 } else { req.budget };
     let mut rng = Rng(req.seed);
-    let eval_one = |genome: Vec<f64>| -> Trial {
+    let daylight = req.location.filter(|_| req.wants_daylight());
+    let opts = req.daylight_opts();
+    let day = |p: &BTreeMap<String, String>| {
+        let loc = daylight?;
+        plan_daylight(site, &settings_with(base, p).ok()?, edits, &loc, &opts)
+    };
+    // The current plan, measured once: at the end, or at the first checkpoint.
+    let current = std::sync::OnceLock::new();
+    let current = || {
+        current
+            .get_or_init(|| {
+                let mut c = evaluate(site, base, edits, req).ok();
+                if let (Some(loc), Some(c)) = (daylight, c.as_mut()) {
+                    set_daylight(&mut c.quantities, plan_daylight(site, base, edits, &loc, &opts));
+                    c.score = req.score(&c.report, &c.ledger, &c.quantities);
+                }
+                c
+            })
+            .clone()
+    };
+    let info = daylight.map(|loc| DaylightInfo::of(&opts, &loc));
+    let finish = |r: OptimizeResult, stopped: bool| OptimizeResult {
+        current: current(),
+        daylight: info.clone(),
+        stopped_early: stopped || r.stopped_early,
+        ..r
+    };
+    let on_checkpoint = |r: OptimizeResult| {
+        if let Some(f) = ctl.on_checkpoint {
+            f(finish(r, true));
+        }
+    };
+    let ctl = Control {
+        on_checkpoint: ctl
+            .on_checkpoint
+            .map(|_| &on_checkpoint as &(dyn Fn(OptimizeResult) + Sync)),
+        ..ctl
+    };
+    // A checkpoint during the search: rank the trials so far as a stop would
+    // (one daylight batch at most), quietly.
+    let snapshot = |trials: &[Trial]| {
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let quiet = Control {
+            cancel: ctl.cancel,
+            stop: Some(&stop),
+            ..Control::default()
+        };
+        let daylight = daylight.map(|_| &day as DaylightOf);
+        ctl.emit_checkpoint(rank(trials.to_vec(), req, daylight, quiet).ok());
+    };
+    let eval_one =|genome: Vec<f64>| -> Trial {
         let mut params = decode(&dims, &genome, base);
                 params.insert(
                     "floors_cap".into(),
@@ -1547,6 +1621,9 @@ pub fn optimize_ctl(
             if stopped {
                 return Ok(true);
             }
+            if progress.feasible > 0 && ctl.checkpoint_due() {
+                snapshot(trials);
+            }
         }
         Ok(false)
     };
@@ -1589,24 +1666,7 @@ pub fn optimize_ctl(
         return Err(STOPPED_EMPTY.into());
     }
 
-    let mut current = evaluate(site, base, edits, req).ok();
-    let daylight = req.location.filter(|_| req.wants_daylight());
-    let opts = req.daylight_opts();
-    let day = |p: &BTreeMap<String, String>| {
-        let loc = daylight?;
-        plan_daylight(site, &settings_with(base, p).ok()?, edits, &loc, &opts)
-    };
-    if let (Some(loc), Some(c)) = (daylight, current.as_mut()) {
-        set_daylight(&mut c.quantities, plan_daylight(site, base, edits, &loc, &opts));
-        c.score = req.score(&c.report, &c.ledger, &c.quantities);
-    }
-    let info = daylight.map(|loc| DaylightInfo::of(&opts, &loc));
-    rank(trials, req, daylight.map(|_| &day as DaylightOf), ctl).map(|r| OptimizeResult {
-        current,
-        daylight: info,
-        stopped_early: stopped || r.stopped_early,
-        ..r
-    })
+    rank(trials, req, daylight.map(|_| &day as DaylightOf), ctl).map(|r| finish(r, stopped))
 }
 
 const NEEDS_LOCATION: &str = "siteoptimize: daylight needs a location — set one with \
@@ -1774,6 +1834,19 @@ fn rank(
             if checked.iter().filter(|(_, e)| e.violations.is_empty()).count() >= req.top.max(1) {
                 break;
             }
+            // A checkpoint (#219) ranks the layouts measured so far; it waits
+            // for one that passes.
+            if ctl.checkpoint_due() {
+                let mut ok: Vec<_> = checked
+                    .iter()
+                    .filter(|(_, e)| e.violations.is_empty())
+                    .cloned()
+                    .collect();
+                if !ok.is_empty() {
+                    ok.sort_by(|a, b| cmp_keys(&sort_key(&a.1), &sort_key(&b.1)));
+                    ctl.emit_checkpoint(Some(ranked(ok, req, evaluated, n_feasible, true)));
+                }
+            }
         }
         checked.retain(|(_, e)| e.violations.is_empty());
         if checked.is_empty() {
@@ -1789,6 +1862,18 @@ fn rank(
         checked.sort_by(|a, b| cmp_keys(&sort_key(&a.1), &sort_key(&b.1)));
         unique = checked;
     }
+    Ok(ranked(unique, req, evaluated, n_feasible, stopped_early))
+}
+
+/// The result of the ranked, deduplicated layouts `unique`: their ranks, the
+/// Pareto front, and the top ones plus the front.
+fn ranked(
+    unique: Vec<(BTreeMap<String, String>, Evaluation)>,
+    req: &OptimizeRequest,
+    evaluated: usize,
+    n_feasible: usize,
+    stopped_early: bool,
+) -> OptimizeResult {
     let unique: Vec<Candidate> = unique
         .into_iter()
         .enumerate()
@@ -1822,7 +1907,7 @@ fn rank(
         .into_iter()
         .filter(|c| c.rank <= req.top.max(1) || pareto.contains(&c.rank))
         .collect();
-    Ok(OptimizeResult {
+    OptimizeResult {
         objective: req.objective,
         candidates,
         pareto,
@@ -1832,7 +1917,7 @@ fn rank(
         current: None,
         daylight: None,
         stopped_early,
-    })
+    }
 }
 
 impl OptimizeResult {
@@ -2950,6 +3035,7 @@ mod tests {
             cancel: None,
             stop: None,
             progress: Some(&log),
+            ..Control::default()
         };
         let watched = optimize_ctl(&site, &base, &PlanEdits::default(), &req(60), ctl).unwrap();
         assert_eq!(
@@ -2986,6 +3072,7 @@ mod tests {
             cancel: Some(&cancel),
             stop: None,
             progress: Some(&stop),
+            ..Control::default()
         };
         let err = optimize_ctl(&site, &base, &PlanEdits::default(), &req(400), ctl).unwrap_err();
         assert_eq!(err, CANCELLED);
@@ -2995,6 +3082,7 @@ mod tests {
             cancel: Some(&cancel),
             stop: None,
             progress: None,
+            ..Control::default()
         };
         assert_eq!(
             optimize_ctl(&site, &base, &PlanEdits::default(), &req(400), ctl).unwrap_err(),
@@ -3019,6 +3107,7 @@ mod tests {
             cancel: None,
             stop: None,
             progress: Some(&log),
+            ..Control::default()
         };
         optimize_ctl(
             &site,
@@ -3326,10 +3415,55 @@ mod tests {
             cancel: Some(&cancel),
             stop: Some(&stop),
             progress: None,
+            ..Control::default()
         };
         assert_eq!(
             optimize_ctl(&site, &base, &PlanEdits::default(), &req(400), ctl).unwrap_err(),
             CANCELLED
+        );
+    }
+
+    /// #219: a checkpoint hands over the plans found so far, ranked and
+    /// marked stopped early, once per request; the search keeps going and
+    /// ends as if unwatched.
+    #[test]
+    fn checkpoint_keeps_searching() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let site = rect(200.0, 150.0);
+        let base = SubdivisionSettings::default();
+        let want = AtomicBool::new(false);
+        let asked = AtomicBool::new(false);
+        let after_two = |p: &Progress| {
+            if p.evaluated >= 2 * CHUNK && !asked.swap(true, Ordering::Relaxed) {
+                want.store(true, Ordering::Relaxed);
+            }
+        };
+        let got = Mutex::new(Vec::new());
+        let keep = |r: OptimizeResult| got.lock().unwrap().push(r);
+        let ctl = Control {
+            progress: Some(&after_two),
+            checkpoint: Some(&want),
+            on_checkpoint: Some(&keep),
+            ..Control::default()
+        };
+        let full = optimize_ctl(&site, &base, &PlanEdits::default(), &req(120), ctl).unwrap();
+        assert_eq!(
+            ranking(&full),
+            ranking(&optimize(&site, &base, &req(120)).unwrap()),
+            "the search is unchanged"
+        );
+        assert!(!full.stopped_early);
+        assert!(!want.load(Ordering::Relaxed), "request cleared");
+        let got = got.into_inner().unwrap();
+        assert_eq!(got.len(), 1);
+        let cp = &got[0];
+        assert!(cp.stopped_early);
+        assert_eq!(cp.evaluated, 2 * CHUNK);
+        assert!(!cp.candidates.is_empty());
+        assert_eq!(
+            cp.current.as_ref().map(|c| c.score),
+            full.current.as_ref().map(|c| c.score)
         );
     }
 }
