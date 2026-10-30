@@ -7,6 +7,16 @@ use crate::{Command, ExecError, ReplayControl, Session};
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Whether a leniently read header value (`optimize_runs` entries,
+/// `cut_export`) carries a `version` this build reads: `1..=current`. A
+/// newer or missing version is unreadable; callers drop the value, and it
+/// is not written back on save (see FORMAT.md).
+pub(crate) fn header_version_ok(v: &serde_json::Value, current: u32) -> bool {
+    v.get("version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|n| (1..=u64::from(current)).contains(&n))
+}
+
 /// Checkpoint sidecar version. Bumped independently of the op-log format; a
 /// stale or unrecognized checkpoint is simply ignored (full replay).
 ///
@@ -277,6 +287,17 @@ mod tests {
     use crate::parse;
 
     #[test]
+    fn header_versions_read_one_to_current() {
+        let ok = |v: serde_json::Value| header_version_ok(&v, 2);
+        assert!(ok(serde_json::json!({"version": 1})), "older");
+        assert!(ok(serde_json::json!({"version": 2})), "current");
+        assert!(!ok(serde_json::json!({"version": 3})), "newer");
+        assert!(!ok(serde_json::json!({"version": 0})));
+        assert!(!ok(serde_json::json!({"version": "1"})));
+        assert!(!ok(serde_json::json!({})));
+    }
+
+    #[test]
     fn save_load_save_byte_identical() {
         let mut s = Session::default();
         for line in [
@@ -543,6 +564,35 @@ mod tests {
         }"#;
         let s = from_json(json).unwrap();
         assert!(s.doc.underlay.is_none());
+    }
+
+    #[test]
+    fn pre_preset_cutcheck_loads_as_sendcutsend_and_resaves_byte_identical() {
+        // A cut_check logged before #209 has no `preset`: it loads as
+        // SendCutSend, which is never written back, so the file is unchanged.
+        let json = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "rectangle",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "width": 0.05, "height": 0.03},
+                {"cmd": "cut_check", "units": "mm", "thickness": 3.0,
+                 "limits": {"thickness": 0.003, "min_hole": 0.0015,
+                            "min_bridge": 0.0015, "min_hole_to_edge": 0.0015,
+                            "min_part": [0.0127, 0.0127],
+                            "max_part": [1.1176, 0.6096],
+                            "source": "rule of thumb"}}
+            ]
+        }"#;
+        let s = from_json(json).unwrap();
+        let log = s.save_log();
+        let Some(Command::CutCheck { preset, .. }) = log.last() else {
+            panic!("cut_check replays into the log: {log:?}");
+        };
+        assert!(preset.is_scs());
+        let json1 = to_json(&s);
+        assert!(json1.contains("cut_check") && !json1.contains("preset"), "{json1}");
+        assert_eq!(to_json(&from_json(&json1).unwrap()), json1, "byte-identical");
     }
 
     #[test]

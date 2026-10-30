@@ -69,13 +69,17 @@ Beyond the `ops` array, a file carries a few small pieces of derived-but-persist
 - **`compliance_reports`** — the per-rule verdicts from `codecheck`, served by `report codecheck`. Each carries the advisory-pre-check disclaimer in its context.
 - **analysis reports** — the compact structured summaries stored by environmental and landscape studies (`sunhours`, `facesunhours`, `radiation`, `shadowstudy`, `cutfill`, `plantschedule`, `flowarrows`, `ponding`, `miyawaki`), served by `report`. Regenerated on replay.
 
+The file header also carries two pieces of document metadata. They are **not ops**: never replayed and never undo steps. Each value carries its own `version` (currently 1), is read leniently (an entry this build cannot read — a newer `version`, an unknown preset, a bad shape or id — loads as unset instead of failing the open), and is omitted while unset so files without it stay byte-identical. Older builds ignore both.
+
+- **`optimize_runs`** — the latest site optimizer run of each site plan (#201), keyed by boundary id. A run is dropped when its site plan is deleted, and replaced by the next run.
+- **`cut_export`** — the last cutting preset used (#209): `{"version": 1, "preset": "scs" | "generic"}`. Unset (or unreadable) means SendCutSend.
+
 Compliance and analysis reports are summaries for critique, never certified results — the app never claims to analyse or certify.
 
 ---
 
 ## Checkpoint sidecar (optional)
-
-Alongside `myfile.itsjustcad.json` the app may write `myfile.itsjustcad.json.checkpoint` — a compact JSON snapshot of the derived document plus the op-count it reflects. This is a pure cache: deleting it is always safe, and a stale or unreadable checkpoint is silently ignored.
+Alongside `myfile.itsjustcad.json` the app writes `myfile.itsjustcad.json.checkpoint` (checkpoint version 3) — a compact JSON snapshot of the derived document plus the core version that wrote it, the op count it reflects, and a hash of those ops. On open it is used only when its checkpoint and core versions match this build and its ops are a prefix of the file's log; the document is then seeded from the snapshot and only the newer ops are replayed. Anything else falls back to a full replay. This is a pure cache: deleting it is always safe, and a stale or unreadable checkpoint is silently ignored. See [FORMAT.md](../FORMAT.md#checkpoint-sidecar-optional-fast-open-cache) for the fields and rules.
 
 ---
 

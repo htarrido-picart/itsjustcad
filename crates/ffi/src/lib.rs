@@ -39,6 +39,7 @@ mod boxsel;
 pub mod cameras;
 pub mod guided;
 pub mod history_job;
+mod job;
 pub mod open_job;
 pub mod optimize_job;
 pub mod replay;
@@ -1059,6 +1060,7 @@ fn install_session(app: &mut AppHandle, mut session: Session) {
     // Undo past a fast-open boundary waits for [`history_job`], never blocks.
     session.set_background_history(true);
     history_job::jobs(app).cancel_all();
+    optimize_job::cancel_all(app);
     app.session = session;
     app.guided = Default::default();
     if let Ok(mut hist) = app.history.lock() {
@@ -1104,6 +1106,8 @@ pub unsafe extern "C" fn ijc_new_document(h: *mut AppHandle) {
         let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return;
         };
+        history_job::jobs(&app).cancel_all();
+        optimize_job::cancel_all(&mut app);
         app.session = Session::default();
         app.guided = Default::default();
         if let Ok(mut hist) = app.history.lock() {

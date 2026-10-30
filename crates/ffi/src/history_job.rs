@@ -17,80 +17,30 @@
 //! The worker never touches the handle; edits made while it runs are kept.
 //! Freeing the handle cancels every running job.
 
-use std::collections::BTreeMap;
 use std::ffi::c_char;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, MutexGuard};
 
-use itsjustcad_commands::{ExecError, RebuiltHistory, ReplayControl};
+use itsjustcad_commands::{ExecError, RebuiltHistory};
 use serde_json::{Value, json};
 
+use super::job::{self, Cancellable, ReplayJob};
 use super::{AppHandle, guard_ffi, handle_mut, handle_ref, into_c_string};
 
 /// The error of a cancelled job.
 const CANCELLED: &str = "history: cancelled";
 
 /// One rebuild.
-#[derive(Default)]
-struct Job {
-    cancel: AtomicBool,
-    state: Mutex<JobState>,
-}
-
-#[derive(Default)]
-struct JobState {
-    done: usize,
-    total: usize,
-    /// `Some` once the rebuild ended.
-    result: Option<Result<RebuiltHistory, String>>,
-}
-
-impl Job {
-    fn state(&self) -> std::sync::MutexGuard<'_, JobState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn progress_json(&self, id: u64) -> Value {
-        let st = self.state();
-        let state = match &st.result {
-            None if self.cancel.load(Ordering::Relaxed) => "cancelling",
-            None => "running",
-            Some(Ok(_)) => "done",
-            Some(Err(e)) if e == CANCELLED => "cancelled",
-            Some(Err(_)) => "failed",
-        };
-        json!({ "job": id, "state": state, "done": st.done, "total": st.total })
-    }
-}
+type Job = ReplayJob<RebuiltHistory>;
 
 /// The history rebuilds of one handle.
-#[derive(Default)]
-pub(crate) struct Jobs {
-    next: u64,
-    jobs: BTreeMap<u64, Arc<Job>>,
-}
+pub(crate) type Jobs = job::Jobs<Job>;
 
-impl Jobs {
-    /// Stop every running rebuild (a freed handle, or a new document).
-    pub(crate) fn cancel_all(&self) {
-        for j in self.jobs.values() {
-            j.cancel.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-impl Drop for Jobs {
-    fn drop(&mut self) {
-        self.cancel_all();
-    }
-}
-
-pub(crate) fn jobs(app: &AppHandle) -> std::sync::MutexGuard<'_, Jobs> {
-    app.history_jobs.lock().unwrap_or_else(|e| e.into_inner())
+pub(crate) fn jobs(app: &AppHandle) -> MutexGuard<'_, Jobs> {
+    job::lock(&app.history_jobs)
 }
 
 fn job(app: &AppHandle, id: u64) -> Option<Arc<Job>> {
-    jobs(app).jobs.get(&id).cloned()
+    jobs(app).get(id)
 }
 
 /// Whether the document was fast-opened and its opened ops still lack undo
@@ -127,35 +77,20 @@ pub unsafe extern "C" fn ijc_history_start(h: *mut AppHandle) -> u64 {
         };
         let mut jobs = jobs(&app);
         let running = jobs
-            .jobs
             .iter()
-            .find(|(_, j)| !j.cancel.load(Ordering::Relaxed) && j.state().result.is_none());
-        if let Some((&id, _)) = running {
+            .find(|(_, j)| !j.is_cancelled() && j.state().result.is_none());
+        if let Some((id, _)) = running {
             return id;
         }
         let job = Arc::new(Job::default());
-        jobs.next += 1;
-        let id = jobs.next;
-        jobs.jobs.insert(id, job.clone());
+        let id = jobs.insert(job.clone());
         job.state().total = work.len();
-        std::thread::spawn(move || {
-            let report = |done: usize, total: usize| {
-                let mut st = job.state();
-                st.done = done;
-                st.total = total;
-            };
-            let ctl = ReplayControl {
-                cancel: Some(&job.cancel),
-                progress: Some(&report),
-            };
-            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.run(ctl)));
-            let out = match out {
-                Ok(Ok(rebuilt)) => Ok(rebuilt),
-                Ok(Err(ExecError::Cancelled)) => Err(CANCELLED.into()),
-                Ok(Err(e)) => Err(format!("history: {e}")),
-                Err(_) => Err("history: the replay failed".into()),
-            };
-            job.state().result = Some(out);
+        job.spawn("history: the replay failed", move |ctl| {
+            match work.run(ctl) {
+                Ok(rebuilt) => Ok(rebuilt),
+                Err(ExecError::Cancelled) => Err(CANCELLED.into()),
+                Err(e) => Err(format!("history: {e}")),
+            }
         });
         id
     })
@@ -173,7 +108,7 @@ pub unsafe extern "C" fn ijc_history_progress(h: *mut AppHandle, job_id: u64) ->
     guard_ffi(std::ptr::null_mut(), || {
         let v = (unsafe { handle_ref(h) })
             .and_then(|app| job(app, job_id))
-            .map_or(Value::Null, |j| j.progress_json(job_id));
+            .map_or(Value::Null, |j| j.progress_json(job_id, false, CANCELLED));
         into_c_string(v.to_string())
     })
 }
@@ -188,7 +123,7 @@ pub unsafe extern "C" fn ijc_history_cancel(h: *mut AppHandle, job_id: u64) -> b
     guard_ffi(false, || {
         (unsafe { handle_ref(h) })
             .and_then(|app| job(app, job_id))
-            .map(|j| j.cancel.store(true, Ordering::Relaxed))
+            .map(|j| j.cancel())
             .is_some()
     })
 }
@@ -212,16 +147,8 @@ pub unsafe extern "C" fn ijc_history_take(h: *mut AppHandle, job_id: u64) -> *mu
         let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return null();
         };
-        let result = {
-            let mut jobs = jobs(&app);
-            let Some(j) = jobs.jobs.get(&job_id).cloned() else {
-                return null();
-            };
-            let Some(result) = j.state().result.take() else {
-                return null();
-            };
-            jobs.jobs.remove(&job_id);
-            result
+        let Some((_, result)) = jobs(&app).take(job_id, |j| j.state().result.take()) else {
+            return null();
         };
         let out = match result {
             Ok(rebuilt) => json!({ "ok": true, "installed": app.session.install_history(rebuilt) }),

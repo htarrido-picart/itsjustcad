@@ -29,11 +29,24 @@ derived; nothing else is stored.
 | `ops` | array of Command | ordered forward log; replayed in array order |
 | `branches` | map name → array of Command | design options; **optional**, omitted when empty (see below) |
 | `branch` | string | which branch `ops` belongs to; **optional**, omitted when there are no branches |
+| `optimize_runs` | map boundary id → saved run | latest site optimizer run of each site plan (#201); **optional**, omitted when empty (see below) |
+| `cut_export` | object | last cutting preset used (#209), `{"version": 1, "preset": "scs" \| "generic"}`; **optional**, omitted while unset (see below) |
 
 `branches`/`branch` are serde-default: pre-branch v1 files (which have neither)
 load unchanged on branch `main`, and a file with no design options serializes
 without either field, staying byte-identical to the original v1 shape. No
 version bump is required.
+
+`optimize_runs` and `cut_export` are document metadata, **not ops**: they are
+never replayed and are not undo steps. Each value carries its own `version`
+(currently **1** for both). They are read leniently: an entry this build cannot
+read (a newer `version`, an unknown preset, a bad shape or id) loads as unset
+instead of failing the open — an unreadable `cut_export` means SendCutSend.
+Any `version` from 1 up to the one the build knows is read. An unreadable
+value is **not kept**: re-saving the file in that build drops it, so a run or
+preset saved by a newer build is lost when an older build saves over it.
+Both are omitted while unset, so files without them stay byte-identical, and
+older builds ignore them.
 
 A reader **must** reject files where the version > the version it knows. A
 reader **must** accept files where the version == 1 forever — regardless of
@@ -367,16 +380,31 @@ gracefully. Every new command or field must add such a test.
 ## Checkpoint sidecar (optional fast-open cache)
 
 Saving `<file>` also writes `<file>.checkpoint`, a compact JSON snapshot of the
-derived document plus the op count it reflects:
+derived document plus the ops it reflects (checkpoint version **3**):
 
 ```json
-{"mydrafter_checkpoint": 1, "op_count": 42, "doc": { … Document snapshot … }}
+{"mydrafter_checkpoint": 3, "core": "0.8.0", "op_count": 42,
+ "ops_hash": "<16 hex digits>", "doc": { … Document snapshot … }}
 ```
 
-On open, if a checkpoint exists **and** its `op_count` matches the op-log's
-length **and** its `mydrafter_checkpoint` version is understood, the document is
-seeded directly from the snapshot and replay is skipped. Otherwise (no sidecar,
-version or count mismatch, or any parse error) the op-log is replayed in full.
+| field | notes |
+| --- | --- |
+| `mydrafter_checkpoint` | checkpoint version, versioned independently of the op-log; currently **3** |
+| `core` | core build version that wrote it (`CARGO_PKG_VERSION`) |
+| `op_count` | number of forward ops the snapshot reflects |
+| `ops_hash` | FNV-1a 64 hash (16 hex digits) of the first `op_count` ops serialized as JSON |
+| `doc` | the Document snapshot |
+
+On open, the checkpoint is used only when **all** of these hold: it parses,
+`mydrafter_checkpoint` equals this build's checkpoint version, `core` equals
+this build's core version, `op_count` is at most the op-log's length, and
+`ops_hash` matches the hash of the log's first `op_count` ops. The document is
+then seeded from the snapshot and only the ops after `op_count` are replayed on
+top of it (none when the counts match). If replaying that tail fails (other than
+by cancellation), the open falls back to a full replay. Otherwise (no sidecar, version, core or hash
+mismatch, a snapshot newer than the log, or any parse error) the op-log is
+replayed in full. File-header metadata (`uuid`, `branches`/`branch`,
+`optimize_runs`, `cut_export`) always comes from the file, never the checkpoint.
 
 The checkpoint is **purely a cache**:
 
@@ -385,7 +413,8 @@ The checkpoint is **purely a cache**:
   first materialized, and `io.rs` tests compare snapshot-load against replay.
 - **Deleting `<file>.checkpoint` is always safe** — the next open just replays.
 - It carries no long-term compatibility promise: a stale or unreadable
-  checkpoint is silently ignored, never an error.
+  checkpoint is silently ignored, never an error. A checkpoint from any other
+  core build is ignored, since replay output may differ between builds.
 - Fast-open defers rebuilding undo inverses until the undo history is first
   touched, so open→view→save never pays for the replay.
 

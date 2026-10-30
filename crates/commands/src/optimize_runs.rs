@@ -130,8 +130,7 @@ pub fn from_header(map: BTreeMap<String, serde_json::Value>) -> BTreeMap<ObjectI
     map.into_iter()
         .filter_map(|(k, v)| {
             let id = ObjectId(k.parse().ok()?);
-            let version = v.get("version")?.as_u64()?;
-            if version != SAVED_RUN_VERSION as u64 {
+            if !crate::io::header_version_ok(&v, SAVED_RUN_VERSION) {
                 return None;
             }
             Some((id, serde_json::from_value(v).ok()?))
@@ -212,6 +211,8 @@ mod tests {
         let back = io::from_json(&v.to_string()).unwrap();
         assert!(back.optimize_run(src).is_none());
         assert_eq!(back.undo_len(), s.undo_len());
+        // Not kept: re-saving in this build loses the newer run (FORMAT.md).
+        assert!(!io::to_json(&back).contains("optimize_runs"));
     }
 
     #[test]
