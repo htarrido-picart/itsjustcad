@@ -51,7 +51,11 @@ pub fn curvature_profile(curve: &Curve, max_samples: usize, tol: f64) -> Vec<Cur
         let (ab, bc, ca) = (b - a, c - b, a - c);
         let (lab, lbc, lca) = (ab.length(), bc.length(), ca.length());
         if lab < 1e-12 || lbc < 1e-12 || lca < 1e-12 {
-            return Some(CurvatureSample { point: b, normal: DVec3::ZERO, kappa: 0.0 });
+            return Some(CurvatureSample {
+                point: b,
+                normal: DVec3::ZERO,
+                kappa: 0.0,
+            });
         }
         let area2 = ab.cross(bc).length(); // 2·triangle area
         let kappa = 2.0 * area2 / (lab * lbc * lca);
@@ -60,7 +64,11 @@ pub fn curvature_profile(curve: &Curve, max_samples: usize, tol: f64) -> Vec<Cur
         let tangent = (c - a).normalize_or_zero();
         let v = (a + c) * 0.5 - b;
         let normal = (v - tangent * v.dot(tangent)).normalize_or_zero();
-        Some(CurvatureSample { point: b, normal, kappa })
+        Some(CurvatureSample {
+            point: b,
+            normal,
+            kappa,
+        })
     };
 
     let mut out: Vec<CurvatureSample> = Vec::with_capacity(count);
@@ -113,7 +121,11 @@ mod tests {
     #[test]
     fn line_curvature_is_zero() {
         let l = Curve::Polyline {
-            points: vec![DVec3::ZERO, DVec3::new(3.0, 0.0, 0.0), DVec3::new(9.0, 0.0, 0.0)],
+            points: vec![
+                DVec3::ZERO,
+                DVec3::new(3.0, 0.0, 0.0),
+                DVec3::new(9.0, 0.0, 0.0),
+            ],
             closed: false,
         };
         for s in curvature_profile(&l, 10, 0.001) {
@@ -142,7 +154,11 @@ mod tests {
     #[test]
     fn ellipse_curvature_extremes_at_axes() {
         // rx=4, ry=2: kappa max = rx/ry^2 = 1.0 at (±rx,0), min = ry/rx^2 = 0.125.
-        let e = Curve::Ellipse { center: DVec3::ZERO, rx: 4.0, ry: 2.0 };
+        let e = Curve::Ellipse {
+            center: DVec3::ZERO,
+            rx: 4.0,
+            ry: 2.0,
+        };
         let prof = curvature_profile(&e, 64, 1e-4);
         let kmax = prof.iter().map(|s| s.kappa).fold(0.0, f64::max);
         let kmin = prof.iter().map(|s| s.kappa).fold(f64::MAX, f64::min);
@@ -152,7 +168,10 @@ mod tests {
 
     #[test]
     fn degenerate_returns_empty() {
-        let l = Curve::Line { a: DVec3::ZERO, b: DVec3::X };
+        let l = Curve::Line {
+            a: DVec3::ZERO,
+            b: DVec3::X,
+        };
         assert!(curvature_profile(&l, 1, 0.01).is_empty());
     }
 }

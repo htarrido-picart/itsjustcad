@@ -83,11 +83,19 @@ impl Curve {
                 *b = m.transform_point3(*b);
                 true
             }
-            Curve::Polyline { points, .. } | Curve::Nurbs { control: points, .. } => {
+            Curve::Polyline { points, .. }
+            | Curve::Nurbs {
+                control: points, ..
+            } => {
                 points.iter_mut().for_each(|p| *p = m.transform_point3(*p));
                 true
             }
-            Curve::Arc { center, radius, start, end } => {
+            Curve::Arc {
+                center,
+                radius,
+                start,
+                end,
+            } => {
                 // Preserved when XY maps to XY as rotation × uniform scale
                 // without flipping orientation.
                 let planar = lx.z.abs() < EPS && ly.z.abs() < EPS;
@@ -109,8 +117,8 @@ impl Curve {
             Curve::Ellipse { center, rx, ry } => {
                 // Preserved only under axis-aligned scaling (the type cannot
                 // store a rotation); axis flips are fine by symmetry.
-                let diagonal = lx.y.abs() < EPS && lx.z.abs() < EPS
-                    && ly.x.abs() < EPS && ly.z.abs() < EPS;
+                let diagonal =
+                    lx.y.abs() < EPS && lx.z.abs() < EPS && ly.x.abs() < EPS && ly.z.abs() < EPS;
                 if diagonal {
                     *center = m.transform_point3(*center);
                     *rx *= lx.x.abs();
@@ -166,12 +174,15 @@ impl Curve {
                 // length (a cheap upper bound on the curve length) so a tighter
                 // tolerance subdivides a tightly-curved span more finely instead
                 // of a fixed count. Floor keeps simple curves smooth; capped so a
-                // huge curve can't blow up the vertex count.
+                // huge curve can't blow up the vertex count — except that the
+                // floor wins past 64 control points (a dense hand-drawn
+                // interpcurve), where a fixed 512 cap made `clamp` panic.
                 let poly_len: f64 = control.windows(2).map(|w| w[0].distance(w[1])).sum();
+                let floor = (control.len() * 8).max(32);
                 let n = if tol > 0.0 {
-                    ((poly_len / tol).ceil() as usize).clamp((control.len() * 8).max(32), 512)
+                    ((poly_len / tol).ceil() as usize).clamp(floor, floor.max(512))
                 } else {
-                    (control.len() * 8).max(32)
+                    floor
                 };
                 let (t0, t1) = (knots[*degree], knots[knots.len() - degree - 1]);
                 (0..=n)
@@ -199,9 +210,17 @@ impl Curve {
                     return None;
                 }
                 let n = DVec3::new(-d.y, d.x, 0.0) * dist; // left of travel
-                Some(Curve::Line { a: *a + n, b: *b + n })
+                Some(Curve::Line {
+                    a: *a + n,
+                    b: *b + n,
+                })
             }
-            Curve::Arc { center, radius, start, end } => {
+            Curve::Arc {
+                center,
+                radius,
+                start,
+                end,
+            } => {
                 // Positive = outward = larger radius.
                 let r = radius + dist;
                 (r > 1e-9).then_some(Curve::Arc {
@@ -268,7 +287,9 @@ fn offset_polyline(points: &[DVec3], closed: bool, dist: f64) -> Option<Vec<DVec
 
     let n = points.len();
     let seg_normal = |i: usize| -> glam::DVec2 {
-        let dir = (points[(i + 1) % n] - points[i]).truncate().normalize_or_zero();
+        let dir = (points[(i + 1) % n] - points[i])
+            .truncate()
+            .normalize_or_zero();
         glam::DVec2::new(-dir.y, dir.x) // left of travel
     };
     let segs = if closed { n } else { n - 1 };
@@ -346,6 +367,26 @@ pub fn clamped_uniform_knots(n: usize, degree: usize) -> Vec<f64> {
 mod tests {
     use super::*;
 
+    /// More than 64 control points used to panic (`min > max` in `clamp`).
+    #[test]
+    fn nurbs_with_many_control_points_tessellates() {
+        let n = 100;
+        let control: Vec<DVec3> = (0..n)
+            .map(|i| DVec3::new(i as f64, (i as f64 * 0.3).sin(), 0.0))
+            .collect();
+        let mut knots = vec![0.0];
+        knots.extend((0..n).map(|i| i as f64));
+        knots.push((n - 1) as f64);
+        let c = Curve::Nurbs {
+            control,
+            weights: vec![1.0; n],
+            knots,
+            degree: 1,
+        };
+        let pts = c.tessellate(0.001);
+        assert!(pts.len() > n * 8);
+    }
+
     #[test]
     fn arc_tessellation_closes_circle() {
         let c = Curve::Arc {
@@ -373,7 +414,15 @@ mod tests {
         };
         let m = glam::DMat4::from_rotation_z(std::f64::consts::FRAC_PI_2);
         assert!(c.transform(&m, 0.01));
-        let Curve::Arc { center, radius, start, .. } = c else { panic!() };
+        let Curve::Arc {
+            center,
+            radius,
+            start,
+            ..
+        } = c
+        else {
+            panic!()
+        };
         assert!((center - DVec3::new(0.0, 2.0, 1.0)).length() < 1e-9);
         assert!((radius - 3.0).abs() < 1e-12);
         assert!((start - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
@@ -388,7 +437,9 @@ mod tests {
             end: 1.0,
         };
         assert!(c.transform(&glam::DMat4::from_scale(DVec3::splat(2.5)), 0.01));
-        let Curve::Arc { radius, .. } = c else { panic!() };
+        let Curve::Arc { radius, .. } = c else {
+            panic!()
+        };
         assert!((radius - 5.0).abs() < 1e-12);
     }
 
@@ -402,7 +453,9 @@ mod tests {
         };
         let exact = c.transform(&glam::DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0)), 0.01);
         assert!(!exact);
-        let Curve::Polyline { closed, ref points } = c else { panic!("expected polyline") };
+        let Curve::Polyline { closed, ref points } = c else {
+            panic!("expected polyline")
+        };
         assert!(closed);
         // stretched to an ellipse: x extent 4, y extent 2
         let max_x = points.iter().map(|p| p.x.abs()).fold(0.0, f64::max);
@@ -412,12 +465,22 @@ mod tests {
 
     #[test]
     fn transform_ellipse_axis_scale_exact_rotation_tessellates() {
-        let mut e = Curve::Ellipse { center: DVec3::ZERO, rx: 4.0, ry: 2.0 };
+        let mut e = Curve::Ellipse {
+            center: DVec3::ZERO,
+            rx: 4.0,
+            ry: 2.0,
+        };
         assert!(e.transform(&glam::DMat4::from_scale(DVec3::new(2.0, 3.0, 1.0)), 0.01));
-        let Curve::Ellipse { rx, ry, .. } = e else { panic!() };
+        let Curve::Ellipse { rx, ry, .. } = e else {
+            panic!()
+        };
         assert_eq!((rx, ry), (8.0, 6.0));
 
-        let mut e = Curve::Ellipse { center: DVec3::ZERO, rx: 4.0, ry: 2.0 };
+        let mut e = Curve::Ellipse {
+            center: DVec3::ZERO,
+            rx: 4.0,
+            ry: 2.0,
+        };
         assert!(!e.transform(&glam::DMat4::from_rotation_z(0.5), 0.01));
         assert!(matches!(e, Curve::Polyline { closed: true, .. }));
     }
@@ -425,9 +488,15 @@ mod tests {
     #[test]
     fn transform_polyline_and_line_exact() {
         let m = glam::DMat4::from_rotation_z(0.7) * glam::DMat4::from_translation(DVec3::X);
-        let mut l = Curve::Line { a: DVec3::ZERO, b: DVec3::X };
+        let mut l = Curve::Line {
+            a: DVec3::ZERO,
+            b: DVec3::X,
+        };
         assert!(l.transform(&m, 0.01));
-        let mut p = Curve::Polyline { points: vec![DVec3::ZERO, DVec3::X, DVec3::Y], closed: true };
+        let mut p = Curve::Polyline {
+            points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+            closed: true,
+        };
         assert!(p.transform(&m, 0.01));
         assert!(p.is_closed());
     }
@@ -455,12 +524,16 @@ mod tests {
             closed: true,
         };
         let out = sq(2.0).offset(1.0, 0.01).unwrap();
-        let Curve::Polyline { ref points, .. } = out else { panic!() };
+        let Curve::Polyline { ref points, .. } = out else {
+            panic!()
+        };
         assert!((shoelace(points).abs() - 36.0).abs() < 1e-9); // grew to 6x6
         assert!(points.iter().all(|p| (p.z - 1.0).abs() < 1e-12)); // z kept
 
         let inw = sq(2.0).offset(-1.0, 0.01).unwrap();
-        let Curve::Polyline { ref points, .. } = inw else { panic!() };
+        let Curve::Polyline { ref points, .. } = inw else {
+            panic!()
+        };
         assert!((shoelace(points).abs() - 4.0).abs() < 1e-9); // shrank to 2x2
 
         // CW winding: outward must still grow.
@@ -474,7 +547,9 @@ mod tests {
             closed: true,
         };
         let out = cw.offset(1.0, 0.01).unwrap();
-        let Curve::Polyline { ref points, .. } = out else { panic!() };
+        let Curve::Polyline { ref points, .. } = out else {
+            panic!()
+        };
         assert!((shoelace(points).abs() - 36.0).abs() < 1e-9);
     }
 
@@ -500,15 +575,22 @@ mod tests {
             start: 0.0,
             end: std::f64::consts::TAU,
         };
-        let Some(Curve::Arc { radius, .. }) = c.offset(0.5, 0.01) else { panic!() };
+        let Some(Curve::Arc { radius, .. }) = c.offset(0.5, 0.01) else {
+            panic!()
+        };
         assert!((radius - 3.5).abs() < 1e-12);
         assert!(c.offset(-3.0, 0.01).is_none()); // collapses to a point
     }
 
     #[test]
     fn offset_line_left_of_travel() {
-        let l = Curve::Line { a: DVec3::ZERO, b: DVec3::new(10.0, 0.0, 0.0) };
-        let Some(Curve::Line { a, b }) = l.offset(2.0, 0.01) else { panic!() };
+        let l = Curve::Line {
+            a: DVec3::ZERO,
+            b: DVec3::new(10.0, 0.0, 0.0),
+        };
+        let Some(Curve::Line { a, b }) = l.offset(2.0, 0.01) else {
+            panic!()
+        };
         assert!((a - DVec3::new(0.0, 2.0, 0.0)).length() < 1e-12);
         assert!((b - DVec3::new(10.0, 2.0, 0.0)).length() < 1e-12);
     }
@@ -517,10 +599,16 @@ mod tests {
     fn offset_open_polyline_l_shape() {
         // L along +x then +y; offset left of travel puts the copy inside the L.
         let l = Curve::Polyline {
-            points: vec![DVec3::ZERO, DVec3::new(4.0, 0.0, 0.0), DVec3::new(4.0, 4.0, 0.0)],
+            points: vec![
+                DVec3::ZERO,
+                DVec3::new(4.0, 0.0, 0.0),
+                DVec3::new(4.0, 4.0, 0.0),
+            ],
             closed: false,
         };
-        let Some(Curve::Polyline { points, .. }) = l.offset(1.0, 0.01) else { panic!() };
+        let Some(Curve::Polyline { points, .. }) = l.offset(1.0, 0.01) else {
+            panic!()
+        };
         assert!((points[0] - DVec3::new(0.0, 1.0, 0.0)).length() < 1e-9);
         assert!((points[1] - DVec3::new(3.0, 1.0, 0.0)).length() < 1e-9); // miter corner
         assert!((points[2] - DVec3::new(3.0, 4.0, 0.0)).length() < 1e-9);
@@ -528,7 +616,11 @@ mod tests {
 
     #[test]
     fn offset_ellipse_tessellates() {
-        let e = Curve::Ellipse { center: DVec3::ZERO, rx: 4.0, ry: 2.0 };
+        let e = Curve::Ellipse {
+            center: DVec3::ZERO,
+            rx: 4.0,
+            ry: 2.0,
+        };
         let Some(Curve::Polyline { closed, .. }) = e.offset(0.5, 0.01) else {
             panic!("expected polyline")
         };

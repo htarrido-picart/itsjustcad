@@ -13,12 +13,12 @@ mod curve;
 mod nurbs;
 mod ops;
 
-pub use analysis::{curvature_profile, CurvatureSample};
-pub use biarc::{fit_biarcs, BiarcFit, Seg2};
+pub use analysis::{CurvatureSample, curvature_profile};
+pub use biarc::{BiarcFit, Seg2, fit_biarcs};
 pub use build::{helix, interpolate_curve, rebuild};
-pub use curve::{clamped_uniform_knots, Curve};
+pub use curve::{Curve, clamped_uniform_knots};
 pub use nurbs::{insert_knot, nurbs_point};
 pub use ops::{
-    chamfer_curves, chamfer_lines, closest_point, extend, fillet_curves, fillet_curves_at,
-    fillet_lines, intersections, join_curves, split_at_points, JOIN_TOL,
+    JOIN_TOL, chamfer_curves, chamfer_lines, closest_point, extend, fillet_curves,
+    fillet_curves_at, fillet_lines, intersections, join_curves, split_at_points,
 };
