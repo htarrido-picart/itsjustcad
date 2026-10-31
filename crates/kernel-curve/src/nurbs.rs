@@ -89,14 +89,21 @@ pub fn insert_knot(
     }
 
     // Homogeneous control points (P*w, w).
-    let hom: Vec<(DVec3, f64)> =
-        control.iter().zip(weights).map(|(p, w)| (*p * *w, *w)).collect();
+    let hom: Vec<(DVec3, f64)> = control
+        .iter()
+        .zip(weights)
+        .map(|(p, w)| (*p * *w, *w))
+        .collect();
 
     let mut out: Vec<(DVec3, f64)> = Vec::with_capacity(n + 1);
     out.extend_from_slice(&hom[..=k - degree]);
     for i in (k - degree + 1)..=(k - s) {
         let denom = knots[i + degree] - knots[i];
-        let alpha = if denom.abs() < 1e-12 { 0.0 } else { (t - knots[i]) / denom };
+        let alpha = if denom.abs() < 1e-12 {
+            0.0
+        } else {
+            (t - knots[i]) / denom
+        };
         out.push((
             hom[i - 1].0 * (1.0 - alpha) + hom[i].0 * alpha,
             hom[i - 1].1 * (1.0 - alpha) + hom[i].1 * alpha,

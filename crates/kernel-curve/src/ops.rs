@@ -34,7 +34,11 @@ fn closest_on_path(pts: &[DVec3], closed: bool, p: DVec3) -> DVec3 {
     let segs = if closed { n } else { n.saturating_sub(1) };
     (0..segs.max(1).min(if n == 1 { 1 } else { segs })).fold(pts[0], |best, i| {
         let c = closest_on_segment(pts[i], pts[(i + 1) % n], p);
-        if c.distance_squared(p) < best.distance_squared(p) { c } else { best }
+        if c.distance_squared(p) < best.distance_squared(p) {
+            c
+        } else {
+            best
+        }
     })
 }
 
@@ -48,7 +52,12 @@ pub fn closest_point(c: &Curve, p: DVec3, tol: f64) -> DVec3 {
     match c {
         Curve::Line { a, b } => closest_on_segment(*a, *b, p),
         Curve::Polyline { points, .. } => closest_on_path(points, c.is_closed(), p),
-        Curve::Arc { center, radius, start, end } => {
+        Curve::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => {
             let sweep = end - start;
             let v = (p - *center).truncate();
             if v.length_squared() < EPS * EPS {
@@ -60,7 +69,11 @@ pub fn closest_point(c: &Curve, p: DVec3, tol: f64) -> DVec3 {
             } else {
                 let s = arc_point(*center, *radius, *start);
                 let e = arc_point(*center, *radius, *end);
-                if s.distance_squared(p) <= e.distance_squared(p) { s } else { e }
+                if s.distance_squared(p) <= e.distance_squared(p) {
+                    s
+                } else {
+                    e
+                }
             }
         }
         _ => closest_on_path(&c.tessellate(tol), c.is_closed(), p),
@@ -72,14 +85,24 @@ pub fn closest_point(c: &Curve, p: DVec3, tol: f64) -> DVec3 {
 /// Analytic form used by the intersector: a segment path or a circular arc.
 enum Prim {
     Path(Vec<DVec3>, bool),
-    Circ { c: DVec3, r: f64, start: f64, sweep: f64 },
+    Circ {
+        c: DVec3,
+        r: f64,
+        start: f64,
+        sweep: f64,
+    },
 }
 
 fn prim(c: &Curve, tol: f64) -> Prim {
     match c {
         Curve::Line { a, b } => Prim::Path(vec![*a, *b], false),
         Curve::Polyline { points, .. } => Prim::Path(points.clone(), c.is_closed()),
-        Curve::Arc { center, radius, start, end } => Prim::Circ {
+        Curve::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => Prim::Circ {
             c: *center,
             r: *radius,
             start: *start,
@@ -177,9 +200,7 @@ pub fn intersections(a: &Curve, b: &Curve, tol: f64) -> Vec<DVec3> {
             );
             for i in 0..sa {
                 for j in 0..sb {
-                    if let Some(p) =
-                        seg_seg_xy(pa[i], pa[(i + 1) % na], pb[j], pb[(j + 1) % nb])
-                    {
+                    if let Some(p) = seg_seg_xy(pa[i], pa[(i + 1) % na], pb[j], pb[(j + 1) % nb]) {
                         pts.push(p);
                     }
                 }
@@ -194,14 +215,27 @@ pub fn intersections(a: &Curve, b: &Curve, tol: f64) -> Vec<DVec3> {
             }
         }
         (
-            Prim::Circ { c: c1, r: r1, start: s1, sweep: w1 },
-            Prim::Circ { c: c2, r: r2, start: s2, sweep: w2 },
+            Prim::Circ {
+                c: c1,
+                r: r1,
+                start: s1,
+                sweep: w1,
+            },
+            Prim::Circ {
+                c: c2,
+                r: r2,
+                start: s2,
+                sweep: w2,
+            },
         ) => circ_circ_xy((c1, r1, s1, w1), (c2, r2, s2, w2), &mut pts),
     }
     // Dedup near-coincident hits (shared polyline vertices, tangencies).
     let mut unique: Vec<DVec3> = Vec::with_capacity(pts.len());
     for p in pts {
-        if !unique.iter().any(|q| q.truncate().distance(p.truncate()) < JOIN_TOL) {
+        if !unique
+            .iter()
+            .any(|q| q.truncate().distance(p.truncate()) < JOIN_TOL)
+        {
             unique.push(p);
         }
     }
@@ -252,7 +286,11 @@ fn poly_param(pts: &[DVec3], closed: bool, p: DVec3) -> f64 {
         let (a, b) = (pts[i], pts[(i + 1) % n]);
         let ab = b - a;
         let len2 = ab.length_squared();
-        let t = if len2 < EPS * EPS { 0.0 } else { ((p - a).dot(ab) / len2).clamp(0.0, 1.0) };
+        let t = if len2 < EPS * EPS {
+            0.0
+        } else {
+            ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+        };
         let d = (a + ab * t).distance_squared(p);
         if d < best.0 {
             best = (d, i as f64 + t);
@@ -286,7 +324,10 @@ pub fn split_at_points(c: &Curve, pts: &[DVec3], tol: f64) -> Option<Vec<Curve>>
             cuts.push(1.0);
             Some(
                 cuts.windows(2)
-                    .map(|w| Curve::Line { a: *a + ab * w[0], b: *a + ab * w[1] })
+                    .map(|w| Curve::Line {
+                        a: *a + ab * w[0],
+                        b: *a + ab * w[1],
+                    })
                     .collect(),
             )
         }
@@ -294,8 +335,7 @@ pub fn split_at_points(c: &Curve, pts: &[DVec3], tol: f64) -> Option<Vec<Curve>>
             let closed = c.is_closed();
             let n = points.len();
             let segs = if closed { n } else { n - 1 } as f64;
-            let params: Vec<f64> =
-                pts.iter().map(|p| poly_param(points, closed, *p)).collect();
+            let params: Vec<f64> = pts.iter().map(|p| poly_param(points, closed, *p)).collect();
             if closed {
                 let params = dedup_sorted(params, 1e-9);
                 if params.len() < 2 {
@@ -307,13 +347,19 @@ pub fn split_at_points(c: &Curve, pts: &[DVec3], tol: f64) -> Option<Vec<Curve>>
                     .take(params.len())
                     .map(|(&s0, &s1)| {
                         let s1 = if s1 <= s0 { s1 + segs } else { s1 };
-                        Curve::Polyline { points: poly_piece(points, s0, s1), closed: false }
+                        Curve::Polyline {
+                            points: poly_piece(points, s0, s1),
+                            closed: false,
+                        }
                     })
                     .collect();
                 Some(pieces)
             } else {
                 let interior = dedup_sorted(
-                    params.into_iter().filter(|&s| s > 1e-9 && s < segs - 1e-9).collect(),
+                    params
+                        .into_iter()
+                        .filter(|&s| s > 1e-9 && s < segs - 1e-9)
+                        .collect(),
                     1e-9,
                 );
                 let mut cuts = vec![0.0];
@@ -329,7 +375,12 @@ pub fn split_at_points(c: &Curve, pts: &[DVec3], tol: f64) -> Option<Vec<Curve>>
                 )
             }
         }
-        Curve::Arc { center, radius, start, end } => {
+        Curve::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => {
             let sweep = end - start;
             if sweep <= EPS || *radius < tol {
                 return None;
@@ -362,7 +413,9 @@ pub fn split_at_points(c: &Curve, pts: &[DVec3], tol: f64) -> Option<Vec<Curve>>
                 )
             } else {
                 let interior = dedup_sorted(
-                    offs.into_iter().filter(|&o| o > tol_a && o < sweep - tol_a).collect(),
+                    offs.into_iter()
+                        .filter(|&o| o > tol_a && o < sweep - tol_a)
+                        .collect(),
                     tol_a,
                 );
                 let mut cuts = vec![0.0];
@@ -388,8 +441,10 @@ pub fn extend(c: &Curve, dist: f64) -> Option<Curve> {
     match c {
         Curve::Line { a, b } => {
             let dir = (*b - *a).normalize_or_zero();
-            (dir != DVec3::ZERO)
-                .then_some(Curve::Line { a: *a - dir * dist, b: *b + dir * dist })
+            (dir != DVec3::ZERO).then_some(Curve::Line {
+                a: *a - dir * dist,
+                b: *b + dir * dist,
+            })
         }
         Curve::Polyline { points, .. } if points.len() >= 2 => {
             let mut points = points.clone();
@@ -401,9 +456,17 @@ pub fn extend(c: &Curve, dist: f64) -> Option<Curve> {
             points[0] -= d0 * dist;
             let last = points.len() - 1;
             points[last] += d1 * dist;
-            Some(Curve::Polyline { points, closed: false })
+            Some(Curve::Polyline {
+                points,
+                closed: false,
+            })
         }
-        Curve::Arc { center, radius, start, end } => {
+        Curve::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => {
             if *radius < EPS {
                 return None;
             }
@@ -414,7 +477,12 @@ pub fn extend(c: &Curve, dist: f64) -> Option<Curve> {
                 let mid = (start + end) / 2.0;
                 (s, e) = (mid - TAU / 2.0, mid + TAU / 2.0);
             }
-            Some(Curve::Arc { center: *center, radius: *radius, start: s, end: e })
+            Some(Curve::Arc {
+                center: *center,
+                radius: *radius,
+                start: s,
+                end: e,
+            })
         }
         _ => None,
     }
@@ -472,7 +540,10 @@ pub fn join_curves(curves: &[Curve], tol: f64, chord_tol: f64) -> Option<Curve> 
     if closed {
         chain.pop();
     }
-    Some(Curve::Polyline { points: chain, closed })
+    Some(Curve::Polyline {
+        points: chain,
+        closed,
+    })
 }
 
 // ------------------------------------------------------------------ fillet
@@ -498,7 +569,13 @@ pub fn fillet_lines(
     let z = a.0.z;
     let p = (a.0.truncate() + d1 * t1).extend(z);
     // Keep the endpoint of each line farther from the intersection.
-    let keep = |l: (DVec3, DVec3)| if l.0.distance_squared(p) >= l.1.distance_squared(p) { l.0 } else { l.1 };
+    let keep = |l: (DVec3, DVec3)| {
+        if l.0.distance_squared(p) >= l.1.distance_squared(p) {
+            l.0
+        } else {
+            l.1
+        }
+    };
     let (e1, e2) = (keep(a), keep(b));
     let u = (e1 - p).truncate().normalize_or_zero();
     let v = (e2 - p).truncate().normalize_or_zero();
@@ -526,7 +603,11 @@ pub fn fillet_lines(
         d.y.atan2(d.x)
     };
     let (mut s, mut e) = (ang(t1p), ang(t2p));
-    if (t1p - center).truncate().perp_dot((t2p - center).truncate()) < 0.0 {
+    if (t1p - center)
+        .truncate()
+        .perp_dot((t2p - center).truncate())
+        < 0.0
+    {
         std::mem::swap(&mut s, &mut e); // keep the arc CCW
     }
     if e < s {
@@ -534,7 +615,12 @@ pub fn fillet_lines(
     }
     Some((
         Curve::Line { a: t1p, b: e1 },
-        Curve::Arc { center, radius, start: s, end: e },
+        Curve::Arc {
+            center,
+            radius,
+            start: s,
+            end: e,
+        },
         Curve::Line { a: t2p, b: e2 },
     ))
 }
@@ -572,7 +658,11 @@ fn pick_fillet_segment(c: &Curve, toward: DVec3, pick: Option<DVec3>) -> Option<
             } else {
                 (*b, *a)
             };
-            Some(FilletSeg { corner, far, corner_idx: None })
+            Some(FilletSeg {
+                corner,
+                far,
+                corner_idx: None,
+            })
         }
         Curve::Polyline { points, closed } => {
             if points.len() < 2 {
@@ -615,7 +705,10 @@ fn apply_trim(src: &Curve, seg: &FilletSeg, tan: DVec3) -> Curve {
         (Curve::Polyline { points, closed }, Some(idx)) => {
             let mut points = points.clone();
             points[idx] = tan;
-            Curve::Polyline { points, closed: *closed }
+            Curve::Polyline {
+                points,
+                closed: *closed,
+            }
         }
         // Lines (and, defensively, anything without a polyline index) rebuild
         // as a trimmed line — matching the historical `fillet_lines` behavior.
@@ -668,14 +761,18 @@ pub fn fillet_curves_at(
     let toward_b = closest_point(a, fillet_seed(b), 0.01);
     let seg_a = pick_fillet_segment(a, toward_a, pick_a)?;
     let seg_b = pick_fillet_segment(b, toward_b, pick_b)?;
-    let (la, arc, lb) = fillet_lines(
-        (seg_a.corner, seg_a.far),
-        (seg_b.corner, seg_b.far),
-        radius,
-    )?;
-    let Curve::Line { a: tan_a, .. } = la else { return None };
-    let Curve::Line { a: tan_b, .. } = lb else { return None };
-    Some((apply_trim(a, &seg_a, tan_a), arc, apply_trim(b, &seg_b, tan_b)))
+    let (la, arc, lb) = fillet_lines((seg_a.corner, seg_a.far), (seg_b.corner, seg_b.far), radius)?;
+    let Curve::Line { a: tan_a, .. } = la else {
+        return None;
+    };
+    let Curve::Line { a: tan_b, .. } = lb else {
+        return None;
+    };
+    Some((
+        apply_trim(a, &seg_a, tan_a),
+        arc,
+        apply_trim(b, &seg_b, tan_b),
+    ))
 }
 
 // ----------------------------------------------------------------- chamfer
@@ -705,7 +802,11 @@ pub fn chamfer_lines(
     let p = (a.0.truncate() + d1 * t1).extend(z);
     // Keep the endpoint of each line farther from the corner.
     let keep = |l: (DVec3, DVec3)| {
-        if l.0.distance_squared(p) >= l.1.distance_squared(p) { l.0 } else { l.1 }
+        if l.0.distance_squared(p) >= l.1.distance_squared(p) {
+            l.0
+        } else {
+            l.1
+        }
     };
     let (e1, e2) = (keep(a), keep(b));
     let u = (e1 - p).truncate().normalize_or_zero();
@@ -743,14 +844,19 @@ pub fn chamfer_curves(a: &Curve, b: &Curve, dist: f64) -> Option<(Curve, Curve, 
     let toward_b = closest_point(a, fillet_seed(b), 0.01);
     let seg_a = pick_fillet_segment(a, toward_a, None)?;
     let seg_b = pick_fillet_segment(b, toward_b, None)?;
-    let (la, bevel, lb) = chamfer_lines(
-        (seg_a.corner, seg_a.far),
-        (seg_b.corner, seg_b.far),
-        dist,
-    )?;
-    let Curve::Line { a: set_a, .. } = la else { return None };
-    let Curve::Line { a: set_b, .. } = lb else { return None };
-    Some((apply_trim(a, &seg_a, set_a), bevel, apply_trim(b, &seg_b, set_b)))
+    let (la, bevel, lb) =
+        chamfer_lines((seg_a.corner, seg_a.far), (seg_b.corner, seg_b.far), dist)?;
+    let Curve::Line { a: set_a, .. } = la else {
+        return None;
+    };
+    let Curve::Line { a: set_b, .. } = lb else {
+        return None;
+    };
+    Some((
+        apply_trim(a, &seg_a, set_a),
+        bevel,
+        apply_trim(b, &seg_b, set_b),
+    ))
 }
 
 #[cfg(test)]
@@ -758,38 +864,68 @@ mod tests {
     use super::*;
 
     fn line(ax: f64, ay: f64, bx: f64, by: f64) -> Curve {
-        Curve::Line { a: DVec3::new(ax, ay, 0.0), b: DVec3::new(bx, by, 0.0) }
+        Curve::Line {
+            a: DVec3::new(ax, ay, 0.0),
+            b: DVec3::new(bx, by, 0.0),
+        }
     }
 
     fn circle(cx: f64, cy: f64, r: f64) -> Curve {
-        Curve::Arc { center: DVec3::new(cx, cy, 0.0), radius: r, start: 0.0, end: TAU }
+        Curve::Arc {
+            center: DVec3::new(cx, cy, 0.0),
+            radius: r,
+            start: 0.0,
+            end: TAU,
+        }
     }
 
     #[test]
     fn closest_point_line_arc_polyline() {
         let l = line(0.0, 0.0, 10.0, 0.0);
-        assert!(closest_point(&l, DVec3::new(3.0, 5.0, 0.0), 0.01)
-            .distance(DVec3::new(3.0, 0.0, 0.0)) < EPS);
+        assert!(
+            closest_point(&l, DVec3::new(3.0, 5.0, 0.0), 0.01).distance(DVec3::new(3.0, 0.0, 0.0))
+                < EPS
+        );
         // beyond the end clamps
-        assert!(closest_point(&l, DVec3::new(20.0, 1.0, 0.0), 0.01)
-            .distance(DVec3::new(10.0, 0.0, 0.0)) < EPS);
+        assert!(
+            closest_point(&l, DVec3::new(20.0, 1.0, 0.0), 0.01)
+                .distance(DVec3::new(10.0, 0.0, 0.0))
+                < EPS
+        );
 
         let arc = Curve::Arc {
-            center: DVec3::ZERO, radius: 2.0, start: 0.0, end: std::f64::consts::FRAC_PI_2,
+            center: DVec3::ZERO,
+            radius: 2.0,
+            start: 0.0,
+            end: std::f64::consts::FRAC_PI_2,
         };
         // radially inside the sweep
-        assert!(closest_point(&arc, DVec3::new(5.0, 5.0, 0.0), 0.01)
-            .distance(DVec3::new(2.0 / 2f64.sqrt(), 2.0 / 2f64.sqrt(), 0.0)) < EPS);
+        assert!(
+            closest_point(&arc, DVec3::new(5.0, 5.0, 0.0), 0.01).distance(DVec3::new(
+                2.0 / 2f64.sqrt(),
+                2.0 / 2f64.sqrt(),
+                0.0
+            )) < EPS
+        );
         // outside the sweep snaps to the nearer endpoint
-        assert!(closest_point(&arc, DVec3::new(3.0, -1.0, 0.0), 0.01)
-            .distance(DVec3::new(2.0, 0.0, 0.0)) < EPS);
+        assert!(
+            closest_point(&arc, DVec3::new(3.0, -1.0, 0.0), 0.01)
+                .distance(DVec3::new(2.0, 0.0, 0.0))
+                < EPS
+        );
 
         let pl = Curve::Polyline {
-            points: vec![DVec3::ZERO, DVec3::new(4.0, 0.0, 0.0), DVec3::new(4.0, 4.0, 0.0)],
+            points: vec![
+                DVec3::ZERO,
+                DVec3::new(4.0, 0.0, 0.0),
+                DVec3::new(4.0, 4.0, 0.0),
+            ],
             closed: false,
         };
-        assert!(closest_point(&pl, DVec3::new(5.0, 2.0, 0.0), 0.01)
-            .distance(DVec3::new(4.0, 2.0, 0.0)) < EPS);
+        assert!(
+            closest_point(&pl, DVec3::new(5.0, 2.0, 0.0), 0.01).distance(DVec3::new(4.0, 2.0, 0.0))
+                < EPS
+        );
     }
 
     #[test]
@@ -798,25 +934,33 @@ mod tests {
         assert_eq!(pts.len(), 1);
         assert!(pts[0].distance(DVec3::ZERO) < EPS);
         // parallel: none
-        assert!(intersections(&line(0.0, 0.0, 5.0, 0.0), &line(0.0, 1.0, 5.0, 1.0), 0.01)
-            .is_empty());
+        assert!(
+            intersections(&line(0.0, 0.0, 5.0, 0.0), &line(0.0, 1.0, 5.0, 1.0), 0.01).is_empty()
+        );
         // disjoint (segments would cross only if extended): none
-        assert!(intersections(&line(0.0, 0.0, 1.0, 0.0), &line(5.0, -1.0, 5.0, 1.0), 0.01)
-            .is_empty());
+        assert!(
+            intersections(&line(0.0, 0.0, 1.0, 0.0), &line(5.0, -1.0, 5.0, 1.0), 0.01).is_empty()
+        );
     }
 
     #[test]
     fn intersect_line_circle_and_tangent() {
         let pts = intersections(&line(-5.0, 0.0, 5.0, 0.0), &circle(0.0, 0.0, 2.0), 0.01);
         assert_eq!(pts.len(), 2);
-        assert!(pts.iter().all(|p| (p.truncate().length() - 2.0).abs() < EPS));
+        assert!(
+            pts.iter()
+                .all(|p| (p.truncate().length() - 2.0).abs() < EPS)
+        );
         // tangent line touches once
         let pts = intersections(&line(-5.0, 2.0, 5.0, 2.0), &circle(0.0, 0.0, 2.0), 0.01);
         assert_eq!(pts.len(), 1);
         assert!(pts[0].distance(DVec3::new(0.0, 2.0, 0.0)) < 1e-6);
         // arc range filters: lower semicircle misses a line above
         let lower = Curve::Arc {
-            center: DVec3::ZERO, radius: 2.0, start: std::f64::consts::PI, end: TAU,
+            center: DVec3::ZERO,
+            radius: 2.0,
+            start: std::f64::consts::PI,
+            end: TAU,
         };
         assert!(intersections(&line(-5.0, 1.0, 5.0, 1.0), &lower, 0.01).is_empty());
     }
@@ -836,7 +980,11 @@ mod tests {
     #[test]
     fn intersect_polyline_line() {
         let pl = Curve::Polyline {
-            points: vec![DVec3::ZERO, DVec3::new(4.0, 0.0, 0.0), DVec3::new(4.0, 4.0, 0.0)],
+            points: vec![
+                DVec3::ZERO,
+                DVec3::new(4.0, 0.0, 0.0),
+                DVec3::new(4.0, 4.0, 0.0),
+            ],
             closed: false,
         };
         let pts = intersections(&pl, &line(2.0, -1.0, 2.0, 1.0), 0.01);
@@ -849,28 +997,46 @@ mod tests {
 
     #[test]
     fn split_line_middle() {
-        let pieces =
-            split_at_points(&line(0.0, 0.0, 10.0, 0.0), &[DVec3::new(4.0, 0.0, 0.0)], 1e-6)
-                .unwrap();
+        let pieces = split_at_points(
+            &line(0.0, 0.0, 10.0, 0.0),
+            &[DVec3::new(4.0, 0.0, 0.0)],
+            1e-6,
+        )
+        .unwrap();
         assert_eq!(pieces.len(), 2);
-        let Curve::Line { a, b } = pieces[0] else { panic!() };
+        let Curve::Line { a, b } = pieces[0] else {
+            panic!()
+        };
         assert!(a.distance(DVec3::ZERO) < EPS && b.distance(DVec3::new(4.0, 0.0, 0.0)) < EPS);
         // cut at the very end: nothing to split
-        let pieces =
-            split_at_points(&line(0.0, 0.0, 10.0, 0.0), &[DVec3::new(10.0, 0.0, 0.0)], 1e-6)
-                .unwrap();
+        let pieces = split_at_points(
+            &line(0.0, 0.0, 10.0, 0.0),
+            &[DVec3::new(10.0, 0.0, 0.0)],
+            1e-6,
+        )
+        .unwrap();
         assert_eq!(pieces.len(), 1);
     }
 
     #[test]
     fn split_polyline_open_and_closed() {
         let pl = Curve::Polyline {
-            points: vec![DVec3::ZERO, DVec3::new(4.0, 0.0, 0.0), DVec3::new(4.0, 4.0, 0.0)],
+            points: vec![
+                DVec3::ZERO,
+                DVec3::new(4.0, 0.0, 0.0),
+                DVec3::new(4.0, 4.0, 0.0),
+            ],
             closed: false,
         };
         let pieces = split_at_points(&pl, &[DVec3::new(4.0, 2.0, 0.0)], 1e-6).unwrap();
         assert_eq!(pieces.len(), 2);
-        let Curve::Polyline { ref points, closed: false } = pieces[0] else { panic!() };
+        let Curve::Polyline {
+            ref points,
+            closed: false,
+        } = pieces[0]
+        else {
+            panic!()
+        };
         assert_eq!(points.len(), 3); // 0,0 · 4,0 · 4,2
 
         // closed square split at two opposite edge midpoints → two open halves
@@ -900,12 +1066,16 @@ mod tests {
     #[test]
     fn split_arc_and_circle() {
         let arc = Curve::Arc {
-            center: DVec3::ZERO, radius: 2.0, start: 0.0, end: std::f64::consts::PI,
+            center: DVec3::ZERO,
+            radius: 2.0,
+            start: 0.0,
+            end: std::f64::consts::PI,
         };
-        let pieces =
-            split_at_points(&arc, &[DVec3::new(0.0, 2.0, 0.0)], 1e-6).unwrap();
+        let pieces = split_at_points(&arc, &[DVec3::new(0.0, 2.0, 0.0)], 1e-6).unwrap();
         assert_eq!(pieces.len(), 2);
-        let Curve::Arc { start, end, .. } = pieces[1] else { panic!() };
+        let Curve::Arc { start, end, .. } = pieces[1] else {
+            panic!()
+        };
         assert!((start - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
         assert!((end - std::f64::consts::PI).abs() < 1e-9);
 
@@ -917,11 +1087,14 @@ mod tests {
         .unwrap();
         assert_eq!(pieces.len(), 2);
         for p in &pieces {
-            let Curve::Arc { start, end, .. } = p else { panic!() };
+            let Curve::Arc { start, end, .. } = p else {
+                panic!()
+            };
             assert!((end - start - std::f64::consts::PI).abs() < 1e-9);
         }
-        assert!(split_at_points(&circle(0.0, 0.0, 2.0), &[DVec3::new(2.0, 0.0, 0.0)], 1e-6)
-            .is_none());
+        assert!(
+            split_at_points(&circle(0.0, 0.0, 2.0), &[DVec3::new(2.0, 0.0, 0.0)], 1e-6).is_none()
+        );
     }
 
     #[test]
@@ -933,18 +1106,31 @@ mod tests {
         assert!(b.distance(DVec3::new(12.0, 0.0, 0.0)) < EPS);
 
         let pl = Curve::Polyline {
-            points: vec![DVec3::ZERO, DVec3::new(4.0, 0.0, 0.0), DVec3::new(4.0, 4.0, 0.0)],
+            points: vec![
+                DVec3::ZERO,
+                DVec3::new(4.0, 0.0, 0.0),
+                DVec3::new(4.0, 4.0, 0.0),
+            ],
             closed: false,
         };
-        let Curve::Polyline { points, .. } = extend(&pl, 1.0).unwrap() else { panic!() };
+        let Curve::Polyline { points, .. } = extend(&pl, 1.0).unwrap() else {
+            panic!()
+        };
         assert!(points[0].distance(DVec3::new(-1.0, 0.0, 0.0)) < EPS);
         assert!(points[2].distance(DVec3::new(4.0, 5.0, 0.0)) < EPS);
 
         let arc = Curve::Arc {
-            center: DVec3::ZERO, radius: 2.0, start: 0.0, end: std::f64::consts::FRAC_PI_2,
+            center: DVec3::ZERO,
+            radius: 2.0,
+            start: 0.0,
+            end: std::f64::consts::FRAC_PI_2,
         };
-        let Curve::Arc { start, end, .. } = extend(&arc, 1.0).unwrap() else { panic!() };
-        assert!((start - (-0.5)).abs() < EPS && (end - (std::f64::consts::FRAC_PI_2 + 0.5)).abs() < EPS);
+        let Curve::Arc { start, end, .. } = extend(&arc, 1.0).unwrap() else {
+            panic!()
+        };
+        assert!(
+            (start - (-0.5)).abs() < EPS && (end - (std::f64::consts::FRAC_PI_2 + 0.5)).abs() < EPS
+        );
 
         // closed curves refuse
         assert!(extend(&circle(0.0, 0.0, 2.0), 1.0).is_none());
@@ -996,25 +1182,37 @@ mod tests {
         assert!(a.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
         assert!(b.distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
         // arc: center 2,2 radius 2, quarter sweep, tangent at both trim points
-        let Curve::Arc { center, radius, start, end } = arc else { panic!() };
+        let Curve::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } = arc
+        else {
+            panic!()
+        };
         assert!(center.distance(DVec3::new(2.0, 2.0, 0.0)) < EPS);
         assert!((radius - 2.0).abs() < EPS);
         assert!((end - start - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
 
         // parallel lines: no fillet
-        assert!(fillet_lines(
-            (DVec3::ZERO, DVec3::new(5.0, 0.0, 0.0)),
-            (DVec3::new(0.0, 1.0, 0.0), DVec3::new(5.0, 1.0, 0.0)),
-            1.0,
-        )
-        .is_none());
+        assert!(
+            fillet_lines(
+                (DVec3::ZERO, DVec3::new(5.0, 0.0, 0.0)),
+                (DVec3::new(0.0, 1.0, 0.0), DVec3::new(5.0, 1.0, 0.0)),
+                1.0,
+            )
+            .is_none()
+        );
         // radius larger than the lines: no fillet
-        assert!(fillet_lines(
-            (DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)),
-            (DVec3::ZERO, DVec3::new(0.0, 1.0, 0.0)),
-            5.0,
-        )
-        .is_none());
+        assert!(
+            fillet_lines(
+                (DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)),
+                (DVec3::ZERO, DVec3::new(0.0, 1.0, 0.0)),
+                5.0,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1026,9 +1224,21 @@ mod tests {
             1.0,
         )
         .unwrap();
-        let Curve::Line { a: ta, .. } = la else { panic!() };
-        let Curve::Line { a: tb, .. } = lb else { panic!() };
-        let Curve::Arc { center, radius, start, end } = arc else { panic!() };
+        let Curve::Line { a: ta, .. } = la else {
+            panic!()
+        };
+        let Curve::Line { a: tb, .. } = lb else {
+            panic!()
+        };
+        let Curve::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } = arc
+        else {
+            panic!()
+        };
         let sp = center + DVec3::new(radius * start.cos(), radius * start.sin(), 0.0);
         let ep = center + DVec3::new(radius * end.cos(), radius * end.sin(), 0.0);
         let hits = |p: DVec3| p.distance(ta) < 1e-9 || p.distance(tb) < 1e-9;
@@ -1049,13 +1259,19 @@ mod tests {
         let a = line(-2.0, 0.0, 8.0, 0.0);
         let b = line(0.0, -2.0, 0.0, 8.0);
         let (ta, arc, tb) = fillet_curves(&a, &b, 2.0).unwrap();
-        let Curve::Line { a: aa, b: ab } = ta else { panic!("a stays a line") };
+        let Curve::Line { a: aa, b: ab } = ta else {
+            panic!("a stays a line")
+        };
         assert!(aa.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS); // tangency
         assert!(ab.distance(DVec3::new(8.0, 0.0, 0.0)) < EPS); // far end kept
-        let Curve::Line { a: ba, b: bb } = tb else { panic!("b stays a line") };
+        let Curve::Line { a: ba, b: bb } = tb else {
+            panic!("b stays a line")
+        };
         assert!(ba.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
         assert!(bb.distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
-        let Curve::Arc { center, radius, .. } = arc else { panic!() };
+        let Curve::Arc { center, radius, .. } = arc else {
+            panic!()
+        };
         assert!(center.distance(DVec3::new(2.0, 2.0, 0.0)) < EPS);
         assert!((radius - 2.0).abs() < EPS);
     }
@@ -1069,13 +1285,17 @@ mod tests {
         let (ta, arc, tb) = fillet_curves(&a, &b, 2.0).unwrap();
 
         // Line trimmed to tangency (0,2), far end (0,8) kept.
-        let Curve::Line { a: la, b: lb } = ta else { panic!("line stays a line") };
+        let Curve::Line { a: la, b: lb } = ta else {
+            panic!("line stays a line")
+        };
         assert!(la.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
         assert!(lb.distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
 
         // Polyline stays a polyline; corner vertex 0 pulled to (2,0); the other
         // two vertices untouched.
-        let Curve::Polyline { points, closed } = tb else { panic!("polyline stays a polyline") };
+        let Curve::Polyline { points, closed } = tb else {
+            panic!("polyline stays a polyline")
+        };
         assert!(!closed);
         assert_eq!(points.len(), 3);
         assert!(points[0].distance(DVec3::new(2.0, 0.0, 0.0)) < EPS);
@@ -1083,13 +1303,23 @@ mod tests {
         assert!(points[2].distance(DVec3::new(8.0, 4.0, 0.0)) < EPS);
 
         // Arc tangent at both trim points.
-        let Curve::Arc { center, radius, start, end } = arc else { panic!() };
+        let Curve::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } = arc
+        else {
+            panic!()
+        };
         assert!(center.distance(DVec3::new(2.0, 2.0, 0.0)) < EPS);
         assert!((radius - 2.0).abs() < EPS);
         let sp = arc_point(center, radius, start);
         let ep = arc_point(center, radius, end);
-        let hits = |p: DVec3| p.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS
-            || p.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS;
+        let hits = |p: DVec3| {
+            p.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS
+                || p.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS
+        };
         assert!(hits(sp) && hits(ep));
     }
 
@@ -1102,16 +1332,22 @@ mod tests {
         let (ta, arc, tb) = fillet_curves(&a, &b, 2.0).unwrap();
 
         // a: last vertex (index 1) moves to (-2,0); first vertex untouched.
-        let Curve::Polyline { points: pa, .. } = ta else { panic!() };
+        let Curve::Polyline { points: pa, .. } = ta else {
+            panic!()
+        };
         assert!(pa[0].distance(DVec3::new(-8.0, 0.0, 0.0)) < EPS);
         assert!(pa[1].distance(DVec3::new(-2.0, 0.0, 0.0)) < EPS);
 
         // b: first vertex (index 0) moves to (0,2); last untouched.
-        let Curve::Polyline { points: pb, .. } = tb else { panic!() };
+        let Curve::Polyline { points: pb, .. } = tb else {
+            panic!()
+        };
         assert!(pb[0].distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
         assert!(pb[1].distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
 
-        let Curve::Arc { center, radius, .. } = arc else { panic!() };
+        let Curve::Arc { center, radius, .. } = arc else {
+            panic!()
+        };
         assert!(center.distance(DVec3::new(-2.0, 2.0, 0.0)) < EPS);
         assert!((radius - 2.0).abs() < EPS);
     }
@@ -1119,12 +1355,9 @@ mod tests {
     #[test]
     fn fillet_curves_rejects_parallel_and_bad_kinds() {
         // Parallel lines: no fillet.
-        assert!(fillet_curves(
-            &line(0.0, 0.0, 5.0, 0.0),
-            &line(0.0, 1.0, 5.0, 1.0),
-            1.0,
-        )
-        .is_none());
+        assert!(
+            fillet_curves(&line(0.0, 0.0, 5.0, 0.0), &line(0.0, 1.0, 5.0, 1.0), 1.0,).is_none()
+        );
         // Arc as a source: unsupported kind → None.
         assert!(fillet_curves(&line(0.0, 0.0, 5.0, 0.0), &circle(0.0, 0.0, 2.0), 1.0).is_none());
     }
@@ -1136,7 +1369,9 @@ mod tests {
         let sq = polyline(&[(-2.0, -2.0), (2.0, -2.0), (2.0, 2.0), (-2.0, 2.0)], true);
         let l = line(8.0, 2.0, 2.0, 2.0); // corner endpoint (2,2), far (8,2)
         let (tsq, arc, _tl) = fillet_curves(&sq, &l, 1.0).unwrap();
-        let Curve::Polyline { points, closed } = tsq else { panic!() };
+        let Curve::Polyline { points, closed } = tsq else {
+            panic!()
+        };
         assert!(closed);
         assert_eq!(points.len(), 4);
         // The (2,2) vertex (index 2) is nearest; it should have moved, rest fixed.
@@ -1161,17 +1396,43 @@ mod tests {
 
         // Pick near the (0,0) corner on both → round there: a's vertex 0 and b's
         // vertex 0 move; the (10,10) ends stay put.
-        let (ta, arc, tb) =
-            fillet_curves_at(&a, &b, 2.0, Some(DVec3::new(0.5, 0.0, 0.0)), Some(DVec3::new(0.0, 0.5, 0.0)))
-                .unwrap();
-        let Curve::Polyline { points: pa, .. } = ta else { panic!() };
-        let Curve::Polyline { points: pb, .. } = tb else { panic!() };
-        assert!(pa[0].distance(DVec3::new(0.0, 0.0, 0.0)) > EPS, "a corner 0 moved");
-        assert!(pa[2].distance(DVec3::new(10.0, 10.0, 0.0)) < EPS, "a far end fixed");
-        assert!(pb[0].distance(DVec3::new(0.0, 0.0, 0.0)) > EPS, "b corner 0 moved");
-        assert!(pb[2].distance(DVec3::new(10.0, 10.0, 0.0)) < EPS, "b far end fixed");
-        let Curve::Arc { center, .. } = arc else { panic!() };
-        assert!(center.distance(DVec3::new(2.0, 2.0, 0.0)) < EPS, "arc at origin corner");
+        let (ta, arc, tb) = fillet_curves_at(
+            &a,
+            &b,
+            2.0,
+            Some(DVec3::new(0.5, 0.0, 0.0)),
+            Some(DVec3::new(0.0, 0.5, 0.0)),
+        )
+        .unwrap();
+        let Curve::Polyline { points: pa, .. } = ta else {
+            panic!()
+        };
+        let Curve::Polyline { points: pb, .. } = tb else {
+            panic!()
+        };
+        assert!(
+            pa[0].distance(DVec3::new(0.0, 0.0, 0.0)) > EPS,
+            "a corner 0 moved"
+        );
+        assert!(
+            pa[2].distance(DVec3::new(10.0, 10.0, 0.0)) < EPS,
+            "a far end fixed"
+        );
+        assert!(
+            pb[0].distance(DVec3::new(0.0, 0.0, 0.0)) > EPS,
+            "b corner 0 moved"
+        );
+        assert!(
+            pb[2].distance(DVec3::new(10.0, 10.0, 0.0)) < EPS,
+            "b far end fixed"
+        );
+        let Curve::Arc { center, .. } = arc else {
+            panic!()
+        };
+        assert!(
+            center.distance(DVec3::new(2.0, 2.0, 0.0)) < EPS,
+            "arc at origin corner"
+        );
 
         // Pick near the (10,10) corner on both → round THERE instead: the far ends
         // (index 2) move, the (0,0) ends stay.
@@ -1183,14 +1444,35 @@ mod tests {
             Some(DVec3::new(9.5, 10.0, 0.0)),
         )
         .unwrap();
-        let Curve::Polyline { points: pa, .. } = ta else { panic!() };
-        let Curve::Polyline { points: pb, .. } = tb else { panic!() };
-        assert!(pa[0].distance(DVec3::new(0.0, 0.0, 0.0)) < EPS, "a corner 0 fixed");
-        assert!(pa[2].distance(DVec3::new(10.0, 10.0, 0.0)) > EPS, "a far end moved");
-        assert!(pb[0].distance(DVec3::new(0.0, 0.0, 0.0)) < EPS, "b corner 0 fixed");
-        assert!(pb[2].distance(DVec3::new(10.0, 10.0, 0.0)) > EPS, "b far end moved");
-        let Curve::Arc { center, .. } = arc else { panic!() };
-        assert!(center.distance(DVec3::new(8.0, 8.0, 0.0)) < EPS, "arc at (10,10) corner");
+        let Curve::Polyline { points: pa, .. } = ta else {
+            panic!()
+        };
+        let Curve::Polyline { points: pb, .. } = tb else {
+            panic!()
+        };
+        assert!(
+            pa[0].distance(DVec3::new(0.0, 0.0, 0.0)) < EPS,
+            "a corner 0 fixed"
+        );
+        assert!(
+            pa[2].distance(DVec3::new(10.0, 10.0, 0.0)) > EPS,
+            "a far end moved"
+        );
+        assert!(
+            pb[0].distance(DVec3::new(0.0, 0.0, 0.0)) < EPS,
+            "b corner 0 fixed"
+        );
+        assert!(
+            pb[2].distance(DVec3::new(10.0, 10.0, 0.0)) > EPS,
+            "b far end moved"
+        );
+        let Curve::Arc { center, .. } = arc else {
+            panic!()
+        };
+        assert!(
+            center.distance(DVec3::new(8.0, 8.0, 0.0)) < EPS,
+            "arc at (10,10) corner"
+        );
     }
 
     #[test]
@@ -1221,24 +1503,30 @@ mod tests {
         assert!(a.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
         assert!(b.distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
         // bevel: straight line between the two setback points.
-        let Curve::Line { a, b } = bevel else { panic!() };
+        let Curve::Line { a, b } = bevel else {
+            panic!()
+        };
         assert!(a.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS);
         assert!(b.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
 
         // parallel lines: no chamfer
-        assert!(chamfer_lines(
-            (DVec3::ZERO, DVec3::new(5.0, 0.0, 0.0)),
-            (DVec3::new(0.0, 1.0, 0.0), DVec3::new(5.0, 1.0, 0.0)),
-            1.0,
-        )
-        .is_none());
+        assert!(
+            chamfer_lines(
+                (DVec3::ZERO, DVec3::new(5.0, 0.0, 0.0)),
+                (DVec3::new(0.0, 1.0, 0.0), DVec3::new(5.0, 1.0, 0.0)),
+                1.0,
+            )
+            .is_none()
+        );
         // distance larger than the lines: no chamfer
-        assert!(chamfer_lines(
-            (DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)),
-            (DVec3::ZERO, DVec3::new(0.0, 1.0, 0.0)),
-            5.0,
-        )
-        .is_none());
+        assert!(
+            chamfer_lines(
+                (DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)),
+                (DVec3::ZERO, DVec3::new(0.0, 1.0, 0.0)),
+                5.0,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1249,12 +1537,16 @@ mod tests {
         let (ta, bevel, tb) = chamfer_curves(&a, &b, 2.0).unwrap();
 
         // Line trimmed to setback (0,2), far end (0,8) kept.
-        let Curve::Line { a: la, b: lb } = ta else { panic!("line stays a line") };
+        let Curve::Line { a: la, b: lb } = ta else {
+            panic!("line stays a line")
+        };
         assert!(la.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
         assert!(lb.distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
 
         // Polyline stays a polyline; corner vertex 0 pulled to (2,0); rest fixed.
-        let Curve::Polyline { points, closed } = tb else { panic!("polyline stays a polyline") };
+        let Curve::Polyline { points, closed } = tb else {
+            panic!("polyline stays a polyline")
+        };
         assert!(!closed);
         assert_eq!(points.len(), 3);
         assert!(points[0].distance(DVec3::new(2.0, 0.0, 0.0)) < EPS);
@@ -1262,9 +1554,12 @@ mod tests {
         assert!(points[2].distance(DVec3::new(8.0, 4.0, 0.0)) < EPS);
 
         // Bevel joins the two setback points.
-        let Curve::Line { a: bva, b: bvb } = bevel else { panic!() };
+        let Curve::Line { a: bva, b: bvb } = bevel else {
+            panic!()
+        };
         let hits = |p: DVec3| {
-            p.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS || p.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS
+            p.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS
+                || p.distance(DVec3::new(2.0, 0.0, 0.0)) < EPS
         };
         assert!(hits(bva) && hits(bvb));
     }
@@ -1277,16 +1572,22 @@ mod tests {
         let (ta, bevel, tb) = chamfer_curves(&a, &b, 2.0).unwrap();
 
         // a: last vertex moves to (-2,0); first vertex untouched.
-        let Curve::Polyline { points: pa, .. } = ta else { panic!() };
+        let Curve::Polyline { points: pa, .. } = ta else {
+            panic!()
+        };
         assert!(pa[0].distance(DVec3::new(-8.0, 0.0, 0.0)) < EPS);
         assert!(pa[1].distance(DVec3::new(-2.0, 0.0, 0.0)) < EPS);
 
         // b: first vertex moves to (0,2); last untouched.
-        let Curve::Polyline { points: pb, .. } = tb else { panic!() };
+        let Curve::Polyline { points: pb, .. } = tb else {
+            panic!()
+        };
         assert!(pb[0].distance(DVec3::new(0.0, 2.0, 0.0)) < EPS);
         assert!(pb[1].distance(DVec3::new(0.0, 8.0, 0.0)) < EPS);
 
-        let Curve::Line { a: bva, b: bvb } = bevel else { panic!() };
+        let Curve::Line { a: bva, b: bvb } = bevel else {
+            panic!()
+        };
         let hits = |p: DVec3| {
             p.distance(DVec3::new(-2.0, 0.0, 0.0)) < EPS
                 || p.distance(DVec3::new(0.0, 2.0, 0.0)) < EPS
@@ -1296,12 +1597,9 @@ mod tests {
 
     #[test]
     fn chamfer_curves_rejects_parallel_and_bad_kinds() {
-        assert!(chamfer_curves(
-            &line(0.0, 0.0, 5.0, 0.0),
-            &line(0.0, 1.0, 5.0, 1.0),
-            1.0,
-        )
-        .is_none());
+        assert!(
+            chamfer_curves(&line(0.0, 0.0, 5.0, 0.0), &line(0.0, 1.0, 5.0, 1.0), 1.0,).is_none()
+        );
         assert!(chamfer_curves(&line(0.0, 0.0, 5.0, 0.0), &circle(0.0, 0.0, 2.0), 1.0).is_none());
     }
 }

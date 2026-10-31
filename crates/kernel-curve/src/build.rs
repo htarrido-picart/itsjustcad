@@ -127,7 +127,12 @@ fn hermite_to_nurbs(pts: &[DVec3], tangents: &[DVec3], closed: bool) -> Curve {
     knots.extend([1.0; 4]);
     let m = control.len();
     debug_assert_eq!(knots.len(), m + 3 + 1);
-    Curve::Nurbs { control, weights: vec![1.0; m], knots, degree: 3 }
+    Curve::Nurbs {
+        control,
+        weights: vec![1.0; m],
+        knots,
+        degree: 3,
+    }
 }
 
 /// Closed interpolation: periodic natural cubic through the points. Solves the
@@ -154,8 +159,7 @@ fn interpolate_closed(pts: &[DVec3]) -> Option<Curve> {
     uu[0] = DVec3::splat(gamma);
     uu[n - 1] = DVec3::splat(sup[n - 1]);
     let z = solve_tridiagonal(&sub, &diag, &sup, &uu);
-    let fact = (d[0] + d[n - 1] * (sub[0] / gamma))
-        / (1.0 + z[0] + z[n - 1] * (sub[0] / gamma));
+    let fact = (d[0] + d[n - 1] * (sub[0] / gamma)) / (1.0 + z[0] + z[n - 1] * (sub[0] / gamma));
     let deriv: Vec<DVec3> = (0..n).map(|i| d[i] - z[i] * fact).collect();
     Some(hermite_to_nurbs(pts, &deriv, true))
 }
@@ -177,7 +181,10 @@ pub fn helix(center: DVec3, radius: f64, height: f64, turns: f64) -> Option<Curv
             center + DVec3::new(radius * ang.cos(), radius * ang.sin(), height * f)
         })
         .collect();
-    Some(Curve::Polyline { points, closed: false })
+    Some(Curve::Polyline {
+        points,
+        closed: false,
+    })
 }
 
 /// Resample any curve to exactly `n` points along its length, returned as an
@@ -229,7 +236,11 @@ fn sample_at_arclen(path: &[DVec3], acc: &[f64], target: f64) -> DVec3 {
         }
     }
     let seg = acc[hi] - acc[lo];
-    let t = if seg < 1e-12 { 0.0 } else { (target - acc[lo]) / seg };
+    let t = if seg < 1e-12 {
+        0.0
+    } else {
+        (target - acc[lo]) / seg
+    };
     path[lo] + (path[hi] - path[lo]) * t
 }
 
@@ -240,7 +251,12 @@ mod tests {
 
     fn eval(c: &Curve, t: f64) -> DVec3 {
         match c {
-            Curve::Nurbs { control, weights, knots, degree } => {
+            Curve::Nurbs {
+                control,
+                weights,
+                knots,
+                degree,
+            } => {
                 let (t0, t1) = (knots[*degree], knots[knots.len() - degree - 1]);
                 nurbs_point(control, weights, knots, *degree, t0 + (t1 - t0) * t)
             }
@@ -258,7 +274,15 @@ mod tests {
             DVec3::new(7.0, 0.0, 0.0),
         ];
         let c = interpolate_curve(&pts, false).unwrap();
-        let Curve::Nurbs { ref control, ref weights, ref knots, degree } = c else { panic!() };
+        let Curve::Nurbs {
+            ref control,
+            ref weights,
+            ref knots,
+            degree,
+        } = c
+        else {
+            panic!()
+        };
         // Each Hermite/Bézier segment interpolates its endpoints, so point i
         // sits at knot value i/(n-1) in the uniform clamped parameterization.
         let segs = (pts.len() - 1) as f64;
@@ -307,7 +331,9 @@ mod tests {
     #[test]
     fn helix_radius_and_height() {
         let c = helix(DVec3::new(1.0, 2.0, 0.0), 3.0, 12.0, 4.0).unwrap();
-        let Curve::Polyline { points, closed } = c else { panic!() };
+        let Curve::Polyline { points, closed } = c else {
+            panic!()
+        };
         assert!(!closed);
         // Radius: every point is `radius` from the axis in XY.
         for p in &points {
@@ -330,7 +356,10 @@ mod tests {
 
     #[test]
     fn rebuild_open_count_and_endpoints() {
-        let line = Curve::Line { a: DVec3::ZERO, b: DVec3::new(10.0, 0.0, 0.0) };
+        let line = Curve::Line {
+            a: DVec3::ZERO,
+            b: DVec3::new(10.0, 0.0, 0.0),
+        };
         let Curve::Polyline { points, closed } = rebuild(&line, 6, 0.01).unwrap() else {
             panic!()
         };
@@ -353,7 +382,9 @@ mod tests {
             ],
             closed: true,
         };
-        let Curve::Polyline { points, closed } = rebuild(&sq, 8, 0.01).unwrap() else { panic!() };
+        let Curve::Polyline { points, closed } = rebuild(&sq, 8, 0.01).unwrap() else {
+            panic!()
+        };
         assert!(closed);
         assert_eq!(points.len(), 8);
         // Perimeter 16, 8 points -> 2 units spacing; last->first also 2.
@@ -362,7 +393,10 @@ mod tests {
 
     #[test]
     fn rebuild_needs_two_points() {
-        let line = Curve::Line { a: DVec3::ZERO, b: DVec3::X };
+        let line = Curve::Line {
+            a: DVec3::ZERO,
+            b: DVec3::X,
+        };
         assert!(rebuild(&line, 1, 0.01).is_none());
     }
 }
