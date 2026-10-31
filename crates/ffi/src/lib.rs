@@ -278,9 +278,12 @@ pub struct AppHandle {
     last_gen: Option<u64>,
     theme: Theme,
     mode: DisplayMode,
-    /// Hand-drawn "sketchy edges" look (itsjustcad-ios#174): view state, never
-    /// logged. Off by default; changing it forces a re-snapshot.
+    /// Sketchy-edge tuning for the Sketchy render style (itsjustcad-ios#174):
+    /// view state, never logged. `enabled` is ignored; the mode switches it.
     sketchy: SketchyParams,
+    /// Device pixels per point ([`ijc_set_pixel_scale`]), so the hidden-line and
+    /// sketchy strokes keep their width on 2x and 3x screens.
+    pixel_scale: f32,
 
     /// Decoded-underlay cache: `(stored path, Arc<(rgba, w, h)>)`. Keyed on the
     /// document's stored underlay path so the (potentially large) image is
@@ -820,6 +823,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         theme: Theme::Dark,
         mode: DisplayMode::default(),
         sketchy: SketchyParams::default(),
+        pixel_scale: 1.0,
         underlay_cache: None,
         gumball_preview: None,
         guided: Default::default(),
@@ -2659,9 +2663,13 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
     // Re-upload geometry only when the document changed.
     let doc_gen = app.session.doc.generation;
     if app.last_gen != Some(doc_gen) {
-        // Sketchy edges (#174): the same params and eye/radius depth cue the
-        // desktop passes. The cue is baked at snapshot time, as on desktop.
-        let sketchy = app.sketchy;
+        // Sketchy edges (#174), on only in the Sketchy style: the same params
+        // and eye/radius depth cue the desktop passes. The cue is baked at
+        // snapshot time, as on desktop.
+        let sketchy = SketchyParams {
+            enabled: app.mode.forces_sketchy(),
+            ..app.sketchy
+        };
         let (sketchy_eye, sketchy_radius) = if sketchy.active() {
             let r = app
                 .session
@@ -2729,7 +2737,14 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
     let aspect = tw as f32 / th.max(1) as f32;
     let vp = camera.view_proj(aspect);
     let eye = camera.eye();
-    let cam = camera_uniform_with_mode(vp, eye, app.mode);
+    let mut cam = camera_uniform_with_mode(vp, eye, app.mode);
+    // Hidden-line and sketchy strokes (#174), in device px for this screen.
+    cam.screen = [
+        tw as f32,
+        th.max(1) as f32,
+        app.mode.line_px(app.pixel_scale),
+        0.0,
+    ];
     gpu.renderer.write_camera(&gpu.device, &gpu.queue, 0, &cam);
 
     let (target, config, depth_view) = match gpu.panes.get(&surface) {
@@ -2747,12 +2762,12 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
         }
     };
     let view = frame.texture.create_view(&Default::default());
-    // Pencil mode clears to paper white whatever the theme, as on desktop.
-    let [r, g, b, a] = if app.mode == DisplayMode::Pencil {
-        DisplayMode::pencil_background()
-    } else {
-        app.theme.background()
-    };
+    // Pencil and Sketchy clear to paper white whatever the theme, as on
+    // desktop; Hidden Line follows the theme (#174).
+    let [r, g, b, a] = app
+        .mode
+        .background_override()
+        .unwrap_or_else(|| app.theme.background());
 
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     {
@@ -5116,8 +5131,10 @@ pub unsafe extern "C" fn ijc_sheet_view_set_mode(
 }
 
 /// Set the live viewport's render style. `mode` ∈
-/// {"shaded","wireframe","pencil","xray","ghosted"} (plus the aliases
-/// [`DisplayMode::parse`] accepts). Returns false on a null/invalid handle or a
+/// {"shaded","wireframe","pencil","hiddenline","sketchy","xray","ghosted"} (plus
+/// the aliases [`DisplayMode::parse`] accepts). `hiddenline` follows the theme;
+/// `pencil` and `sketchy` draw on paper white, `sketchy` with hand-drawn edges
+/// (itsjustcad-ios#174). Returns false on a null/invalid handle or a
 /// null/unparseable `mode`. The change takes effect on the next
 /// [`ijc_render_frame`] (which reads `app.mode`). Mirrors
 /// [`ijc_sheet_view_set_mode`] but targets the on-screen view, not a sheet view.
@@ -5140,6 +5157,9 @@ pub unsafe extern "C" fn ijc_set_render_mode(h: *mut AppHandle, mode: *const c_c
         let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return false;
         };
+        if app.mode.forces_sketchy() != parsed.forces_sketchy() {
+            app.last_gen = None; // sketchy edges are baked into the snapshot
+        }
         app.mode = parsed;
         true
     })
@@ -5189,48 +5209,35 @@ pub unsafe extern "C" fn ijc_get_render_mode(h: *mut AppHandle) -> *mut c_char {
     })
 }
 
-/// Turn the live viewport's hand-drawn "sketchy edges" look on or off
-/// (itsjustcad-ios#174): jitter overdraw, endpoint overshoot and depth cue on
-/// feature edges, the desktop's `sketchy on|off`. View state, never logged; works
-/// with any render style, best with Pencil. Takes effect on the next
-/// [`ijc_render_frame`] (the scene is re-snapshotted). Returns false on a
-/// null/invalid handle.
+/// Device pixels per point of the drawable (UIKit `contentScaleFactor`, 2 or
+/// 3 on iOS). Scales the Hidden Line and Sketchy stroke widths
+/// (`DisplayMode::line_px`) so they look the same on every screen
+/// (itsjustcad-ios#174). A handle starts at 1. Returns false on a null/invalid
+/// handle or a non-finite or non-positive `scale`.
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ijc_set_sketchy(h: *mut AppHandle, on: bool) -> bool {
+pub unsafe extern "C" fn ijc_set_pixel_scale(h: *mut AppHandle, scale: f32) -> bool {
     guard_ffi(false, || {
+        if !scale.is_finite() || scale <= 0.0 {
+            return false;
+        }
         let Some(mut app) = (unsafe { handle_mut(h) }) else {
             return false;
         };
-        if app.sketchy.enabled != on {
-            app.sketchy.enabled = on;
-            app.last_gen = None; // force re-snapshot next frame
-        }
+        app.pixel_scale = scale;
         true
     })
 }
 
-/// True when sketchy edges are on ([`ijc_set_sketchy`]). False on a
-/// null/invalid handle.
-///
-/// # Safety
-/// `h` must be null or a live handle from [`ijc_init`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ijc_sketchy_enabled(h: *mut AppHandle) -> bool {
-    guard_ffi(false, || {
-        unsafe { handle_ref(h) }.is_some_and(|app| app.sketchy.enabled)
-    })
-}
-
-/// Tune sketchy edges with the desktop `edgefx` tokens, space-separated
-/// `key=value`: `jitter`, `passes`, `extension`/`ext`, `depthcue`/`depth`,
-/// `endpoints` (0/1), `hatching` (0/1). See `SketchyParams::apply_tokens`:
-/// unknown keys and bad values are ignored. Unlike desktop `edgefx`, this does
-/// NOT switch the effect on; the host's toggle stays the one switch
-/// ([`ijc_set_sketchy`]). Returns false on a null/invalid handle or a null or
-/// non-UTF-8 `tokens`.
+/// Tune the Sketchy render style's edges (itsjustcad-ios#174) with the desktop
+/// `edgefx` tokens, space-separated `key=value`: `jitter`, `passes`,
+/// `extension`/`ext`, `depthcue`/`depth`, `endpoints` (0/1), `hatching` (0/1).
+/// See `SketchyParams::apply_tokens`: unknown keys and bad values are ignored.
+/// Unlike desktop `edgefx`, this does not switch anything on: the effect shows
+/// only in the `sketchy` render style ([`ijc_set_render_mode`]). Returns false
+/// on a null/invalid handle or a null or non-UTF-8 `tokens`.
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`]. `tokens` must be null or
@@ -5257,9 +5264,9 @@ pub unsafe extern "C" fn ijc_set_sketchy_params(h: *mut AppHandle, tokens: *cons
 }
 
 /// The current sketchy params as `edgefx` tokens, e.g.
-/// `"enabled=0 jitter=0.03 passes=2 extension=0.05 depthcue=0 endpoints=0 hatching=0"`,
+/// `"jitter=0.03 passes=2 extension=0.05 depthcue=0 endpoints=0 hatching=0"`,
 /// in a C string the caller owns, or null on a null/invalid handle. The tokens
-/// round-trip through [`ijc_set_sketchy_params`] (which ignores `enabled`).
+/// round-trip through [`ijc_set_sketchy_params`].
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`ijc_init`]. A non-null result must
@@ -5272,8 +5279,7 @@ pub unsafe extern "C" fn ijc_get_sketchy_params(h: *mut AppHandle) -> *mut c_cha
         };
         let p = app.sketchy;
         into_c_string(format!(
-            "enabled={} jitter={} passes={} extension={} depthcue={} endpoints={} hatching={}",
-            u8::from(p.enabled),
+            "jitter={} passes={} extension={} depthcue={} endpoints={} hatching={}",
             p.jitter,
             p.passes,
             p.extension,

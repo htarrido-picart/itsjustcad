@@ -18,6 +18,10 @@ pub struct CameraUniform {
     /// x = lighting mode (0 = Working hemispheric, 1 = Sun, 2 = Presentation).
     /// y,z,w spare. GPU-only view state; never serialized (no replay concern).
     pub light: [f32; 4],
+    /// Screen-space stroke (itsjustcad-ios#174): x,y = target size in device
+    /// px, z = stroke width in device px, w spare. All zero (the default) keeps
+    /// the 1-device-px hardware hairline; see [`DisplayMode::line_pt`].
+    pub screen: [f32; 4],
 }
 
 /// Lighting model applied to mesh fills. Decoupled from [`DisplayMode`]: a pane
@@ -86,15 +90,26 @@ pub enum DisplayMode {
     /// (occlusion) and black feature edges on top. Background and grid also
     /// switch to paper white regardless of the egui theme.
     Pencil,
+    /// Theme-following hidden-line (itsjustcad-ios#174): faces write depth but
+    /// no colour, so occluded edges vanish while the faces show the theme
+    /// background (and the grid stays hidden behind them). Edges keep the
+    /// theme ink, slightly thicker than the default hairline.
+    HiddenLine,
+    /// Hand-drawn pencil sketch (itsjustcad-ios#174): [`DisplayMode::Pencil`]'s
+    /// paper and dark ink with occlusion, plus sketchy edges
+    /// ([`crate::sketchify_segments`]) forced on and a pencil-weight stroke.
+    Sketchy,
 }
 
 impl DisplayMode {
-    pub const ALL: [DisplayMode; 5] = [
+    pub const ALL: [DisplayMode; 7] = [
         DisplayMode::Shaded,
         DisplayMode::Wireframe,
         DisplayMode::XRay,
         DisplayMode::Ghosted,
         DisplayMode::Pencil,
+        DisplayMode::HiddenLine,
+        DisplayMode::Sketchy,
     ];
 
     pub fn label(self) -> &'static str {
@@ -104,6 +119,8 @@ impl DisplayMode {
             DisplayMode::XRay => "X-Ray",
             DisplayMode::Ghosted => "Ghosted",
             DisplayMode::Pencil => "Pencil",
+            DisplayMode::HiddenLine => "Hidden Line",
+            DisplayMode::Sketchy => "Sketchy",
         }
     }
 
@@ -114,6 +131,8 @@ impl DisplayMode {
             "xray" | "x-ray" => Some(DisplayMode::XRay),
             "ghosted" | "ghost" => Some(DisplayMode::Ghosted),
             "pencil" => Some(DisplayMode::Pencil),
+            "hiddenline" | "hidden-line" | "hidden" => Some(DisplayMode::HiddenLine),
+            "sketchy" | "sketch" => Some(DisplayMode::Sketchy),
             _ => None,
         }
     }
@@ -127,7 +146,9 @@ impl DisplayMode {
             DisplayMode::Wireframe => 0.0, // fill pass skipped entirely
             DisplayMode::XRay => 0.18,
             DisplayMode::Ghosted => 0.55,
-            DisplayMode::Pencil => -1.0, // sentinel: pencil white fill
+            DisplayMode::Pencil | DisplayMode::Sketchy => -1.0, // sentinel: pencil white fill
+            // Depth only: the face shows whatever the clear colour is.
+            DisplayMode::HiddenLine => 0.0,
         }
     }
 
@@ -148,7 +169,41 @@ impl DisplayMode {
     /// Transparent modes skip depth writes so geometry reads through.
     /// Pencil uses depth writes: occlusion is the whole point of hidden-line.
     pub fn depth_writes(self) -> bool {
-        matches!(self, DisplayMode::Shaded | DisplayMode::Pencil)
+        matches!(
+            self,
+            DisplayMode::Shaded
+                | DisplayMode::Pencil
+                | DisplayMode::HiddenLine
+                | DisplayMode::Sketchy
+        )
+    }
+
+    /// The clear colour this mode forces over the theme's, if any: paper white
+    /// for the pencil modes. Hidden Line follows the theme.
+    pub fn background_override(self) -> Option<[f32; 4]> {
+        matches!(self, DisplayMode::Pencil | DisplayMode::Sketchy).then(Self::pencil_background)
+    }
+
+    /// True when this mode forces sketchy edges on.
+    pub fn forces_sketchy(self) -> bool {
+        self == DisplayMode::Sketchy
+    }
+
+    /// Edge and curve stroke width in logical points (itsjustcad-ios#174), or
+    /// `0.0` for the default 1-device-px hairline. The hidden-line modes read
+    /// as a drawing, so they get a little weight; Sketchy gets a pencil stroke.
+    pub fn line_pt(self) -> f32 {
+        match self {
+            DisplayMode::HiddenLine | DisplayMode::Pencil => 1.25,
+            DisplayMode::Sketchy => 2.25,
+            _ => 0.0,
+        }
+    }
+
+    /// [`DisplayMode::line_pt`] in device pixels for a device-pixel ratio, so a
+    /// stroke looks the same at 1x, 2x and 3x. `0.0` for hairline modes.
+    pub fn line_px(self, dpr: f32) -> f32 {
+        self.line_pt() * dpr.max(1.0)
     }
 
     /// Pencil mode forces the viewport clear colour to paper white regardless
@@ -409,10 +464,18 @@ mod tests {
     #[test]
     fn pencil_fill_alpha_is_negative_sentinel() {
         assert!(DisplayMode::Pencil.fill_alpha() < 0.0);
-        // Other modes are non-negative
+        // Only the paper modes use the sentinel; the rest are non-negative.
         for mode in DisplayMode::ALL {
-            if mode != DisplayMode::Pencil {
-                assert!(mode.fill_alpha() >= 0.0, "{mode:?} should have non-negative alpha");
+            if mode.fill_alpha() < 0.0 {
+                assert!(
+                    mode.background_override().is_some(),
+                    "{mode:?} is a paper mode"
+                );
+            } else {
+                assert!(
+                    mode.fill_alpha() >= 0.0,
+                    "{mode:?} should have non-negative alpha"
+                );
             }
         }
     }
@@ -436,6 +499,40 @@ mod tests {
     }
 
     #[test]
+    fn mode_background_ink_and_width_mapping() {
+        // Hidden Line follows the theme: no paper, depth-only fill (alpha 0,
+        // not the pencil ink sentinel), occlusion on, a little stroke weight.
+        let hl = DisplayMode::HiddenLine;
+        assert_eq!(hl.background_override(), None);
+        assert_eq!(hl.fill_alpha(), 0.0);
+        assert!(hl.draws_fill() && hl.depth_writes() && !hl.forces_sketchy());
+        // Sketchy: paper, dark ink (negative sentinel), occlusion, sketchy on.
+        let sk = DisplayMode::Sketchy;
+        assert_eq!(
+            sk.background_override(),
+            Some(DisplayMode::pencil_background())
+        );
+        assert!(sk.fill_alpha() < 0.0);
+        assert!(sk.depth_writes() && sk.forces_sketchy());
+        assert_eq!(
+            DisplayMode::Pencil.background_override(),
+            Some(DisplayMode::pencil_background())
+        );
+        // Widths: hairline elsewhere, Hidden Line < Sketchy, scaled by dpr.
+        assert_eq!(DisplayMode::Shaded.line_px(3.0), 0.0);
+        assert!(hl.line_pt() > 1.0 && sk.line_pt() > hl.line_pt());
+        assert_eq!(hl.line_px(2.0), hl.line_pt() * 2.0);
+        assert_eq!(sk.line_px(3.0), sk.line_pt() * 3.0);
+        assert_eq!(sk.line_px(0.0), sk.line_pt());
+        for mode in DisplayMode::ALL {
+            assert_eq!(
+                DisplayMode::parse(&mode.label().to_lowercase().replace(' ', "")),
+                Some(mode)
+            );
+        }
+    }
+
+    #[test]
     fn pencil_background_is_near_white() {
         let bg = DisplayMode::pencil_background();
         // All channels > 0.9 (near white)
@@ -454,6 +551,9 @@ mod tests {
             ("ghosted", DisplayMode::Ghosted),
             ("ghost", DisplayMode::Ghosted),
             ("pencil", DisplayMode::Pencil),
+            ("hiddenline", DisplayMode::HiddenLine),
+            ("hidden-line", DisplayMode::HiddenLine),
+            ("sketchy", DisplayMode::Sketchy),
         ] {
             assert_eq!(DisplayMode::parse(s), Some(expected), "parse({s:?}) failed");
         }
@@ -574,6 +674,12 @@ pub struct SceneRenderer {
     curve_pipeline: wgpu::RenderPipeline,
     /// LineList variant of the curve pipeline for mesh feature edges.
     edge_pipeline: wgpu::RenderPipeline,
+    /// Screen-space quad strokes for edges (LineList) and curves (LineStrip)
+    /// when the camera carries a stroke width (itsjustcad-ios#174).
+    fat_edge_pipeline: wgpu::RenderPipeline,
+    fat_curve_pipeline: wgpu::RenderPipeline,
+    /// Per pane: whether its last camera asked for fat strokes.
+    fat_lines: Vec<bool>,
     /// World-axis variant of the edge pipeline: LineList using the `vs_axis`
     /// shader entry, which nudges depth slightly toward the camera so the
     /// coplanar grid plane (which writes an ANALYTIC frag_depth that quantizes
@@ -854,6 +960,58 @@ impl SceneRenderer {
             cache: None,
         });
 
+        // Fat strokes (itsjustcad-ios#174): one instance per segment, read
+        // straight from the hairline vertex buffers, bound twice: slot 0 from
+        // the start (segment start), slot 1 one point in (segment end).
+        // LineList soups step two points per instance (stride 24); LineStrip
+        // curves step one (stride 12), so each instance sees `(p[i], p[i+1])`.
+        let fat_pipeline = |label: &str, stride: u64| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&mesh_layout),
+                vertex: wgpu::VertexState {
+                    module: &curve_shader,
+                    entry_point: Some("vs_fat"),
+                    compilation_options: Default::default(),
+                    buffers: &[
+                        wgpu::VertexBufferLayout {
+                            array_stride: stride,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: stride,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &wgpu::vertex_attr_array![1 => Float32x3],
+                        },
+                    ],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &curve_shader,
+                    entry_point: Some("fs_fat"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let fat_edge_pipeline = fat_pipeline("fat_edge_pipeline", 24);
+        let fat_curve_pipeline = fat_pipeline("fat_curve_pipeline", 12);
+
         // World axes: same shader/topology as feature edges, but with the
         // `vs_axis` entry point, which nudges depth a few ULPs toward the
         // camera. The axes are coplanar with the grid plane (z=0) but the grid
@@ -1035,6 +1193,9 @@ impl SceneRenderer {
             mesh_xray_pipeline,
             curve_pipeline,
             edge_pipeline,
+            fat_edge_pipeline,
+            fat_curve_pipeline,
+            fat_lines: Vec::new(),
             axis_pipeline,
             point_pipeline,
             camera_layout,
@@ -1101,6 +1262,11 @@ impl SceneRenderer {
             self.cameras.push((buf, bind_group));
         }
         queue.write_buffer(&self.cameras[viewport].0, 0, bytemuck::bytes_of(cam));
+        if self.fat_lines.len() <= viewport {
+            self.fat_lines.resize(viewport + 1, false);
+        }
+        self.fat_lines[viewport] =
+            cam.screen[0] > 0.0 && cam.screen[1] > 0.0 && cam.screen[2] > 0.0;
     }
 
     /// Rebuild all mesh buffers. Called when the document generation changes;
@@ -1473,7 +1639,16 @@ impl SceneRenderer {
         // never be suppressed there.
         let draw_edges = mode.draws_edges()
             && (edges_enabled || mode == DisplayMode::Wireframe);
-        if draw_edges {
+        let fat = self.fat_lines.get(viewport).copied().unwrap_or(false);
+        if draw_edges && fat {
+            render_pass.set_pipeline(&self.fat_edge_pipeline);
+            for edge in &self.edges {
+                render_pass.set_bind_group(1, &edge.object_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, edge.vertex_buf.slice(..));
+                render_pass.set_vertex_buffer(1, edge.vertex_buf.slice(12..));
+                render_pass.draw(0..6, 0..edge.vertex_count / 2);
+            }
+        } else if draw_edges {
             render_pass.set_pipeline(&self.edge_pipeline);
             for edge in &self.edges {
                 render_pass.set_bind_group(1, &edge.object_bind_group, &[]);
@@ -1498,11 +1673,22 @@ impl SceneRenderer {
 
         // Default curves: the crisp 1-device-pixel hardware hairline is the
         // Rhino wire (constant on-screen width, selection shown by colour).
-        render_pass.set_pipeline(&self.curve_pipeline);
-        for line in &self.lines {
-            render_pass.set_bind_group(1, &line.object_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, line.vertex_buf.slice(..));
-            render_pass.draw(0..line.vertex_count, 0..1);
+        // Fat-stroke modes widen them like the edges above.
+        if fat {
+            render_pass.set_pipeline(&self.fat_curve_pipeline);
+            for line in &self.lines {
+                render_pass.set_bind_group(1, &line.object_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, line.vertex_buf.slice(..));
+                render_pass.set_vertex_buffer(1, line.vertex_buf.slice(12..));
+                render_pass.draw(0..6, 0..line.vertex_count - 1);
+            }
+        } else {
+            render_pass.set_pipeline(&self.curve_pipeline);
+            for line in &self.lines {
+                render_pass.set_bind_group(1, &line.object_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, line.vertex_buf.slice(..));
+                render_pass.draw(0..line.vertex_count, 0..1);
+            }
         }
 
         // Point clouds: rendered as PointList after lines so they appear on top
