@@ -59,8 +59,9 @@ use itsjustcad_deck::{
     digest_filtered, ffi_system_prompt, make_deck_with_client, normalize_selectors,
 };
 use itsjustcad_render::{
-    DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer, StandardView, Theme,
-    UnderlayData, camera_uniform_with_mode, object_wireframe_world, snapshot,
+    ColorModeSnapshot, DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer,
+    SketchyParams, StandardView, Theme, UnderlayData, camera_uniform_with_mode,
+    object_wireframe_world, snapshot, snapshot_with_mode,
 };
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
 
@@ -277,6 +278,9 @@ pub struct AppHandle {
     last_gen: Option<u64>,
     theme: Theme,
     mode: DisplayMode,
+    /// Hand-drawn "sketchy edges" look (itsjustcad-ios#174): view state, never
+    /// logged. Off by default; changing it forces a re-snapshot.
+    sketchy: SketchyParams,
 
     /// Decoded-underlay cache: `(stored path, Arc<(rgba, w, h)>)`. Keyed on the
     /// document's stored underlay path so the (potentially large) image is
@@ -815,6 +819,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         last_gen: None,
         theme: Theme::Dark,
         mode: DisplayMode::default(),
+        sketchy: SketchyParams::default(),
         underlay_cache: None,
         gumball_preview: None,
         guided: Default::default(),
@@ -2654,7 +2659,27 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
     // Re-upload geometry only when the document changed.
     let doc_gen = app.session.doc.generation;
     if app.last_gen != Some(doc_gen) {
-        let mut scene = snapshot(&app.session.doc, app.theme);
+        // Sketchy edges (#174): the same params and eye/radius depth cue the
+        // desktop passes. The cue is baked at snapshot time, as on desktop.
+        let sketchy = app.sketchy;
+        let (sketchy_eye, sketchy_radius) = if sketchy.active() {
+            let r = app
+                .session
+                .doc
+                .scene_aabb()
+                .map(|bb| (bb.size().length() as f32 * 0.5).max(0.5))
+                .unwrap_or(8.0);
+            (Some(camera.eye()), r)
+        } else {
+            (None, 0.0)
+        };
+        let cms = ColorModeSnapshot {
+            sketchy,
+            sketchy_eye,
+            sketchy_radius,
+            ..Default::default()
+        };
+        let mut scene = snapshot_with_mode(&app.session.doc, app.theme, cms);
         // The host owns image decoding (the render crate has no `image` dep),
         // so attach the decoded underlay here — the FFI twin of the desktop's
         // `App::decode_underlay`. Without this a granted underlay applies to
@@ -2722,7 +2747,12 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
         }
     };
     let view = frame.texture.create_view(&Default::default());
-    let [r, g, b, a] = app.theme.background();
+    // Pencil mode clears to paper white whatever the theme, as on desktop.
+    let [r, g, b, a] = if app.mode == DisplayMode::Pencil {
+        DisplayMode::pencil_background()
+    } else {
+        app.theme.background()
+    };
 
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     {
@@ -5156,6 +5186,101 @@ pub unsafe extern "C" fn ijc_get_render_mode(h: *mut AppHandle) -> *mut c_char {
             return std::ptr::null_mut();
         };
         into_c_string(app.mode.label().to_owned())
+    })
+}
+
+/// Turn the live viewport's hand-drawn "sketchy edges" look on or off
+/// (itsjustcad-ios#174): jitter overdraw, endpoint overshoot and depth cue on
+/// feature edges, the desktop's `sketchy on|off`. View state, never logged; works
+/// with any render style, best with Pencil. Takes effect on the next
+/// [`ijc_render_frame`] (the scene is re-snapshotted). Returns false on a
+/// null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_set_sketchy(h: *mut AppHandle, on: bool) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        if app.sketchy.enabled != on {
+            app.sketchy.enabled = on;
+            app.last_gen = None; // force re-snapshot next frame
+        }
+        true
+    })
+}
+
+/// True when sketchy edges are on ([`ijc_set_sketchy`]). False on a
+/// null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_sketchy_enabled(h: *mut AppHandle) -> bool {
+    guard_ffi(false, || {
+        unsafe { handle_ref(h) }.is_some_and(|app| app.sketchy.enabled)
+    })
+}
+
+/// Tune sketchy edges with the desktop `edgefx` tokens, space-separated
+/// `key=value`: `jitter`, `passes`, `extension`/`ext`, `depthcue`/`depth`,
+/// `endpoints` (0/1), `hatching` (0/1). See `SketchyParams::apply_tokens`:
+/// unknown keys and bad values are ignored. Unlike desktop `edgefx`, this does
+/// NOT switch the effect on; the host's toggle stays the one switch
+/// ([`ijc_set_sketchy`]). Returns false on a null/invalid handle or a null or
+/// non-UTF-8 `tokens`.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. `tokens` must be null or
+/// a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_set_sketchy_params(h: *mut AppHandle, tokens: *const c_char) -> bool {
+    guard_ffi(false, || {
+        if tokens.is_null() {
+            return false;
+        }
+        let Ok(tokens) = (unsafe { CStr::from_ptr(tokens) }).to_str() else {
+            return false;
+        };
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let tuned = app.sketchy.apply_tokens(tokens.split_whitespace());
+        if tuned != app.sketchy {
+            app.sketchy = tuned;
+            app.last_gen = None; // force re-snapshot next frame
+        }
+        true
+    })
+}
+
+/// The current sketchy params as `edgefx` tokens, e.g.
+/// `"enabled=0 jitter=0.03 passes=2 extension=0.05 depthcue=0 endpoints=0 hatching=0"`,
+/// in a C string the caller owns, or null on a null/invalid handle. The tokens
+/// round-trip through [`ijc_set_sketchy_params`] (which ignores `enabled`).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. A non-null result must
+/// be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_get_sketchy_params(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return std::ptr::null_mut();
+        };
+        let p = app.sketchy;
+        into_c_string(format!(
+            "enabled={} jitter={} passes={} extension={} depthcue={} endpoints={} hatching={}",
+            u8::from(p.enabled),
+            p.jitter,
+            p.passes,
+            p.extension,
+            p.depthcue,
+            u8::from(p.endpoints),
+            u8::from(p.hatching),
+        ))
     })
 }
 
