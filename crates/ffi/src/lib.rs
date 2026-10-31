@@ -1700,12 +1700,80 @@ fn box_select_in(
     end: glam::Vec2,
     additive: bool,
 ) -> usize {
-    let mode = boxsel::mode(start, end);
     let drag = boxsel::Rect::from_points(start, end);
+    region_select_in(doc, vp, w, h, &drag, boxsel::mode(start, end), additive)
+}
+
+/// Lasso select in drawable pixels (y down): `xy_px` holds `n` interleaved
+/// `x,y` points of a freehand loop, closed from the last point back to the
+/// first; concave loops are fine (even-odd inside). Same object rules as
+/// [`ijc_box_select`]: curves test their tessellated line, other geometry its
+/// projected bounds; hidden objects and layers are skipped. A window
+/// (`!crossing`) takes objects fully inside the loop, a crossing anything the
+/// loop touches or encloses. Replaces the selection unless `additive`. Returns
+/// how many objects matched, or -1 on a null/invalid handle, a headless one
+/// (no drawable), a null `xy_px`, or `n < 3`.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `xy_px` must be null
+/// or valid for `2 * n` reads.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_lasso_select(
+    h: *mut AppHandle,
+    xy_px: *const f32,
+    n: usize,
+    crossing: bool,
+    additive: bool,
+) -> i32 {
+    guard_ffi(-1, || {
+        if xy_px.is_null() || n < 3 {
+            return -1;
+        }
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return -1;
+        };
+        let app: &mut AppHandle = &mut app;
+        let Some((w, h)) = drawable_size(app) else {
+            return -1;
+        };
+        let xy = unsafe { std::slice::from_raw_parts(xy_px, n * 2) };
+        let pts = xy.as_chunks::<2>().0.iter().map(|&[x, y]| glam::Vec2::new(x, y)).collect();
+        let vp = app.camera.view_proj(w / h);
+        lasso_select_in(&mut app.session.doc, vp, w, h, pts, crossing, additive).map_or(-1, |m| m as i32)
+    })
+}
+
+/// [`ijc_lasso_select`] against an explicit camera and drawable (testable
+/// headless). None under three points.
+fn lasso_select_in(
+    doc: &mut itsjustcad_doc::Document,
+    vp: glam::Mat4,
+    w: f32,
+    h: f32,
+    pts: Vec<glam::Vec2>,
+    crossing: bool,
+    additive: bool,
+) -> Option<usize> {
+    let lasso = boxsel::Lasso::new(pts)?;
+    let mode = if crossing { boxsel::BoxMode::Crossing } else { boxsel::BoxMode::Window };
+    Some(region_select_in(doc, vp, w, h, &lasso, mode, additive))
+}
+
+/// Select the visible objects whose projection matches `region` under `mode`,
+/// replacing the selection unless `additive`. Returns the match count.
+fn region_select_in<R: boxsel::Region>(
+    doc: &mut itsjustcad_doc::Document,
+    vp: glam::Mat4,
+    w: f32,
+    h: f32,
+    region: &R,
+    mode: boxsel::BoxMode,
+    additive: bool,
+) -> usize {
     let ids: Vec<_> = doc
         .objects()
         .filter(|o| o.visible && doc.layer_visible(&o.layer))
-        .filter(|o| boxsel::matches(&o.geometry, vp, w, h, drag, mode))
+        .filter(|o| boxsel::matches(&o.geometry, vp, w, h, region, mode))
         .map(|o| o.id)
         .collect();
     if !additive {
@@ -7828,6 +7896,85 @@ mod headless_tests {
         unsafe {
             assert_eq!(ijc_box_select(h, 0.0, 0.0, 1.0, 1.0, false), -1, "headless has no drawable");
             assert_eq!(ijc_box_select(std::ptr::null_mut(), 0.0, 0.0, 1.0, 1.0, false), -1);
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn lasso_select_concave_window_crossing_additive() {
+        let h = ijc_init_headless();
+        let mut guard = unsafe { handle_mut(h) }.unwrap();
+        let app: &mut AppHandle = &mut guard;
+        // Three boxes in a row seen from the top, framed across the view.
+        for line in ["box 0,0,0 1,1,1", "box 3,0,0 1,1,1", "box 6,0,0 1,1,1", "top", "ze"] {
+            match check_line(line).unwrap() {
+                PendingOp::Cmd(cmd) => { app.session.run(cmd).unwrap(); }
+                PendingOp::Camera(k) => apply_camera(app, k),
+            }
+        }
+        let (w, hh) = (800.0, 600.0);
+        let vp = app.camera.view_proj(w / hh);
+        let doc = &mut app.session.doc;
+        // Each box's projected bounds.
+        let rects: Vec<boxsel::Rect> = doc
+            .objects()
+            .map(|o| {
+                let bb = o.geometry.aabb();
+                let ps: Vec<_> = (0..8)
+                    .map(|i| {
+                        let c = glam::DVec3::new(
+                            if i & 1 == 0 { bb.min.x } else { bb.max.x },
+                            if i & 2 == 0 { bb.min.y } else { bb.max.y },
+                            if i & 4 == 0 { bb.min.z } else { bb.max.z },
+                        );
+                        boxsel::project(vp, w, hh, c).unwrap()
+                    })
+                    .collect();
+                let min = ps.iter().fold(ps[0], |a, &p| a.min(p));
+                let max = ps.iter().fold(ps[0], |a, &p| a.max(p));
+                boxsel::Rect::from_points(min, max)
+            })
+            .collect();
+        let mut xs: Vec<(f32, f32)> = rects.iter().map(|r| (r.min.x, r.max.x)).collect();
+        xs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(xs[0].1 < xs[1].0 && xs[1].1 < xs[2].0, "boxes apart on screen: {xs:?}");
+        let top = rects.iter().map(|r| r.min.y).fold(f32::MAX, f32::min) - 10.0;
+        let bot = rects.iter().map(|r| r.max.y).fold(f32::MIN, f32::max) + 10.0;
+        let v = glam::Vec2::new;
+        // A U opening upward whose notch holds the middle box.
+        let (gap_l, gap_r) = ((xs[0].1 + xs[1].0) / 2.0, (xs[1].1 + xs[2].0) / 2.0);
+        let u = vec![
+            v(0.0, 0.0),
+            v(gap_l, 0.0),
+            v(gap_l, bot),
+            v(gap_r, bot),
+            v(gap_r, 0.0),
+            v(w, 0.0),
+            v(w, hh),
+            v(0.0, hh),
+        ];
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false), Some(2), "notch box left out");
+        // The U's base wall runs under the middle box's bottom, so a crossing
+        // that reaches into it would also take it: raise the base above it.
+        let mid = (top + bot) / 2.0;
+        let u_mid: Vec<_> = u.iter().map(|p| if p.y == bot { v(p.x, mid) } else { *p }).collect();
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid.clone(), false, false), Some(2), "window: middle cut");
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid, true, false), Some(3), "crossing: touched");
+        // Additive: a loop round the middle box alone adds to an existing pick.
+        let around_mid = vec![v(gap_l, top), v(gap_r, top), v(gap_r, bot), v(gap_l, bot)];
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false), Some(2));
+        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid.clone(), false, true), Some(1));
+        assert_eq!(doc.selection.len(), 3, "additive keeps the rest");
+        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid, false, false), Some(1));
+        assert_eq!(doc.selection.len(), 1, "non-additive replaces");
+        assert_eq!(lasso_select_in(doc, vp, w, hh, vec![v(0.0, 0.0), v(w, hh)], false, false), None);
+        drop(guard);
+        let xy = [0.0f32, 0.0, 800.0, 0.0, 800.0, 600.0];
+        unsafe {
+            assert_eq!(ijc_lasso_select(h, xy.as_ptr(), 3, false, false), -1, "headless has no drawable");
+            assert_eq!(ijc_lasso_select(std::ptr::null_mut(), xy.as_ptr(), 3, false, false), -1);
+            assert_eq!(ijc_lasso_select(h, std::ptr::null(), 3, false, false), -1);
+            assert_eq!(ijc_lasso_select(h, xy.as_ptr(), 2, false, false), -1, "under three points");
             ijc_free(h);
         }
     }
