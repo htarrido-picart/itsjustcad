@@ -217,6 +217,12 @@ fn resolve_color(
     if selected {
         return theme.selected();
     }
+    // Light theme: darken layer colors on lines (not faces) to ≥ 3:1 against
+    // the background, display-time only (#248). Dark theme is unchanged.
+    let layer_color = match layer_color {
+        Some(c) if theme == Theme::Light && !is_mesh => Some(light_line_color(c)),
+        other => other,
+    };
     match mode {
         // ByLayer: object color beats layer color beats theme default.
         // The `color` command stores object.color; it always wins over layer.
@@ -251,6 +257,16 @@ fn resolve_color(
             hue_from_seed(seed)
         }
     }
+}
+
+/// Minimum WCAG contrast for layer-colored lines on the light background.
+const LIGHT_LINE_MIN_CONTRAST: f32 = 3.0;
+
+fn light_line_color([r, g, b, a]: [f32; 4]) -> [f32; 4] {
+    let [bg_r, bg_g, bg_b, _] = Theme::Light.background();
+    let [r, g, b] =
+        crate::contrast::ensure_contrast([r, g, b], [bg_r, bg_g, bg_b], LIGHT_LINE_MIN_CONTRAST);
+    [r, g, b, a]
 }
 
 /// Default material scalars for a mesh with no `material2`: mid-roughness
@@ -1315,6 +1331,50 @@ mod tests {
         assert_eq!(scene.meshes[0].1, [0.35, 0.75, 0.72, 1.0]);
         // Curve color is theme curve (not mesh)
         assert_ne!(scene.lines[0].1, scene.meshes[0].1);
+    }
+
+    #[test]
+    fn light_theme_darkens_layer_colored_lines_but_not_faces() {
+        // #248: on the light background, a layer-colored curve is darkened to
+        // ≥ 3:1 at display time; the face keeps the stored color, and the dark
+        // theme is the identity.
+        let mut doc = Document::default();
+        let olive = itsjustcad_doc::default_layer_color(0);
+        doc.layers.insert(
+            "default".into(),
+            LayerStyle { color: Some(olive), visible: true, ..LayerStyle::default() },
+        );
+        insert_tri(&mut doc, "default");
+        doc.insert(SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: "default".into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            edge_tags: None,
+            street: None,
+            geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
+                points: vec![DVec3::ZERO, DVec3::X],
+                closed: false,
+            }),
+        });
+
+        let light = snapshot(&doc, Theme::Light);
+        assert_eq!(light.meshes[0].1, olive);
+        let line = light.lines[0].1;
+        assert_ne!(line, olive);
+        let bg = Theme::Light.background();
+        let ratio = crate::contrast::contrast_ratio(
+            [line[0], line[1], line[2]],
+            [bg[0], bg[1], bg[2]],
+        );
+        assert!(ratio >= 3.0, "{ratio}");
+
+        let dark = snapshot(&doc, Theme::Dark);
+        assert_eq!(dark.lines[0].1, olive);
+        assert_eq!(dark.meshes[0].1, olive);
     }
 
     #[test]

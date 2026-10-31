@@ -4,6 +4,7 @@
 //! Viewport rendering: wgpu pipelines inside egui paint callbacks.
 
 mod camera;
+mod contrast;
 mod control;
 mod cubemap;
 mod layout;
