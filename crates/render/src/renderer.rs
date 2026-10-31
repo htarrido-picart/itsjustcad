@@ -674,10 +674,11 @@ pub struct SceneRenderer {
     curve_pipeline: wgpu::RenderPipeline,
     /// LineList variant of the curve pipeline for mesh feature edges.
     edge_pipeline: wgpu::RenderPipeline,
-    /// Screen-space quad strokes for edges (LineList) and curves (LineStrip)
-    /// when the camera carries a stroke width (itsjustcad-ios#174).
-    fat_edge_pipeline: wgpu::RenderPipeline,
-    fat_curve_pipeline: wgpu::RenderPipeline,
+    /// Screen-space quad strokes for edges and curves when the camera carries
+    /// a stroke width (itsjustcad-ios#174).
+    fat_pipeline: wgpu::RenderPipeline,
+    /// LineList copies of `lines` (strips) for the fat-stroke pass.
+    curve_segments: Vec<GpuLine>,
     /// Per pane: whether its last camera asked for fat strokes.
     fat_lines: Vec<bool>,
     /// World-axis variant of the edge pipeline: LineList using the `vs_axis`
@@ -960,57 +961,46 @@ impl SceneRenderer {
             cache: None,
         });
 
-        // Fat strokes (itsjustcad-ios#174): one instance per segment, read
-        // straight from the hairline vertex buffers, bound twice: slot 0 from
-        // the start (segment start), slot 1 one point in (segment end).
-        // LineList soups step two points per instance (stride 24); LineStrip
-        // curves step one (stride 12), so each instance sees `(p[i], p[i+1])`.
-        let fat_pipeline = |label: &str, stride: u64| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&mesh_layout),
-                vertex: wgpu::VertexState {
-                    module: &curve_shader,
-                    entry_point: Some("vs_fat"),
-                    compilation_options: Default::default(),
-                    buffers: &[
-                        wgpu::VertexBufferLayout {
-                            array_stride: stride,
-                            step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-                        },
-                        wgpu::VertexBufferLayout {
-                            array_stride: stride,
-                            step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: &wgpu::vertex_attr_array![1 => Float32x3],
-                        },
-                    ],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &curve_shader,
-                    entry_point: Some("fs_fat"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let fat_edge_pipeline = fat_pipeline("fat_edge_pipeline", 24);
-        let fat_curve_pipeline = fat_pipeline("fat_curve_pipeline", 12);
+        // Fat strokes (itsjustcad-ios#174): one instance per segment of a
+        // LineList soup (stride 24: start at 0, end at 12), so edges reuse
+        // their hairline buffer as is. Curve strips get a LineList copy
+        // (`curve_segments`), since one binding cannot read `p[i+1]` at
+        // stride 12.
+        let fat_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fat_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &curve_shader,
+                entry_point: Some("vs_fat"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 24,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &curve_shader,
+                entry_point: Some("fs_fat"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         // World axes: same shader/topology as feature edges, but with the
         // `vs_axis` entry point, which nudges depth a few ULPs toward the
@@ -1193,8 +1183,8 @@ impl SceneRenderer {
             mesh_xray_pipeline,
             curve_pipeline,
             edge_pipeline,
-            fat_edge_pipeline,
-            fat_curve_pipeline,
+            fat_pipeline,
+            curve_segments: Vec::new(),
             fat_lines: Vec::new(),
             axis_pipeline,
             point_pipeline,
@@ -1354,10 +1344,22 @@ impl SceneRenderer {
         self.set_meshes(device, &scene.meshes, generation);
 
         self.lines.clear();
+        self.curve_segments.clear();
         for (points, color, _lw_mm) in &scene.lines {
             if points.len() < 2 {
                 continue;
             }
+            // The fat-stroke pass reads segments as LineList pairs (#174).
+            let pairs: Vec<[f32; 3]> = points.windows(2).flatten().copied().collect();
+            self.curve_segments.push(GpuLine {
+                vertex_buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("curve_seg_vb"),
+                    contents: bytemuck::cast_slice(&pairs),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                vertex_count: pairs.len() as u32,
+                object_bind_group: self.object_bind_group(device, *color),
+            });
             let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("curve_vb"),
                 contents: bytemuck::cast_slice(points),
@@ -1641,11 +1643,10 @@ impl SceneRenderer {
             && (edges_enabled || mode == DisplayMode::Wireframe);
         let fat = self.fat_lines.get(viewport).copied().unwrap_or(false);
         if draw_edges && fat {
-            render_pass.set_pipeline(&self.fat_edge_pipeline);
+            render_pass.set_pipeline(&self.fat_pipeline);
             for edge in &self.edges {
                 render_pass.set_bind_group(1, &edge.object_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, edge.vertex_buf.slice(..));
-                render_pass.set_vertex_buffer(1, edge.vertex_buf.slice(12..));
                 render_pass.draw(0..6, 0..edge.vertex_count / 2);
             }
         } else if draw_edges {
@@ -1675,12 +1676,11 @@ impl SceneRenderer {
         // Rhino wire (constant on-screen width, selection shown by colour).
         // Fat-stroke modes widen them like the edges above.
         if fat {
-            render_pass.set_pipeline(&self.fat_curve_pipeline);
-            for line in &self.lines {
+            render_pass.set_pipeline(&self.fat_pipeline);
+            for line in &self.curve_segments {
                 render_pass.set_bind_group(1, &line.object_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, line.vertex_buf.slice(..));
-                render_pass.set_vertex_buffer(1, line.vertex_buf.slice(12..));
-                render_pass.draw(0..6, 0..line.vertex_count - 1);
+                render_pass.draw(0..6, 0..line.vertex_count / 2);
             }
         } else {
             render_pass.set_pipeline(&self.curve_pipeline);
