@@ -82,6 +82,7 @@ pub fn camera_uniform_ex(
         eye: [eye.x, eye.y, eye.z, 1.0],
         misc: [mode.fill_alpha(), sx, sy, sz],
         light: [light.shader_flag(), if background_gradient { 1.0 } else { 0.0 }, 0.0, 0.0],
+        screen: [0.0; 4],
     }
 }
 

@@ -35,6 +35,9 @@ pub struct ViewportCallback {
     /// `doc.generation`, so the usual generation gate would skip the upload and
     /// the pieces would never visibly disappear.
     pub force: bool,
+    /// Pane size in egui points, for the hidden-line and sketchy strokes
+    /// ([`DisplayMode::line_px`], itsjustcad-ios#174). Zero keeps hairlines.
+    pub size_points: [f32; 2],
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -42,7 +45,7 @@ impl CallbackTrait for ViewportCallback {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _screen: &egui_wgpu::ScreenDescriptor,
+        screen_desc: &egui_wgpu::ScreenDescriptor,
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
@@ -64,6 +67,11 @@ impl CallbackTrait for ViewportCallback {
                 0.0,
                 0.0,
             ],
+            screen: {
+                let ppp = screen_desc.pixels_per_point;
+                let [w, h] = self.size_points;
+                [w * ppp, h * ppp, self.mode.line_px(ppp), 0.0]
+            },
         };
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene

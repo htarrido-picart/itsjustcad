@@ -4612,12 +4612,17 @@ impl App {
         // True on enter/change/leave of the preview, so Esc restores the scene.
         let trim_mark_change = self.uploaded_trim_marks != trim_marks;
         let force_upload = trim_mark_change;
+        // The Sketchy display mode forces sketchy edges on (itsjustcad-ios#174).
+        let mut sketchy = self.sketchy;
+        if self.display_modes[self.effective_camera_index(self.active_pane)].forces_sketchy() {
+            sketchy.enabled = true;
+        }
         let stale = self.uploaded_generation != Some(generation)
             || self.uploaded_theme != Some(theme)
             || self.uploaded_color_mode != Some(active_color_mode)
             || self.uploaded_profile_edges != Some(self.profile_edges)
             || self.uploaded_plant_symbols != Some(self.plant_symbols)
-            || self.uploaded_sketchy != Some(self.sketchy)
+            || self.uploaded_sketchy != Some(sketchy)
             || trim_mark_change;
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
@@ -4627,10 +4632,10 @@ impl App {
             self.uploaded_color_mode = Some(active_color_mode);
             self.uploaded_profile_edges = Some(self.profile_edges);
             self.uploaded_plant_symbols = Some(self.plant_symbols);
-            self.uploaded_sketchy = Some(self.sketchy);
+            self.uploaded_sketchy = Some(sketchy);
             self.uploaded_trim_marks = trim_marks;
             // Sketchy depth cue: bias by the active pane's eye + scene radius.
-            let (sketchy_eye, sketchy_radius) = if self.sketchy.active() {
+            let (sketchy_eye, sketchy_radius) = if sketchy.active() {
                 let cam = &self.cameras[self.effective_camera_index(self.active_pane)];
                 let r = self
                     .session
@@ -4645,7 +4650,7 @@ impl App {
             let cms = itsjustcad_render::ColorModeSnapshot {
                 color_mode: active_color_mode,
                 profile_edges: self.profile_edges,
-                sketchy: self.sketchy,
+                sketchy,
                 sketchy_eye,
                 sketchy_radius,
             };
@@ -4892,6 +4897,7 @@ impl App {
                         background_gradient: self.profile_edges,
                         edges_enabled: self.shaded_edges,
                         force: force_upload,
+                        size_points: [rect.width(), rect.height()],
                     },
                 ));
             }
@@ -9261,8 +9267,9 @@ impl App {
             DisplayMode::Wireframe => Some(DisplayModeTag::Wireframe),
             DisplayMode::XRay => Some(DisplayModeTag::XRay),
             DisplayMode::Pencil => Some(DisplayModeTag::Pencil),
-            // Ghosted has no menu entry; nothing is checked for it.
-            DisplayMode::Ghosted => None,
+            // Ghosted, Hidden Line and Sketchy have no menu entry (the
+            // display combo lists them); nothing is checked for them.
+            DisplayMode::Ghosted | DisplayMode::HiddenLine | DisplayMode::Sketchy => None,
         };
         let lighting = match self.light_mode {
             LightMode::Working => Some(LightModeTag::Working),
@@ -11175,12 +11182,12 @@ fn draw_rubber_box(
 
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        // Pencil mode forces paper white regardless of the egui theme.
+        // Pencil and Sketchy force paper white regardless of the egui theme.
         // Use the active pane's display mode to drive the clear colour.
         let active_mode =
             self.display_modes[self.effective_camera_index(self.active_pane)];
-        if active_mode == itsjustcad_render::DisplayMode::Pencil {
-            return itsjustcad_render::DisplayMode::pencil_background();
+        if let Some(paper) = active_mode.background_override() {
+            return paper;
         }
         // Dark mode wins for the 3D model space: a near-black off-grey, even
         // under a legacy-CAD preset (whose fixed light-grey/white bg would

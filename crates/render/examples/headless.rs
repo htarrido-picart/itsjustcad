@@ -211,5 +211,6 @@ fn main() {
         background_gradient: false,
         edges_enabled: true,
         force: false,
+        size_points: [0.0; 2],
     };
 }
