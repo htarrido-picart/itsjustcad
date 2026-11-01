@@ -1765,12 +1765,22 @@ pub unsafe extern "C" fn ijc_box_select(
             return -1;
         };
         let vp = app.camera.view_proj(w / h);
-        box_select_in(&mut app.session.doc, vp, w, h, glam::Vec2::new(x0, y0), glam::Vec2::new(x1, y1), additive)
-            as i32
+        let context = app.edit_context;
+        box_select_in(
+            &mut app.session.doc,
+            vp,
+            w,
+            h,
+            glam::Vec2::new(x0, y0),
+            glam::Vec2::new(x1, y1),
+            additive,
+            context,
+        ) as i32
     })
 }
 
 /// [`ijc_box_select`] against an explicit camera and drawable (testable headless).
+#[allow(clippy::too_many_arguments)]
 fn box_select_in(
     doc: &mut itsjustcad_doc::Document,
     vp: glam::Mat4,
@@ -1779,9 +1789,10 @@ fn box_select_in(
     start: glam::Vec2,
     end: glam::Vec2,
     additive: bool,
+    context: Option<itsjustcad_doc::ObjectId>,
 ) -> usize {
     let drag = boxsel::Rect::from_points(start, end);
-    region_select_in(doc, vp, w, h, &drag, boxsel::mode(start, end), additive)
+    region_select_in(doc, vp, w, h, &drag, boxsel::mode(start, end), additive, context)
 }
 
 /// Lasso select in drawable pixels (y down): `xy_px` holds `n` interleaved
@@ -1819,12 +1830,24 @@ pub unsafe extern "C" fn ijc_lasso_select(
         let xy = unsafe { std::slice::from_raw_parts(xy_px, n * 2) };
         let pts = xy.as_chunks::<2>().0.iter().map(|&[x, y]| glam::Vec2::new(x, y)).collect();
         let vp = app.camera.view_proj(w / h);
-        lasso_select_in(&mut app.session.doc, vp, w, h, pts, crossing, additive).map_or(-1, |m| m as i32)
+        let context = app.edit_context;
+        lasso_select_in(
+            &mut app.session.doc,
+            vp,
+            w,
+            h,
+            pts,
+            crossing,
+            additive,
+            context,
+        )
+        .map_or(-1, |m| m as i32)
     })
 }
 
 /// [`ijc_lasso_select`] against an explicit camera and drawable (testable
 /// headless). None under three points.
+#[allow(clippy::too_many_arguments)]
 fn lasso_select_in(
     doc: &mut itsjustcad_doc::Document,
     vp: glam::Mat4,
@@ -1833,16 +1856,18 @@ fn lasso_select_in(
     pts: Vec<glam::Vec2>,
     crossing: bool,
     additive: bool,
+    context: Option<itsjustcad_doc::ObjectId>,
 ) -> Option<usize> {
     let lasso = boxsel::Lasso::new(pts)?;
     let mode = if crossing { boxsel::BoxMode::Crossing } else { boxsel::BoxMode::Window };
-    Some(region_select_in(doc, vp, w, h, &lasso, mode, additive))
+    Some(region_select_in(doc, vp, w, h, &lasso, mode, additive, context))
 }
 
 /// Select the visible objects whose projection matches `region` under `mode`,
 /// replacing the selection unless `additive`. Anything a parametric generator
 /// produced selects as its top parent (the site plan, #199). Returns how many
 /// objects that selects.
+#[allow(clippy::too_many_arguments)]
 fn region_select_in<R: boxsel::Region>(
     doc: &mut itsjustcad_doc::Document,
     vp: glam::Mat4,
@@ -1851,14 +1876,17 @@ fn region_select_in<R: boxsel::Region>(
     region: &R,
     mode: boxsel::BoxMode,
     additive: bool,
+    context: Option<itsjustcad_doc::ObjectId>,
 ) -> usize {
-    // Generated objects select as their top parent (#199).
-    let ids = itsjustcad_commands::lot::hierarchy::top_parents(
+    // Generated objects select as their top parent, or, drilled into
+    // `context` (`ijc_set_edit_context`), at the level below it (#199).
+    let ids = itsjustcad_commands::lot::hierarchy::region_targets(
         doc,
         doc.objects()
             .filter(|o| o.visible && doc.layer_visible(&o.layer))
             .filter(|o| boxsel::matches(&o.geometry, vp, w, h, region, mode))
             .map(|o| o.id),
+        context,
     );
     if !additive {
         doc.selection.clear();
@@ -6497,6 +6525,7 @@ mod tests {
             glam::Vec2::new(400.0, 300.0),
             glam::Vec2::new(0.0, 0.0),
             false,
+            None,
         );
         assert_eq!(n, 1);
         assert_eq!(doc.selection, std::collections::BTreeSet::from([source]));
@@ -8350,18 +8379,18 @@ mod headless_tests {
         let vp = app.camera.view_proj(w / hh);
         let all = (glam::Vec2::new(0.0, 0.0), glam::Vec2::new(w, hh));
         // Window over the whole view takes both boxes.
-        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.0, all.1, false), 2);
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.0, all.1, false, None), 2);
         assert_eq!(app.session.doc.selection.len(), 2);
         // A tiny box at the centre: a window holds nothing, a crossing (drawn
         // right→left) touches whatever projects there.
         let c = glam::Vec2::new(w / 2.0, hh / 2.0);
         let d = glam::Vec2::new(2.0, 2.0);
-        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, false), 0);
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, false, None), 0);
         assert!(app.session.doc.selection.is_empty(), "a window replaces the selection");
         // The whole view drawn right→left is a crossing: still both.
-        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.1, all.0, false), 2);
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.1, all.0, false, None), 2);
         // Additive keeps what was there.
-        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, true), 0);
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, true, None), 0);
         assert_eq!(app.session.doc.selection.len(), 2);
         drop(guard);
         unsafe {
@@ -8424,21 +8453,21 @@ mod headless_tests {
             v(w, hh),
             v(0.0, hh),
         ];
-        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false), Some(2), "notch box left out");
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false, None), Some(2), "notch box left out");
         // The U's base wall runs under the middle box's bottom, so a crossing
         // that reaches into it would also take it: raise the base above it.
         let mid = (top + bot) / 2.0;
         let u_mid: Vec<_> = u.iter().map(|p| if p.y == bot { v(p.x, mid) } else { *p }).collect();
-        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid.clone(), false, false), Some(2), "window: middle cut");
-        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid, true, false), Some(3), "crossing: touched");
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid.clone(), false, false, None), Some(2), "window: middle cut");
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid, true, false, None), Some(3), "crossing: touched");
         // Additive: a loop round the middle box alone adds to an existing pick.
         let around_mid = vec![v(gap_l, top), v(gap_r, top), v(gap_r, bot), v(gap_l, bot)];
-        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false), Some(2));
-        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid.clone(), false, true), Some(1));
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false, None), Some(2));
+        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid.clone(), false, true, None), Some(1));
         assert_eq!(doc.selection.len(), 3, "additive keeps the rest");
-        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid, false, false), Some(1));
+        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid, false, false, None), Some(1));
         assert_eq!(doc.selection.len(), 1, "non-additive replaces");
-        assert_eq!(lasso_select_in(doc, vp, w, hh, vec![v(0.0, 0.0), v(w, hh)], false, false), None);
+        assert_eq!(lasso_select_in(doc, vp, w, hh, vec![v(0.0, 0.0), v(w, hh)], false, false, None), None);
         drop(guard);
         let xy = [0.0f32, 0.0, 800.0, 0.0, 800.0, 600.0];
         unsafe {

@@ -3617,6 +3617,20 @@ impl App {
                     self.run_viewport_edit(cmd);
                     continue;
                 }
+                // Generated blocks, lots and buildings can't be deleted (#199).
+                if matches!(key, egui::Key::Delete | egui::Key::Backspace) {
+                    let doc = &self.session.doc;
+                    if doc
+                        .selection
+                        .iter()
+                        .any(|id| !itsjustcad_commands::lot::hierarchy::deletable(doc, *id))
+                    {
+                        self.command_line.push_line(
+                            "generated blocks, lots and buildings can't be deleted".to_string(),
+                        );
+                        continue;
+                    }
+                }
             }
             let line = keymap::keymap(
                 *key,
@@ -4057,10 +4071,30 @@ impl App {
         Some((c, l))
     }
 
-    /// The parent objects outside of which the scene fades while drilled in.
+    /// The parent outside of which the scene fades while drilled in.
     fn edit_context(&self) -> Option<itsjustcad_doc::ObjectId> {
-        let (c, l) = self.selection_level()?;
-        self.drill.context_parent(&c, l)
+        self.drill.parent()
+    }
+
+    /// After an edit re-derived the plan (fresh ids, #199): keep the entered
+    /// level on the re-selected child, else go up to the top parent.
+    fn sync_drill(&mut self) {
+        let Some(parent) = self.drill.parent() else {
+            return;
+        };
+        if self.session.doc.get(parent).is_some() {
+            return;
+        }
+        if let Some((c, l)) = self.selection_level().filter(|(_, l)| *l > 0) {
+            self.drill.enter(&c, l);
+            return;
+        }
+        let root = self.drill.root();
+        self.drill.reset();
+        if let Some(root) = root.filter(|r| self.session.doc.get(*r).is_some()) {
+            self.session.doc.selection = std::collections::BTreeSet::from([root]);
+            self.session.doc.generation += 1;
+        }
     }
 
     /// Esc on a generated level: up ONE level (#199). Returns whether it
@@ -4143,6 +4177,9 @@ impl App {
         // Generated objects select at the drilled level (#199): the top parent
         // first, a street off the site's edge directly.
         let level = match &chain {
+            Some(c) if c.levels[0].kind != LevelKind::Object && additive => {
+                Some(self.drill.add_level(c))
+            }
             Some(c) if c.levels[0].kind != LevelKind::Object => Some(self.drill.click(c)),
             _ => {
                 if !additive {
@@ -4191,8 +4228,9 @@ impl App {
         mode: crate::boxsel::BoxMode,
         additive: bool,
     ) {
-        // Generated objects select as their top parent (#199).
-        let ids = itsjustcad_commands::lot::hierarchy::top_parents(
+        // Generated objects select as their top parent, or inside the
+        // entered parent at its level (#199).
+        let ids = itsjustcad_commands::lot::hierarchy::region_targets(
             &self.session.doc,
             self.session
                 .doc
@@ -4200,8 +4238,8 @@ impl App {
                 .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
                 .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
                 .map(|obj| obj.id),
+            self.drill.parent(),
         );
-        self.drill.reset();
         let doc = &mut self.session.doc;
         if !additive {
             doc.selection.clear();
@@ -4710,6 +4748,7 @@ impl App {
         if self.display_modes[self.effective_camera_index(self.active_pane)].forces_sketchy() {
             sketchy.enabled = true;
         }
+        self.sync_drill();
         let stale = self.uploaded_generation != Some(generation)
             || self.uploaded_theme != Some(theme)
             || self.uploaded_color_mode != Some(active_color_mode)

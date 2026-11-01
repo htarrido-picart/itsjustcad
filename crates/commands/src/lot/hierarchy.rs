@@ -521,11 +521,14 @@ pub fn whole_street(doc: &Document, id: ObjectId) -> BTreeSet<ObjectId> {
 
 /// The entered level of a hierarchical selection (Figma-style, #199): after
 /// a double-click drills in, plain clicks select at that depth inside the
-/// same top parent. A click on empty space, another parent, or Esc resets it.
+/// entered parent. A click on empty space, on an object outside the entered
+/// parent (drawn faded), or Esc at the top resets it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Drill {
     root: Option<ObjectId>,
     depth: usize,
+    /// The entered parent: the level above `depth` (its first object).
+    parent: Option<ObjectId>,
 }
 
 impl Drill {
@@ -539,23 +542,57 @@ impl Drill {
         self.depth > 0
     }
 
-    /// The level a plain click on `chain` selects.
+    /// The entered parent, whose subtree stays in full colour (the SketchUp
+    /// edit context) and bounds box and lasso selection. `None` at the top.
+    pub fn parent(&self) -> Option<ObjectId> {
+        self.parent.filter(|_| self.entered())
+    }
+
+    /// The top parent of the entered chain, when entered.
+    pub fn root(&self) -> Option<ObjectId> {
+        self.root.filter(|_| self.entered())
+    }
+
+    /// Whether `chain` lies inside the entered parent.
+    pub fn inside(&self, chain: &Chain) -> bool {
+        self.entered()
+            && self.root == Some(chain.root())
+            && self.parent.is_some_and(|p| {
+                chain
+                    .levels
+                    .get(self.depth - 1)
+                    .is_some_and(|l| l.ids.contains(&p))
+            })
+    }
+
+    /// The level a plain click on `chain` selects: the entered depth inside
+    /// the entered parent, else what a fresh first click selects.
     pub fn click_level(&self, chain: &Chain) -> usize {
-        if self.root == Some(chain.root()) && self.depth > 0 {
+        if self.inside(chain) {
             self.depth.min(chain.last()).max(chain.start)
         } else {
             chain.start
         }
     }
 
-    /// A plain click on `chain`: the level to select. A click in another
-    /// parent leaves the entered level.
+    /// A plain click on `chain`: the level to select. A click outside the
+    /// entered parent (a faded object) leaves the entered level.
     pub fn click(&mut self, chain: &Chain) -> usize {
         let l = self.click_level(chain);
-        if self.root != Some(chain.root()) {
+        if !self.inside(chain) {
             self.reset();
         }
         l
+    }
+
+    /// A Shift-click on `chain` (add or remove): the level it toggles, the
+    /// current depth in the same top parent; the drill is unchanged.
+    pub fn add_level(&self, chain: &Chain) -> usize {
+        if self.entered() && self.root == Some(chain.root()) {
+            self.depth.min(chain.last()).max(chain.start)
+        } else {
+            chain.start
+        }
     }
 
     /// A double-click on `chain`, with `selection` the current selection: one
@@ -566,8 +603,7 @@ impl Drill {
             .level_of(selection)
             .unwrap_or_else(|| self.click_level(chain));
         let next = (base + 1).min(chain.last());
-        self.root = Some(chain.root());
-        self.depth = next;
+        self.enter(chain, next);
         next
     }
 
@@ -580,32 +616,74 @@ impl Drill {
             return None;
         }
         let l = level - 1;
-        if l == 0 {
-            self.reset();
-        } else {
-            self.enter(chain, l);
-        }
+        self.enter(chain, l);
         Some(l)
     }
 
-    /// The parent whose subtree stays in full colour while drilled in (the
-    /// SketchUp edit context, #199): the level above `level` of `chain`, when
-    /// a level was entered. `None` shows everything normally.
-    pub fn context_parent(&self, chain: &Chain, level: usize) -> Option<ObjectId> {
-        (self.entered() && self.root == Some(chain.root()) && level >= 1 && level <= chain.last())
-            .then(|| chain.levels[level - 1].ids[0])
-    }
-
-    /// Enter `level` of `chain` directly (a breadcrumb click).
+    /// Enter `level` of `chain` directly (a breadcrumb click); level 0 resets.
     pub fn enter(&mut self, chain: &Chain, level: usize) {
+        let depth = level.min(chain.last());
+        if depth == 0 {
+            self.reset();
+            return;
+        }
         self.root = Some(chain.root());
-        self.depth = level.min(chain.last());
+        self.depth = depth;
+        self.parent = Some(chain.levels[depth - 1].ids[0]);
     }
 
     /// Back to the top level (a click on empty space).
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+}
+
+/// After an edit re-derived the plan (fresh ids): the level to go to when
+/// the edited object has no match. The nearest level above `level` of the
+/// pre-edit `chain` whose objects still `exist`, else the top (#199).
+pub fn fallback_level(chain: &Chain, level: usize, exist: impl Fn(&[ObjectId]) -> bool) -> usize {
+    (1..level.min(chain.levels.len()))
+        .rev()
+        .find(|l| exist(&chain.levels[*l].ids))
+        .unwrap_or(0)
+}
+
+/// The objects a box or lasso over `hits` selects (#199): their top parents
+/// at the top level; while drilled into `parent`, only objects inside it,
+/// at the level just below it.
+pub fn region_targets(
+    doc: &Document,
+    hits: impl IntoIterator<Item = ObjectId>,
+    parent: Option<ObjectId>,
+) -> BTreeSet<ObjectId> {
+    let Some(parent) = parent else {
+        return top_parents(doc, hits);
+    };
+    hits.into_iter()
+        .flat_map(|id| {
+            let c = chain_of(doc, id);
+            c.levels
+                .iter()
+                .position(|l| l.ids.contains(&parent))
+                .and_then(|i| c.levels.get(i + 1))
+                .map(|l| l.ids.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Whether deleting `id` is an edit the core supports (#199): a plain
+/// object, a generator's source (the whole site plan) or a generated road
+/// (`delete` removes the street and re-derives). Generated blocks, lots,
+/// buildings and other outputs are not deletable.
+pub fn deletable(doc: &Document, id: ObjectId) -> bool {
+    doc.subdiv_source_of(id).is_none() || doc.get(id).is_some_and(|o| o.street.is_some())
+}
+
+/// Whether the gumball may move `id` (#199): only hand-drawn objects and
+/// top-level parents, never generated children.
+pub fn gumball_allowed(doc: &Document, id: ObjectId) -> bool {
+    doc.subdiv_source_of(id).is_none()
 }
 
 #[cfg(test)]
@@ -693,7 +771,7 @@ mod tests {
         assert_eq!(d.click(&c), 3);
         // The edit context is the lot: it and its building stay in colour.
         let lot = c.levels[2].ids[0];
-        assert_eq!(d.context_parent(&c, 3), Some(lot));
+        assert_eq!(d.parent(), Some(lot));
         let members = context_members(doc, lot);
         assert!(members.contains(&lot) && c.levels[3].ids.iter().all(|i| members.contains(i)));
         assert!(!members.contains(&source(doc)) && !members.contains(&road(doc)));
@@ -707,7 +785,7 @@ mod tests {
         assert_eq!(d.up(&c, 2), Some(1));
         assert_eq!(d.up(&c, 1), Some(0));
         assert!(!d.entered(), "back at the top");
-        assert_eq!(d.context_parent(&c, 0), None, "no fade at the top");
+        assert_eq!(d.parent(), None, "no fade at the top");
         assert_eq!(d.up(&c, 0), None);
         assert_eq!(d.click(&c), 0);
     }
@@ -724,11 +802,81 @@ mod tests {
         assert_eq!(d.depth(), 1);
         d.double_click(&lots, &lots.levels[1].ids.iter().copied().collect());
         assert_eq!(d.depth(), 2, "entered lot level");
-        assert_eq!(d.click(&street), 1, "a street clamps to its depth");
-        assert_eq!(d.click(&lots), 2, "and lots stay at lot level");
-        d.reset();
+        assert_eq!(d.click(&lots), 2, "a lot of the entered block: lot level");
+        // A lot of the other block is faded: a tap there starts fresh.
+        let block = lots.levels[1].ids[0];
+        let other = doc
+            .objects()
+            .filter(|o| o.layer == LOTS_LAYER)
+            .map(|o| chain_of(doc, o.id))
+            .find(|c| c.levels[1].ids[0] != block)
+            .unwrap();
+        assert!(!d.inside(&other));
+        assert_eq!(
+            d.add_level(&other),
+            2,
+            "Shift-click still adds at lot level"
+        );
+        assert_eq!(
+            d.click(&other),
+            0,
+            "outside the entered block: its site plan"
+        );
+        assert!(!d.entered());
+        d.double_click(&lots, &BTreeSet::from([source(doc)]));
+        assert_eq!(d.click(&street), 1, "inside the site: street level");
+        assert!(d.entered());
+        d.double_click(&lots, &BTreeSet::from([block]));
+        assert_eq!(d.click(&street), 1, "the street is outside the block");
+        assert!(!d.entered());
         assert_eq!(d.click(&lots), 0);
         assert_eq!(d.up(&lots, 0), None);
+    }
+
+    #[test]
+    fn box_inside_the_entered_parent_delete_and_gumball_rules() {
+        let s = site_plan();
+        let doc = &s.doc;
+        let all: Vec<ObjectId> = doc.objects().map(|o| o.id).collect();
+        assert_eq!(
+            region_targets(doc, all.clone(), None),
+            BTreeSet::from([source(doc)])
+        );
+        let lot = doc.objects().find(|o| o.layer == LOTS_LAYER).unwrap().id;
+        let c = chain_of(doc, lot);
+        let block = c.levels[1].ids[0];
+        let lots = region_targets(doc, all.clone(), Some(block));
+        assert_eq!(lots.len(), 2, "the block's two lots, not the other block's");
+        assert!(
+            lots.iter()
+                .all(|l| doc.get(*l).unwrap().layer == LOTS_LAYER)
+        );
+        let at_site = region_targets(doc, all, Some(source(doc)));
+        assert!(
+            at_site.contains(&block) && at_site.contains(&road(doc)),
+            "blocks and streets"
+        );
+
+        assert!(deletable(doc, source(doc)) && deletable(doc, road(doc)));
+        assert!(!deletable(doc, lot) && !deletable(doc, block));
+        assert!(gumball_allowed(doc, source(doc)));
+        assert!(!gumball_allowed(doc, road(doc)) && !gumball_allowed(doc, lot));
+
+        // After a re-derive: the nearest surviving level above, else the top.
+        let b = chain_of(
+            doc,
+            doc.objects()
+                .find(|o| o.layer == BUILDINGS_LAYER)
+                .unwrap()
+                .id,
+        );
+        assert_eq!(fallback_level(&b, 3, |_| true), 2, "the lot");
+        assert_eq!(
+            fallback_level(&b, 3, |ids| ids == b.levels[1].ids.as_slice()),
+            1
+        );
+        assert_eq!(fallback_level(&b, 3, |_| false), 0);
+        assert_eq!(fallback_level(&b, 1, |_| true), 0);
     }
 
     #[test]
