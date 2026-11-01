@@ -1769,7 +1769,9 @@ fn lasso_select_in(
 }
 
 /// Select the visible objects whose projection matches `region` under `mode`,
-/// replacing the selection unless `additive`. Returns the match count.
+/// replacing the selection unless `additive`. Anything a parametric generator
+/// produced selects as its top parent (the site plan, #199). Returns how many
+/// objects that selects.
 fn region_select_in<R: boxsel::Region>(
     doc: &mut itsjustcad_doc::Document,
     vp: glam::Mat4,
@@ -1779,12 +1781,14 @@ fn region_select_in<R: boxsel::Region>(
     mode: boxsel::BoxMode,
     additive: bool,
 ) -> usize {
-    let ids: Vec<_> = doc
-        .objects()
-        .filter(|o| o.visible && doc.layer_visible(&o.layer))
-        .filter(|o| boxsel::matches(&o.geometry, vp, w, h, region, mode))
-        .map(|o| o.id)
-        .collect();
+    // Generated objects select as their top parent (#199).
+    let ids = itsjustcad_commands::lot::hierarchy::top_parents(
+        doc,
+        doc.objects()
+            .filter(|o| o.visible && doc.layer_visible(&o.layer))
+            .filter(|o| boxsel::matches(&o.geometry, vp, w, h, region, mode))
+            .map(|o| o.id),
+    );
     if !additive {
         doc.selection.clear();
     }
@@ -1880,6 +1884,103 @@ pub unsafe extern "C" fn ijc_pick_json(
             .to_string(),
         )
     })
+}
+
+/// The parent → child chain of the object under a tap (#199), without
+/// changing the selection: the hosts choose the level (a tap selects
+/// `levels[start]`, each double-tap one level deeper) and select its `ids`
+/// with [`selection::ijc_select_ids`]. Same pick as [`ijc_pick`], resolved to
+/// the deepest generated child on that spot. Returns
+/// `{"hit":true,"start":n,"levels":[{"kind","id","ids":[…],"label"}]}`,
+/// top parent first, or `{"hit":false}` on a miss or a headless handle.
+/// `kind` is `site`, `street`, `block`, `lot`, `building`, `part` (another
+/// generated output) or `object` (a plain object: a one-level chain). `start`
+/// is 1 for a street off the site's edge (a tap picks it directly), else 0.
+/// `id` is the level's short id, `ids` full uuids. Caller must
+/// [`ijc_string_free`] the result; null only on a panic.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer
+/// must be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_pick_chain_json(
+    h: *mut AppHandle,
+    x_px: f32,
+    y_px: f32,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let miss = || into_c_string(String::from(r#"{"hit":false}"#));
+        let Some(app) = (unsafe { handle_mut(h) }) else {
+            return miss();
+        };
+        let Some((w, h)) = drawable_size(&app) else {
+            return miss();
+        };
+        let vp = app.camera.view_proj(w / h);
+        let Some((origin, dir)) = screen_ray(vp, w, h, x_px, y_px) else {
+            return miss();
+        };
+        let (size, pos) = (glam::Vec2::new(w, h), glam::Vec2::new(x_px, y_px));
+        match itsjustcad_commands::lot::hierarchy::pick_chain(
+            &app.session.doc,
+            vp,
+            size,
+            pos,
+            origin,
+            dir,
+        ) {
+            Some(chain) => into_c_string(chain_json(&chain).to_string()),
+            None => miss(),
+        }
+    })
+}
+
+/// The hierarchy chain of the current selection (#199), for the inspector's
+/// breadcrumb: the chain of the first selected object, as
+/// [`ijc_pick_chain_json`] returns it, plus `"level"`: the index of the level
+/// the selection is exactly (`null` when it is none of them, e.g. a mixed
+/// selection). `{"hit":false}` with nothing selected or on a null handle.
+/// Caller must [`ijc_string_free`] the result; null only on a panic.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer
+/// must be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_selection_chain_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_mut(h) }) else {
+            return into_c_string(String::from(r#"{"hit":false}"#));
+        };
+        into_c_string(selection_chain_json(&app.session.doc).to_string())
+    })
+}
+
+/// [`ijc_selection_chain_json`] on a document.
+fn selection_chain_json(doc: &itsjustcad_doc::Document) -> serde_json::Value {
+    let Some(first) = doc.selection.first() else {
+        return serde_json::json!({"hit": false});
+    };
+    let chain = itsjustcad_commands::lot::hierarchy::chain_of(doc, *first);
+    let mut v = chain_json(&chain);
+    v["level"] = serde_json::json!(chain.level_of(&doc.selection));
+    v
+}
+
+/// The JSON [`ijc_pick_chain_json`] returns for a hit.
+fn chain_json(chain: &itsjustcad_commands::lot::hierarchy::Chain) -> serde_json::Value {
+    let levels: Vec<_> = chain
+        .levels
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "kind": l.kind.token(),
+                "id": l.ids[0].to_string(),
+                "ids": l.ids.iter().map(|i| i.0.to_string()).collect::<Vec<_>>(),
+                "label": l.label,
+            })
+        })
+        .collect();
+    serde_json::json!({"hit": true, "start": chain.start, "levels": levels})
 }
 
 /// World-space AABB over the current selection, for placing the gumball overlay.
@@ -6182,6 +6283,62 @@ mod tests {
             assert!(fixed.contains(&format!("id:{short}")), "{fixed}");
             assert!(check_line(&fixed).is_ok(), "{fixed} must validate");
         }
+    }
+
+    #[test]
+    fn pick_chain_json_lists_levels_and_box_select_picks_the_site() {
+        use itsjustcad_commands::lot::hierarchy::chain_of;
+        let mut session = Session::default();
+        for line in ["rect 0,0,0 200 150", "siteplan last"] {
+            session.run(parse(line).unwrap()).unwrap();
+        }
+        let doc = &mut session.doc;
+        let mass = doc
+            .objects()
+            .find(|o| {
+                o.name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with("building:mass"))
+            })
+            .unwrap()
+            .id;
+        let v = chain_json(&chain_of(doc, mass));
+        assert_eq!(v["hit"], true);
+        assert_eq!(v["start"], 0);
+        let kinds: Vec<_> = v["levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["kind"].clone())
+            .collect();
+        assert_eq!(kinds, ["site", "block", "lot", "building"]);
+        assert_eq!(v["levels"][3]["ids"].as_array().unwrap().len(), 2);
+        assert!(object_by_id(doc, v["levels"][0]["ids"][0].as_str().unwrap()).is_some());
+
+        doc.selection = [mass].into();
+        assert_eq!(selection_chain_json(doc)["level"], serde_json::Value::Null, "half a building");
+        doc.selection = v["levels"][2]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| object_by_id(doc, i.as_str().unwrap()))
+            .collect();
+        assert_eq!(selection_chain_json(doc)["level"], 2, "the lot");
+
+        // A crossing box over everything selects the site boundary only.
+        let source = *doc.subdivision_links.keys().next().unwrap();
+        let vp = glam::Mat4::orthographic_rh(-1.0, 201.0, -1.0, 151.0, -10.0, 10.0);
+        let n = box_select_in(
+            doc,
+            vp,
+            404.0,
+            304.0,
+            glam::Vec2::new(400.0, 300.0),
+            glam::Vec2::new(0.0, 0.0),
+            false,
+        );
+        assert_eq!(n, 1);
+        assert_eq!(doc.selection, std::collections::BTreeSet::from([source]));
     }
 
     #[test]

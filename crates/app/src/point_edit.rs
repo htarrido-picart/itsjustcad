@@ -319,9 +319,11 @@ impl PointEdit {
             out.consumed = pressed.is_some();
         }
 
-        // Double-click a polyline segment (not a handle): insert a vertex.
+        // Alt-double-click a polyline segment (not a handle): insert a vertex.
+        // A plain double-click drills into a parametric object (#199).
         if out.command.is_none()
             && response.double_clicked()
+            && response.ctx.input(|i| i.modifiers.alt)
             && let Some(pos) = response.interact_pointer_pos()
             && nearest_handle(&screen, pos, HIT_PX).is_none()
             && matches!(

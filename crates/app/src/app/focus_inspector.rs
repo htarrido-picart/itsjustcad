@@ -10,6 +10,7 @@
 //! re-selects the edited lot(s) / street, whose ids the re-derive replaced.
 
 use egui::RichText;
+use itsjustcad_commands::lot::hierarchy::{Chain, chain_of};
 use itsjustcad_commands::lot::{self, Focus, LotRules, LotView, StreetView};
 use itsjustcad_commands::{Command, LotEdit, LotField, Selector};
 use itsjustcad_doc::{ObjectId, StreetClass};
@@ -188,6 +189,14 @@ fn class_label(class: StreetClass) -> &'static str {
     }
 }
 
+/// The selection's hierarchy chain and its level (#199), when the selection
+/// is exactly one generated level below the top parent.
+pub(super) fn selected_chain(doc: &itsjustcad_doc::Document) -> Option<(Chain, usize)> {
+    let c = chain_of(doc, *doc.selection.first()?);
+    let l = c.level_of(&doc.selection)?;
+    (l > 0).then_some((c, l))
+}
+
 /// The breadcrumb title of a lot / street focus.
 fn crumb_title(doc: &itsjustcad_doc::Document, focus: &Focus) -> String {
     match focus {
@@ -259,6 +268,9 @@ impl App {
                         }
                     });
                 }
+                if !back {
+                    self.level_breadcrumb(ui);
+                }
                 self.subdivision_inspector(ui, source);
             }
             Inspector::Lots { source, lots } => self.lot_inspector(ui, focus, source, &lots),
@@ -268,16 +280,64 @@ impl App {
         }
     }
 
+    /// The breadcrumb of a lot / street focus: the selection's chain (#199),
+    /// "Site plan › Block #1 › Lot #2". "Site plan" opens the subdivision
+    /// inspector; a middle crumb selects that level.
     fn focus_breadcrumb(&mut self, ui: &mut egui::Ui, focus: &Focus) {
         let title = crumb_title(&self.session.doc, focus);
-        ui.horizontal(|ui| {
+        let chain = selected_chain(&self.session.doc);
+        let mut pick = None;
+        ui.horizontal_wrapped(|ui| {
             if ui.link(t("focus.site_plan")).clicked() {
                 self.focus_site_override = Some(focus.clone());
+            }
+            if let Some((c, l)) = &chain {
+                for (i, lv) in c.levels.iter().enumerate().take(*l).skip(1) {
+                    ui.weak("›");
+                    if ui.link(&lv.label).clicked() {
+                        pick = Some((c.clone(), i));
+                    }
+                }
             }
             ui.weak("›");
             ui.strong(title);
         });
+        self.pick_crumb(pick);
         ui.add_space(4.0);
+    }
+
+    /// The breadcrumb over the subdivision inspector when a generated level
+    /// below the site is selected (a block): every crumb but the last selects.
+    fn level_breadcrumb(&mut self, ui: &mut egui::Ui) {
+        let Some((c, l)) = selected_chain(&self.session.doc) else {
+            return;
+        };
+        let mut pick = None;
+        ui.horizontal_wrapped(|ui| {
+            for (i, lv) in c.levels.iter().enumerate().take(l) {
+                if i > 0 {
+                    ui.weak("›");
+                }
+                if ui.link(&lv.label).clicked() {
+                    pick = Some((c.clone(), i));
+                }
+            }
+            ui.weak("›");
+            ui.strong(&c.levels[l].label);
+        });
+        self.pick_crumb(pick);
+        ui.add_space(4.0);
+    }
+
+    /// Select level `i` of a chain from a breadcrumb click, entering it.
+    fn pick_crumb(&mut self, pick: Option<(Chain, usize)>) {
+        if let Some((c, i)) = pick {
+            self.drill.enter(&c, i);
+            self.focus_site_override = None;
+            let doc = &mut self.session.doc;
+            doc.selection = c.levels[i].ids.iter().copied().collect();
+            doc.generation += 1;
+        }
     }
 
     /// Run one inspector edit, then re-select what was focused (the
@@ -754,6 +814,31 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn breadcrumb_chain_follows_the_selected_level() {
+        let mut s = itsjustcad_commands::Session::default();
+        for line in ["rect 0,0,0 200 150", "siteplan last"] {
+            s.run(itsjustcad_commands::parse(line).unwrap()).unwrap();
+        }
+        let doc = &mut s.doc;
+        let lot = doc
+            .objects()
+            .find(|o| o.layer == lot::LOTS_LAYER)
+            .unwrap()
+            .id;
+        doc.selection = [lot].into();
+        let (c, l) = selected_chain(doc).unwrap();
+        assert_eq!(l, 2);
+        let labels: Vec<_> = c.levels.iter().map(|v| v.label.as_str()).collect();
+        assert_eq!(labels[0], "Site plan");
+        assert!(labels[1].starts_with("Block"), "{labels:?}");
+        doc.selection = [c.root()].into();
+        assert!(
+            selected_chain(doc).is_none(),
+            "the top parent has no crumbs"
+        );
+    }
 
     fn view(area: f64, floors: Option<usize>, gfa: Option<f64>) -> LotView {
         LotView {
