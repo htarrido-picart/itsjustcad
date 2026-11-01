@@ -77,7 +77,7 @@ struct FatOut {
 // over the face it lies on. Relative, so it hides lines as well at 300 m as at
 // 3 m; a fixed clip-space offset grows with distance squared under
 // perspective and let far lines show through whole buildings (#174).
-const STROKE_PULL: f32 = 5e-4;
+const STROKE_PULL: f32 = 2e-3;
 
 // Pull a world point toward the eye along its view ray: same pixel, nearer
 // depth. Orthographic views (clip w = 1 at the eye, not 0) get a small fixed
