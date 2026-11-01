@@ -1291,6 +1291,73 @@ pub unsafe extern "C" fn ijc_run_command_result(
     })
 }
 
+/// Like [`ijc_run_command_result`], for a point edit of a curve that may be a
+/// subdivision's boundary (`setpoint`, `insertpoint`, `deletepoint` on a
+/// selected site plan's boundary, #199): when the line changes the boundary
+/// of a non-frozen subdivision, the plan re-derives (`lotrefresh`) chained to
+/// the edit, so both are ONE undo step, as the desktop's auto-recompute does.
+/// A re-derive that fails rolls the edit back and reports `ok:false` with the
+/// reason. Same JSON as [`ijc_run_command_result`]. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `line` must be null or
+/// a valid NUL-terminated C string. The returned pointer must be freed exactly
+/// once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_run_boundary_edit(
+    h: *mut AppHandle,
+    line: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        if line.is_null() {
+            return fail("line is null");
+        }
+        let Ok(s) = (unsafe { CStr::from_ptr(line) }).to_str() else {
+            return fail("line is not valid UTF-8");
+        };
+        let Ok(PendingOp::Cmd(cmd)) = check_line(s) else {
+            return fail("not an edit");
+        };
+        apply_pending(app);
+        into_c_string(boundary_edit(&mut app.session, cmd))
+    })
+}
+
+/// [`ijc_run_boundary_edit`] on a session: run `cmd`, then re-derive every
+/// non-frozen subdivision whose boundary it changed, chained to it.
+fn boundary_edit(session: &mut Session, cmd: Command) -> String {
+    let boundaries: Vec<_> = session
+        .doc
+        .subdivision_links
+        .iter()
+        .filter(|(_, l)| !l.frozen)
+        .filter_map(|(src, _)| Some((*src, session.doc.get(*src)?.geometry.clone())))
+        .collect();
+    let out = match session.run(cmd) {
+        Ok(out) => out,
+        Err(e) => return run_result_json(false, None, Some(&e.to_string()), &[]),
+    };
+    for (source, before) in boundaries {
+        if session
+            .doc
+            .get(source)
+            .is_some_and(|o| o.geometry != before)
+            && let Err(e) = session.run_chained(Command::LotRefresh { source, ids: None })
+        {
+            let _ = session.run(Command::Undo);
+            let msg = format!("the site plan can't follow that boundary: {e}");
+            return run_result_json(false, None, Some(&msg), &[]);
+        }
+    }
+    run_result_json(true, Some(&out.message), None, &out.created)
+}
+
 /// Import a CAD file the host copied into the granted workdir
 /// ([`ijc_set_workdir`]), by bare file name. Host-typed `import` stays behind
 /// the side-effect gate ([`ijc_run_command`]); this is the host's one import
@@ -6339,6 +6406,28 @@ mod tests {
         );
         assert_eq!(n, 1);
         assert_eq!(doc.selection, std::collections::BTreeSet::from([source]));
+    }
+
+    #[test]
+    fn boundary_edit_rederives_the_plan_in_one_undo_step() {
+        let mut session = Session::default();
+        for line in ["rect 0,0,0 200 150", "siteplan last"] {
+            session.run(parse(line).unwrap()).unwrap();
+        }
+        let source = *session.doc.subdivision_links.keys().next().unwrap();
+        let produced = session.doc.subdiv_link(source).unwrap().produced.clone();
+        let line = format!("setpoint id:{source} 2 260,150,0");
+        let v: serde_json::Value =
+            serde_json::from_str(&boundary_edit(&mut session, parse(&line).unwrap())).unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        let after = session.doc.subdiv_link(source).unwrap().produced.clone();
+        assert_ne!(after, produced, "the plan re-derived");
+        session.run(Command::Undo).unwrap();
+        assert_eq!(
+            session.doc.subdiv_link(source).unwrap().produced,
+            produced,
+            "one undo restores boundary and plan"
+        );
     }
 
     #[test]
