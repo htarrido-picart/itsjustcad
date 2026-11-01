@@ -1,0 +1,250 @@
+# Large site plan used as the profiling workload (wayfinder ticket #255).
+# ~2400 x 4050 m district: terrain, 12 sub-districts of streets/blocks/lots with
+# mixed typologies (row, detached, courtyard, slab), street-tree rows, Miyawaki patches.
+# Run from the repo root:
+#   ItsJustCAD --run examples/scripts/perf-site.script --headless --out /tmp/perf-site.itsjustcad.json
+#
+# Each sub-district works on its own layer. The lot verbs act on every unlocked closed
+# curve, so the boundary, blocks and setbacks layers are locked before the next verb
+# runs, and the finished lots/blocks/buildings layers are renamed and locked so the next
+# sub-district starts clean. Lots are not draped on the terrain (no verb for that),
+# so terrain above z=0 shows through between buildings.
+#
+# Builds in about 130 s on an M-series Mac (release). Most of that is planting:
+# every plant scans the whole document to find the terrain (see #256).
+units m
+location 3.45 -76.53 -5
+terrain examples/scripts/perf-site-terrain.csv
+
+# d1: row
+layer d1
+rect 0,0,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=70 seed=1
+layerlock d1 on
+lotsubdivide all grid area=300 width=10 seed=1
+layerlock blocks on
+lotsetbacks all front=3 side=0 rear=4
+layerlock setbacks on
+lotbuilding all typology=row floors=3 roof=gable pitch=30
+layerrename lots lots-d1
+layerlock lots-d1 on
+layerrename blocks blocks-d1
+layerrename setbacks setbacks-d1
+layerrename buildings buildings-d1
+layerlock buildings-d1 on
+
+# d2: detached
+layer d2
+rect 810,0,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=70 seed=2
+layerlock d2 on
+lotsubdivide all grid area=600 width=18 seed=2
+layerlock blocks on
+lotsetbacks all front=5 side=2 rear=5
+layerlock setbacks on
+lotbuilding all typology=detached floors=2 roof=hip pitch=25
+layerrename lots lots-d2
+layerlock lots-d2 on
+layerrename blocks blocks-d2
+layerrename setbacks setbacks-d2
+layerrename buildings buildings-d2
+layerlock buildings-d2 on
+
+# d3: row
+layer d3
+rect 1620,0,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=70 seed=3
+layerlock d3 on
+lotsubdivide all grid area=300 width=10 seed=3
+layerlock blocks on
+lotsetbacks all front=3 side=0 rear=4
+layerlock setbacks on
+lotbuilding all typology=row floors=3 roof=gable pitch=30
+layerrename lots lots-d3
+layerlock lots-d3 on
+layerrename blocks blocks-d3
+layerrename setbacks setbacks-d3
+layerrename buildings buildings-d3
+layerlock buildings-d3 on
+
+# d4: courtyard
+layer d4
+rect 0,1020,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=90 seed=4
+layerlock d4 on
+lotsubdivide all grid area=1600 width=36 seed=4
+layerlock blocks on
+lotsetbacks all front=3 side=0 rear=3
+layerlock setbacks on
+lotbuilding all typology=courtyard floors=4 roof=flat
+layerrename lots lots-d4
+layerlock lots-d4 on
+layerrename blocks blocks-d4
+layerrename setbacks setbacks-d4
+layerrename buildings buildings-d4
+layerlock buildings-d4 on
+
+# d5: slab
+layer d5
+rect 810,1020,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=90 seed=5
+layerlock d5 on
+lotsubdivide all grid area=2500 width=45 seed=5
+layerlock blocks on
+lotsetbacks all front=6 side=4 rear=6
+layerlock setbacks on
+lotbuilding all typology=slab floors=8 roof=flat
+layerrename lots lots-d5
+layerlock lots-d5 on
+layerrename blocks blocks-d5
+layerrename setbacks setbacks-d5
+layerrename buildings buildings-d5
+layerlock buildings-d5 on
+
+# d6: courtyard
+layer d6
+rect 1620,1020,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=90 seed=6
+layerlock d6 on
+lotsubdivide all grid area=1600 width=36 seed=6
+layerlock blocks on
+lotsetbacks all front=3 side=0 rear=3
+layerlock setbacks on
+lotbuilding all typology=courtyard floors=4 roof=flat
+layerrename lots lots-d6
+layerlock lots-d6 on
+layerrename blocks blocks-d6
+layerrename setbacks setbacks-d6
+layerrename buildings buildings-d6
+layerlock buildings-d6 on
+
+# d7: detached
+layer d7
+rect 0,2040,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=70 seed=7
+layerlock d7 on
+lotsubdivide all grid area=600 width=18 seed=7
+layerlock blocks on
+lotsetbacks all front=5 side=2 rear=5
+layerlock setbacks on
+lotbuilding all typology=detached floors=2 roof=hip pitch=25
+layerrename lots lots-d7
+layerlock lots-d7 on
+layerrename blocks blocks-d7
+layerrename setbacks setbacks-d7
+layerrename buildings buildings-d7
+layerlock buildings-d7 on
+
+# d8: row
+layer d8
+rect 810,2040,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=70 seed=8
+layerlock d8 on
+lotsubdivide all grid area=300 width=10 seed=8
+layerlock blocks on
+lotsetbacks all front=3 side=0 rear=4
+layerlock setbacks on
+lotbuilding all typology=row floors=3 roof=gable pitch=30
+layerrename lots lots-d8
+layerlock lots-d8 on
+layerrename blocks blocks-d8
+layerrename setbacks setbacks-d8
+layerrename buildings buildings-d8
+layerlock buildings-d8 on
+
+# d9: detached
+layer d9
+rect 1620,2040,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=70 seed=9
+layerlock d9 on
+lotsubdivide all grid area=600 width=18 seed=9
+layerlock blocks on
+lotsetbacks all front=5 side=2 rear=5
+layerlock setbacks on
+lotbuilding all typology=detached floors=2 roof=hip pitch=25
+layerrename lots lots-d9
+layerlock lots-d9 on
+layerrename blocks blocks-d9
+layerrename setbacks setbacks-d9
+layerrename buildings buildings-d9
+layerlock buildings-d9 on
+
+# d10: slab
+layer d10
+rect 0,3060,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=90 seed=10
+layerlock d10 on
+lotsubdivide all grid area=2500 width=45 seed=10
+layerlock blocks on
+lotsetbacks all front=6 side=4 rear=6
+layerlock setbacks on
+lotbuilding all typology=slab floors=8 roof=flat
+layerrename lots lots-d10
+layerlock lots-d10 on
+layerrename blocks blocks-d10
+layerrename setbacks setbacks-d10
+layerrename buildings buildings-d10
+layerlock buildings-d10 on
+
+# d11: courtyard
+layer d11
+rect 810,3060,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=90 seed=11
+layerlock d11 on
+lotsubdivide all grid area=1600 width=36 seed=11
+layerlock blocks on
+lotsetbacks all front=3 side=0 rear=3
+layerlock setbacks on
+lotbuilding all typology=courtyard floors=4 roof=flat
+layerrename lots lots-d11
+layerlock lots-d11 on
+layerrename blocks blocks-d11
+layerrename setbacks setbacks-d11
+layerrename buildings buildings-d11
+layerlock buildings-d11 on
+
+# d12: row
+layer d12
+rect 1620,3060,0 780 990
+lotgeneratesite last orthogonal roadwidth=14 blockdepth=70 seed=12
+layerlock d12 on
+lotsubdivide all grid area=300 width=10 seed=12
+layerlock blocks on
+lotsetbacks all front=3 side=0 rear=4
+layerlock setbacks on
+lotbuilding all typology=row floors=3 roof=gable pitch=30
+layerrename lots lots-d12
+layerlock lots-d12 on
+layerrename blocks blocks-d12
+layerrename setbacks setbacks-d12
+layerrename buildings buildings-d12
+layerlock buildings-d12 on
+
+# Street trees along the arterials and the perimeter.
+layer green
+plantrow samanea-saman 795,0 795,4050 15
+plantrow samanea-saman 1605,0 1605,4050 15
+plantrow samanea-saman 0,1005 2400,1005 15
+plantrow samanea-saman 0,2025 2400,2025 15
+plantrow samanea-saman 0,3045 2400,3045 15
+plantrow roystonea-regia -10,0 -10,4050 12
+plantrow roystonea-regia 2410,0 2410,4050 12
+plantrow roystonea-regia 0,-10 2400,-10 12
+plantrow roystonea-regia 0,4060 2400,4060 12
+
+# Miyawaki pocket forests at the arterial crossings. Keep them small: each sapling
+# costs a full document scan, so a patch costs saplings x objects (see #255/#256).
+rect 789,999,0 12 12
+miyawaki last 3
+rect 789,2019,0 12 12
+miyawaki last 3
+rect 789,3039,0 12 12
+miyawaki last 3
+rect 1599,999,0 12 12
+miyawaki last 3
+rect 1599,2019,0 12 12
+miyawaki last 3
+rect 1599,3039,0 12 12
+miyawaki last 3
+top
+ze
