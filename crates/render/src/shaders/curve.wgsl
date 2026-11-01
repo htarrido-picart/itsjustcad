@@ -64,12 +64,33 @@ fn ink() -> vec4<f32> {
 // Fat strokes (itsjustcad-ios#174): wgpu draws lines as 1-device-px hairlines,
 // so the hidden-line and sketchy modes expand each segment into a screen-space
 // quad (one instance per segment, 6 vertices) of width camera.screen.z, with
-// square caps and a 1 px anti-aliased edge.
+// round caps (so polyline joins close up) and a 1 px anti-aliased edge.
 struct FatOut {
     @builtin(position) pos: vec4<f32>,
-    // Signed device px from the centre line, for the AA ramp.
-    @location(0) across: f32,
+    // Device px across the centre line and along the segment (0 at the start),
+    // and the segment's screen length, for the round caps and AA ramp.
+    @location(0) @interpolate(linear) local: vec2<f32>,
+    @location(1) @interpolate(flat) len_px: f32,
 };
+
+// Fraction of the eye distance a stroke is pulled toward the camera so it wins
+// over the face it lies on. Relative, so it hides lines as well at 300 m as at
+// 3 m; a fixed clip-space offset grows with distance squared under
+// perspective and let far lines show through whole buildings (#174).
+const STROKE_PULL: f32 = 5e-4;
+
+// Pull a world point toward the eye along its view ray: same pixel, nearer
+// depth. Orthographic views (clip w = 1 at the eye, not 0) get a small fixed
+// depth offset instead, since their depth is linear.
+fn pulled_clip(p: vec3<f32>) -> vec4<f32> {
+    let eye_clip = camera.view_proj * vec4(camera.eye.xyz, 1.0);
+    if (abs(eye_clip.w) < 0.5) {
+        return camera.view_proj * vec4(mix(p, camera.eye.xyz, STROKE_PULL), 1.0);
+    }
+    var c = camera.view_proj * vec4(p, 1.0);
+    c.z -= 5e-7 * c.w;
+    return c;
+}
 
 @vertex
 fn vs_fat(
@@ -78,13 +99,14 @@ fn vs_fat(
     @location(1) b: vec3<f32>,
 ) -> FatOut {
     var out: FatOut;
-    var ca = camera.view_proj * vec4(a, 1.0);
-    var cb = camera.view_proj * vec4(b, 1.0);
+    var ca = pulled_clip(a);
+    var cb = pulled_clip(b);
     // Clip to just in front of the eye so a segment crossing it does not flip.
     let near = 1e-4;
     if (ca.w < near && cb.w < near) {
         out.pos = vec4(2.0, 2.0, 2.0, 1.0); // fully clipped
-        out.across = 0.0;
+        out.local = vec2(0.0);
+        out.len_px = 0.0;
         return out;
     }
     if (ca.w < near) {
@@ -116,17 +138,21 @@ fn vs_fat(
     }
     let off = nrm * c.y * half_w + dir * along * half_w;
     clip = vec4(clip.xy + off / half_size * clip.w, clip.z, clip.w);
-    // Same idea as vs_axis: pull the stroke a little toward the camera so it
-    // wins over the face it lies on instead of stippling.
-    clip.z -= 3e-6 * clip.w;
     out.pos = clip;
-    out.across = c.y * half_w;
+    out.local = vec2(c.y * half_w, c.x * len + along * half_w);
+    out.len_px = len;
     return out;
 }
 
 @fragment
 fn fs_fat(in: FatOut) -> @location(0) vec4<f32> {
     let c = ink();
-    let cover = clamp(camera.screen.z * 0.5 + 0.5 - abs(in.across), 0.0, 1.0);
+    // Distance to the segment (not just across it): round caps.
+    let past = max(-in.local.y, in.local.y - in.len_px);
+    let dist = length(vec2(in.local.x, max(past, 0.0)));
+    let cover = clamp(camera.screen.z * 0.5 + 0.5 - dist, 0.0, 1.0);
+    if (cover <= 0.0) {
+        discard; // keep the cap corners out of the depth buffer
+    }
     return vec4(c.rgb, c.a * cover);
 }

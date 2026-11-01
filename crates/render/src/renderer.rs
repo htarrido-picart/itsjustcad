@@ -190,12 +190,13 @@ impl DisplayMode {
     }
 
     /// Edge and curve stroke width in logical points (itsjustcad-ios#174), or
-    /// `0.0` for the default 1-device-px hairline. The hidden-line modes read
-    /// as a drawing, so they get a little weight; Sketchy gets a pencil stroke.
+    /// `0.0` for the default 1-device-px hairline (1/3 pt at 3x). The
+    /// hidden-line modes read as a drawing, so they get a little weight;
+    /// Sketchy gets a pencil stroke, kept light enough for dense site plans.
     pub fn line_pt(self) -> f32 {
         match self {
-            DisplayMode::HiddenLine | DisplayMode::Pencil => 1.25,
-            DisplayMode::Sketchy => 2.25,
+            DisplayMode::HiddenLine | DisplayMode::Pencil => 1.0,
+            DisplayMode::Sketchy => 1.5,
             _ => 0.0,
         }
     }
@@ -520,7 +521,8 @@ mod tests {
         );
         // Widths: hairline elsewhere, Hidden Line < Sketchy, scaled by dpr.
         assert_eq!(DisplayMode::Shaded.line_px(3.0), 0.0);
-        assert!(hl.line_pt() > 1.0 && sk.line_pt() > hl.line_pt());
+        // Hairline = 1 device px; Hidden Line beats it on any retina screen.
+        assert!(hl.line_px(2.0) > 1.0 && sk.line_pt() > hl.line_pt());
         assert_eq!(hl.line_px(2.0), hl.line_pt() * 2.0);
         assert_eq!(sk.line_px(3.0), sk.line_pt() * 3.0);
         assert_eq!(sk.line_px(0.0), sk.line_pt());
