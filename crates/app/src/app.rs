@@ -6,6 +6,7 @@ mod cut_export;
 mod optimize_panel;
 
 use itsjustcad_commands::Session;
+use itsjustcad_commands::lot::hierarchy::LevelKind;
 use itsjustcad_render::{
     ColorMode, DisplayMode, OrbitCamera, SceneRenderer, StandardView, UnderlayData,
     ViewportCallback, ViewportLayout,
@@ -887,6 +888,9 @@ pub struct App {
     /// The lot/street focus whose "Site plan ›" breadcrumb was clicked: while
     /// the focus is unchanged the subdivision inspector shows instead (#159).
     focus_site_override: Option<itsjustcad_commands::lot::Focus>,
+    /// The entered level of a hierarchical selection (#199): a double-click
+    /// drills into a site plan, and later clicks pick at that depth.
+    drill: itsjustcad_commands::lot::hierarchy::Drill,
     /// Site plan optimizer form / running search / results (#145).
     optimize: optimize_panel::OptimizePanel,
     /// Background undo-history rebuild after a fast open (#224).
@@ -1609,6 +1613,7 @@ impl App {
             subdiv_segment: 0,
             subdiv_yield: None,
             focus_site_override: None,
+            drill: Default::default(),
             optimize: Default::default(),
             history_rebuild: Default::default(),
             subdiv_sig_cache: std::collections::HashMap::new(),
@@ -3603,11 +3608,28 @@ impl App {
                 if *key == egui::Key::Escape && self.point_edit.escape(&self.session.doc) {
                     continue;
                 }
+                if *key == egui::Key::Escape && self.drill_escape() {
+                    continue;
+                }
                 if matches!(key, egui::Key::Delete | egui::Key::Backspace)
                     && let Some(cmd) = self.point_edit.delete_command(&self.session.doc)
                 {
                     self.run_viewport_edit(cmd);
                     continue;
+                }
+                // Generated blocks, lots and buildings can't be deleted (#199).
+                if matches!(key, egui::Key::Delete | egui::Key::Backspace) {
+                    let doc = &self.session.doc;
+                    if doc
+                        .selection
+                        .iter()
+                        .any(|id| !itsjustcad_commands::lot::hierarchy::deletable(doc, *id))
+                    {
+                        self.command_line.push_line(
+                            "generated blocks, lots and buildings can't be deleted".to_string(),
+                        );
+                        continue;
+                    }
                 }
             }
             let line = keymap::keymap(
@@ -4007,6 +4029,95 @@ impl App {
         )
     }
 
+    /// The parent → child chain under the click (#199), or `None` on a miss.
+    fn hit_chain(
+        &self,
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) -> Option<itsjustcad_commands::lot::hierarchy::Chain> {
+        let (origin, dir) = screen_ray(view_proj, rect, pos);
+        itsjustcad_commands::lot::hierarchy::pick_chain(
+            &self.session.doc,
+            view_proj,
+            glam::Vec2::new(rect.width(), rect.height()),
+            glam::Vec2::new(pos.x - rect.left(), pos.y - rect.top()),
+            origin,
+            dir,
+        )
+    }
+
+    /// Double-click on a generated object: drill one level down to the child
+    /// under the cursor (#199). Returns whether it drilled.
+    fn drill_down(&mut self, view_proj: glam::Mat4, rect: egui::Rect, pos: egui::Pos2) -> bool {
+        let Some(c) = self.hit_chain(view_proj, rect, pos) else {
+            return false;
+        };
+        if c.levels[0].kind == LevelKind::Object {
+            return false;
+        }
+        let doc = &mut self.session.doc;
+        let l = self.drill.double_click(&c, &doc.selection);
+        doc.selection = c.levels[l].ids.iter().copied().collect();
+        doc.generation += 1;
+        true
+    }
+
+    /// The selection's chain and the level it is exactly, if any (#199).
+    fn selection_level(&self) -> Option<(itsjustcad_commands::lot::hierarchy::Chain, usize)> {
+        let doc = &self.session.doc;
+        let c = itsjustcad_commands::lot::hierarchy::chain_of(doc, *doc.selection.first()?);
+        let l = c.level_of(&doc.selection)?;
+        Some((c, l))
+    }
+
+    /// The parent outside of which the scene fades while drilled in.
+    fn edit_context(&self) -> Option<itsjustcad_doc::ObjectId> {
+        self.drill.parent()
+    }
+
+    /// After an edit re-derived the plan (fresh ids, #199): keep the entered
+    /// level on the re-selected child, else go up to the top parent.
+    fn sync_drill(&mut self) {
+        let Some(parent) = self.drill.parent() else {
+            return;
+        };
+        if self.session.doc.get(parent).is_some() {
+            return;
+        }
+        if let Some((c, l)) = self.selection_level().filter(|(_, l)| *l > 0) {
+            self.drill.enter(&c, l);
+            return;
+        }
+        let root = self.drill.root();
+        self.drill.reset();
+        if let Some(root) = root.filter(|r| self.session.doc.get(*r).is_some()) {
+            self.session.doc.selection = std::collections::BTreeSet::from([root]);
+            self.session.doc.generation += 1;
+        }
+    }
+
+    /// Esc on a generated level: up ONE level (#199). Returns whether it
+    /// applied (otherwise Esc does its usual job).
+    fn drill_escape(&mut self) -> bool {
+        let Some((c, l)) = self.selection_level() else {
+            self.drill.reset();
+            return false;
+        };
+        let Some(up) = self.drill.up(&c, l) else {
+            return false;
+        };
+        self.select_level(&c, up);
+        true
+    }
+
+    /// Select level `l` of `c`.
+    fn select_level(&mut self, c: &itsjustcad_commands::lot::hierarchy::Chain, l: usize) {
+        let doc = &mut self.session.doc;
+        doc.selection = c.levels[l].ids.iter().copied().collect();
+        doc.generation += 1;
+    }
+
     /// A viewport double-click: if it lands on a block instance, reveal the
     /// Blocks tab and scroll to that block. Any other hit (or a miss) is a no-op
     /// here — normal single-click selection still applies. Pure decision lives in
@@ -4062,17 +4173,32 @@ impl App {
         additive: bool,
         expand: bool,
     ) {
-        let best = self.hit_object(view_proj, rect, pos);
+        let chain = self.hit_chain(view_proj, rect, pos);
+        // Generated objects select at the drilled level (#199): the top parent
+        // first, a street off the site's edge directly.
+        let level = match &chain {
+            Some(c) if c.levels[0].kind != LevelKind::Object && additive => {
+                Some(self.drill.add_level(c))
+            }
+            Some(c) if c.levels[0].kind != LevelKind::Object => Some(self.drill.click(c)),
+            _ => {
+                if !additive {
+                    self.drill.reset();
+                }
+                None
+            }
+        };
         let doc = &mut self.session.doc;
         if !additive {
             doc.selection.clear();
         }
         let mut note = None;
-        if let Some(id) = best {
-            let ids = if expand {
-                doc.expand_pick(id)
-            } else {
-                std::collections::BTreeSet::from([id])
+        if let Some(c) = &chain {
+            let id = c.levels[0].ids[0];
+            let ids = match level {
+                Some(l) => c.levels[l].ids.iter().copied().collect(),
+                None if expand => doc.expand_pick(id),
+                None => std::collections::BTreeSet::from([id]),
             };
             if additive && ids.iter().all(|i| doc.selection.contains(i)) {
                 for i in &ids {
@@ -4092,7 +4218,8 @@ impl App {
     }
 
     /// Apply a finished drag-box: project visible object AABBs to screen
-    /// rects, run the pure window/crossing test, update the selection.
+    /// rects, run the pure window/crossing test, update the selection
+    /// (generated objects as their top parent).
     fn box_select(
         &mut self,
         view_proj: glam::Mat4,
@@ -4101,14 +4228,18 @@ impl App {
         mode: crate::boxsel::BoxMode,
         additive: bool,
     ) {
-        let ids: Vec<itsjustcad_doc::ObjectId> = self
-            .session
-            .doc
-            .objects()
-            .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
-            .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
-            .map(|obj| obj.id)
-            .collect();
+        // Generated objects select as their top parent, or inside the
+        // entered parent at its level (#199).
+        let ids = itsjustcad_commands::lot::hierarchy::region_targets(
+            &self.session.doc,
+            self.session
+                .doc
+                .objects()
+                .filter(|obj| obj.visible && self.session.doc.layer_visible(&obj.layer))
+                .filter(|obj| obj_matches_box(&obj.geometry, view_proj, rect, drag, mode))
+                .map(|obj| obj.id),
+            self.drill.parent(),
+        );
         let doc = &mut self.session.doc;
         if !additive {
             doc.selection.clear();
@@ -4617,6 +4748,7 @@ impl App {
         if self.display_modes[self.effective_camera_index(self.active_pane)].forces_sketchy() {
             sketchy.enabled = true;
         }
+        self.sync_drill();
         let stale = self.uploaded_generation != Some(generation)
             || self.uploaded_theme != Some(theme)
             || self.uploaded_color_mode != Some(active_color_mode)
@@ -4688,7 +4820,17 @@ impl App {
                 }
                 s
             } else {
-                scene::snapshot_with_mode(&self.session.doc, theme, cms)
+                // Drilled in (#199): fade everything outside the entered parent.
+                let context = self.edit_context().map(|p| {
+                    itsjustcad_commands::lot::hierarchy::context_members(&self.session.doc, p)
+                });
+                scene::snapshot_in_context(
+                    &self.session.doc,
+                    theme,
+                    cms,
+                    &Default::default(),
+                    context.as_ref(),
+                )
             };
             // Planting plan overlay: add 2D top-view plant symbols when toggled
             // on. The 3D canopy meshes stay in `s`; symbols lie flat on the
@@ -4836,6 +4978,7 @@ impl App {
                 if !consumed
                     && response.double_clicked()
                     && let Some(pos) = response.interact_pointer_pos()
+                    && !self.drill_down(view_proj, rect, pos)
                 {
                     self.double_click_viewport(view_proj, rect, pos);
                 }

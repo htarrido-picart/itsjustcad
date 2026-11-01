@@ -61,7 +61,7 @@ use itsjustcad_deck::{
 use itsjustcad_render::{
     ColorModeSnapshot, DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer,
     SketchyParams, StandardView, Theme, UnderlayData, camera_uniform_with_mode,
-    object_wireframe_world, snapshot, snapshot_with_mode,
+    object_wireframe_world, snapshot,
 };
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
 
@@ -276,6 +276,9 @@ pub struct AppHandle {
     /// `None` until set; unused on a GPU handle.
     viewport: Option<(f32, f32)>,
     last_gen: Option<u64>,
+    /// The drilled-into parent of a hierarchical selection (#199): objects
+    /// outside it draw faded. Set by [`ijc_set_edit_context`].
+    edit_context: Option<itsjustcad_doc::ObjectId>,
     theme: Theme,
     mode: DisplayMode,
     /// Sketchy-edge tuning for the Sketchy render style (itsjustcad-ios#174):
@@ -820,6 +823,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         grid_spacing: snap::DEFAULT_GRID,
         viewport: None,
         last_gen: None,
+        edit_context: None,
         theme: Theme::Dark,
         mode: DisplayMode::default(),
         sketchy: SketchyParams::default(),
@@ -1291,6 +1295,73 @@ pub unsafe extern "C" fn ijc_run_command_result(
     })
 }
 
+/// Like [`ijc_run_command_result`], for a point edit of a curve that may be a
+/// subdivision's boundary (`setpoint`, `insertpoint`, `deletepoint` on a
+/// selected site plan's boundary, #199): when the line changes the boundary
+/// of a non-frozen subdivision, the plan re-derives (`lotrefresh`) chained to
+/// the edit, so both are ONE undo step, as the desktop's auto-recompute does.
+/// A re-derive that fails rolls the edit back and reports `ok:false` with the
+/// reason. Same JSON as [`ijc_run_command_result`]. Caller must
+/// [`ijc_string_free`] the result.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `line` must be null or
+/// a valid NUL-terminated C string. The returned pointer must be freed exactly
+/// once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_run_boundary_edit(
+    h: *mut AppHandle,
+    line: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let fail = |msg: &str| into_c_string(run_result_json(false, None, Some(msg), &[]));
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return fail("invalid or busy handle");
+        };
+        let app: &mut AppHandle = &mut guard;
+        if line.is_null() {
+            return fail("line is null");
+        }
+        let Ok(s) = (unsafe { CStr::from_ptr(line) }).to_str() else {
+            return fail("line is not valid UTF-8");
+        };
+        let Ok(PendingOp::Cmd(cmd)) = check_line(s) else {
+            return fail("not an edit");
+        };
+        apply_pending(app);
+        into_c_string(boundary_edit(&mut app.session, cmd))
+    })
+}
+
+/// [`ijc_run_boundary_edit`] on a session: run `cmd`, then re-derive every
+/// non-frozen subdivision whose boundary it changed, chained to it.
+fn boundary_edit(session: &mut Session, cmd: Command) -> String {
+    let boundaries: Vec<_> = session
+        .doc
+        .subdivision_links
+        .iter()
+        .filter(|(_, l)| !l.frozen)
+        .filter_map(|(src, _)| Some((*src, session.doc.get(*src)?.geometry.clone())))
+        .collect();
+    let out = match session.run(cmd) {
+        Ok(out) => out,
+        Err(e) => return run_result_json(false, None, Some(&e.to_string()), &[]),
+    };
+    for (source, before) in boundaries {
+        if session
+            .doc
+            .get(source)
+            .is_some_and(|o| o.geometry != before)
+            && let Err(e) = session.run_chained(Command::LotRefresh { source, ids: None })
+        {
+            let _ = session.run(Command::Undo);
+            let msg = format!("the site plan can't follow that boundary: {e}");
+            return run_result_json(false, None, Some(&msg), &[]);
+        }
+    }
+    run_result_json(true, Some(&out.message), None, &out.created)
+}
+
 /// Import a CAD file the host copied into the granted workdir
 /// ([`ijc_set_workdir`]), by bare file name. Host-typed `import` stays behind
 /// the side-effect gate ([`ijc_run_command`]); this is the host's one import
@@ -1694,12 +1765,22 @@ pub unsafe extern "C" fn ijc_box_select(
             return -1;
         };
         let vp = app.camera.view_proj(w / h);
-        box_select_in(&mut app.session.doc, vp, w, h, glam::Vec2::new(x0, y0), glam::Vec2::new(x1, y1), additive)
-            as i32
+        let context = app.edit_context;
+        box_select_in(
+            &mut app.session.doc,
+            vp,
+            w,
+            h,
+            glam::Vec2::new(x0, y0),
+            glam::Vec2::new(x1, y1),
+            additive,
+            context,
+        ) as i32
     })
 }
 
 /// [`ijc_box_select`] against an explicit camera and drawable (testable headless).
+#[allow(clippy::too_many_arguments)]
 fn box_select_in(
     doc: &mut itsjustcad_doc::Document,
     vp: glam::Mat4,
@@ -1708,9 +1789,10 @@ fn box_select_in(
     start: glam::Vec2,
     end: glam::Vec2,
     additive: bool,
+    context: Option<itsjustcad_doc::ObjectId>,
 ) -> usize {
     let drag = boxsel::Rect::from_points(start, end);
-    region_select_in(doc, vp, w, h, &drag, boxsel::mode(start, end), additive)
+    region_select_in(doc, vp, w, h, &drag, boxsel::mode(start, end), additive, context)
 }
 
 /// Lasso select in drawable pixels (y down): `xy_px` holds `n` interleaved
@@ -1748,12 +1830,24 @@ pub unsafe extern "C" fn ijc_lasso_select(
         let xy = unsafe { std::slice::from_raw_parts(xy_px, n * 2) };
         let pts = xy.as_chunks::<2>().0.iter().map(|&[x, y]| glam::Vec2::new(x, y)).collect();
         let vp = app.camera.view_proj(w / h);
-        lasso_select_in(&mut app.session.doc, vp, w, h, pts, crossing, additive).map_or(-1, |m| m as i32)
+        let context = app.edit_context;
+        lasso_select_in(
+            &mut app.session.doc,
+            vp,
+            w,
+            h,
+            pts,
+            crossing,
+            additive,
+            context,
+        )
+        .map_or(-1, |m| m as i32)
     })
 }
 
 /// [`ijc_lasso_select`] against an explicit camera and drawable (testable
 /// headless). None under three points.
+#[allow(clippy::too_many_arguments)]
 fn lasso_select_in(
     doc: &mut itsjustcad_doc::Document,
     vp: glam::Mat4,
@@ -1762,14 +1856,18 @@ fn lasso_select_in(
     pts: Vec<glam::Vec2>,
     crossing: bool,
     additive: bool,
+    context: Option<itsjustcad_doc::ObjectId>,
 ) -> Option<usize> {
     let lasso = boxsel::Lasso::new(pts)?;
     let mode = if crossing { boxsel::BoxMode::Crossing } else { boxsel::BoxMode::Window };
-    Some(region_select_in(doc, vp, w, h, &lasso, mode, additive))
+    Some(region_select_in(doc, vp, w, h, &lasso, mode, additive, context))
 }
 
 /// Select the visible objects whose projection matches `region` under `mode`,
-/// replacing the selection unless `additive`. Returns the match count.
+/// replacing the selection unless `additive`. Anything a parametric generator
+/// produced selects as its top parent (the site plan, #199). Returns how many
+/// objects that selects.
+#[allow(clippy::too_many_arguments)]
 fn region_select_in<R: boxsel::Region>(
     doc: &mut itsjustcad_doc::Document,
     vp: glam::Mat4,
@@ -1778,13 +1876,18 @@ fn region_select_in<R: boxsel::Region>(
     region: &R,
     mode: boxsel::BoxMode,
     additive: bool,
+    context: Option<itsjustcad_doc::ObjectId>,
 ) -> usize {
-    let ids: Vec<_> = doc
-        .objects()
-        .filter(|o| o.visible && doc.layer_visible(&o.layer))
-        .filter(|o| boxsel::matches(&o.geometry, vp, w, h, region, mode))
-        .map(|o| o.id)
-        .collect();
+    // Generated objects select as their top parent, or, drilled into
+    // `context` (`ijc_set_edit_context`), at the level below it (#199).
+    let ids = itsjustcad_commands::lot::hierarchy::region_targets(
+        doc,
+        doc.objects()
+            .filter(|o| o.visible && doc.layer_visible(&o.layer))
+            .filter(|o| boxsel::matches(&o.geometry, vp, w, h, region, mode))
+            .map(|o| o.id),
+        context,
+    );
     if !additive {
         doc.selection.clear();
     }
@@ -1880,6 +1983,176 @@ pub unsafe extern "C" fn ijc_pick_json(
             .to_string(),
         )
     })
+}
+
+/// The parent → child chain of the object under a tap (#199), without
+/// changing the selection: the hosts choose the level (a tap selects
+/// `levels[start]`, each double-tap one level deeper) and select its `ids`
+/// with [`selection::ijc_select_ids`]. Same pick as [`ijc_pick`], resolved to
+/// the deepest generated child on that spot. Returns
+/// `{"hit":true,"start":n,"levels":[{"kind","id","ids":[…],"label"}]}`,
+/// top parent first, or `{"hit":false}` on a miss or a headless handle.
+/// `kind` is `site`, `street`, `block`, `lot`, `building`, `part` (another
+/// generated output) or `object` (a plain object: a one-level chain). `start`
+/// is 1 for a street off the site's edge (a tap picks it directly), else 0.
+/// `id` is the level's short id, `ids` full uuids. Caller must
+/// [`ijc_string_free`] the result; null only on a panic.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer
+/// must be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_pick_chain_json(
+    h: *mut AppHandle,
+    x_px: f32,
+    y_px: f32,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let miss = || into_c_string(String::from(r#"{"hit":false}"#));
+        let Some(app) = (unsafe { handle_mut(h) }) else {
+            return miss();
+        };
+        let Some((w, h)) = drawable_size(&app) else {
+            return miss();
+        };
+        let vp = app.camera.view_proj(w / h);
+        let Some((origin, dir)) = screen_ray(vp, w, h, x_px, y_px) else {
+            return miss();
+        };
+        let (size, pos) = (glam::Vec2::new(w, h), glam::Vec2::new(x_px, y_px));
+        match itsjustcad_commands::lot::hierarchy::pick_chain(
+            &app.session.doc,
+            vp,
+            size,
+            pos,
+            origin,
+            dir,
+        ) {
+            Some(chain) => into_c_string(chain_json(&chain).to_string()),
+            None => miss(),
+        }
+    })
+}
+
+/// The hierarchy chain of the current selection (#199), for the inspector's
+/// breadcrumb: the chain of the first selected object, as
+/// [`ijc_pick_chain_json`] returns it, plus `"level"`: the index of the level
+/// the selection is exactly (`null` when it is none of them, e.g. a mixed
+/// selection). `{"hit":false}` with nothing selected or on a null handle.
+/// Caller must [`ijc_string_free`] the result; null only on a panic.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]. The returned pointer
+/// must be freed exactly once via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_selection_chain_json(h: *mut AppHandle) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let Some(app) = (unsafe { handle_mut(h) }) else {
+            return into_c_string(String::from(r#"{"hit":false}"#));
+        };
+        into_c_string(selection_chain_json(&app.session.doc).to_string())
+    })
+}
+
+/// [`ijc_selection_chain_json`] on a document.
+fn selection_chain_json(doc: &itsjustcad_doc::Document) -> serde_json::Value {
+    let Some(first) = doc.selection.first() else {
+        return serde_json::json!({"hit": false});
+    };
+    let chain = itsjustcad_commands::lot::hierarchy::chain_of(doc, *first);
+    let mut v = chain_json(&chain);
+    v["level"] = serde_json::json!(chain.level_of(&doc.selection));
+    v
+}
+
+/// Set the edit context of a hierarchical selection (#199, SketchUp-style):
+/// while a host has drilled into a level, `id` (short id or uuid) is the
+/// entered parent, and every object outside it and its descendants draws
+/// faded toward the background (still visible and pickable). Null or an
+/// unknown id clears it. A display setting: not logged, no undo. Returns
+/// whether a context is now set.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `id` must be null or
+/// a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_set_edit_context(h: *mut AppHandle, id: *const c_char) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let next = (unsafe { c_str(id) }).and_then(|s| object_by_id(&app.session.doc, s));
+        if next != app.edit_context {
+            app.edit_context = next;
+            app.last_gen = None; // re-snapshot with the new fade
+        }
+        next.is_some()
+    })
+}
+
+/// Objects related to `id` (short id or uuid) for the viewport menu's
+/// selection rows (#199), as `{"ids":[uuid…]}`: `kind` `"same_type"` is every
+/// object of `id`'s level kind in its site plan (all lots, all buildings,
+/// all streets); `"whole_street"` is `id`'s street carried on through
+/// straight junctions (CityEngine's Select Continuous Graph Objects).
+/// `{"ids":[]}` for an unknown id or kind. Caller must [`ijc_string_free`]
+/// the result; null only on a panic.
+///
+/// # Safety
+/// `h` must be null or a live handle; `id` and `kind` must be null or valid
+/// NUL-terminated C strings. The returned pointer must be freed exactly once
+/// via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_related_ids_json(
+    h: *mut AppHandle,
+    id: *const c_char,
+    kind: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let empty = || into_c_string(String::from(r#"{"ids":[]}"#));
+        let Some(app) = (unsafe { handle_mut(h) }) else {
+            return empty();
+        };
+        let (Some(id), Some(kind)) = (unsafe { c_str(id) }, unsafe { c_str(kind) }) else {
+            return empty();
+        };
+        let Some(id) = object_by_id(&app.session.doc, id) else {
+            return empty();
+        };
+        into_c_string(related_ids_json(&app.session.doc, id, kind).to_string())
+    })
+}
+
+/// [`ijc_related_ids_json`] on a document.
+fn related_ids_json(
+    doc: &itsjustcad_doc::Document,
+    id: itsjustcad_doc::ObjectId,
+    kind: &str,
+) -> serde_json::Value {
+    use itsjustcad_commands::lot::hierarchy::{same_type, whole_street};
+    let ids = match kind {
+        "same_type" => same_type(doc, id),
+        "whole_street" => whole_street(doc, id),
+        _ => Default::default(),
+    };
+    serde_json::json!({ "ids": ids.iter().map(|i| i.0.to_string()).collect::<Vec<_>>() })
+}
+
+/// The JSON [`ijc_pick_chain_json`] returns for a hit.
+fn chain_json(chain: &itsjustcad_commands::lot::hierarchy::Chain) -> serde_json::Value {
+    let levels: Vec<_> = chain
+        .levels
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "kind": l.kind.token(),
+                "id": l.ids[0].to_string(),
+                "ids": l.ids.iter().map(|i| i.0.to_string()).collect::<Vec<_>>(),
+                "label": l.label,
+            })
+        })
+        .collect();
+    serde_json::json!({"hit": true, "start": chain.start, "levels": levels})
 }
 
 /// World-space AABB over the current selection, for placing the gumball overlay.
@@ -2755,7 +3028,18 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
             sketchy_radius,
             ..Default::default()
         };
-        let mut scene = snapshot_with_mode(&app.session.doc, app.theme, cms);
+        let doc = &app.session.doc;
+        app.edit_context = app.edit_context.filter(|id| doc.get(*id).is_some());
+        let context = app
+            .edit_context
+            .map(|p| itsjustcad_commands::lot::hierarchy::context_members(doc, p));
+        let mut scene = itsjustcad_render::snapshot_in_context(
+            doc,
+            app.theme,
+            cms,
+            &Default::default(),
+            context.as_ref(),
+        );
         // The host owns image decoding (the render crate has no `image` dep),
         // so attach the decoded underlay here — the FFI twin of the desktop's
         // `App::decode_underlay`. Without this a granted underlay applies to
@@ -6185,6 +6469,91 @@ mod tests {
     }
 
     #[test]
+    fn pick_chain_json_lists_levels_and_box_select_picks_the_site() {
+        use itsjustcad_commands::lot::hierarchy::chain_of;
+        let mut session = Session::default();
+        for line in ["rect 0,0,0 200 150", "siteplan last"] {
+            session.run(parse(line).unwrap()).unwrap();
+        }
+        let doc = &mut session.doc;
+        let mass = doc
+            .objects()
+            .find(|o| {
+                o.name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with("building:mass"))
+            })
+            .unwrap()
+            .id;
+        let v = chain_json(&chain_of(doc, mass));
+        assert_eq!(v["hit"], true);
+        assert_eq!(v["start"], 0);
+        let kinds: Vec<_> = v["levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["kind"].clone())
+            .collect();
+        assert_eq!(kinds, ["site", "block", "lot", "building"]);
+        assert_eq!(v["levels"][3]["ids"].as_array().unwrap().len(), 2);
+        assert!(object_by_id(doc, v["levels"][0]["ids"][0].as_str().unwrap()).is_some());
+
+        doc.selection = [mass].into();
+        assert_eq!(selection_chain_json(doc)["level"], serde_json::Value::Null, "half a building");
+        doc.selection = v["levels"][2]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| object_by_id(doc, i.as_str().unwrap()))
+            .collect();
+        assert_eq!(selection_chain_json(doc)["level"], 2, "the lot");
+
+        let lot = object_by_id(doc, v["levels"][2]["id"].as_str().unwrap()).unwrap();
+        let lots = related_ids_json(doc, lot, "same_type");
+        assert_eq!(lots["ids"].as_array().unwrap().len(), 4, "all four lots");
+        let none = related_ids_json(doc, mass, "nope");
+        assert!(none["ids"].as_array().unwrap().is_empty());
+
+        // A crossing box over everything selects the site boundary only.
+        let source = *doc.subdivision_links.keys().next().unwrap();
+        let vp = glam::Mat4::orthographic_rh(-1.0, 201.0, -1.0, 151.0, -10.0, 10.0);
+        let n = box_select_in(
+            doc,
+            vp,
+            404.0,
+            304.0,
+            glam::Vec2::new(400.0, 300.0),
+            glam::Vec2::new(0.0, 0.0),
+            false,
+            None,
+        );
+        assert_eq!(n, 1);
+        assert_eq!(doc.selection, std::collections::BTreeSet::from([source]));
+    }
+
+    #[test]
+    fn boundary_edit_rederives_the_plan_in_one_undo_step() {
+        let mut session = Session::default();
+        for line in ["rect 0,0,0 200 150", "siteplan last"] {
+            session.run(parse(line).unwrap()).unwrap();
+        }
+        let source = *session.doc.subdivision_links.keys().next().unwrap();
+        let produced = session.doc.subdiv_link(source).unwrap().produced.clone();
+        let line = format!("setpoint id:{source} 2 260,150,0");
+        let v: serde_json::Value =
+            serde_json::from_str(&boundary_edit(&mut session, parse(&line).unwrap())).unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        let after = session.doc.subdiv_link(source).unwrap().produced.clone();
+        assert_ne!(after, produced, "the plan re-derived");
+        session.run(Command::Undo).unwrap();
+        assert_eq!(
+            session.doc.subdiv_link(source).unwrap().produced,
+            produced,
+            "one undo restores boundary and plan"
+        );
+    }
+
+    #[test]
     fn done_usage_payload_is_json() {
         let v: serde_json::Value = serde_json::from_str(&done_usage_json((1500, 87))).unwrap();
         assert_eq!(v["input_tokens"], 1500);
@@ -8010,18 +8379,18 @@ mod headless_tests {
         let vp = app.camera.view_proj(w / hh);
         let all = (glam::Vec2::new(0.0, 0.0), glam::Vec2::new(w, hh));
         // Window over the whole view takes both boxes.
-        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.0, all.1, false), 2);
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.0, all.1, false, None), 2);
         assert_eq!(app.session.doc.selection.len(), 2);
         // A tiny box at the centre: a window holds nothing, a crossing (drawn
         // right→left) touches whatever projects there.
         let c = glam::Vec2::new(w / 2.0, hh / 2.0);
         let d = glam::Vec2::new(2.0, 2.0);
-        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, false), 0);
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, false, None), 0);
         assert!(app.session.doc.selection.is_empty(), "a window replaces the selection");
         // The whole view drawn right→left is a crossing: still both.
-        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.1, all.0, false), 2);
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, all.1, all.0, false, None), 2);
         // Additive keeps what was there.
-        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, true), 0);
+        assert_eq!(box_select_in(&mut app.session.doc, vp, w, hh, c - d, c + d, true, None), 0);
         assert_eq!(app.session.doc.selection.len(), 2);
         drop(guard);
         unsafe {
@@ -8084,21 +8453,21 @@ mod headless_tests {
             v(w, hh),
             v(0.0, hh),
         ];
-        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false), Some(2), "notch box left out");
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false, None), Some(2), "notch box left out");
         // The U's base wall runs under the middle box's bottom, so a crossing
         // that reaches into it would also take it: raise the base above it.
         let mid = (top + bot) / 2.0;
         let u_mid: Vec<_> = u.iter().map(|p| if p.y == bot { v(p.x, mid) } else { *p }).collect();
-        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid.clone(), false, false), Some(2), "window: middle cut");
-        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid, true, false), Some(3), "crossing: touched");
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid.clone(), false, false, None), Some(2), "window: middle cut");
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u_mid, true, false, None), Some(3), "crossing: touched");
         // Additive: a loop round the middle box alone adds to an existing pick.
         let around_mid = vec![v(gap_l, top), v(gap_r, top), v(gap_r, bot), v(gap_l, bot)];
-        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false), Some(2));
-        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid.clone(), false, true), Some(1));
+        assert_eq!(lasso_select_in(doc, vp, w, hh, u.clone(), false, false, None), Some(2));
+        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid.clone(), false, true, None), Some(1));
         assert_eq!(doc.selection.len(), 3, "additive keeps the rest");
-        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid, false, false), Some(1));
+        assert_eq!(lasso_select_in(doc, vp, w, hh, around_mid, false, false, None), Some(1));
         assert_eq!(doc.selection.len(), 1, "non-additive replaces");
-        assert_eq!(lasso_select_in(doc, vp, w, hh, vec![v(0.0, 0.0), v(w, hh)], false, false), None);
+        assert_eq!(lasso_select_in(doc, vp, w, hh, vec![v(0.0, 0.0), v(w, hh)], false, false, None), None);
         drop(guard);
         let xy = [0.0f32, 0.0, 800.0, 0.0, 800.0, 600.0];
         unsafe {

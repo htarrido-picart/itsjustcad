@@ -323,6 +323,36 @@ pub fn snapshot_hiding(
     cms: ColorModeSnapshot,
     hidden: &std::collections::HashSet<ObjectId>,
 ) -> SceneData {
+    snapshot_in_context(doc, theme, cms, hidden, None)
+}
+
+/// How far a faded object's colour moves toward the background (#199).
+pub const CONTEXT_FADE: f32 = 0.75;
+
+/// `color` faded toward the theme background, for objects outside an edit
+/// context.
+pub fn fade_color(color: [f32; 4], theme: Theme) -> [f32; 4] {
+    let bg = theme.background();
+    let mix = |c: f32, b: f32| c + (b - c) * CONTEXT_FADE;
+    [
+        mix(color[0], bg[0]),
+        mix(color[1], bg[1]),
+        mix(color[2], bg[2]),
+        color[3],
+    ]
+}
+
+/// Like [`snapshot_hiding`], with an edit context (SketchUp-style, #199):
+/// when `context` is set, every object outside it draws faded toward the
+/// background (still visible and pickable), so the drilled-into parent
+/// stands out.
+pub fn snapshot_in_context(
+    doc: &Document,
+    theme: Theme,
+    cms: ColorModeSnapshot,
+    hidden: &std::collections::HashSet<ObjectId>,
+    context: Option<&std::collections::HashSet<ObjectId>>,
+) -> SceneData {
     let mode = cms.color_mode;
     let mut scene = SceneData {
         meshes: Vec::new(),
@@ -368,6 +398,15 @@ pub fn snapshot_hiding(
             })
         };
         let lw_mm = doc.effective_lineweight(obj) as f32;
+        let fade = context.is_some_and(|c| !c.contains(&obj.id));
+        let before = (
+            scene.meshes.len(),
+            scene.lines.len(),
+            scene.edges.len(),
+            scene.profile_edges.len(),
+            scene.points.len(),
+            deferred_source_lines.len(),
+        );
         match &obj.geometry {
             // Strut-lattice parametric generators (spaceframe/geodesic/
             // tensegrity/funicular/gridshell): the derived MEMBER SEGMENTS live
@@ -681,6 +720,23 @@ pub fn snapshot_hiding(
                 }
             }
         }
+        if fade {
+            let f = |c: &mut [f32; 4]| *c = fade_color(*c, theme);
+            scene.meshes[before.0..]
+                .iter_mut()
+                .for_each(|m| f(&mut m.1));
+            scene.lines[before.1..].iter_mut().for_each(|l| f(&mut l.1));
+            scene.edges[before.2..].iter_mut().for_each(|l| f(&mut l.1));
+            scene.profile_edges[before.3..]
+                .iter_mut()
+                .for_each(|l| f(&mut l.1));
+            scene.points[before.4..]
+                .iter_mut()
+                .for_each(|p| f(&mut p.1));
+            deferred_source_lines[before.5..]
+                .iter_mut()
+                .for_each(|l| f(&mut l.1));
+        }
     }
     // Source outlines last, so the live/frozen cue sits visibly on top of its
     // lot/road children (whose boundaries coincide with the source).
@@ -700,6 +756,33 @@ mod tests {
     use itsjustcad_doc::{Document, LayerStyle, ObjectId, SceneObject};
 
     use super::*;
+
+    #[test]
+    fn objects_outside_the_edit_context_fade() {
+        let mut doc = Document::default();
+        let a = insert_tri(&mut doc, itsjustcad_doc::DEFAULT_LAYER);
+        let _b = insert_tri(&mut doc, itsjustcad_doc::DEFAULT_LAYER);
+        let none = std::collections::HashSet::new();
+        let plain = snapshot_hiding(&doc, Theme::Dark, ColorModeSnapshot::default(), &none);
+        let keep = std::collections::HashSet::from([a]);
+        let ctx = snapshot_in_context(
+            &doc,
+            Theme::Dark,
+            ColorModeSnapshot::default(),
+            &none,
+            Some(&keep),
+        );
+        let order: Vec<_> = doc.objects().map(|o| o.id == a).collect();
+        for (i, kept) in order.into_iter().enumerate() {
+            let (c0, c1) = (plain.meshes[i].1, ctx.meshes[i].1);
+            if kept {
+                assert_eq!(c0, c1, "inside the context: unchanged");
+            } else {
+                assert_eq!(c1, fade_color(c0, Theme::Dark));
+                assert_ne!(c0, c1, "outside: faded");
+            }
+        }
+    }
 
     fn insert_tri(doc: &mut Document, layer: &str) -> ObjectId {
         let mesh = kernel_mesh::Mesh::new(

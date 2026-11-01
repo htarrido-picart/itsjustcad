@@ -247,10 +247,17 @@ impl Gumball {
 
 /// The selected objects the gumball manipulates — none (gumball hidden) when
 /// the selection holds a generated building: it is a parametric output of its
-/// subdivision link, driven by the building parameters. Roads stay movable.
+/// subdivision link, driven by the building parameters. Since #199 no
+/// generated child (road, block, lot, building) gets it: only hand-drawn
+/// objects and top-level parents.
 fn gumball_targets(doc: &Document) -> Vec<ObjectId> {
     let ids: Vec<ObjectId> = doc.objects().filter(|o| doc.selection.contains(&o.id)).map(|o| o.id).collect();
-    if ids.iter().any(|id| itsjustcad_commands::lot::is_locked_generated(doc, *id)) {
+    // Only hand-drawn objects and top-level parents, never generated
+    // children (#199).
+    if ids
+        .iter()
+        .any(|id| !itsjustcad_commands::lot::hierarchy::gumball_allowed(doc, *id))
+    {
         return Vec::new();
     }
     ids
@@ -580,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn no_gumball_on_generated_buildings_roads_still_move() {
+    fn no_gumball_on_generated_children_only_the_site_plan() {
         let mut s = itsjustcad_commands::Session::default();
         for line in ["rect 0,0,0 200 150", "siteplan last"] {
             s.run(itsjustcad_commands::parse(line).unwrap()).unwrap();
@@ -594,7 +601,10 @@ mod tests {
         doc.selection = [building, road].into();
         assert!(gumball_targets(&doc).is_empty(), "nor on a mixed selection holding one");
         doc.selection = [road].into();
-        assert_eq!(gumball_targets(&doc), vec![road], "roads keep the gumball");
+        assert!(gumball_targets(&doc).is_empty(), "nor on a generated road (#199)");
+        let site = *doc.subdivision_links.keys().next().unwrap();
+        doc.selection = [site].into();
+        assert_eq!(gumball_targets(&doc), vec![site], "the site plan keeps it");
     }
 
     #[test]

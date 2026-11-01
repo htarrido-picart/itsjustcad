@@ -156,9 +156,23 @@ pub fn pick_object(
     origin: DVec3,
     dir: DVec3,
 ) -> Option<ObjectId> {
+    pick_object_where(doc, vp, size, pos, origin, dir, |_| true)
+}
+
+/// [`pick_object`] among the visible objects `keep` accepts (#199: the child
+/// of a parametric object under a click that hit the object's boundary).
+pub fn pick_object_where(
+    doc: &Document,
+    vp: Mat4,
+    size: Vec2,
+    pos: Vec2,
+    origin: DVec3,
+    dir: DVec3,
+    keep: impl Fn(&crate::SceneObject) -> bool,
+) -> Option<ObjectId> {
     let visible: Vec<_> = doc
         .objects()
-        .filter(|o| o.visible && doc.layer_visible(&o.layer))
+        .filter(|o| o.visible && doc.layer_visible(&o.layer) && keep(o))
         .collect();
     let boxes: Vec<_> = visible
         .iter()
@@ -190,15 +204,15 @@ pub fn pick_object(
             continue;
         };
         seen[i] = true;
-        let keep = |slot: &mut Option<(f32, ObjectId)>| {
+        let closer = |slot: &mut Option<(f32, ObjectId)>| {
             if slot.is_none_or(|(bd, _)| d < bd) {
                 *slot = Some((d, o.id));
             }
         };
         if d <= PICK_PX {
-            keep(&mut near);
+            closer(&mut near);
         } else if in_band {
-            keep(&mut road);
+            closer(&mut road);
         }
     }
     if let Some((_, id)) = near.or(road) {
