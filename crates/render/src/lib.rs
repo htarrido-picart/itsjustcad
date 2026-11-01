@@ -33,7 +33,8 @@ pub use sketchy::{
     edge_seed, jitter_offset, sketchify_segments, SketchyParams,
 };
 pub use snapshot::{
-    object_wireframe_world, snapshot, snapshot_hiding, snapshot_with_mode, ColorModeSnapshot, Theme,
+    fade_color, object_wireframe_world, snapshot, snapshot_hiding, snapshot_in_context,
+    snapshot_with_mode, ColorModeSnapshot, Theme,
 };
 pub use viewport_callback::ViewportCallback;
 

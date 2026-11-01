@@ -4049,19 +4049,39 @@ impl App {
         true
     }
 
-    /// Esc after drilling in: back to the top parent (#199). Returns whether
-    /// it applied (otherwise Esc does its usual job).
+    /// The selection's chain and the level it is exactly, if any (#199).
+    fn selection_level(&self) -> Option<(itsjustcad_commands::lot::hierarchy::Chain, usize)> {
+        let doc = &self.session.doc;
+        let c = itsjustcad_commands::lot::hierarchy::chain_of(doc, *doc.selection.first()?);
+        let l = c.level_of(&doc.selection)?;
+        Some((c, l))
+    }
+
+    /// The parent objects outside of which the scene fades while drilled in.
+    fn edit_context(&self) -> Option<itsjustcad_doc::ObjectId> {
+        let (c, l) = self.selection_level()?;
+        self.drill.context_parent(&c, l)
+    }
+
+    /// Esc on a generated level: up ONE level (#199). Returns whether it
+    /// applied (otherwise Esc does its usual job).
     fn drill_escape(&mut self) -> bool {
-        let Some(root) = self.drill.escape() else {
+        let Some((c, l)) = self.selection_level() else {
+            self.drill.reset();
             return false;
         };
-        let doc = &mut self.session.doc;
-        if doc.get(root).is_none() {
+        let Some(up) = self.drill.up(&c, l) else {
             return false;
-        }
-        doc.selection = std::collections::BTreeSet::from([root]);
-        doc.generation += 1;
+        };
+        self.select_level(&c, up);
         true
+    }
+
+    /// Select level `l` of `c`.
+    fn select_level(&mut self, c: &itsjustcad_commands::lot::hierarchy::Chain, l: usize) {
+        let doc = &mut self.session.doc;
+        doc.selection = c.levels[l].ids.iter().copied().collect();
+        doc.generation += 1;
     }
 
     /// A viewport double-click: if it lands on a block instance, reveal the
@@ -4761,7 +4781,17 @@ impl App {
                 }
                 s
             } else {
-                scene::snapshot_with_mode(&self.session.doc, theme, cms)
+                // Drilled in (#199): fade everything outside the entered parent.
+                let context = self.edit_context().map(|p| {
+                    itsjustcad_commands::lot::hierarchy::context_members(&self.session.doc, p)
+                });
+                scene::snapshot_in_context(
+                    &self.session.doc,
+                    theme,
+                    cms,
+                    &Default::default(),
+                    context.as_ref(),
+                )
             };
             // Planting plan overlay: add 2D top-view plant symbols when toggled
             // on. The 3D canopy meshes stay in `s`; symbols lie flat on the

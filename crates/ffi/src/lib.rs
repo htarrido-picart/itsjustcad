@@ -61,7 +61,7 @@ use itsjustcad_deck::{
 use itsjustcad_render::{
     ColorModeSnapshot, DEPTH_FORMAT, DisplayMode, LineEntry, OrbitCamera, SceneRenderer,
     SketchyParams, StandardView, Theme, UnderlayData, camera_uniform_with_mode,
-    object_wireframe_world, snapshot, snapshot_with_mode,
+    object_wireframe_world, snapshot,
 };
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
 
@@ -276,6 +276,9 @@ pub struct AppHandle {
     /// `None` until set; unused on a GPU handle.
     viewport: Option<(f32, f32)>,
     last_gen: Option<u64>,
+    /// The drilled-into parent of a hierarchical selection (#199): objects
+    /// outside it draw faded. Set by [`ijc_set_edit_context`].
+    edit_context: Option<itsjustcad_doc::ObjectId>,
     theme: Theme,
     mode: DisplayMode,
     /// Sketchy-edge tuning for the Sketchy render style (itsjustcad-ios#174):
@@ -820,6 +823,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         grid_spacing: snap::DEFAULT_GRID,
         viewport: None,
         last_gen: None,
+        edit_context: None,
         theme: Theme::Dark,
         mode: DisplayMode::default(),
         sketchy: SketchyParams::default(),
@@ -2033,6 +2037,79 @@ fn selection_chain_json(doc: &itsjustcad_doc::Document) -> serde_json::Value {
     v
 }
 
+/// Set the edit context of a hierarchical selection (#199, SketchUp-style):
+/// while a host has drilled into a level, `id` (short id or uuid) is the
+/// entered parent, and every object outside it and its descendants draws
+/// faded toward the background (still visible and pickable). Null or an
+/// unknown id clears it. A display setting: not logged, no undo. Returns
+/// whether a context is now set.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `id` must be null or
+/// a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_set_edit_context(h: *mut AppHandle, id: *const c_char) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let next = (unsafe { c_str(id) }).and_then(|s| object_by_id(&app.session.doc, s));
+        if next != app.edit_context {
+            app.edit_context = next;
+            app.last_gen = None; // re-snapshot with the new fade
+        }
+        next.is_some()
+    })
+}
+
+/// Objects related to `id` (short id or uuid) for the viewport menu's
+/// selection rows (#199), as `{"ids":[uuid…]}`: `kind` `"same_type"` is every
+/// object of `id`'s level kind in its site plan (all lots, all buildings,
+/// all streets); `"whole_street"` is `id`'s street carried on through
+/// straight junctions (CityEngine's Select Continuous Graph Objects).
+/// `{"ids":[]}` for an unknown id or kind. Caller must [`ijc_string_free`]
+/// the result; null only on a panic.
+///
+/// # Safety
+/// `h` must be null or a live handle; `id` and `kind` must be null or valid
+/// NUL-terminated C strings. The returned pointer must be freed exactly once
+/// via [`ijc_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_related_ids_json(
+    h: *mut AppHandle,
+    id: *const c_char,
+    kind: *const c_char,
+) -> *mut c_char {
+    guard_ffi(std::ptr::null_mut(), || {
+        let empty = || into_c_string(String::from(r#"{"ids":[]}"#));
+        let Some(app) = (unsafe { handle_mut(h) }) else {
+            return empty();
+        };
+        let (Some(id), Some(kind)) = (unsafe { c_str(id) }, unsafe { c_str(kind) }) else {
+            return empty();
+        };
+        let Some(id) = object_by_id(&app.session.doc, id) else {
+            return empty();
+        };
+        into_c_string(related_ids_json(&app.session.doc, id, kind).to_string())
+    })
+}
+
+/// [`ijc_related_ids_json`] on a document.
+fn related_ids_json(
+    doc: &itsjustcad_doc::Document,
+    id: itsjustcad_doc::ObjectId,
+    kind: &str,
+) -> serde_json::Value {
+    use itsjustcad_commands::lot::hierarchy::{same_type, whole_street};
+    let ids = match kind {
+        "same_type" => same_type(doc, id),
+        "whole_street" => whole_street(doc, id),
+        _ => Default::default(),
+    };
+    serde_json::json!({ "ids": ids.iter().map(|i| i.0.to_string()).collect::<Vec<_>>() })
+}
+
 /// The JSON [`ijc_pick_chain_json`] returns for a hit.
 fn chain_json(chain: &itsjustcad_commands::lot::hierarchy::Chain) -> serde_json::Value {
     let levels: Vec<_> = chain
@@ -2923,7 +3000,18 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
             sketchy_radius,
             ..Default::default()
         };
-        let mut scene = snapshot_with_mode(&app.session.doc, app.theme, cms);
+        let doc = &app.session.doc;
+        app.edit_context = app.edit_context.filter(|id| doc.get(*id).is_some());
+        let context = app
+            .edit_context
+            .map(|p| itsjustcad_commands::lot::hierarchy::context_members(doc, p));
+        let mut scene = itsjustcad_render::snapshot_in_context(
+            doc,
+            app.theme,
+            cms,
+            &Default::default(),
+            context.as_ref(),
+        );
         // The host owns image decoding (the render crate has no `image` dep),
         // so attach the decoded underlay here — the FFI twin of the desktop's
         // `App::decode_underlay`. Without this a granted underlay applies to
@@ -6391,6 +6479,12 @@ mod tests {
             .filter_map(|i| object_by_id(doc, i.as_str().unwrap()))
             .collect();
         assert_eq!(selection_chain_json(doc)["level"], 2, "the lot");
+
+        let lot = object_by_id(doc, v["levels"][2]["id"].as_str().unwrap()).unwrap();
+        let lots = related_ids_json(doc, lot, "same_type");
+        assert_eq!(lots["ids"].as_array().unwrap().len(), 4, "all four lots");
+        let none = related_ids_json(doc, mass, "nope");
+        assert!(none["ids"].as_array().unwrap().is_empty());
 
         // A crossing box over everything selects the site boundary only.
         let source = *doc.subdivision_links.keys().next().unwrap();

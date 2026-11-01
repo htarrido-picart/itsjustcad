@@ -7,7 +7,9 @@
 //! `crate::scene::digest(...)` call sites keep working unchanged.
 
 pub use itsjustcad_deck::digest;
-pub use itsjustcad_render::{snapshot_hiding, snapshot_with_mode, SceneData, Theme};
+pub use itsjustcad_render::{snapshot_hiding, snapshot_in_context, SceneData, Theme};
+#[cfg(test)]
+pub use itsjustcad_render::snapshot_with_mode;
 
 use itsjustcad_doc::{Document, Geometry};
 

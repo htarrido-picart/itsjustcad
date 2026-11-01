@@ -364,6 +364,161 @@ pub fn top_parents(doc: &Document, ids: impl IntoIterator<Item = ObjectId>) -> B
         .collect()
 }
 
+/// The generator source at the top of `id`'s chain (itself when no generator
+/// produced it).
+fn top_source(doc: &Document, mut id: ObjectId) -> ObjectId {
+    for _ in 0..MAX_DEPTH {
+        match doc.subdiv_source_of(id) {
+            Some(src) => id = src,
+            None => break,
+        }
+    }
+    id
+}
+
+/// Every object a generator under `root` produced, nested generators
+/// included.
+fn descendants(doc: &Document, root: ObjectId) -> Vec<ObjectId> {
+    let mut out = Vec::new();
+    let mut stack = vec![(root, 0)];
+    while let Some((src, depth)) = stack.pop() {
+        let Some(link) = doc.subdiv_link(src).filter(|_| depth < MAX_DEPTH) else {
+            continue;
+        };
+        for id in &link.produced {
+            out.push(*id);
+            stack.push((*id, depth + 1));
+        }
+    }
+    out
+}
+
+/// The objects that stay in full colour while `parent` is the edit context
+/// (#199): `parent` and everything below it in the hierarchy.
+pub fn context_members(doc: &Document, parent: ObjectId) -> HashSet<ObjectId> {
+    let mut out = HashSet::from([parent]);
+    let root = top_source(doc, parent);
+    for id in descendants(doc, root) {
+        if out.contains(&id) {
+            continue;
+        }
+        let c = chain_of(doc, id);
+        if let Some(l) = c.levels.iter().position(|l| l.ids.contains(&parent)) {
+            for lv in &c.levels[l..] {
+                out.extend(lv.ids.iter().copied());
+            }
+        }
+    }
+    out
+}
+
+/// "Select Same Type" (#199): every object of the same level kind as `id`'s
+/// own level, within its top parent (all lots, all buildings, all streets
+/// of the site plan). Just `id`'s level for a plain object.
+pub fn same_type(doc: &Document, id: ObjectId) -> BTreeSet<ObjectId> {
+    let c = chain_of(doc, id);
+    let own = &c.levels[c.last()];
+    if c.levels.len() < 2 {
+        return own.ids.iter().copied().collect();
+    }
+    let kind = own.kind;
+    let layer = doc.get(id).map(|o| o.layer.clone());
+    descendants(doc, c.root())
+        .into_iter()
+        .filter_map(|d| doc.get(d))
+        .filter(|o| match kind {
+            LevelKind::Street => o.street.is_some(),
+            LevelKind::Building => o.layer == BUILDINGS_LAYER,
+            _ => o.street.is_none() && Some(&o.layer) == layer.as_ref(),
+        })
+        .filter(|o| {
+            // Same kind at its own level (a subdivided block stays a block).
+            let oc = chain_of(doc, o.id);
+            oc.levels[oc.last()].kind == kind
+        })
+        .map(|o| o.id)
+        .collect()
+}
+
+/// A road's centreline endpoints and the unit directions leaving them.
+fn road_ends(o: &itsjustcad_doc::SceneObject) -> Option<[(DVec2, DVec2); 2]> {
+    let Geometry::Curve(c) = &o.geometry else {
+        return None;
+    };
+    let p: Vec<DVec2> = c
+        .tessellate(super::BLOCK_TOL)
+        .iter()
+        .map(|v| v.truncate())
+        .collect();
+    let n = p.len();
+    if n < 2 {
+        return None;
+    }
+    Some([
+        (p[0], (p[0] - p[1]).normalize_or_zero()),
+        (p[n - 1], (p[n - 1] - p[n - 2]).normalize_or_zero()),
+    ])
+}
+
+/// Streets continue through a junction when they turn by less than this.
+const CONTINUE_DEG: f64 = 30.0;
+
+/// "Select Whole Street" (#199, CityEngine's Select Continuous Graph
+/// Objects): the roads of `id`'s street plus, through each junction, the
+/// best-aligned road of the same class that carries on within
+/// [`CONTINUE_DEG`]. Empty when `id` is not a generated road.
+pub fn whole_street(doc: &Document, id: ObjectId) -> BTreeSet<ObjectId> {
+    let Some(src) = doc.subdiv_source_of(id) else {
+        return BTreeSet::new();
+    };
+    let Some(class) = doc.get(id).and_then(|o| o.street.as_ref()).map(|s| s.class) else {
+        return BTreeSet::new();
+    };
+    let link = doc.subdiv_link(src).expect("source has a link");
+    let roads: Vec<(ObjectId, [(DVec2, DVec2); 2])> = link
+        .produced
+        .iter()
+        .filter_map(|r| doc.get(*r))
+        .filter(|o| o.street.as_ref().is_some_and(|s| s.class == class))
+        .filter_map(|o| Some((o.id, road_ends(o)?)))
+        .collect();
+    let cos = CONTINUE_DEG.to_radians().cos();
+    let mut out = BTreeSet::from([id]);
+    let mut stack = vec![id];
+    while let Some(r) = stack.pop() {
+        let Some((_, ends)) = roads.iter().find(|(x, _)| *x == r) else {
+            continue;
+        };
+        for (at, out_dir) in ends {
+            // Leaving `r` at `at` along `-out_dir` reversed: the next road
+            // starts at `at` and heads on along `out_dir`.
+            let next = roads
+                .iter()
+                .filter(|(x, _)| !out.contains(x))
+                .flat_map(|(x, e)| e.iter().map(move |(p, d)| (*x, *p, -*d)))
+                .filter(|(_, p, _)| p.distance(*at) < 1e-3)
+                .map(|(x, _, d)| (x, d.dot(*out_dir)))
+                .filter(|(_, c)| *c >= cos)
+                .max_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((x, _)) = next {
+                out.insert(x);
+                stack.push(x);
+            }
+        }
+    }
+    // The other road objects of the streets reached.
+    let ids: BTreeSet<u32> = out
+        .iter()
+        .filter_map(|r| doc.get(*r)?.street.as_ref().map(|s| s.id))
+        .collect();
+    out.extend(roads.iter().map(|(x, _)| *x).filter(|x| {
+        doc.get(*x)
+            .and_then(|o| o.street.as_ref())
+            .is_some_and(|s| ids.contains(&s.id))
+    }));
+    out
+}
+
 /// The entered level of a hierarchical selection (Figma-style, #199): after
 /// a double-click drills in, plain clicks select at that depth inside the
 /// same top parent. A click on empty space, another parent, or Esc resets it.
@@ -416,12 +571,29 @@ impl Drill {
         next
     }
 
-    /// Esc: the top parent to select when a level was entered (then reset),
-    /// else `None` (the host's usual Esc applies).
-    pub fn escape(&mut self) -> Option<ObjectId> {
-        let root = self.root.filter(|_| self.depth > 0);
-        self.reset();
-        root
+    /// Esc: up ONE level from the selected `level` of `chain` (#199). The
+    /// level to select, entered unless it is the top; `None` at the top (the
+    /// host's usual Esc applies, and the drill resets).
+    pub fn up(&mut self, chain: &Chain, level: usize) -> Option<usize> {
+        if level == 0 || level > chain.last() {
+            self.reset();
+            return None;
+        }
+        let l = level - 1;
+        if l == 0 {
+            self.reset();
+        } else {
+            self.enter(chain, l);
+        }
+        Some(l)
+    }
+
+    /// The parent whose subtree stays in full colour while drilled in (the
+    /// SketchUp edit context, #199): the level above `level` of `chain`, when
+    /// a level was entered. `None` shows everything normally.
+    pub fn context_parent(&self, chain: &Chain, level: usize) -> Option<ObjectId> {
+        (self.entered() && self.root == Some(chain.root()) && level >= 1 && level <= chain.last())
+            .then(|| chain.levels[level - 1].ids[0])
     }
 
     /// Enter `level` of `chain` directly (a breadcrumb click).
@@ -519,8 +691,25 @@ mod tests {
         }
         // Entered: a click on a sibling building stays at building level.
         assert_eq!(d.click(&c), 3);
-        assert_eq!(d.escape(), Some(source(doc)));
-        assert_eq!(d.click(&c), 0, "Esc reset to the top");
+        // The edit context is the lot: it and its building stay in colour.
+        let lot = c.levels[2].ids[0];
+        assert_eq!(d.context_parent(&c, 3), Some(lot));
+        let members = context_members(doc, lot);
+        assert!(members.contains(&lot) && c.levels[3].ids.iter().all(|i| members.contains(i)));
+        assert!(!members.contains(&source(doc)) && !members.contains(&road(doc)));
+        assert!(
+            context_members(doc, source(doc)).contains(&road(doc)),
+            "the site holds all"
+        );
+        // Esc goes up ONE level at a time, then hands over at the top.
+        assert_eq!(d.up(&c, 3), Some(2));
+        assert_eq!(d.click(&c), 2, "lot level entered");
+        assert_eq!(d.up(&c, 2), Some(1));
+        assert_eq!(d.up(&c, 1), Some(0));
+        assert!(!d.entered(), "back at the top");
+        assert_eq!(d.context_parent(&c, 0), None, "no fade at the top");
+        assert_eq!(d.up(&c, 0), None);
+        assert_eq!(d.click(&c), 0);
     }
 
     #[test]
@@ -539,7 +728,57 @@ mod tests {
         assert_eq!(d.click(&lots), 2, "and lots stay at lot level");
         d.reset();
         assert_eq!(d.click(&lots), 0);
-        assert_eq!(d.escape(), None);
+        assert_eq!(d.up(&lots, 0), None);
+    }
+
+    #[test]
+    fn same_type_selects_every_sibling_kind_of_the_site_plan() {
+        let s = site_plan();
+        let doc = &s.doc;
+        let lot = doc.objects().find(|o| o.layer == LOTS_LAYER).unwrap().id;
+        assert_eq!(same_type(doc, lot).len(), 4, "all four lots");
+        let mass = doc
+            .objects()
+            .find(|o| o.layer == BUILDINGS_LAYER && matches!(o.geometry, Geometry::Mesh(_)))
+            .unwrap()
+            .id;
+        assert_eq!(
+            same_type(doc, mass).len(),
+            8,
+            "four buildings, footprint + mass"
+        );
+        assert_eq!(same_type(doc, road(doc)), BTreeSet::from([road(doc)]));
+    }
+
+    #[test]
+    fn whole_street_carries_on_through_straight_junctions() {
+        let mut s = Session::default();
+        for line in ["rect 0,0,0 600 450", "siteplan last"] {
+            s.run(parse(line).unwrap()).unwrap();
+        }
+        let doc = &s.doc;
+        let ends = |id: ObjectId| road_ends(doc.get(id).unwrap()).unwrap();
+        let roads: Vec<ObjectId> = doc
+            .objects()
+            .filter(|o| o.street.is_some())
+            .map(|o| o.id)
+            .collect();
+        assert!(roads.len() > 2, "a grid of streets");
+        for r in &roads {
+            let all = whole_street(doc, *r);
+            assert!(all.contains(r));
+            // Every road reached runs parallel to the first one.
+            let d0 = ends(*r)[0].1;
+            for x in &all {
+                assert!(
+                    ends(*x)[0].1.dot(d0).abs() > 0.86,
+                    "{x:?} turns off the street"
+                );
+            }
+        }
+        // Some road continues through a junction into another road.
+        assert!(roads.iter().any(|r| whole_street(doc, *r).len() > 1));
+        assert!(whole_street(doc, source(doc)).is_empty());
     }
 
     #[test]
