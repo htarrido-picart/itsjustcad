@@ -1310,6 +1310,12 @@ pub enum Command {
         /// exec so replay never needs the EPW file again.
         #[serde(default)]
         bins: Option<Vec<[f64; 2]>>,
+        /// Score objects on locked layers too (#284: a lock means "can't edit"
+        /// only). Always `true` in ops logged since; absent (`false`) in older
+        /// documents, whose replay keeps skipping locked objects so their
+        /// overlays don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_locked: bool,
     },
     /// Sun-path diagram: draw the yearly sun-path dome for the document's
     /// location as polylines on the `sunpath` layer — seven date arcs (Dec 21 →
@@ -1342,6 +1348,12 @@ pub enum Command {
         year: i32,
         month: u32,
         day: u32,
+        /// Score objects on locked layers too (#284: a lock means "can't edit"
+        /// only). Always `true` in ops logged since; absent (`false`) in older
+        /// documents, whose replay keeps skipping locked objects so their
+        /// overlays don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_locked: bool,
     },
     // -- underlay (raster reference image on the ground plane) --
     /// Place a raster image (PNG) on the ground plane. `height` is `None` when
