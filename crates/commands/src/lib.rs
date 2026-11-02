@@ -33,6 +33,7 @@ pub mod paths;
 pub mod pat;
 pub mod pdf;
 pub mod plugin;
+pub mod qos;
 pub mod raster;
 mod registry;
 pub mod rhino3dm;

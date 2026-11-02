@@ -217,7 +217,7 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
         match prepared {
             Err(e) => job.finish(Err(e)),
             Ok(p) => {
-                std::thread::spawn(move || {
+                itsjustcad_commands::qos::spawn_utility(move || {
                     let report = |pr: &Progress| {
                         job.state().progress = *pr;
                     };

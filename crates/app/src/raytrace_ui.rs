@@ -212,6 +212,9 @@ impl RaytraceJob {
             std::thread::Builder::new()
                 .name("raytrace-render".into())
                 .spawn(move || {
+                    itsjustcad_commands::qos::set_current_thread(
+                        itsjustcad_commands::qos::Qos::UserInteractive,
+                    );
                     render_fn(&shared, &cancel);
                     if let Ok(mut s) = shared.lock() {
                         s.finished = true;

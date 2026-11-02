@@ -2775,6 +2775,7 @@ dependencies = [
  "kernel-mesh",
  "kernel-occt",
  "laz",
+ "libc",
  "rayon",
  "serde",
  "serde_json",

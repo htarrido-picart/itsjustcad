@@ -33,7 +33,7 @@ impl HistoryRebuild {
             };
             let slot: Slot = Arc::default();
             let out = slot.clone();
-            std::thread::spawn(move || {
+            itsjustcad_commands::qos::spawn_utility(move || {
                 let r = job.run(ReplayControl::default()).map_err(|e| e.to_string());
                 *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
             });
