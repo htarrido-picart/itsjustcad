@@ -5535,8 +5535,11 @@ fn exec_shadow_study(
     }
 
     // Per-object world-space vertices (grouped so each object gets its own hull).
+    // Terrain meshes (layer "terrain", as the landscape verbs identify them)
+    // are the ground, not occluders: their site-wide hull would swamp every
+    // building shadow (#285). The ground plane stays flat at z = 0.
     let mut object_pts: Vec<Vec<[f64; 3]>> = Vec::new();
-    for obj in doc.objects() {
+    for obj in doc.objects().filter(|o| o.layer != "terrain") {
         if let Geometry::Mesh(m) = &obj.geometry {
             object_pts.push(m.positions().iter().map(|p| [p.x, p.y, p.z]).collect());
         }
@@ -25043,6 +25046,45 @@ mod tests {
                 _ => None,
             })
             .sum()
+    }
+
+    /// #285: terrain meshes are not shadowstudy occluders — their site-wide
+    /// hull would swamp building shadows. Every terrain mesh is skipped, and
+    /// the shadows equal those of the same document without terrain.
+    #[test]
+    fn shadowstudy_skips_terrain_occluders() {
+        let shadows = |s: &mut Session| -> Vec<Vec<[f64; 3]>> {
+            let out = run(s, "shadowstudy 2024-06-21 12:00 14:00 120");
+            out.created
+                .iter()
+                .map(|id| match &s.doc.get(*id).unwrap().geometry {
+                    Geometry::Curve(Curve::Polyline { points, .. }) => {
+                        points.iter().map(|p| [p.x, p.y, p.z]).collect()
+                    }
+                    g => panic!("expected polyline, got {g:?}"),
+                })
+                .collect()
+        };
+        let mut plain = Session::default();
+        run(&mut plain, "box 0,0,0 4,4,4");
+        run(&mut plain, "sun 40.71 -74.01 2024-06-21 16:58");
+        let expected = shadows(&mut plain);
+        assert_eq!(expected.len(), 2);
+
+        let a = write_tmp(
+            "shadow_terr_a.csv",
+            b"x,y,z\n-100,-100,0\n100,-100,0\n100,100,0\n-100,100,0\n0,0,5\n",
+        );
+        let b = write_tmp(
+            "shadow_terr_b.csv",
+            b"x,y,z\n-80,-80,1\n80,-80,1\n80,80,1\n-80,80,1\n0,0,3\n",
+        );
+        let mut s = Session::default();
+        run(&mut s, &format!("terrain {a}"));
+        run(&mut s, &format!("terrain {b}"));
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "sun 40.71 -74.01 2024-06-21 16:58");
+        assert_eq!(shadows(&mut s), expected, "only the box casts shadows");
     }
 
     #[test]
