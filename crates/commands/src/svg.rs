@@ -10,6 +10,7 @@
 
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{Annotation, Document, Geometry, LayerStyle, ViewDirection};
+use rayon::prelude::*;
 
 /// Chord tolerance for tessellating curves (meters), matching the other exporters.
 const SVG_TOL: f64 = 0.005;
@@ -169,16 +170,7 @@ fn css_color(c: Option<[f32; 4]>) -> String {
     )
 }
 
-/// Compact float: 4 decimal places, trailing zeros trimmed.
-fn svg_num(v: f64) -> String {
-    let mut s = format!("{v:.4}");
-    while s.ends_with('0') { s.pop(); }
-    if s.ends_with('.') { s.push('0'); }
-    s
-}
 
-/// Build SVG bytes for the current document view.
-/// Returns the SVG bytes and a summary string for the command echo.
 /// One layer's worth of projected 2D segments, ready to render to SVG or a
 /// raster. Each segment carries its effective lineweight in mm (per-object beats
 /// layer).
@@ -201,13 +193,13 @@ pub struct ProjectedScene {
 
 /// Project the document to 2D once. `export_svg` (vector) and `export_jpg`
 /// (raster) both build on this so the two exports never drift apart.
+///
+/// Per-object segment collection and projection run in parallel
+/// ([`crate::segments::par_objects`], ordered), so layer contents and bounds are
+/// identical to a sequential pass.
 pub fn project_scene(doc: &Document) -> ProjectedScene {
-    let dir = DEFAULT_DIR; // always top-down for now (no live camera in export path)
+    let dir = DEFAULT_DIR;
 
-    // Text annotations are tessellated by collect_segments via the Hershey
-    // stroke font and flow through as regular line segments.
-
-    // Gather layers in document layer order (alphabetical + default first).
     let fallback = LayerStyle::default();
     let layer_names: Vec<String> = {
         let mut names: Vec<String> = doc.layers.keys().cloned().collect();
@@ -223,58 +215,54 @@ pub fn project_scene(doc: &Document) -> ProjectedScene {
             segs: Vec::new(),
         })
         .collect();
-    // Objects whose layer is not in the layer table go to an implicit fallback.
+
     let mut orphan = LayerData {
         name: "__orphan__".to_string(),
         style: fallback.clone(),
         segs: Vec::new(),
     };
 
-    let mut all_pts: Vec<DVec2> = Vec::new();
-    let mut total_segs = 0usize;
-
-    for obj in doc.objects() {
+    // (layer, effective lineweight, projected segments) per visible object.
+    let per_object = crate::segments::par_objects(doc, |obj| {
         if !obj.visible || !doc.layer_visible(&obj.layer) {
-            continue;
+            return None;
         }
-        let eff_lw = doc.effective_lineweight(obj);
-        let layer_data = layers
-            .iter_mut()
-            .find(|l| l.name == obj.layer)
-            .unwrap_or(&mut orphan);
-
         let mut world_segs = collect_segments(doc, &obj.geometry);
-        // Planting plan: a mesh named `plant:<id>` also emits its 2D top-view
-        // drafting symbol. Only in the Top (plan) projection — a plan glyph is
-        // meaningless in elevation/iso. The 3D mesh feature edges still export;
-        // the symbol overlays them so the drawing reads as a planting plan.
         if dir == ViewDirection::Top
             && let (Some(name), Geometry::Mesh(mesh)) = (obj.name.as_deref(), &obj.geometry)
-            && let Some(sym) =
-                crate::landscape::plant_object_symbol(name, mesh.positions())
+            && let Some(sym) = crate::landscape::plant_object_symbol(name, mesh.positions())
         {
             world_segs.extend(sym);
         }
-        for (a, b) in &world_segs {
-            let pa = project(dir, *a);
-            let pb = project(dir, *b);
-            all_pts.push(pa);
-            all_pts.push(pb);
-            layer_data.segs.push((pa, pb, eff_lw));
-        }
-        total_segs += world_segs.len();
-    }
+        let projected: Vec<(DVec2, DVec2)> = world_segs
+            .iter()
+            .map(|(a, b)| (project(dir, *a), project(dir, *b)))
+            .collect();
+        Some((&obj.layer, doc.effective_lineweight(obj), projected))
+    });
 
-    // --- viewBox from scene bounds ---
     let (mut min_x, mut min_y, mut max_x, mut max_y) =
         (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    for p in &all_pts {
-        min_x = min_x.min(p.x);
-        min_y = min_y.min(p.y);
-        max_x = max_x.max(p.x);
-        max_y = max_y.max(p.y);
+    let mut total_segs = 0usize;
+
+    for (layer, eff_lw, projected) in per_object.into_iter().flatten() {
+        let layer_data = layers
+            .iter_mut()
+            .find(|l| &l.name == layer)
+            .unwrap_or(&mut orphan);
+        total_segs += projected.len();
+        layer_data.segs.reserve(projected.len());
+        for (pa, pb) in projected {
+            for p in [pa, pb] {
+                min_x = min_x.min(p.x);
+                min_y = min_y.min(p.y);
+                max_x = max_x.max(p.x);
+                max_y = max_y.max(p.y);
+            }
+            layer_data.segs.push((pa, pb, eff_lw));
+        }
     }
-    // Guard empty doc.
+
     if !min_x.is_finite() || min_x >= max_x || min_y >= max_y {
         min_x = -1.0; min_y = -1.0; max_x = 1.0; max_y = 1.0;
     }
@@ -285,7 +273,6 @@ pub fn project_scene(doc: &Document) -> ProjectedScene {
     let vw = (max_x - min_x) + 2.0 * pad;
     let vh = (max_y - min_y) + 2.0 * pad;
 
-    // Fold the orphan bucket in as the last layer so callers see a single list.
     layers.push(orphan);
     ProjectedScene {
         layers,
@@ -294,28 +281,63 @@ pub fn project_scene(doc: &Document) -> ProjectedScene {
     }
 }
 
+/// Append an SVG number: 4 decimals, trailing zeros trimmed.
+fn push_num(out: &mut String, v: f64) {
+    crate::segments::push_trimmed(out, v, 4);
+}
+
+/// `<line>` elements per parallel formatting task. Small under test so the
+/// byte-equality test crosses many chunk joins.
+#[cfg(not(test))]
+const LINE_CHUNK: usize = 4096;
+#[cfg(test)]
+const LINE_CHUNK: usize = 64;
+
+/// Append one `<line>` element; the stroke width is written only when the
+/// segment's weight differs from its layer's.
+fn push_line(out: &mut String, (a, b, eff_lw): &(DVec2, DVec2, f64), layer_sw: f64) {
+    let seg_sw = eff_lw / 1000.0;
+    out.push_str("    <line x1=\"");
+    push_num(out, a.x);
+    out.push_str("\" y1=\"");
+    push_num(out, a.y);
+    out.push_str("\" x2=\"");
+    push_num(out, b.x);
+    out.push_str("\" y2=\"");
+    push_num(out, b.y);
+    out.push('"');
+    if (seg_sw - layer_sw).abs() > 1e-9 {
+        out.push_str(" stroke-width=\"");
+        push_num(out, seg_sw);
+        out.push('"');
+    }
+    out.push_str("/>\n");
+}
+
+/// Build SVG bytes for the current document view.
+/// Returns the SVG bytes and a summary string for the command echo.
 pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
     let scene = project_scene(doc);
     let (vx, vy, vw, vh) = scene.bounds;
     let total_segs = scene.total_segs;
 
-    // SVG user-units = meters; lineweight stays in mm so divide by 1000 to
-    // convert to meter-scale user-units.
-    let mut svg = String::new();
+    // ~80 bytes per <line> element.
+    let mut svg = String::with_capacity(256 + total_segs * 80);
     svg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    svg.push_str(&format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" \
-         viewBox=\"{} {} {} {}\" \
-         width=\"{}\" height=\"{}\">\n",
-        svg_num(vx),
-        svg_num(vy),
-        svg_num(vw),
-        svg_num(vh),
-        svg_num(vw * 1000.0), // display width in mm (1 m = 1000 mm)
-        svg_num(vh * 1000.0),
-    ));
+    svg.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"");
+    push_num(&mut svg, vx);
+    svg.push(' ');
+    push_num(&mut svg, vy);
+    svg.push(' ');
+    push_num(&mut svg, vw);
+    svg.push(' ');
+    push_num(&mut svg, vh);
+    svg.push_str("\" width=\"");
+    push_num(&mut svg, vw * 1000.0); // display width in mm (1 m = 1000 mm)
+    svg.push_str("\" height=\"");
+    push_num(&mut svg, vh * 1000.0);
+    svg.push_str("\">\n");
 
-    // Emit layers (only those with content).
     let mut layer_count = 0usize;
     let mut path_count = 0usize;
 
@@ -324,33 +346,32 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
             continue;
         }
         layer_count += 1;
-        let stroke = css_color(layer.style.color);
-        let layer_sw = layer.style.lineweight_mm / 1000.0; // mm → meters (SVG user-units)
-        svg.push_str(&format!(
-            "  <g id=\"{}\" stroke=\"{}\" stroke-width=\"{}\" fill=\"none\">\n",
-            xml_escape(&layer.name),
-            stroke,
-            svg_num(layer_sw),
-        ));
+        let layer_sw = layer.style.lineweight_mm / 1000.0;
+        svg.push_str("  <g id=\"");
+        svg.push_str(&xml_escape(&layer.name));
+        svg.push_str("\" stroke=\"");
+        svg.push_str(&css_color(layer.style.color));
+        svg.push_str("\" stroke-width=\"");
+        push_num(&mut svg, layer_sw);
+        svg.push_str("\" fill=\"none\">\n");
 
-        // Emit each segment as a separate `<line>`. Per-object lineweight
-        // overrides are expressed as a `stroke-width` attribute on the element
-        // when they differ from the layer default.
-        for (a, b, eff_lw) in &layer.segs {
-            let seg_sw = eff_lw / 1000.0;
-            let override_attr = if (seg_sw - layer_sw).abs() > 1e-9 {
-                format!(" stroke-width=\"{}\"", svg_num(seg_sw))
-            } else {
-                String::new()
-            };
-            svg.push_str(&format!(
-                "    <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\"{}/>\n",
-                svg_num(a.x), svg_num(a.y),
-                svg_num(b.x), svg_num(b.y),
-                override_attr,
-            ));
-            path_count += 1;
+        // Number formatting dominates on big drawings, so chunks of <line>
+        // elements are written in parallel and joined in order (same bytes).
+        let chunks: Vec<String> = layer
+            .segs
+            .par_chunks(LINE_CHUNK)
+            .map(|chunk| {
+                let mut out = String::with_capacity(chunk.len() * 80);
+                for seg in chunk {
+                    push_line(&mut out, seg, layer_sw);
+                }
+                out
+            })
+            .collect();
+        for chunk in &chunks {
+            svg.push_str(chunk);
         }
+        path_count += layer.segs.len();
 
         svg.push_str("  </g>\n");
     }
@@ -361,6 +382,184 @@ pub fn export_svg(doc: &Document) -> (Vec<u8>, String) {
         "{total_segs} segments across {layer_count} layer(s), {path_count} SVG elements"
     );
     (svg.into_bytes(), summary)
+}
+
+/// The pre-#278 sequential exporter, verbatim: the byte-equality reference.
+#[cfg(test)]
+pub(crate) mod seq_ref {
+    use super::*;
+
+    /// Compact float: 4 decimal places, trailing zeros trimmed.
+    fn svg_num_seq(v: f64) -> String {
+        let mut s = format!("{v:.4}");
+        while s.ends_with('0') { s.pop(); }
+        if s.ends_with('.') { s.push('0'); }
+        s
+    }
+
+    /// Project the document to 2D once. `export_svg` (vector) and `export_jpg`
+    /// (raster) both build on this so the two exports never drift apart.
+    pub(super) fn project_scene_seq(doc: &Document) -> ProjectedScene {
+        let dir = DEFAULT_DIR; // always top-down for now (no live camera in export path)
+
+        // Text annotations are tessellated by collect_segments via the Hershey
+        // stroke font and flow through as regular line segments.
+
+        // Gather layers in document layer order (alphabetical + default first).
+        let fallback = LayerStyle::default();
+        let layer_names: Vec<String> = {
+            let mut names: Vec<String> = doc.layers.keys().cloned().collect();
+            names.sort();
+            names
+        };
+
+        let mut layers: Vec<LayerData> = layer_names
+            .iter()
+            .map(|n| LayerData {
+                name: n.clone(),
+                style: doc.layers.get(n).unwrap_or(&fallback).clone(),
+                segs: Vec::new(),
+            })
+            .collect();
+        // Objects whose layer is not in the layer table go to an implicit fallback.
+        let mut orphan = LayerData {
+            name: "__orphan__".to_string(),
+            style: fallback.clone(),
+            segs: Vec::new(),
+        };
+
+        let mut all_pts: Vec<DVec2> = Vec::new();
+        let mut total_segs = 0usize;
+
+        for obj in doc.objects() {
+            if !obj.visible || !doc.layer_visible(&obj.layer) {
+                continue;
+            }
+            let eff_lw = doc.effective_lineweight(obj);
+            let layer_data = layers
+                .iter_mut()
+                .find(|l| l.name == obj.layer)
+                .unwrap_or(&mut orphan);
+
+            let mut world_segs = collect_segments(doc, &obj.geometry);
+            // Planting plan: a mesh named `plant:<id>` also emits its 2D top-view
+            // drafting symbol. Only in the Top (plan) projection — a plan glyph is
+            // meaningless in elevation/iso. The 3D mesh feature edges still export;
+            // the symbol overlays them so the drawing reads as a planting plan.
+            if dir == ViewDirection::Top
+                && let (Some(name), Geometry::Mesh(mesh)) = (obj.name.as_deref(), &obj.geometry)
+                && let Some(sym) =
+                    crate::landscape::plant_object_symbol(name, mesh.positions())
+            {
+                world_segs.extend(sym);
+            }
+            for (a, b) in &world_segs {
+                let pa = project(dir, *a);
+                let pb = project(dir, *b);
+                all_pts.push(pa);
+                all_pts.push(pb);
+                layer_data.segs.push((pa, pb, eff_lw));
+            }
+            total_segs += world_segs.len();
+        }
+
+        // --- viewBox from scene bounds ---
+        let (mut min_x, mut min_y, mut max_x, mut max_y) =
+            (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for p in &all_pts {
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            max_y = max_y.max(p.y);
+        }
+        // Guard empty doc.
+        if !min_x.is_finite() || min_x >= max_x || min_y >= max_y {
+            min_x = -1.0; min_y = -1.0; max_x = 1.0; max_y = 1.0;
+        }
+
+        let pad = ((max_x - min_x).max(max_y - min_y)) * 0.02;
+        let vx = min_x - pad;
+        let vy = min_y - pad;
+        let vw = (max_x - min_x) + 2.0 * pad;
+        let vh = (max_y - min_y) + 2.0 * pad;
+
+        // Fold the orphan bucket in as the last layer so callers see a single list.
+        layers.push(orphan);
+        ProjectedScene {
+            layers,
+            bounds: (vx, vy, vw, vh),
+            total_segs,
+        }
+    }
+
+    pub(crate) fn export_svg_seq(doc: &Document) -> (Vec<u8>, String) {
+        let scene = project_scene_seq(doc);
+        let (vx, vy, vw, vh) = scene.bounds;
+        let total_segs = scene.total_segs;
+
+        // SVG user-units = meters; lineweight stays in mm so divide by 1000 to
+        // convert to meter-scale user-units.
+        let mut svg = String::new();
+        svg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        svg.push_str(&format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" \
+             viewBox=\"{} {} {} {}\" \
+             width=\"{}\" height=\"{}\">\n",
+            svg_num_seq(vx),
+            svg_num_seq(vy),
+            svg_num_seq(vw),
+            svg_num_seq(vh),
+            svg_num_seq(vw * 1000.0), // display width in mm (1 m = 1000 mm)
+            svg_num_seq(vh * 1000.0),
+        ));
+
+        // Emit layers (only those with content).
+        let mut layer_count = 0usize;
+        let mut path_count = 0usize;
+
+        for layer in &scene.layers {
+            if layer.segs.is_empty() {
+                continue;
+            }
+            layer_count += 1;
+            let stroke = css_color(layer.style.color);
+            let layer_sw = layer.style.lineweight_mm / 1000.0; // mm → meters (SVG user-units)
+            svg.push_str(&format!(
+                "  <g id=\"{}\" stroke=\"{}\" stroke-width=\"{}\" fill=\"none\">\n",
+                xml_escape(&layer.name),
+                stroke,
+                svg_num_seq(layer_sw),
+            ));
+
+            // Emit each segment as a separate `<line>`. Per-object lineweight
+            // overrides are expressed as a `stroke-width` attribute on the element
+            // when they differ from the layer default.
+            for (a, b, eff_lw) in &layer.segs {
+                let seg_sw = eff_lw / 1000.0;
+                let override_attr = if (seg_sw - layer_sw).abs() > 1e-9 {
+                    format!(" stroke-width=\"{}\"", svg_num_seq(seg_sw))
+                } else {
+                    String::new()
+                };
+                svg.push_str(&format!(
+                    "    <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\"{}/>\n",
+                    svg_num_seq(a.x), svg_num_seq(a.y),
+                    svg_num_seq(b.x), svg_num_seq(b.y),
+                    override_attr,
+                ));
+                path_count += 1;
+            }
+
+            svg.push_str("  </g>\n");
+        }
+
+        svg.push_str("</svg>\n");
+
+        let summary = format!(
+            "{total_segs} segments across {layer_count} layer(s), {path_count} SVG elements"
+        );
+        (svg.into_bytes(), summary)
+    }
 }
 
 #[cfg(test)]
@@ -508,5 +707,16 @@ mod tests {
             !summary.contains("0 segments"),
             "segments must be > 0 for text annotation: {summary}"
         );
+    }
+
+    /// #278: the parallel exporter writes the same bytes as the sequential one.
+    #[test]
+    fn parallel_svg_is_byte_identical_to_sequential() {
+        let s = crate::segments::mixed_session();
+        let (par, par_sum) = export_svg(&s.doc);
+        let (seq, seq_sum) = seq_ref::export_svg_seq(&s.doc);
+        assert!(par.len() > 10_000, "fixture too small: {} bytes", par.len());
+        assert_eq!(par_sum, seq_sum);
+        assert!(par == seq, "SVG bytes differ");
     }
 }

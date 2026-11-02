@@ -7,6 +7,8 @@
 //! and arcs export exactly; ellipses and NURBS tessellate (R12 has neither);
 //! meshes export their feature edges as LINE entities.
 
+use std::fmt::Write as _;
+
 use glam::DVec3;
 use itsjustcad_doc::{Annotation, BlockGeometry, Document, Geometry};
 
@@ -22,20 +24,18 @@ struct Tags(String);
 
 impl Tags {
     fn tag(&mut self, code: i32, value: &str) {
-        self.0.push_str(&format!("{code}\n{value}\n"));
+        let _ = writeln!(self.0, "{code}");
+        self.0.push_str(value);
+        self.0.push('\n');
     }
 
     fn num(&mut self, code: i32, value: f64) {
         // Enough digits to round-trip drafting coordinates; trailing zeros
-        // trimmed so files stay small and diffs readable.
-        let mut s = format!("{value:.9}");
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.push('0');
-        }
-        self.tag(code, &s);
+        // trimmed so files stay small and diffs readable. Written straight
+        // into the buffer (#278).
+        let _ = writeln!(self.0, "{code}");
+        crate::segments::push_trimmed(&mut self.0, value, 9);
+        self.0.push('\n');
     }
 
     fn point(&mut self, p: DVec3) {
@@ -397,9 +397,18 @@ pub fn document_dxf(doc: &Document) -> (String, usize) {
 
     t.tag(0, "SECTION");
     t.tag(2, "ENTITIES");
+    // Each object's entities are written to their own buffer in parallel
+    // (mesh feature edges dominate); the ordered collect keeps document order.
+    let parts = crate::segments::par_objects(doc, |obj| {
+        let mut part = Tags(String::new());
+        let n = entity(&mut part, &dxf_layer(&obj.layer), &obj.geometry, doc.units, doc);
+        (part.0, n)
+    });
+    t.0.reserve(parts.iter().map(|(p, _)| p.len()).sum());
     let mut count = 0usize;
-    for obj in doc.objects() {
-        count += entity(&mut t, &dxf_layer(&obj.layer), &obj.geometry, doc.units, doc);
+    for (part, n) in parts {
+        t.0.push_str(&part);
+        count += n;
     }
     t.tag(0, "ENDSEC");
     t.tag(0, "EOF");
@@ -1310,6 +1319,77 @@ fn record_point(fields: &[(i32, &str)], base: i32) -> Option<DVec3> {
         record_num(fields, base + 10)?,
         record_num(fields, base + 20).unwrap_or(0.0),
     ))
+}
+
+/// Test-only reference for the parallel exporter.
+#[cfg(test)]
+pub(crate) mod seq_ref {
+    use super::*;
+
+    /// The pre-#278 sequential `document_dxf`, verbatim: the byte-equality reference.
+    pub(crate) fn document_dxf_seq(doc: &Document) -> (String, usize) {
+        let mut t = Tags(String::new());
+
+        t.tag(0, "SECTION");
+        t.tag(2, "HEADER");
+        t.tag(9, "$ACADVER");
+        t.tag(1, "AC1009"); // R12
+        t.tag(0, "ENDSEC");
+
+        // Layer table so receivers list the document's layers by name.
+        t.tag(0, "SECTION");
+        t.tag(2, "TABLES");
+        t.tag(0, "TABLE");
+        t.tag(2, "LAYER");
+        t.tag(70, &doc.layers.len().to_string());
+        for (name, style) in &doc.layers {
+            t.tag(0, "LAYER");
+            t.tag(2, &dxf_layer(name));
+            t.tag(70, "0");
+            t.tag(62, "7");
+            t.tag(6, "CONTINUOUS");
+            // Code 370: lineweight in hundredths of a mm (ISO standard values).
+            // Round to the nearest hundredth and clamp to sane drafting range.
+            let lw_hundredths = (style.lineweight_mm * 100.0).round().clamp(0.0, 211.0) as i32;
+            t.tag(370, &lw_hundredths.to_string());
+        }
+        t.tag(0, "ENDTAB");
+        t.tag(0, "ENDSEC");
+
+        // BLOCKS section: one BLOCK/ENDBLK per definition in `doc.blocks`. Parametric
+        // (dynamic) blocks have no DXF equivalent, but each parametric instance keeps
+        // its baked geometry in `doc.blocks` under its per-instance key, so those keys
+        // export as ordinary static blocks here — no special handling needed. Block
+        // bodies are written at the origin (base point 0,0,0); INSERT places them.
+        t.tag(0, "SECTION");
+        t.tag(2, "BLOCKS");
+        for (name, geoms) in &doc.blocks {
+            let bname = dxf_layer(name);
+            t.tag(0, "BLOCK");
+            t.tag(8, "0");
+            t.tag(2, &bname);
+            t.tag(70, "0"); // 0 = a normal (non-anonymous) block
+            t.point(DVec3::ZERO); // base point at origin
+            t.tag(3, &bname); // block name repeated (R12 convention)
+            for g in geoms {
+                block_entity(&mut t, "0", g, doc.units);
+            }
+            t.tag(0, "ENDBLK");
+            t.tag(8, "0");
+        }
+        t.tag(0, "ENDSEC");
+
+        t.tag(0, "SECTION");
+        t.tag(2, "ENTITIES");
+        let mut count = 0usize;
+        for obj in doc.objects() {
+            count += entity(&mut t, &dxf_layer(&obj.layer), &obj.geometry, doc.units, doc);
+        }
+        t.tag(0, "ENDSEC");
+        t.tag(0, "EOF");
+
+        (t.0, count)
+    }
 }
 
 #[cfg(test)]
@@ -2349,5 +2429,16 @@ mod tests {
         assert!(n_clip >= 1);
         // The unclipped export references the block via a single INSERT.
         assert!(n_noclip >= 1);
+    }
+
+    /// #278: the parallel exporter writes the same bytes as the sequential one.
+    #[test]
+    fn parallel_dxf_is_byte_identical_to_sequential() {
+        let s = crate::segments::mixed_session();
+        let (par, par_n) = document_dxf(&s.doc);
+        let (seq, seq_n) = seq_ref::document_dxf_seq(&s.doc);
+        assert!(par.len() > 10_000, "fixture too small: {} bytes", par.len());
+        assert_eq!(par_n, seq_n);
+        assert!(par == seq, "DXF bytes differ");
     }
 }
