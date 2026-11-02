@@ -3069,6 +3069,7 @@ checksum = "5a1bd8242fad6a61a7520b73d072ddf63dff1f3680e3f5c157b1dc6e8e5ab2ec"
 dependencies = [
  "byteorder",
  "num-traits",
+ "rayon",
 ]
 
 [[package]]
