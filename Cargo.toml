@@ -81,12 +81,15 @@ itsjustcad-render = { path = "crates/render" }
 itsjustcad-raytrace = { path = "crates/raytrace" }
 itsjustcad-solar = { path = "crates/solar" }
 
+# Release: one profile for the desktop app and the iOS/Catalyst xcframework.
+# opt-level "s" (#266): ~1.35-2x faster analysis than "z" for ~29% more binary,
+# at about the same build time; 2/3 were only ~10% faster for ~1.8x builds.
 [profile.release]
 strip = true
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-opt-level = "z"
+opt-level = "s"
 
 # ── Fast local iteration (previews + dist testing) ──────────────────────────
 # macOS: keep debuginfo in the .o files (skip the slow dsymutil dSYM pack).

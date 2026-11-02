@@ -925,7 +925,7 @@ crates/
 ## Building & testing
 
 ```sh
-cargo build --release        # single ~10 MB binary
+cargo build --release        # single ~17 MB binary
 cargo test --workspace       # 630+ tests
 cargo clippy --workspace
 scripts/bundle-macos.sh      # ad-hoc signed .app bundle
