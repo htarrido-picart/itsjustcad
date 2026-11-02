@@ -3080,7 +3080,11 @@ pub fn resolve_targets(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, 
     resolve(doc, sel)
 }
 
-fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
+/// Resolve a selector for a read-only verb (analysis, measurement, reports):
+/// live ids, locked layers included. A layer lock means "can't edit" only
+/// (#270), so locked geometry is still scored and measured. Editing verbs use
+/// [`resolve`], which drops locked objects.
+fn resolve_read(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
     let raw: Vec<ObjectId> = match sel {
         // Validate ids against the document: the parser never emits `Ids`, but a
         // hand-edited/corrupted/malicious `.ijc` op-log can, and ~48 downstream
@@ -3101,6 +3105,11 @@ fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
             _ => format!("document has {} objects", doc.len()),
         }));
     }
+    Ok(raw)
+}
+
+fn resolve(doc: &Document, sel: &Selector) -> Result<Vec<ObjectId>, ExecError> {
+    let raw = resolve_read(doc, sel)?;
     // Objects on a locked layer are not selectable/editable: drop them so no
     // edit/transform/delete command can touch them. `layerlock <layer> off`
     // restores access.
@@ -5769,6 +5778,7 @@ fn exec_radiation(
     ids: Option<Vec<ObjectId>>,
     path: String,
     bins: Option<Vec<[f64; 2]>>,
+    include_locked: bool,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
     let loc = doc.location.ok_or_else(|| {
         ExecError::Invalid(
@@ -5788,7 +5798,11 @@ fn exec_radiation(
                 .map_err(|e| ExecError::Invalid(format!("EPW '{path}': {e}")))?
         }
     };
-    let target_ids = resolve(doc, &targets)?;
+    // Fresh runs (and ops logged since #284) score locked layers too; older
+    // logged ops replay as they ran, skipping them.
+    let include_locked = include_locked || ids.is_none();
+    let target_ids =
+        if include_locked { resolve_read(doc, &targets)? } else { resolve(doc, &targets)? };
 
     // World-space triangles of the selected faces (what we score + color).
     let mut faces: Vec<[DVec3; 3]> = Vec::new();
@@ -5893,6 +5907,7 @@ fn exec_radiation(
             ids: Some(new_ids.clone()),
             path,
             bins: Some(bins),
+            include_locked,
         },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
@@ -8056,7 +8071,7 @@ fn exec_lot_report(
     // nothing) reports the whole document.
     let sel_ids: Vec<ObjectId> = match &targets {
         Selector::Selected => Vec::new(),
-        _ => resolve(doc, &targets).unwrap_or_default(),
+        _ => resolve_read(doc, &targets).unwrap_or_default(),
     };
     let inputs = crate::lot::gather_yield_inputs(doc, &sel_ids, &settings);
     let report = subdivision::YieldReport::compute(&inputs);
@@ -9320,6 +9335,7 @@ fn exec_face_sun_hours(
     year: i32,
     month: u32,
     day: u32,
+    include_locked: bool,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
     let loc = doc.location.ok_or_else(|| {
         ExecError::Invalid(
@@ -9328,7 +9344,11 @@ fn exec_face_sun_hours(
                 .into(),
         )
     })?;
-    let target_ids = resolve(doc, &targets)?;
+    // Fresh runs (and ops logged since #284) score locked layers too; older
+    // logged ops replay as they ran, skipping them.
+    let include_locked = include_locked || ids.is_none();
+    let target_ids =
+        if include_locked { resolve_read(doc, &targets)? } else { resolve(doc, &targets)? };
 
     // World-space triangles of the *selected* faces only (what we score + color).
     let mut faces: Vec<[DVec3; 3]> = Vec::new();
@@ -9463,7 +9483,14 @@ fn exec_face_sun_hours(
     let daylight = itsjustcad_solar::daylight_hours(year, month, day, loc.lat_deg);
 
     Ok((
-        Command::FaceSunHours { targets, ids: Some(new_ids.clone()), year, month, day },
+        Command::FaceSunHours {
+            targets,
+            ids: Some(new_ids.clone()),
+            year,
+            month,
+            day,
+            include_locked,
+        },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
             message: format!(
@@ -14532,11 +14559,11 @@ fn apply_forward(
             exec_sun_hours(doc, ids, year, month, day, spacing)
         }
         Command::SunPath { ids, year, radius } => exec_sun_path(doc, ids, year, radius),
-        Command::Radiation { targets, ids, path, bins } => {
-            exec_radiation(doc, targets, ids, path, bins)
+        Command::Radiation { targets, ids, path, bins, include_locked } => {
+            exec_radiation(doc, targets, ids, path, bins, include_locked)
         }
-        Command::FaceSunHours { targets, ids, year, month, day } => {
-            exec_face_sun_hours(doc, targets, ids, year, month, day)
+        Command::FaceSunHours { targets, ids, year, month, day, include_locked } => {
+            exec_face_sun_hours(doc, targets, ids, year, month, day, include_locked)
         }
         Command::Contours { interval, major_every, ids } => {
             exec_contours(doc, interval, major_every, ids)
@@ -15099,7 +15126,7 @@ fn apply_forward(
             ))
         }
         Command::Area { targets } => {
-            let ids = resolve(doc, &targets)?;
+            let ids = resolve_read(doc, &targets)?;
             let mut total = 0.0;
             for id in &ids {
                 total += match &doc.get(*id).expect("resolved").geometry {
@@ -15146,7 +15173,7 @@ fn apply_forward(
             ))
         }
         Command::Volume { targets } => {
-            let ids = resolve(doc, &targets)?;
+            let ids = resolve_read(doc, &targets)?;
             let mut total = 0.0;
             for id in &ids {
                 match &doc.get(*id).expect("resolved").geometry {
@@ -15190,7 +15217,7 @@ fn apply_forward(
             ))
         }
         Command::Bbox { targets } => {
-            let ids = resolve(doc, &targets)?;
+            let ids = resolve_read(doc, &targets)?;
             let mut bb = doc.geometry_aabb(&doc.get(ids[0]).expect("resolved").geometry);
             for id in &ids[1..] {
                 bb = bb.union(doc.geometry_aabb(&doc.get(*id).expect("resolved").geometry));
@@ -23793,13 +23820,83 @@ mod tests {
     fn facesunhours_parse_round_trip() {
         let c = parse("facesunhours last 2024-06-21").unwrap();
         match &c {
-            Command::FaceSunHours { targets, ids, year, month, day } => {
+            Command::FaceSunHours { targets, ids, year, month, day, .. } => {
                 assert!(matches!(targets, Selector::Last { n: 1 }));
                 assert!(ids.is_none());
                 assert_eq!((*year, *month, *day), (2024, 6, 21));
             }
             other => panic!("expected FaceSunHours, got {other:?}"),
         }
+    }
+
+    /// Locks one box's layer and leaves a second box free: analysis must still
+    /// read the locked one (#284: a lock means "can't edit" only).
+    fn locked_and_free_boxes() -> Session {
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "layer site");
+        run(&mut s, "box 10,0,0 4,4,4");
+        run(&mut s, "layerlock walls on");
+        s
+    }
+
+    #[test]
+    fn facesunhours_scores_locked_layer_receivers() {
+        let mut s = locked_and_free_boxes();
+        run(&mut s, "location 40.0 0.0 0");
+        let out = run(&mut s, "facesunhours all 2024-06-21");
+        assert_eq!(out.created.len(), 24, "both boxes' 12 faces each: {}", out.message);
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn radiation_scores_locked_layer_receivers() {
+        let path = write_synth_epw("locked.epw");
+        let mut s = locked_and_free_boxes();
+        run(&mut s, &format!("import {}", path.display()));
+        let out = run(&mut s, &format!("radiation all {}", path.display()));
+        assert_eq!(out.created.len(), 24, "both boxes' 12 faces each: {}", out.message);
+        assert_replay_stable(&s);
+    }
+
+    /// Ops logged before #284 carry no `include_locked`: replay keeps skipping
+    /// locked receivers, so existing documents rebuild the same overlays.
+    #[test]
+    fn analysis_ops_logged_before_284_replay_unchanged() {
+        let mut s = locked_and_free_boxes();
+        run(&mut s, "location 40.0 0.0 0");
+        let mut log = s.save_log();
+        let legacy: Command = serde_json::from_str(
+            r#"{"cmd":"face_sun_hours","targets":{"sel":"all"},"ids":[],"year":2024,"month":6,"day":21}"#,
+        )
+        .unwrap();
+        assert!(matches!(legacy, Command::FaceSunHours { include_locked: false, .. }));
+        log.push(legacy);
+        let replayed = Session::replay(log).unwrap();
+        let overlays = replayed
+            .doc
+            .all_ids()
+            .iter()
+            .filter(|id| replayed.doc.get(**id).unwrap().layer == "analysis")
+            .count();
+        assert_eq!(overlays, 12, "legacy op scores only the unlocked box");
+        let saved = serde_json::to_string(replayed.save_log().last().unwrap()).unwrap();
+        assert!(!saved.contains("include_locked"), "legacy op re-saves unchanged: {saved}");
+    }
+
+    #[test]
+    fn measure_verbs_read_locked_layers() {
+        let mut s = Session::default();
+        run(&mut s, "layer walls");
+        run(&mut s, "box 0,0,0 2,2,2");
+        run(&mut s, "layerlock walls on");
+        assert!(run(&mut s, "area all").message.contains("1 object"));
+        assert!(run(&mut s, "volume all").message.contains("1 object"));
+        assert!(run(&mut s, "bbox all").message.contains("1 object"));
+        // Editing still refuses the locked box.
+        let err = s.run(parse("delete all").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("locked layer"), "{err}");
     }
 
     #[test]

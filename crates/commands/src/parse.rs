@@ -2107,7 +2107,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
             let (targets, rest) = selector(&args, "facesunhours")?;
             let [date] = take::<1>("facesunhours", "a YYYY-MM-DD date after the selector", rest)?;
             let (year, month, day) = parse_date(date)?;
-            Ok(Command::FaceSunHours { targets, ids: None, year, month, day })
+            Ok(Command::FaceSunHours { targets, ids: None, year, month, day, include_locked: true })
         }
         // radiation <selector> <path.epw>
         // climate <path.epw> | climate off
@@ -2130,7 +2130,13 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
             }
             // Join the remaining args so EPW paths with spaces survive
             // whitespace tokenization (same approach as `import`).
-            Ok(Command::Radiation { targets, ids: None, path: rest.join(" "), bins: None })
+            Ok(Command::Radiation {
+                targets,
+                ids: None,
+                path: rest.join(" "),
+                bins: None,
+                include_locked: true,
+            })
         }
         // sunpath [radius] [year]
         "sunpath" => {
