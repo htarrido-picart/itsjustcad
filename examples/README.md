@@ -33,6 +33,10 @@ Add `--headless --shot out.png` to render an offscreen PNG with no window:
 ItsJustCAD --run examples/scripts/site-plan.script --headless --shot /tmp/site.png
 ```
 
+`scripts/perf-site.script` (with `scripts/perf-site-terrain.csv`) builds a large
+2400 × 4050 m district for profiling. It is a script only, not a committed
+document, because its op-log is large. Run it from the repo root.
+
 Scripts are one command per line; `#` starts a comment. See the
 [command reference](../docs/command-reference.md) for every verb.
 
