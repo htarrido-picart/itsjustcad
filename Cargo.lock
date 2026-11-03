@@ -2983,6 +2983,7 @@ name = "kernel-mesh"
 version = "0.8.0"
 dependencies = [
  "glam 0.30.10",
+ "rayon",
  "serde",
 ]
 
