@@ -6,6 +6,8 @@
 //! art. The writer is hand-rolled — the output is uncompressed line/text
 //! operators only, which keeps the crate dependency-free.
 
+use std::fmt::Write as _;
+
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{
     Annotation, Document, Geometry, ScheduleRow, Sheet, SheetDim, SheetLeader, SheetTag,
@@ -567,12 +569,14 @@ fn collect_view_fit(doc: &Document, view: &SheetView, rect: (DVec2, DVec2)) -> O
     // pattern). The plot pen (color + weight) is resolved through the active
     // plot style, if any: `doc.plot_pen` returns the base pen (default black)
     // for unmapped objects, so the drawing is unchanged without a plot style.
-    let mut weighted: Vec<(f64, [f32; 3], DVec3, DVec3)> = Vec::new();
-    for obj in doc.objects() {
+    //
+    // Per-object collection runs in parallel; the ordered collect keeps
+    // document order, so the (stable) pen sort below sees the same sequence.
+    let per_object = crate::segments::par_objects(doc, |obj| {
+        let mut tmp = Vec::new();
         if obj.visible && doc.layer_visible(&obj.layer) {
             let pen = doc.plot_pen(obj, [0.0, 0.0, 0.0]);
             let w = pen.weight_mm;
-            let mut tmp = Vec::new();
             geometry_segments(doc, &obj.geometry, &mut tmp);
             // Planting plan: in a Top (plan) view, a mesh named `plant:<id>`
             // also draws its 2D drafting symbol atop the 3D feature edges. Plan
@@ -583,10 +587,14 @@ fn collect_view_fit(doc: &Document, view: &SheetView, rect: (DVec2, DVec2)) -> O
             {
                 tmp.extend(sym);
             }
-            for (a, b) in tmp {
-                weighted.push((w, pen.color, a, b));
-            }
+            return tmp.into_iter().map(|(a, b)| (w, pen.color, a, b)).collect();
         }
+        Vec::new()
+    });
+    let mut weighted: Vec<(f64, [f32; 3], DVec3, DVec3)> =
+        Vec::with_capacity(per_object.iter().map(Vec::len).sum());
+    for segs in per_object {
+        weighted.extend(segs);
     }
     if weighted.is_empty() {
         return None;
@@ -808,7 +816,7 @@ fn render_view(
         // Emit a `w` (line width) operator only on weight change.
         // PDF line width is in points; 1 mm = PT_PER_MM pt.
         if (w - cur_w).abs() > 1e-6 {
-            content.push_str(&format!("{:.4} w\n", w * PT_PER_MM));
+            let _ = writeln!(content, "{:.4} w", w * PT_PER_MM);
             cur_w = w;
         }
         // Emit an `RG` (stroke color) operator only on color change. Black
@@ -818,19 +826,18 @@ fn render_view(
             || (color[1] - cur_c[1]).abs() > 1e-6
             || (color[2] - cur_c[2]).abs() > 1e-6
         {
-            content.push_str(&format!(
-                "{:.4} {:.4} {:.4} RG\n",
-                color[0], color[1], color[2]
-            ));
+            let _ = writeln!(content, "{:.4} {:.4} {:.4} RG", color[0], color[1], color[2]);
             cur_c = color;
         }
-        content.push_str(&format!(
-            "{} {} m {} {} l S\n",
-            mm(a.x),
-            mm(a.y),
-            mm(b.x),
-            mm(b.y)
-        ));
+        // Written straight into `content`: same bytes as `mm()`, no per-number String.
+        let _ = writeln!(
+            content,
+            "{:.2} {:.2} m {:.2} {:.2} l S",
+            a.x * PT_PER_MM,
+            a.y * PT_PER_MM,
+            b.x * PT_PER_MM,
+            b.y * PT_PER_MM
+        );
         drawn += 1;
     }
 
@@ -2181,5 +2188,17 @@ mod tests {
         };
         assert_eq!(build(false), build(true), "explicit wireframe == default");
     }
-}
 
+    /// #278: the parallel segment collector gives the same PDF bytes as the
+    /// sequential pass, for every view of the mixed sheet.
+    #[test]
+    fn parallel_pdf_is_byte_identical_to_sequential() {
+        let s = crate::segments::mixed_session();
+        let sheet = s.doc.sheet("s1").unwrap().clone();
+        let (par, par_n) = sheet_pdf(&s.doc, &sheet);
+        let (seq, seq_n) = crate::segments::sequential(|| sheet_pdf(&s.doc, &sheet));
+        assert!(par_n > 1_000, "fixture too small: {par_n} lines");
+        assert_eq!(par_n, seq_n);
+        assert!(par == seq, "PDF bytes differ");
+    }
+}

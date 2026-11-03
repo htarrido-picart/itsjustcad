@@ -45,6 +45,7 @@ pub mod sketch;
 pub mod stairs;
 pub mod subdiv_params;
 pub mod svg;
+mod segments;
 pub mod textoutline;
 pub mod trace;
 pub mod workdir;
