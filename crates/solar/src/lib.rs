@@ -460,6 +460,85 @@ pub fn annual_face_irradiation(
 // is unit-testable in isolation.
 // ---------------------------------------------------------------------------
 
+/// The face-independent half of [`annual_face_irradiation`]: each month×hour
+/// bin's day weight, DNI/DHI and sun direction, computed once per command and
+/// shared read-only by every face (#296). [`AnnualSky::face_irradiation`]
+/// returns the same bits as [`annual_face_irradiation`] with the same inputs:
+/// the cached values come from identical expressions, and the per-face sum
+/// runs in the same bin order.
+#[derive(Debug, Clone)]
+pub struct AnnualSky {
+    /// Bins with any irradiance, in month-major order.
+    bins: Vec<SkyBin>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SkyBin {
+    days: f64,
+    dni: f64,
+    dhi: f64,
+    /// Sun direction when the bin can add beam (DNI > 0 and the sun is up).
+    sun: Option<[f64; 3]>,
+}
+
+impl AnnualSky {
+    pub fn new(bins: &RadiationBins, year: i32, lat_deg: f64, lon_deg: f64, tz_hours: f64) -> Self {
+        assert_eq!(bins.len(), 288, "bins must be 12 months x 24 hours");
+        let mut out = Vec::new();
+        for m in 0..12usize {
+            let days = DAYS_IN_MONTH[m];
+            for h in 0..24usize {
+                let [dni, dhi] = bins[m * 24 + h];
+                if dni <= 0.0 && dhi <= 0.0 {
+                    continue;
+                }
+                let sun = if dni <= 0.0 {
+                    None
+                } else {
+                    let local_min = h as f64 * 60.0 + 30.0;
+                    let utc = (local_min - tz_hours * 60.0).rem_euclid(1440.0);
+                    let pos = solar_position(
+                        year,
+                        m as u32 + 1,
+                        21,
+                        (utc / 60.0) as u32,
+                        (utc % 60.0) as u32,
+                        lat_deg,
+                        lon_deg,
+                    );
+                    if pos.altitude_deg <= 0.0 {
+                        None
+                    } else {
+                        Some(sun_dir_f64(pos.azimuth_deg, pos.altitude_deg))
+                    }
+                };
+                out.push(SkyBin { days, dni, dhi, sun });
+            }
+        }
+        Self { bins: out }
+    }
+
+    /// Annual insolation on a face, kWh/m²·yr; see [`annual_face_irradiation`].
+    pub fn face_irradiation(
+        &self,
+        normal: [f64; 3],
+        mut occluded: impl FnMut([f64; 3]) -> bool,
+    ) -> f64 {
+        let sky_view = (1.0 + normal[2].clamp(-1.0, 1.0)) / 2.0;
+        let mut wh = 0.0f64;
+        for b in &self.bins {
+            wh += b.days * b.dhi * sky_view;
+            let Some(s) = b.sun else { continue };
+            let cos_inc = normal[0] * s[0] + normal[1] * s[1] + normal[2] * s[2];
+            if cos_inc <= 0.0 || occluded(s) {
+                continue;
+            }
+            wh += b.days * b.dni * cos_inc;
+        }
+        wh / 1000.0
+    }
+}
+
 /// A 3D point/vector in doc space (X=East, Y=North, Z=Up), f64.
 pub type Vec3 = [f64; 3];
 
@@ -1184,6 +1263,38 @@ DATA PERIODS,1,1,Data,Sunday,1/1,12/31
         // Magnitude sanity: 10 daylight bins × 500/100 W → hundreds of kWh/yr,
         // not tens of thousands.
         assert!((300.0..3000.0).contains(&up), "up-roof {up:.0} kWh/m2yr");
+    }
+
+    #[test]
+    fn annual_sky_matches_per_face_oracle_bit_for_bit() {
+        // Hoisted sun table (#296) vs the per-face recompute: same bits for
+        // every normal and occluder, across hemispheres and time zones.
+        let mut bins = parse_epw_radiation(&synth_epw()).unwrap();
+        bins[3 * 24 + 2] = [0.0, 40.0]; // night diffuse, no beam
+        bins[8 * 24 + 13] = [700.0, 0.0]; // beam only
+        let normals = [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.0, -1.0, 0.0],
+            [0.6, 0.0, 0.8],
+            [-0.48, 0.6, 0.64],
+            [0.267_261_24, -0.534_522_5, 0.801_783_7],
+        ];
+        let sites = [(40.71, -74.01, -5.0), (-33.87, 151.21, 10.0), (64.1, -21.9, 0.0)];
+        for (lat, lon, tz) in sites {
+            let sky = AnnualSky::new(&bins, 2026, lat, lon, tz);
+            for n in normals {
+                let occl = |s: [f64; 3]| s[0] > 0.2;
+                let open = annual_face_irradiation(&bins, 2026, lat, lon, tz, n, |_| false);
+                let shut = annual_face_irradiation(&bins, 2026, lat, lon, tz, n, occl);
+                for (o, a) in [
+                    (open, sky.face_irradiation(n, |_| false)),
+                    (shut, sky.face_irradiation(n, occl)),
+                ] {
+                    assert_eq!(o.to_bits(), a.to_bits(), "lat {lat} n {n:?}: {o} vs {a}");
+                }
+            }
+        }
     }
 
     #[test]

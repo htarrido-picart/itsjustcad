@@ -5040,9 +5040,25 @@ fn face_lit_slots_seq(
 }
 
 /// Per-face annual insolation for `radiation`: kWh/m²·yr, centroid, normal.
-/// The 288-bin sum inside `annual_face_irradiation` stays sequential — only
-/// faces run in parallel, so float addition order is unchanged.
+/// `sky` holds the sun positions, computed once per command (#296); the
+/// 288-bin sum stays sequential per face, so float addition order is unchanged.
 fn face_radiation_one(
+    tri: &[DVec3; 3],
+    sky: &itsjustcad_solar::AnnualSky,
+    bvh: &kernel_mesh::TriBvh,
+) -> (f64, DVec3, DVec3) {
+    let (centroid, normal) = tri_centroid_normal(tri);
+    let origin = centroid + normal * 1e-3;
+    let k = sky.face_irradiation(normal.to_array(), |s| {
+        bvh.ray_occluded(origin, DVec3::new(s[0], s[1], s[2]))
+    });
+    (k, centroid, normal)
+}
+
+/// Pre-#296 per-face path: recomputes the sun positions for every face.
+/// Oracle for [`face_radiation_one`].
+#[cfg(test)]
+fn face_radiation_one_ref(
     tri: &[DVec3; 3],
     bins: &itsjustcad_solar::RadiationBins,
     year: i32,
@@ -5063,7 +5079,7 @@ fn face_radiation_one(
     (k, centroid, normal)
 }
 
-/// [`face_radiation_one`] over all faces, parallel.
+/// [`face_radiation_one`] over all faces, parallel, sharing one sun table.
 fn face_radiation_scores(
     faces: &[[DVec3; 3]],
     bins: &itsjustcad_solar::RadiationBins,
@@ -5071,13 +5087,16 @@ fn face_radiation_scores(
     loc: GeoLocation,
     bvh: &kernel_mesh::TriBvh,
 ) -> Vec<(f64, DVec3, DVec3)> {
+    let sky =
+        itsjustcad_solar::AnnualSky::new(bins, year, loc.lat_deg, loc.lon_deg, loc.tz_hours);
     faces
         .par_iter()
-        .map(|tri| face_radiation_one(tri, bins, year, loc, bvh))
+        .map(|tri| face_radiation_one(tri, &sky, bvh))
         .collect()
 }
 
-/// Sequential reference for [`face_radiation_scores`] (determinism oracle).
+/// Sequential, per-face-sun reference for [`face_radiation_scores`]
+/// (determinism and #296 bit-identity oracle).
 #[cfg(test)]
 fn face_radiation_scores_seq(
     faces: &[[DVec3; 3]],
@@ -5088,7 +5107,7 @@ fn face_radiation_scores_seq(
 ) -> Vec<(f64, DVec3, DVec3)> {
     faces
         .iter()
-        .map(|tri| face_radiation_one(tri, bins, year, loc, bvh))
+        .map(|tri| face_radiation_one_ref(tri, bins, year, loc, bvh))
         .collect()
 }
 
