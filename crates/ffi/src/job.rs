@@ -177,7 +177,7 @@ impl<R: Send + 'static> ReplayJob<R> {
         failed: &'static str,
         replay: impl FnOnce(ReplayControl) -> Result<R, String> + Send + 'static,
     ) {
-        std::thread::spawn(move || {
+        itsjustcad_commands::qos::spawn_utility(move || {
             let report = |done: usize, total: usize| {
                 let mut st = self.state();
                 st.done = done;

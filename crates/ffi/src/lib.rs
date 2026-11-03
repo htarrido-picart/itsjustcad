@@ -52,7 +52,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use itsjustcad_commands::{Command, Selector, Session, io, parse};
+use itsjustcad_commands::{Command, Selector, Session, io, parse, qos};
 use itsjustcad_deck::{
     ChatMessage, ChatRequest, DeckConfig, DeckDelta, DeckKind, DigestFilter, ExtractEvent,
     Extractor, HereContext, ImagePart, LlmDeck, Role, compact_command_catalog, digest,
@@ -713,6 +713,8 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
         let Some(view) = NonNull::new(ui_view) else {
             return std::ptr::null_mut();
         };
+        // The host calls this from its UI thread, which also renders (#234).
+        qos::set_current_thread(qos::Qos::UserInteractive);
 
         let instance = wgpu::Instance::default();
 
@@ -801,6 +803,7 @@ pub unsafe extern "C" fn ijc_init(ui_view: *mut c_void, w: u32, h: u32) -> *mut 
 /// Box a fresh handle around `gpu` (`None` = headless). Null if the tokio
 /// runtime cannot be built.
 fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
+    qos::init_global_pool();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

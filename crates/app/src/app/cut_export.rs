@@ -482,7 +482,7 @@ impl CutExportPanel {
         let state = Arc::new(Mutex::new(UpdateState::Fetching(0)));
         self.update = Some(state.clone());
         self.update_error = None;
-        std::thread::spawn(move || {
+        itsjustcad_commands::qos::spawn_utility(move || {
             let s = state.clone();
             let mut progress = move |i| *s.lock().expect("update state") = UpdateState::Fetching(i);
             let done = match update_data(&dir, &mut fetch, &mut progress) {

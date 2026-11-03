@@ -135,7 +135,7 @@ impl OptimizePanel {
         let ctx = ctx.clone();
         let (flag, latest) = (cancel.clone(), progress.clone());
         let worker = prepared.clone();
-        std::thread::spawn(move || {
+        itsjustcad_commands::qos::spawn_utility(move || {
             let report = |p: &site_optimize::Progress| {
                 *latest.lock().unwrap_or_else(|e| e.into_inner()) = *p;
                 ctx.request_repaint();

@@ -327,6 +327,8 @@ fn install_crash_hook() {
 
 fn main() -> eframe::Result<()> {
     install_crash_hook();
+    // Before any rayon use: interactive work runs at user-initiated (#234).
+    itsjustcad_commands::qos::init_global_pool();
 
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         print!("{}", cli_help_text());
@@ -357,6 +359,10 @@ fn main() -> eframe::Result<()> {
     }
 
     tracing_subscriber::fmt::init();
+    // UI, viewport and render all run on this thread (#234).
+    itsjustcad_commands::qos::set_current_thread(
+        itsjustcad_commands::qos::Qos::UserInteractive,
+    );
 
     // Tokio runtime on a background thread; the UI keeps a Handle for
     // spawning deck streams.
