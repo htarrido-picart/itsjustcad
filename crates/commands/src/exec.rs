@@ -2526,40 +2526,35 @@ impl Session {
         })
     }
 
-    /// Ground elevation for planting at `(x, y)`: the terrain surface height
-    /// when a terrain mesh exists and the point is inside its footprint, else
-    /// the caller's own z.
-    fn ground_z(&self, x: f64, y: f64, fallback: f64) -> f64 {
-        terrain_surface(&self.doc)
-            .ok()
-            .and_then(|(_, m)| {
-                crate::landscape::terrain_z_at(m.positions(), m.faces(), x, y)
+    /// Plant meshes for `(species, at)` sites, each rooted on the terrain
+    /// surface where `at` is inside its footprint (else at `at.z`). The
+    /// terrain is resolved and indexed once for the whole batch (#265) and
+    /// the meshes are built in parallel, in input order.
+    fn plant_meshes(
+        &self,
+        sites: &[(&'static crate::landscape::PlantSpecies, DVec3)],
+        age_years: Option<f64>,
+    ) -> Vec<(DVec3, Vec<DVec3>, Vec<[u32; 3]>)> {
+        let terrain = terrain_index(&self.doc);
+        sites
+            .par_iter()
+            .map(|&(sp, at)| {
+                let z = terrain.as_ref().and_then(|t| t.z_at(at.x, at.y)).unwrap_or(at.z);
+                let base = DVec3::new(at.x, at.y, z);
+                let (positions, faces) = crate::landscape::plant_mesh(sp, base, age_years);
+                (base, positions, faces)
             })
-            .unwrap_or(fallback)
+            .collect()
     }
 
-    /// Place one plant from the embedded catalog: trunk + canopy mesh at `at`
-    /// (draped onto the terrain), one MeshLiteral op named "plant:<id>" on
-    /// layer "planting". Like `terrain`, the Plant verb itself is not logged —
-    /// its MeshLiteral expansion is, so replay never depends on the catalog.
-    fn plant(
+    /// Insert one plant mesh: one MeshLiteral op named "plant:<id>" on layer
+    /// "planting", bracketed by layer switches when needed.
+    fn insert_plant(
         &mut self,
-        species: String,
-        at: DVec3,
-        age_years: Option<f64>,
-    ) -> Result<ApplyOutcome, ExecError> {
-        let sp = crate::landscape::find_species(&species).ok_or_else(|| {
-            let ids: Vec<&str> =
-                crate::landscape::plant_catalog().iter().map(|s| s.id.as_str()).collect();
-            ExecError::Invalid(format!(
-                "unknown species '{species}' — catalog: {}",
-                ids.join(", ")
-            ))
-        })?;
-        let base = DVec3::new(at.x, at.y, self.ground_z(at.x, at.y, at.z));
-        let (positions, faces) = crate::landscape::plant_mesh(sp, base, age_years);
-        let (h, canopy_d) = crate::landscape::plant_size(sp, age_years);
-
+        sp: &crate::landscape::PlantSpecies,
+        positions: Vec<DVec3>,
+        faces: Vec<[u32; 3]>,
+    ) -> Result<Vec<ObjectId>, ExecError> {
         let prev_layer = self.doc.current_layer.clone();
         if self.doc.current_layer != "planting" {
             self.run(Command::Layer { name: "planting".to_string() })?;
@@ -2573,12 +2568,30 @@ impl Session {
         if self.doc.current_layer != prev_layer {
             self.run(Command::Layer { name: prev_layer })?;
         }
+        Ok(out.created)
+    }
+
+    /// Place one plant from the embedded catalog: trunk + canopy mesh at `at`
+    /// (draped onto the terrain), one MeshLiteral op named "plant:<id>" on
+    /// layer "planting". Like `terrain`, the Plant verb itself is not logged —
+    /// its MeshLiteral expansion is, so replay never depends on the catalog.
+    fn plant(
+        &mut self,
+        species: String,
+        at: DVec3,
+        age_years: Option<f64>,
+    ) -> Result<ApplyOutcome, ExecError> {
+        let sp = species_or_err(&species)?;
+        let (base, positions, faces) =
+            self.plant_meshes(&[(sp, at)], age_years).pop().expect("one site");
+        let (h, canopy_d) = crate::landscape::plant_size(sp, age_years);
+        let created = self.insert_plant(sp, positions, faces)?;
         let age_note = match age_years {
             Some(a) => format!(" at {a:.0} yr"),
             None => " (mature)".to_string(),
         };
         Ok(ApplyOutcome {
-            created: out.created,
+            created,
             message: format!(
                 "planted {} ({}){age_note}: height {h:.1} m, canopy {canopy_d:.1} m at \
                  ({:.1}, {:.1}, {:.2}) on layer 'planting'{}",
@@ -2605,10 +2618,11 @@ impl Session {
             return Err(ExecError::Invalid("plantrow spacing must be > 0".into()));
         }
         let positions = crate::landscape::row_positions(a, b, spacing);
+        let sp = species_or_err(&species)?;
+        let sites: Vec<_> = positions.iter().map(|p| (sp, *p)).collect();
         let mut created = Vec::new();
-        for p in &positions {
-            let out = self.plant(species.clone(), *p, None)?;
-            created.extend(out.created);
+        for (_, pos, faces) in self.plant_meshes(&sites, None) {
+            created.extend(self.insert_plant(sp, pos, faces)?);
         }
         let n = positions.len();
         Ok(ApplyOutcome {
@@ -2871,6 +2885,7 @@ impl Session {
         let wsum: f64 = strata.iter().map(|(_, w, _)| w).sum();
 
         let mut placed: Vec<(String, &'static str)> = Vec::new(); // (species id, layer)
+        let mut sites: Vec<(&'static crate::landscape::PlantSpecies, DVec3)> = Vec::new();
         let mut prev_species: Option<String> = None;
         let mut prev_layer: Option<&str> = None;
         let mut attempts = 0usize;
@@ -2903,11 +2918,15 @@ impl Session {
             }
             let sp = species[si];
             // Plant as a sapling (age 1 yr → 5% floor size).
-            let z = self.ground_z(x, y, 0.0);
-            self.plant(sp.id.clone(), DVec3::new(x, y, z), Some(1.0))?;
+            // Off-terrain saplings root at z = 0. Heights and meshes are
+            // computed for the whole patch below, then inserted in order.
+            sites.push((species_or_err(&sp.id)?, DVec3::new(x, y, 0.0)));
             placed.push((sp.id.clone(), layer));
             prev_species = Some(sp.id.clone());
             prev_layer = Some(layer);
+        }
+        for ((sp, _), (_, pos, faces)) in sites.iter().zip(self.plant_meshes(&sites, Some(1.0))) {
+            self.insert_plant(sp, pos, faces)?;
         }
 
         // Species mix % and per-layer tallies for the report.
@@ -5921,6 +5940,23 @@ fn exec_radiation(
     ))
 }
 
+/// Catalog species by id or name, or an error listing the catalog ids.
+fn species_or_err(species: &str) -> Result<&'static crate::landscape::PlantSpecies, ExecError> {
+    crate::landscape::find_species(species).ok_or_else(|| {
+        let ids: Vec<&str> =
+            crate::landscape::plant_catalog().iter().map(|s| s.id.as_str()).collect();
+        ExecError::Invalid(format!("unknown species '{species}' — catalog: {}", ids.join(", ")))
+    })
+}
+
+/// Height index over the terrain surface (see [`terrain_surface`]), built
+/// once per command; `None` without a terrain mesh.
+fn terrain_index(doc: &Document) -> Option<crate::landscape::TerrainIndex<'_>> {
+    terrain_surface(doc)
+        .ok()
+        .map(|(_, m)| crate::landscape::TerrainIndex::new(m.positions(), m.faces()))
+}
+
 /// The terrain surface: the most recently created mesh on layer "terrain".
 /// Landscape verbs (`contours`, `pad`, `cutfill`, `flowarrows`, `ponding`,
 /// `sitepath`) all operate on this single surface.
@@ -8773,23 +8809,19 @@ fn exec_site_path(
     }
     // Drape onto the terrain surface where the path crosses it (2 cm wear
     // course above grade); off-terrain samples keep the curve's own z.
-    let terrain = terrain_surface(doc).ok().map(|(_, m)| (m.positions().to_vec(), m.faces().to_vec()));
+    let terrain = terrain_index(doc);
     let mut draped_n = 0usize;
     let draped: Vec<DVec3> = centerline
         .iter()
-        .map(|p| match &terrain {
-            Some((pos, faces)) => {
-                match crate::landscape::terrain_z_at(pos, faces, p.x, p.y) {
-                    Some(z) => {
-                        draped_n += 1;
-                        DVec3::new(p.x, p.y, z + 0.02)
-                    }
-                    None => *p,
-                }
+        .map(|p| match terrain.as_ref().and_then(|t| t.z_at(p.x, p.y)) {
+            Some(z) => {
+                draped_n += 1;
+                DVec3::new(p.x, p.y, z + 0.02)
             }
             None => *p,
         })
         .collect();
+    drop(terrain);
     const ACCESS_LIMIT: f64 = 1.0 / 12.0;
     let (max_slope, steep) = crate::landscape::path_slope_check(&draped, ACCESS_LIMIT);
     let (positions, faces) = crate::landscape::ribbon(&draped, width);
@@ -27227,6 +27259,72 @@ mod tests {
         assert_eq!(s.doc.current_layer, "0");
         let err = s.run(parse("plant triffid 0,0").unwrap()).unwrap_err();
         assert!(format!("{err}").contains("quercus-robur"), "{err}");
+    }
+
+    /// The perf-site terrain (11k survey points → Delaunay TIN), loaded the
+    /// way users load it.
+    fn perf_site_terrain() -> Session {
+        let csv =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/scripts/perf-site-terrain.csv");
+        let mut s = Session::default();
+        run(&mut s, &format!("terrain {csv}"));
+        s
+    }
+
+    #[test]
+    fn terrain_index_matches_linear_scan_on_real_terrain() {
+        let s = perf_site_terrain();
+        let (_, m) = terrain_surface(&s.doc).unwrap();
+        let (pos, faces) = (m.positions(), m.faces());
+        assert!(faces.len() > 20_000, "real TIN, got {} faces", faces.len());
+        let idx = crate::landscape::TerrainIndex::new(pos, faces);
+        // Vertices (shared by many faces), edge midpoints (shared by two),
+        // and a pseudo-random spread including points off the footprint.
+        let mut pts: Vec<(f64, f64)> = pos.iter().step_by(7).map(|p| (p.x, p.y)).collect();
+        for f in faces.iter().step_by(13) {
+            let (a, b) = (pos[f[0] as usize], pos[f[1] as usize]);
+            pts.push(((a.x + b.x) / 2.0, (a.y + b.y) / 2.0));
+        }
+        let mut r = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..1_000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            let (u, v) = ((r & 0xffff_ffff) as f64 / 4.3e9, (r >> 32) as f64 / 4.3e9);
+            pts.push((u * 2600.0 - 100.0, v * 4250.0 - 100.0));
+        }
+        for &(x, y) in &pts {
+            assert_eq!(
+                idx.z_at(x, y).map(f64::to_bits),
+                crate::landscape::terrain_z_at(pos, faces, x, y).map(f64::to_bits),
+                "({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn miyawaki_at_120m_on_real_terrain_roots_every_sapling() {
+        // 120×120 m at 2 stems/m² = 28,800 saplings: quadratic before #265
+        // (every sapling rescanned the document and every terrain face).
+        let mut s = perf_site_terrain();
+        run(&mut s, "location 3.45 -76.53 -5");
+        run(&mut s, "rect 1000,1500,0 120 120");
+        let out = run(&mut s, "miyawaki last 2");
+        assert!(out.message.contains("Miyawaki forest"), "{}", out.message);
+        let (_, m) = terrain_surface(&s.doc).unwrap();
+        let plants: Vec<_> = s.doc.objects().filter(|o| o.layer == "planting").collect();
+        assert!(plants.len() > 25_000, "got {}", plants.len());
+        for o in plants.iter().step_by(97) {
+            let Geometry::Mesh(pm) = &o.geometry else { panic!("plant must be a mesh") };
+            let p = pm.positions();
+            // The trunk's bottom ring is centred on the rooting point.
+            let zmin = p.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+            let ring: Vec<_> = p.iter().filter(|p| p.z == zmin).collect();
+            let x = ring.iter().map(|p| p.x).sum::<f64>() / ring.len() as f64;
+            let y = ring.iter().map(|p| p.y).sum::<f64>() / ring.len() as f64;
+            let z = crate::landscape::terrain_z_at(m.positions(), m.faces(), x, y);
+            assert!(z.is_some_and(|z| (z - zmin).abs() < 1e-6), "({x}, {y}): {z:?} vs {zmin}");
+        }
     }
 
     #[test]
