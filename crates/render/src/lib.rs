@@ -9,6 +9,7 @@ mod control;
 mod cubemap;
 mod layout;
 mod pano;
+mod batch;
 mod renderer;
 mod sketchy;
 mod snapshot;

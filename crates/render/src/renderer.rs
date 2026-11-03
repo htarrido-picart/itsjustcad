@@ -4,6 +4,7 @@
 use bytemuck::{Pod, Zeroable};
 use kernel_mesh::RenderMesh;
 
+use crate::batch::{Batch, ObjectParams, ParamBuffer, Staged};
 use crate::DEPTH_FORMAT;
 
 #[repr(C)]
@@ -346,246 +347,6 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 4] {
     [r, g, b, 1.0]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{curve_px, world_axis_lines, DisplayMode, LightMode, AXIS_EXTENT, RHINO_CURVE_PX};
-
-    #[test]
-    fn world_axis_lines_geometry() {
-        let axes = world_axis_lines();
-        assert_eq!(axes.len(), 2);
-
-        let (x_pts, x_color) = axes[0];
-        let (y_pts, y_color) = axes[1];
-
-        // Finite, f32-exact extent, symmetric about the origin.
-        assert!(AXIS_EXTENT.is_finite() && AXIS_EXTENT > 0.0);
-        assert_eq!(x_pts, [[-AXIS_EXTENT, 0.0, 0.0], [AXIS_EXTENT, 0.0, 0.0]]);
-        assert_eq!(y_pts, [[0.0, -AXIS_EXTENT, 0.0], [0.0, AXIS_EXTENT, 0.0]]);
-
-        // Both axes lie exactly on the z=0 datum plane.
-        for p in x_pts.iter().chain(y_pts.iter()) {
-            assert_eq!(p[2], 0.0);
-        }
-
-        // X is the red axis, Y the green one (red channel dominates on X,
-        // green on Y), both fully opaque.
-        assert!(x_color[0] > x_color[1] && x_color[0] > x_color[2]);
-        assert!(y_color[1] > y_color[0] && y_color[1] > y_color[2]);
-        assert_eq!(x_color[3], 1.0);
-        assert_eq!(y_color[3], 1.0);
-    }
-
-    #[test]
-    fn curve_px_scales_with_dpr() {
-        // Rhino default is 1 logical px; physical thickness stays constant
-        // across DPI, so 1x → 1 px and 2x → 2 px.
-        assert_eq!(RHINO_CURVE_PX, 1.0);
-        assert_eq!(curve_px(1.0), 1.0);
-        assert_eq!(curve_px(2.0), 2.0);
-        assert_eq!(curve_px(1.5), 1.5);
-        // Never sub-pixel: a bogus <1 dpr floors to a visible hairline.
-        assert_eq!(curve_px(0.0), 1.0);
-        assert_eq!(curve_px(0.5), 1.0);
-    }
-
-    #[test]
-    fn light_mode_default_is_working() {
-        assert_eq!(LightMode::default(), LightMode::Working);
-    }
-
-    #[test]
-    fn light_mode_parse_round_trip() {
-        for (s, expected) in [
-            ("working", LightMode::Working),
-            ("work", LightMode::Working),
-            ("sun", LightMode::Sun),
-            ("solar", LightMode::Sun),
-            ("presentation", LightMode::Presentation),
-            ("present", LightMode::Presentation),
-            ("pbr", LightMode::Presentation),
-        ] {
-            assert_eq!(LightMode::parse(s), Some(expected), "parse({s:?})");
-        }
-        assert_eq!(LightMode::parse("nope"), None);
-    }
-
-    #[test]
-    fn light_mode_labels_parse_back() {
-        for m in LightMode::ALL {
-            // label lowercased must parse back to the same mode.
-            assert_eq!(LightMode::parse(&m.label().to_lowercase()), Some(m));
-        }
-    }
-
-    #[test]
-    fn light_mode_shader_flags_distinct() {
-        let flags: Vec<f32> = LightMode::ALL.iter().map(|m| m.shader_flag()).collect();
-        assert_eq!(flags, vec![0.0, 1.0, 2.0]);
-    }
-
-    // Mirror of the mesh.wgsl hemispheric fill so the ambient-floor invariant is
-    // checked in pure Rust on every `cargo test` (the shader itself only runs on
-    // a GPU). If you change the constants in mesh.wgsl, change them here too.
-    fn hemispheric_ambient(nz: f32) -> f32 {
-        let up = (nz * 0.5 + 0.5).clamp(0.0, 1.0);
-        0.30 + (0.65 - 0.30) * up // mix(0.30, 0.65, up)
-    }
-    fn diffuse_floor(nz: f32, key: f32) -> f32 {
-        // diffuse = ambient + 0.55 * max(dot(n, key_dir), 0)
-        hemispheric_ambient(nz) + 0.55 * key.max(0.0)
-    }
-
-    #[test]
-    fn ambient_floor_keeps_faces_off_black() {
-        // A face pointing straight DOWN (nz=-1) with ZERO key contribution still
-        // gets the ground-bounce ambient — luminance must be strictly positive.
-        let lum = diffuse_floor(-1.0, 0.0);
-        assert!(lum > 0.0, "downward face fully unlit must not be black: {lum}");
-        assert!((lum - 0.30).abs() < 1e-6, "ground floor is 0.30, got {lum}");
-
-        // A face turned fully AWAY from the key light (negative dot) still reads
-        // by its hemispheric ambient — no crush to black at any orientation.
-        for nz in [-1.0_f32, -0.5, 0.0, 0.5, 1.0] {
-            assert!(diffuse_floor(nz, -1.0) > 0.0, "nz={nz} away-from-key went black");
-        }
-    }
-
-    #[test]
-    fn pencil_parse_round_trip() {
-        assert_eq!(DisplayMode::parse("pencil"), Some(DisplayMode::Pencil));
-        assert_eq!(DisplayMode::Pencil.label(), "Pencil");
-    }
-
-    #[test]
-    fn pencil_in_all() {
-        assert!(DisplayMode::ALL.contains(&DisplayMode::Pencil));
-    }
-
-    #[test]
-    fn pencil_fill_alpha_is_negative_sentinel() {
-        assert!(DisplayMode::Pencil.fill_alpha() < 0.0);
-        // Only the paper modes use the sentinel; the rest are non-negative.
-        for mode in DisplayMode::ALL {
-            if mode.fill_alpha() < 0.0 {
-                assert!(
-                    mode.background_override().is_some(),
-                    "{mode:?} is a paper mode"
-                );
-            } else {
-                assert!(
-                    mode.fill_alpha() >= 0.0,
-                    "{mode:?} should have non-negative alpha"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn pencil_draws_fill_and_edges_with_depth_writes() {
-        assert!(DisplayMode::Pencil.draws_fill());
-        assert!(DisplayMode::Pencil.draws_edges());
-        assert!(DisplayMode::Pencil.depth_writes());
-    }
-
-    #[test]
-    fn shaded_draws_feature_edges_by_default() {
-        // Shaded now draws mesh feature edges (the SketchUp/Rhino "shaded +
-        // edges" look), matching every other mode.
-        assert!(DisplayMode::Shaded.draws_edges());
-        assert!(DisplayMode::Shaded.draws_fill());
-        for mode in DisplayMode::ALL {
-            assert!(mode.draws_edges(), "{mode:?} should draw feature edges");
-        }
-    }
-
-    #[test]
-    fn mode_background_ink_and_width_mapping() {
-        // Hidden Line follows the theme: no paper, depth-only fill (alpha 0,
-        // not the pencil ink sentinel), occlusion on, a little stroke weight.
-        let hl = DisplayMode::HiddenLine;
-        assert_eq!(hl.background_override(), None);
-        assert_eq!(hl.fill_alpha(), 0.0);
-        assert!(hl.draws_fill() && hl.depth_writes() && !hl.forces_sketchy());
-        // Sketchy: paper, dark ink (negative sentinel), occlusion, sketchy on.
-        let sk = DisplayMode::Sketchy;
-        assert_eq!(
-            sk.background_override(),
-            Some(DisplayMode::pencil_background())
-        );
-        assert!(sk.fill_alpha() < 0.0);
-        assert!(sk.depth_writes() && sk.forces_sketchy());
-        assert_eq!(
-            DisplayMode::Pencil.background_override(),
-            Some(DisplayMode::pencil_background())
-        );
-        // Widths: hairline elsewhere, Hidden Line < Sketchy, scaled by dpr.
-        assert_eq!(DisplayMode::Shaded.line_px(3.0), 0.0);
-        // Hairline = 1 device px; Hidden Line beats it on any retina screen.
-        assert!(hl.line_px(2.0) > 1.0 && sk.line_pt() > hl.line_pt());
-        assert_eq!(hl.line_px(2.0), hl.line_pt() * 2.0);
-        assert_eq!(sk.line_px(3.0), sk.line_pt() * 3.0);
-        assert_eq!(sk.line_px(0.0), sk.line_pt());
-        for mode in DisplayMode::ALL {
-            assert_eq!(
-                DisplayMode::parse(&mode.label().to_lowercase().replace(' ', "")),
-                Some(mode)
-            );
-        }
-    }
-
-    #[test]
-    fn pencil_background_is_near_white() {
-        let bg = DisplayMode::pencil_background();
-        // All channels > 0.9 (near white)
-        assert!(bg[0] > 0.9 && bg[1] > 0.9 && bg[2] > 0.9);
-        assert_eq!(bg[3], 1.0);
-    }
-
-    #[test]
-    fn all_modes_parse() {
-        for (s, expected) in [
-            ("shaded", DisplayMode::Shaded),
-            ("wireframe", DisplayMode::Wireframe),
-            ("wire", DisplayMode::Wireframe),
-            ("xray", DisplayMode::XRay),
-            ("x-ray", DisplayMode::XRay),
-            ("ghosted", DisplayMode::Ghosted),
-            ("ghost", DisplayMode::Ghosted),
-            ("pencil", DisplayMode::Pencil),
-            ("hiddenline", DisplayMode::HiddenLine),
-            ("hidden-line", DisplayMode::HiddenLine),
-            ("sketchy", DisplayMode::Sketchy),
-        ] {
-            assert_eq!(DisplayMode::parse(s), Some(expected), "parse({s:?}) failed");
-        }
-        assert_eq!(DisplayMode::parse("unknown"), None);
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct ObjectParams {
-    color: [f32; 4],
-    /// x = roughness (0 smooth .. 1 matte), y = metallic (0 dielectric .. 1
-    /// metal), z,w spare. Drives the specular term in the mesh shader so
-    /// `material2` presets read differently (glass shiny, concrete matte).
-    material: [f32; 4],
-}
-
-struct GpuMesh {
-    vertex_buf: wgpu::Buffer,
-    index_buf: wgpu::Buffer,
-    index_count: u32,
-    object_bind_group: wgpu::BindGroup,
-}
-
-struct GpuLine {
-    vertex_buf: wgpu::Buffer,
-    vertex_count: u32,
-    object_bind_group: wgpu::BindGroup,
-}
-
 /// Half-length of the world axis lines in meters. Large enough to read as
 /// infinite at any practical zoom, small enough that f32 keeps full precision
 /// on the endpoints (1e5 is exactly representable; 2e5 m total span).
@@ -680,7 +441,7 @@ pub struct SceneRenderer {
     /// a stroke width (itsjustcad-ios#174).
     fat_pipeline: wgpu::RenderPipeline,
     /// LineList copies of `lines` (strips) for the fat-stroke pass.
-    curve_segments: Vec<GpuLine>,
+    curve_segments: Batch,
     /// Per pane: whether its last camera asked for fat strokes.
     fat_lines: Vec<bool>,
     /// World-axis variant of the edge pipeline: LineList using the `vs_axis`
@@ -696,25 +457,31 @@ pub struct SceneRenderer {
     /// single camera buffer — the last write would win for all of them.
     cameras: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     object_layout: wgpu::BindGroupLayout,
+    /// Per-object color/material for every scene batch, one bind group.
+    scene_params: ParamBuffer,
+    /// Parameters of the ghost and axis batches, kept apart so a drag frame
+    /// or the constant axes never rewrite the scene's buffer.
+    ghost_params: ParamBuffer,
+    axis_params: ParamBuffer,
     /// Textured-quad pipeline + its (texture, sampler, opacity) bind layout.
     underlay_pipeline: wgpu::RenderPipeline,
     underlay_layout: wgpu::BindGroupLayout,
-    meshes: Vec<GpuMesh>,
-    lines: Vec<GpuLine>,
-    edges: Vec<GpuLine>,
+    meshes: Batch,
+    lines: Batch,
+    edges: Batch,
     /// Profile / silhouette edges tessellated into fat-line ribbon meshes so
     /// they render visibly thicker than the 1-pixel interior edge lines.
-    profile_ribbons: Vec<GpuMesh>,
-    point_clouds: Vec<GpuLine>,
+    profile_ribbons: Batch,
+    point_clouds: Batch,
     /// Transient ghost preview lines (the iOS gumball live wireframe). Rebuilt
     /// every drag frame via [`SceneRenderer::set_ghost_lines`] and cleared on
     /// commit/cancel. Drawn as hairline segments over the scene, under the grid.
     /// Independent of the scene `generation` so it updates between doc changes.
-    ghost_lines: Vec<GpuLine>,
+    ghost_lines: Batch,
     /// Persistent world X/Y axis segments (see [`world_axis_lines`]). Built
     /// once in [`SceneRenderer::new`]; drawn every frame wherever the grid is
     /// drawn, independent of document content.
-    axis_lines: Vec<GpuLine>,
+    axis_lines: Batch,
     underlay: Option<GpuUnderlay>,
     basemap: Option<GpuUnderlay>,
     /// Document generation the GPU buffers were built from.
@@ -743,8 +510,8 @@ impl SceneRenderer {
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    has_dynamic_offset: true,
+                    min_binding_size: Some(ParamBuffer::binding_size()),
                 },
                 count: None,
             }],
@@ -1179,53 +946,45 @@ impl SceneRenderer {
             cache: None,
         });
 
-        let mut renderer = Self {
+        let mut axis_lines = Batch::new("axis");
+        let mut axis = Staged::default();
+        for (points, color) in world_axis_lines() {
+            axis.push_segments(&points, ObjectParams::stroke(color));
+        }
+        let mut axis_params = ParamBuffer::new(device);
+        axis_params.init(device, &object_layout, axis.params.iter());
+        axis_lines.init(device, axis);
+
+        Self {
             grid_pipeline,
             mesh_pipeline,
             mesh_xray_pipeline,
             curve_pipeline,
             edge_pipeline,
             fat_pipeline,
-            curve_segments: Vec::new(),
+            curve_segments: Batch::new("curve_segments"),
             fat_lines: Vec::new(),
             axis_pipeline,
             point_pipeline,
             camera_layout,
             cameras: Vec::new(),
+            scene_params: ParamBuffer::new(device),
+            ghost_params: ParamBuffer::new(device),
+            axis_params,
             object_layout,
             underlay_pipeline,
             underlay_layout,
-            meshes: Vec::new(),
-            lines: Vec::new(),
-            edges: Vec::new(),
-            profile_ribbons: Vec::new(),
-            point_clouds: Vec::new(),
-            ghost_lines: Vec::new(),
-            axis_lines: Vec::new(),
+            meshes: Batch::new("meshes"),
+            lines: Batch::new("curves"),
+            edges: Batch::new("edges"),
+            profile_ribbons: Batch::new("profile_ribbons"),
+            point_clouds: Batch::new("point_clouds"),
+            ghost_lines: Batch::new("ghost_lines"),
+            axis_lines,
             underlay: None,
             basemap: None,
             generation: u64::MAX,
-        };
-
-        // Persistent world X/Y axis segments: two tiny vertex buffers uploaded
-        // once, drawn every frame alongside the grid.
-        {
-            use wgpu::util::DeviceExt as _;
-            for (points, color) in world_axis_lines() {
-                let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("axis_vb"),
-                    contents: bytemuck::cast_slice(&points),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                let object_bind_group = renderer.object_bind_group(device, color);
-                renderer.axis_lines.push(GpuLine {
-                    vertex_buf,
-                    vertex_count: points.len() as u32,
-                    object_bind_group,
-                });
-            }
         }
-        renderer
     }
 
     /// Upload the camera for one viewport pane, growing the slot list on demand.
@@ -1261,76 +1020,24 @@ impl SceneRenderer {
             cam.screen[0] > 0.0 && cam.screen[1] > 0.0 && cam.screen[2] > 0.0;
     }
 
-    /// Rebuild all mesh buffers. Called when the document generation changes;
-    /// fine at MVP scale, batch/diff later.
+    /// Replace the mesh fill only, leaving the other scene batches as they
+    /// are. Geometry identical to what the GPU already holds is not re-sent.
     pub fn set_meshes(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         meshes: &[(RenderMesh, [f32; 4], [f32; 2])],
         generation: u64,
     ) {
-        use wgpu::util::DeviceExt as _;
-        self.meshes.clear();
-        for (mesh, color, rm) in meshes {
-            let mut vertices = Vec::with_capacity(mesh.positions.len() * 6);
-            for (p, n) in mesh.positions.iter().zip(&mesh.normals) {
-                vertices.extend_from_slice(p);
-                vertices.extend_from_slice(n);
-            }
-            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mesh_vb"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mesh_ib"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-            let params = ObjectParams { color: *color, material: [rm[0], rm[1], 0.0, 0.0] };
-            let object_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("object_ubo"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let object_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("object_bg"),
-                layout: &self.object_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: object_buf.as_entire_binding(),
-                }],
-            });
-            self.meshes.push(GpuMesh {
-                vertex_buf,
-                index_buf,
-                index_count: mesh.indices.len() as u32,
-                object_bind_group,
-            });
-        }
+        self.meshes.set(device, queue, stage_meshes(meshes));
+        self.write_scene_params(device, queue);
         self.generation = generation;
     }
 
-    fn object_bind_group(&self, device: &wgpu::Device, color: [f32; 4]) -> wgpu::BindGroup {
-        use wgpu::util::DeviceExt as _;
-        let params = ObjectParams { color, material: [0.5, 0.0, 0.0, 0.0] };
-        let object_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("object_ubo"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("object_bg"),
-            layout: &self.object_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: object_buf.as_entire_binding(),
-            }],
-        })
-    }
-
-    /// Rebuild all GPU buffers from a scene snapshot. The queue uploads texture
-    /// pixels for the underlay (buffers go through create_buffer_init).
+    /// Upload a scene snapshot into the shared batches (#269). Unchanged
+    /// geometry is skipped, so a color-only change (selection, theme, color
+    /// mode) costs one in-place write of the parameter buffer. The queue also
+    /// uploads texture pixels for the underlay.
     pub fn set_scene(
         &mut self,
         device: &wgpu::Device,
@@ -1338,132 +1045,54 @@ impl SceneRenderer {
         scene: &SceneData,
         generation: u64,
     ) {
-        use wgpu::util::DeviceExt as _;
-        // The `show_lineweights` flag controls an egui overlay drawn by the app;
-        // the wgpu pipeline always renders 1-pixel hairlines (wgpu does not support
-        // variable line width per-draw-call on WebGPU/Metal/Vulkan). The app reads
-        // `scene.show_lineweights` and draws a thick-stroke egui overlay on top.
-        self.set_meshes(device, &scene.meshes, generation);
+        self.meshes.set(device, queue, stage_meshes(&scene.meshes));
 
-        self.lines.clear();
-        self.curve_segments.clear();
+        // Curves: strips for the hairline pass, plus LineList copies of the
+        // same strips for the fat-stroke pass.
+        let mut lines = Staged::default();
+        let mut segments = Staged::default();
         for (points, color, _lw_mm) in &scene.lines {
             if points.len() < 2 {
-                continue;
+                continue; // a strip needs at least one segment
             }
-            // The fat-stroke pass reads segments as LineList pairs (#174).
             let pairs: Vec<[f32; 3]> = points.windows(2).flatten().copied().collect();
-            self.curve_segments.push(GpuLine {
-                vertex_buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("curve_seg_vb"),
-                    contents: bytemuck::cast_slice(&pairs),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                vertex_count: pairs.len() as u32,
-                object_bind_group: self.object_bind_group(device, *color),
-            });
-            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("curve_vb"),
-                contents: bytemuck::cast_slice(points),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            self.lines.push(GpuLine {
-                vertex_buf,
-                vertex_count: points.len() as u32,
-                object_bind_group: self.object_bind_group(device, *color),
-            });
+            segments.push_segments(&pairs, ObjectParams::stroke(*color));
+            lines.push_points(points, ObjectParams::stroke(*color));
         }
-        self.edges.clear();
-        for (points, color, _lw_mm) in &scene.edges {
-            if points.len() < 2 {
-                continue;
-            }
-            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("edge_vb"),
-                contents: bytemuck::cast_slice(points),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            self.edges.push(GpuLine {
-                vertex_buf,
-                vertex_count: points.len() as u32,
-                object_bind_group: self.object_bind_group(device, *color),
-            });
-        }
+        self.lines.set(device, queue, lines);
+        self.curve_segments.set(device, queue, segments);
 
-        // Profile edges → fat-line ribbon meshes. Each segment becomes a small
-        // cross of two perpendicular quads so the thick outline reads from any
-        // camera angle, matching the SketchUp silhouette look.
-        self.profile_ribbons.clear();
+        let mut edges = Staged::default();
+        for (points, color, _lw_mm) in &scene.edges {
+            if points.len() >= 2 {
+                edges.push_segments(points, ObjectParams::stroke(*color));
+            }
+        }
+        self.edges.set(device, queue, edges);
+
+        // Profile edges: tessellate into ribbon meshes, drawn with the solid
+        // mesh pipeline. Fully matte so they read as flat ink.
+        let mut ribbons = Staged::default();
         for (points, color, half) in &scene.profile_edges {
             if points.len() < 2 || *half <= 0.0 {
                 continue;
             }
             let ribbon = build_edge_ribbon(points, *half);
-            if ribbon.indices.is_empty() {
-                continue;
-            }
-            let mut vertices = Vec::with_capacity(ribbon.positions.len() * 6);
-            for (p, n) in ribbon.positions.iter().zip(&ribbon.normals) {
-                vertices.extend_from_slice(p);
-                vertices.extend_from_slice(n);
-            }
-            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("profile_vb"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("profile_ib"),
-                contents: bytemuck::cast_slice(&ribbon.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-            // Flatten via material — ribbons want a solid ink look, so we mark
-            // them fully matte; the shader still applies the ambient floor which
-            // keeps a dark, readable outline.
             let params = ObjectParams { color: *color, material: [1.0, 0.0, 0.0, 0.0] };
-            let object_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("profile_ubo"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let object_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("profile_bg"),
-                layout: &self.object_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: object_buf.as_entire_binding(),
-                }],
-            });
-            self.profile_ribbons.push(GpuMesh {
-                vertex_buf,
-                index_buf,
-                index_count: ribbon.indices.len() as u32,
-                object_bind_group,
-            });
+            ribbons.push_mesh(&ribbon.positions, &ribbon.normals, &ribbon.indices, params);
         }
+        self.profile_ribbons.set(device, queue, ribbons);
 
-        // Default curves are drawn as the 1-device-pixel hardware hairline
-        // (`self.lines` via `curve_pipeline`) — Rhino's default wire, constant
-        // on-screen thickness regardless of zoom. We deliberately do NOT widen
-        // them into world-space ribbons: that made thickness zoom-dependent
-        // (fattening as you zoom in), the opposite of Rhino. See [`curve_px`].
-
-        self.point_clouds.clear();
+        let mut clouds = Staged::default();
         for (points, color) in &scene.points {
-            if points.is_empty() {
-                continue;
+            if !points.is_empty() {
+                clouds.push_points(points, ObjectParams::stroke(*color));
             }
-            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pointcloud_vb"),
-                contents: bytemuck::cast_slice(points),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            self.point_clouds.push(GpuLine {
-                vertex_buf,
-                vertex_count: points.len() as u32,
-                object_bind_group: self.object_bind_group(device, *color),
-            });
         }
+        self.point_clouds.set(device, queue, clouds);
+
+        self.write_scene_params(device, queue);
+        self.generation = generation;
 
         self.underlay = scene
             .underlay
@@ -1475,36 +1104,63 @@ impl SceneRenderer {
             .map(|u| self.build_underlay(device, queue, u));
     }
 
+    /// Lay the scene batches' parameters out back to back in the shared
+    /// buffer (in paint order) and write it; a no-op when nothing changed.
+    fn write_scene_params(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut base = 0;
+        for batch in self.scene_batches_mut() {
+            batch.slot_base = base;
+            base += batch.params.len() as u32;
+        }
+        let Self {
+            meshes,
+            edges,
+            profile_ribbons,
+            curve_segments,
+            lines,
+            point_clouds,
+            scene_params,
+            object_layout,
+            ..
+        } = self;
+        let params = [&*meshes, &*edges, &*profile_ribbons, &*curve_segments, &*lines, &*point_clouds]
+            .into_iter()
+            .flat_map(|b| b.params.iter());
+        scene_params.write(device, queue, object_layout, params);
+    }
+
+    fn scene_batches_mut(&mut self) -> [&mut Batch; 6] {
+        [
+            &mut self.meshes,
+            &mut self.edges,
+            &mut self.profile_ribbons,
+            &mut self.curve_segments,
+            &mut self.lines,
+            &mut self.point_clouds,
+        ]
+    }
+
     /// Replace the transient ghost preview lines (iOS gumball live wireframe).
     /// Each entry is `(segment-soup points, rgba, lineweight_mm)` where the
     /// points are flat LineList pairs in world space — the same shape the edge
     /// pass consumes. Lineweight is ignored (ghost is always a 1-pixel hairline).
-    /// Uploads one vertex buffer per entry, mirroring [`SceneRenderer::set_scene`]'s
-    /// line path; call every drag frame. Additive — does not touch the scene.
-    pub fn set_ghost_lines(&mut self, device: &wgpu::Device, lines: &[LineEntry]) {
-        use wgpu::util::DeviceExt as _;
-        self.ghost_lines.clear();
+    /// Rewrites one shared vertex buffer in place; call every drag frame.
+    /// Additive — does not touch the scene.
+    pub fn set_ghost_lines(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, lines: &[LineEntry]) {
+        let mut ghost = Staged::default();
         for (points, color, _lw_mm) in lines {
-            if points.len() < 2 {
-                continue;
+            if points.len() >= 2 {
+                ghost.push_segments(points, ObjectParams::stroke(*color));
             }
-            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("ghost_vb"),
-                contents: bytemuck::cast_slice(points),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            self.ghost_lines.push(GpuLine {
-                vertex_buf,
-                vertex_count: points.len() as u32,
-                object_bind_group: self.object_bind_group(device, *color),
-            });
         }
+        self.ghost_params.write(device, queue, &self.object_layout, ghost.params.iter());
+        self.ghost_lines.set(device, queue, ghost);
     }
 
     /// Drop all ghost preview lines (gumball commit / cancel). Cheap no-op when
     /// already empty.
     pub fn clear_ghost_lines(&mut self) {
-        self.ghost_lines.clear();
+        self.ghost_lines.draws.clear();
     }
 
     /// Upload one underlay: an RGBA8 texture, a quad (two triangles) with uvs,
@@ -1624,18 +1280,14 @@ impl SceneRenderer {
             render_pass.draw_indexed(0..6, 0, 0..1);
         }
 
+        let scene = &self.scene_params;
         if mode.draws_fill() {
             render_pass.set_pipeline(if mode.depth_writes() {
                 &self.mesh_pipeline
             } else {
                 &self.mesh_xray_pipeline
             });
-            for mesh in &self.meshes {
-                render_pass.set_bind_group(1, &mesh.object_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                render_pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
+            draw_indexed(render_pass, &self.meshes, scene);
         }
 
         // Shaded draws edges by default but can be turned off; other modes
@@ -1646,32 +1298,18 @@ impl SceneRenderer {
         let fat = self.fat_lines.get(viewport).copied().unwrap_or(false);
         if draw_edges && fat {
             render_pass.set_pipeline(&self.fat_pipeline);
-            for edge in &self.edges {
-                render_pass.set_bind_group(1, &edge.object_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, edge.vertex_buf.slice(..));
-                render_pass.draw(0..6, 0..edge.vertex_count / 2);
-            }
+            draw_fat(render_pass, &self.edges, scene);
         } else if draw_edges {
             render_pass.set_pipeline(&self.edge_pipeline);
-            for edge in &self.edges {
-                render_pass.set_bind_group(1, &edge.object_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, edge.vertex_buf.slice(..));
-                render_pass.draw(0..edge.vertex_count, 0..1);
-            }
+            draw_ranges(render_pass, &self.edges, scene);
         }
 
         // Profile / silhouette ribbons: thick outline meshes. Drawn with the
         // solid mesh pipeline (depth-writing) so they read as fat ink edges on
         // top of the fill. Present only when the snapshot populated them.
-        if !self.profile_ribbons.is_empty() {
+        if !self.profile_ribbons.draws.is_empty() {
             render_pass.set_pipeline(&self.mesh_pipeline);
-            for ribbon in &self.profile_ribbons {
-                render_pass.set_bind_group(1, &ribbon.object_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, ribbon.vertex_buf.slice(..));
-                render_pass
-                    .set_index_buffer(ribbon.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..ribbon.index_count, 0, 0..1);
-            }
+            draw_indexed(render_pass, &self.profile_ribbons, scene);
         }
 
         // Default curves: the crisp 1-device-pixel hardware hairline is the
@@ -1679,40 +1317,24 @@ impl SceneRenderer {
         // Fat-stroke modes widen them like the edges above.
         if fat {
             render_pass.set_pipeline(&self.fat_pipeline);
-            for line in &self.curve_segments {
-                render_pass.set_bind_group(1, &line.object_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, line.vertex_buf.slice(..));
-                render_pass.draw(0..6, 0..line.vertex_count / 2);
-            }
+            draw_fat(render_pass, &self.curve_segments, scene);
         } else {
             render_pass.set_pipeline(&self.curve_pipeline);
-            for line in &self.lines {
-                render_pass.set_bind_group(1, &line.object_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, line.vertex_buf.slice(..));
-                render_pass.draw(0..line.vertex_count, 0..1);
-            }
+            draw_ranges(render_pass, &self.lines, scene);
         }
 
         // Point clouds: rendered as PointList after lines so they appear on top
         // of surfaces but below the grid.
         render_pass.set_pipeline(&self.point_pipeline);
-        for cloud in &self.point_clouds {
-            render_pass.set_bind_group(1, &cloud.object_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, cloud.vertex_buf.slice(..));
-            render_pass.draw(0..cloud.vertex_count, 0..1);
-        }
+        draw_ranges(render_pass, &self.point_clouds, scene);
 
         // Ghost preview lines (iOS gumball live wireframe): hairline segments
         // drawn with the LineList edge pipeline (the ghost is a flat segment
         // soup, not a strip). Over the scene, under the grid. Present only while
         // a gumball drag is active; empty otherwise.
-        if !self.ghost_lines.is_empty() {
+        if !self.ghost_lines.draws.is_empty() {
             render_pass.set_pipeline(&self.edge_pipeline);
-            for ghost in &self.ghost_lines {
-                render_pass.set_bind_group(1, &ghost.object_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, ghost.vertex_buf.slice(..));
-                render_pass.draw(0..ghost.vertex_count, 0..1);
-            }
+            draw_ranges(render_pass, &self.ghost_lines, &self.ghost_params);
         }
 
         // Grid last: blends over background, depth-tested against meshes.
@@ -1727,10 +1349,273 @@ impl SceneRenderer {
         // They share the grid's visibility: any view that paints the grid
         // paints the axes.
         render_pass.set_pipeline(&self.axis_pipeline);
-        for axis in &self.axis_lines {
-            render_pass.set_bind_group(1, &axis.object_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, axis.vertex_buf.slice(..));
-            render_pass.draw(0..axis.vertex_count, 0..1);
+        draw_ranges(render_pass, &self.axis_lines, &self.axis_params);
+    }
+}
+
+/// Pack scene meshes into one indexed batch.
+fn stage_meshes(meshes: &[(RenderMesh, [f32; 4], [f32; 2])]) -> Staged {
+    let mut s = Staged::default();
+    for (mesh, color, rm) in meshes {
+        let params = ObjectParams { color: *color, material: [rm[0], rm[1], 0.0, 0.0] };
+        s.push_mesh(&mesh.positions, &mesh.normals, &mesh.indices, params);
+    }
+    s
+}
+
+/// Draw every object of an indexed batch, one draw per object (paint order is
+/// object order, as before batching, so blending is unchanged).
+fn draw_indexed(pass: &mut wgpu::RenderPass<'static>, batch: &Batch, params: &ParamBuffer) {
+    let (Some(vb), Some(ib), Some(bg)) = (batch.vertex_slice(), batch.index_slice(), params.bind_group())
+    else {
+        return;
+    };
+    pass.set_vertex_buffer(0, vb);
+    pass.set_index_buffer(ib, wgpu::IndexFormat::Uint32);
+    for d in &batch.draws {
+        pass.set_bind_group(1, bg, &[params.offset(batch.slot_base + d.slot)]);
+        pass.draw_indexed(d.range(), d.base_vertex, 0..1);
+    }
+}
+
+/// Draw every object of a line or point batch as a vertex range.
+fn draw_ranges(pass: &mut wgpu::RenderPass<'static>, batch: &Batch, params: &ParamBuffer) {
+    let (Some(vb), Some(bg)) = (batch.vertex_slice(), params.bind_group()) else {
+        return;
+    };
+    pass.set_vertex_buffer(0, vb);
+    for d in &batch.draws {
+        pass.set_bind_group(1, bg, &[params.offset(batch.slot_base + d.slot)]);
+        pass.draw(d.range(), 0..1);
+    }
+}
+
+/// Draw a line-list batch through the fat-stroke pipeline: six quad vertices
+/// per segment, segments read as instances.
+fn draw_fat(pass: &mut wgpu::RenderPass<'static>, batch: &Batch, params: &ParamBuffer) {
+    let (Some(vb), Some(bg)) = (batch.vertex_slice(), params.bind_group()) else {
+        return;
+    };
+    pass.set_vertex_buffer(0, vb);
+    for d in &batch.draws {
+        pass.set_bind_group(1, bg, &[params.offset(batch.slot_base + d.slot)]);
+        pass.draw(0..6, d.segments());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{curve_px, world_axis_lines, DisplayMode, LightMode, AXIS_EXTENT, RHINO_CURVE_PX};
+
+    #[test]
+    fn world_axis_lines_geometry() {
+        let axes = world_axis_lines();
+        assert_eq!(axes.len(), 2);
+
+        let (x_pts, x_color) = axes[0];
+        let (y_pts, y_color) = axes[1];
+
+        // Finite, f32-exact extent, symmetric about the origin.
+        assert!(AXIS_EXTENT.is_finite() && AXIS_EXTENT > 0.0);
+        assert_eq!(x_pts, [[-AXIS_EXTENT, 0.0, 0.0], [AXIS_EXTENT, 0.0, 0.0]]);
+        assert_eq!(y_pts, [[0.0, -AXIS_EXTENT, 0.0], [0.0, AXIS_EXTENT, 0.0]]);
+
+        // Both axes lie exactly on the z=0 datum plane.
+        for p in x_pts.iter().chain(y_pts.iter()) {
+            assert_eq!(p[2], 0.0);
         }
+
+        // X is the red axis, Y the green one (red channel dominates on X,
+        // green on Y), both fully opaque.
+        assert!(x_color[0] > x_color[1] && x_color[0] > x_color[2]);
+        assert!(y_color[1] > y_color[0] && y_color[1] > y_color[2]);
+        assert_eq!(x_color[3], 1.0);
+        assert_eq!(y_color[3], 1.0);
+    }
+
+    #[test]
+    fn curve_px_scales_with_dpr() {
+        // Rhino default is 1 logical px; physical thickness stays constant
+        // across DPI, so 1x → 1 px and 2x → 2 px.
+        assert_eq!(RHINO_CURVE_PX, 1.0);
+        assert_eq!(curve_px(1.0), 1.0);
+        assert_eq!(curve_px(2.0), 2.0);
+        assert_eq!(curve_px(1.5), 1.5);
+        // Never sub-pixel: a bogus <1 dpr floors to a visible hairline.
+        assert_eq!(curve_px(0.0), 1.0);
+        assert_eq!(curve_px(0.5), 1.0);
+    }
+
+    #[test]
+    fn light_mode_default_is_working() {
+        assert_eq!(LightMode::default(), LightMode::Working);
+    }
+
+    #[test]
+    fn light_mode_parse_round_trip() {
+        for (s, expected) in [
+            ("working", LightMode::Working),
+            ("work", LightMode::Working),
+            ("sun", LightMode::Sun),
+            ("solar", LightMode::Sun),
+            ("presentation", LightMode::Presentation),
+            ("present", LightMode::Presentation),
+            ("pbr", LightMode::Presentation),
+        ] {
+            assert_eq!(LightMode::parse(s), Some(expected), "parse({s:?})");
+        }
+        assert_eq!(LightMode::parse("nope"), None);
+    }
+
+    #[test]
+    fn light_mode_labels_parse_back() {
+        for m in LightMode::ALL {
+            // label lowercased must parse back to the same mode.
+            assert_eq!(LightMode::parse(&m.label().to_lowercase()), Some(m));
+        }
+    }
+
+    #[test]
+    fn light_mode_shader_flags_distinct() {
+        let flags: Vec<f32> = LightMode::ALL.iter().map(|m| m.shader_flag()).collect();
+        assert_eq!(flags, vec![0.0, 1.0, 2.0]);
+    }
+
+    // Mirror of the mesh.wgsl hemispheric fill so the ambient-floor invariant is
+    // checked in pure Rust on every `cargo test` (the shader itself only runs on
+    // a GPU). If you change the constants in mesh.wgsl, change them here too.
+    fn hemispheric_ambient(nz: f32) -> f32 {
+        let up = (nz * 0.5 + 0.5).clamp(0.0, 1.0);
+        0.30 + (0.65 - 0.30) * up // mix(0.30, 0.65, up)
+    }
+    fn diffuse_floor(nz: f32, key: f32) -> f32 {
+        // diffuse = ambient + 0.55 * max(dot(n, key_dir), 0)
+        hemispheric_ambient(nz) + 0.55 * key.max(0.0)
+    }
+
+    #[test]
+    fn ambient_floor_keeps_faces_off_black() {
+        // A face pointing straight DOWN (nz=-1) with ZERO key contribution still
+        // gets the ground-bounce ambient — luminance must be strictly positive.
+        let lum = diffuse_floor(-1.0, 0.0);
+        assert!(lum > 0.0, "downward face fully unlit must not be black: {lum}");
+        assert!((lum - 0.30).abs() < 1e-6, "ground floor is 0.30, got {lum}");
+
+        // A face turned fully AWAY from the key light (negative dot) still reads
+        // by its hemispheric ambient — no crush to black at any orientation.
+        for nz in [-1.0_f32, -0.5, 0.0, 0.5, 1.0] {
+            assert!(diffuse_floor(nz, -1.0) > 0.0, "nz={nz} away-from-key went black");
+        }
+    }
+
+    #[test]
+    fn pencil_parse_round_trip() {
+        assert_eq!(DisplayMode::parse("pencil"), Some(DisplayMode::Pencil));
+        assert_eq!(DisplayMode::Pencil.label(), "Pencil");
+    }
+
+    #[test]
+    fn pencil_in_all() {
+        assert!(DisplayMode::ALL.contains(&DisplayMode::Pencil));
+    }
+
+    #[test]
+    fn pencil_fill_alpha_is_negative_sentinel() {
+        assert!(DisplayMode::Pencil.fill_alpha() < 0.0);
+        // Only the paper modes use the sentinel; the rest are non-negative.
+        for mode in DisplayMode::ALL {
+            if mode.fill_alpha() < 0.0 {
+                assert!(
+                    mode.background_override().is_some(),
+                    "{mode:?} is a paper mode"
+                );
+            } else {
+                assert!(
+                    mode.fill_alpha() >= 0.0,
+                    "{mode:?} should have non-negative alpha"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pencil_draws_fill_and_edges_with_depth_writes() {
+        assert!(DisplayMode::Pencil.draws_fill());
+        assert!(DisplayMode::Pencil.draws_edges());
+        assert!(DisplayMode::Pencil.depth_writes());
+    }
+
+    #[test]
+    fn shaded_draws_feature_edges_by_default() {
+        // Shaded now draws mesh feature edges (the SketchUp/Rhino "shaded +
+        // edges" look), matching every other mode.
+        assert!(DisplayMode::Shaded.draws_edges());
+        assert!(DisplayMode::Shaded.draws_fill());
+        for mode in DisplayMode::ALL {
+            assert!(mode.draws_edges(), "{mode:?} should draw feature edges");
+        }
+    }
+
+    #[test]
+    fn mode_background_ink_and_width_mapping() {
+        // Hidden Line follows the theme: no paper, depth-only fill (alpha 0,
+        // not the pencil ink sentinel), occlusion on, a little stroke weight.
+        let hl = DisplayMode::HiddenLine;
+        assert_eq!(hl.background_override(), None);
+        assert_eq!(hl.fill_alpha(), 0.0);
+        assert!(hl.draws_fill() && hl.depth_writes() && !hl.forces_sketchy());
+        // Sketchy: paper, dark ink (negative sentinel), occlusion, sketchy on.
+        let sk = DisplayMode::Sketchy;
+        assert_eq!(
+            sk.background_override(),
+            Some(DisplayMode::pencil_background())
+        );
+        assert!(sk.fill_alpha() < 0.0);
+        assert!(sk.depth_writes() && sk.forces_sketchy());
+        assert_eq!(
+            DisplayMode::Pencil.background_override(),
+            Some(DisplayMode::pencil_background())
+        );
+        // Widths: hairline elsewhere, Hidden Line < Sketchy, scaled by dpr.
+        assert_eq!(DisplayMode::Shaded.line_px(3.0), 0.0);
+        // Hairline = 1 device px; Hidden Line beats it on any retina screen.
+        assert!(hl.line_px(2.0) > 1.0 && sk.line_pt() > hl.line_pt());
+        assert_eq!(hl.line_px(2.0), hl.line_pt() * 2.0);
+        assert_eq!(sk.line_px(3.0), sk.line_pt() * 3.0);
+        assert_eq!(sk.line_px(0.0), sk.line_pt());
+        for mode in DisplayMode::ALL {
+            assert_eq!(
+                DisplayMode::parse(&mode.label().to_lowercase().replace(' ', "")),
+                Some(mode)
+            );
+        }
+    }
+
+    #[test]
+    fn pencil_background_is_near_white() {
+        let bg = DisplayMode::pencil_background();
+        // All channels > 0.9 (near white)
+        assert!(bg[0] > 0.9 && bg[1] > 0.9 && bg[2] > 0.9);
+        assert_eq!(bg[3], 1.0);
+    }
+
+    #[test]
+    fn all_modes_parse() {
+        for (s, expected) in [
+            ("shaded", DisplayMode::Shaded),
+            ("wireframe", DisplayMode::Wireframe),
+            ("wire", DisplayMode::Wireframe),
+            ("xray", DisplayMode::XRay),
+            ("x-ray", DisplayMode::XRay),
+            ("ghosted", DisplayMode::Ghosted),
+            ("ghost", DisplayMode::Ghosted),
+            ("pencil", DisplayMode::Pencil),
+            ("hiddenline", DisplayMode::HiddenLine),
+            ("hidden-line", DisplayMode::HiddenLine),
+            ("sketchy", DisplayMode::Sketchy),
+        ] {
+            assert_eq!(DisplayMode::parse(s), Some(expected), "parse({s:?}) failed");
+        }
+        assert_eq!(DisplayMode::parse("unknown"), None);
     }
 }

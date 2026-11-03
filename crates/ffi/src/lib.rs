@@ -3082,7 +3082,7 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
                 Some((pts, GHOST_COLOR, 0.0))
             })
             .collect();
-        gpu.renderer.set_ghost_lines(&gpu.device, &ghost);
+        gpu.renderer.set_ghost_lines(&gpu.device, &gpu.queue, &ghost);
     } else {
         gpu.renderer.clear_ghost_lines();
     }
