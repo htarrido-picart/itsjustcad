@@ -787,6 +787,196 @@ pub fn terrain_z_at(positions: &[DVec3], faces: &[[u32; 3]], x: f64, y: f64) -> 
 
 // ─── drainage visualization ──────────────────────────────────────────────────
 
+/// One face of [`terrain_z_at`]'s scan: the same barycentric test and
+/// arithmetic, so [`TerrainIndex::z_at`] returns bit-identical heights.
+#[inline]
+fn face_z(positions: &[DVec3], f: &[u32; 3], x: f64, y: f64) -> Option<f64> {
+    let (a, b, c) = (
+        positions[f[0] as usize],
+        positions[f[1] as usize],
+        positions[f[2] as usize],
+    );
+    let det = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+    if det.abs() < 1e-18 {
+        return None;
+    }
+    let u = ((x - a.x) * (c.y - a.y) - (c.x - a.x) * (y - a.y)) / det;
+    let v = ((b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y)) / det;
+    let w = 1.0 - u - v;
+    let eps = -1e-9;
+    (u >= eps && v >= eps && w >= eps).then_some(w * a.z + u * b.z + v * c.z)
+}
+
+/// Upper bound on grid cells per axis, so a sliver-spanning terrain cannot
+/// allocate an unbounded grid.
+const TERRAIN_GRID_MAX: usize = 2048;
+
+/// Uniform 2D grid over the terrain triangles, built once per command (#265)
+/// so each height lookup tests only the faces near the point instead of
+/// scanning them all.
+///
+/// [`TerrainIndex::z_at`] equals [`terrain_z_at`] bit for bit: every face is
+/// listed (in ascending face order) in each cell its padded XY box touches,
+/// and the first listed face that passes the same barycentric test wins —
+/// the lowest-numbered matching face, exactly as the linear scan picks it.
+/// The pad covers the test's `-1e-9` tolerance and the rounding of `u`/`v`
+/// (which grows for slivers); faces with non-finite coordinates are listed
+/// everywhere.
+pub struct TerrainIndex<'a> {
+    positions: &'a [DVec3],
+    faces: &'a [[u32; 3]],
+    x0: f64,
+    y0: f64,
+    inv_cell: f64,
+    nx: usize,
+    ny: usize,
+    /// CSR rows: the faces of cell `c` are `items[start[c]..start[c + 1]]`.
+    start: Vec<u32>,
+    items: Vec<u32>,
+}
+
+impl<'a> TerrainIndex<'a> {
+    pub fn new(positions: &'a [DVec3], faces: &'a [[u32; 3]]) -> Self {
+        // Padded XY box per face.
+        enum FaceBox {
+            /// Degenerate in XY: the scan skips it, so never listed.
+            Skip,
+            Box([f64; 4]),
+            /// Non-finite coordinates: listed in every cell.
+            Everywhere,
+        }
+        let mut cmax = 0.0f64;
+        for p in positions {
+            if p.x.is_finite() && p.y.is_finite() {
+                cmax = cmax.max(p.x.abs()).max(p.y.abs());
+            }
+        }
+        let boxes: Vec<FaceBox> = faces
+            .iter()
+            .map(|f| {
+                let [a, b, c] = f.map(|i| positions[i as usize]);
+                let det = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+                if det.abs() < 1e-18 {
+                    return FaceBox::Skip;
+                }
+                let (xmin, xmax) = (a.x.min(b.x).min(c.x), a.x.max(b.x).max(c.x));
+                let (ymin, ymax) = (a.y.min(b.y).min(c.y), a.y.max(b.y).max(c.y));
+                let l = (xmax - xmin).max(ymax - ymin);
+                // Passing region ⊂ triangle scaled about its centroid by
+                // 1 + 3·δ, δ = 1e-9 tolerance + rounding of u/v (≲ few ulps
+                // of l·(l + |coords|) over |det|). Generous constants.
+                let delta = 1e-9 + 1e-12 * l * (l + cmax) / det.abs();
+                let pad = 4.0 * delta * l + 1e-9 * (1.0 + cmax);
+                let bx = [xmin - pad, ymin - pad, xmax + pad, ymax + pad];
+                if bx.iter().all(|v| v.is_finite()) {
+                    FaceBox::Box(bx)
+                } else {
+                    FaceBox::Everywhere
+                }
+            })
+            .collect();
+        // Grid over the finite face boxes (degenerate faces never match).
+        let (mut x0, mut y0, mut x1, mut y1) =
+            (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut n_live = 0usize;
+        for b in boxes.iter().filter_map(|b| match b {
+            FaceBox::Box(b) => Some(b),
+            _ => None,
+        }) {
+            x0 = x0.min(b[0]);
+            y0 = y0.min(b[1]);
+            x1 = x1.max(b[2]);
+            y1 = y1.max(b[3]);
+            n_live += 1;
+        }
+        let (nx, ny, inv_cell) = if n_live == 0 {
+            (x0, y0) = (0.0, 0.0);
+            (1, 1, 0.0)
+        } else {
+            let (w, h) = (x1 - x0, y1 - y0);
+            let cell = (w * h / n_live as f64)
+                .sqrt()
+                .max(w.max(h) / TERRAIN_GRID_MAX as f64)
+                .max(1e-9);
+            let n = |e: f64| ((e / cell).ceil() as usize).clamp(1, TERRAIN_GRID_MAX);
+            (n(w), n(h), 1.0 / cell)
+        };
+        let mut idx = Self {
+            positions,
+            faces,
+            x0,
+            y0,
+            inv_cell,
+            nx,
+            ny,
+            start: Vec::new(),
+            items: Vec::new(),
+        };
+        // Cell ranges per face.
+        let ranges: Vec<Option<[usize; 4]>> = boxes
+            .iter()
+            .map(|b| match b {
+                FaceBox::Skip => None,
+                FaceBox::Box(b) => Some([
+                    idx.col(b[0]),
+                    idx.row(b[1]),
+                    idx.col(b[2]),
+                    idx.row(b[3]),
+                ]),
+                FaceBox::Everywhere => Some([0, 0, nx - 1, ny - 1]),
+            })
+            .collect();
+        let mut count = vec![0u32; nx * ny + 1];
+        for r in ranges.iter().flatten() {
+            for j in r[1]..=r[3] {
+                for i in r[0]..=r[2] {
+                    count[j * nx + i + 1] += 1;
+                }
+            }
+        }
+        for c in 1..count.len() {
+            count[c] += count[c - 1];
+        }
+        let mut fill = count.clone();
+        let mut items = vec![0u32; count[nx * ny] as usize];
+        for (fi, r) in ranges.iter().enumerate() {
+            let Some(r) = r else { continue };
+            for j in r[1]..=r[3] {
+                for i in r[0]..=r[2] {
+                    let c = j * nx + i;
+                    items[fill[c] as usize] = fi as u32;
+                    fill[c] += 1;
+                }
+            }
+        }
+        idx.start = count;
+        idx.items = items;
+        idx
+    }
+
+    /// Grid column of `x`, clamped. Monotone in `x`, so a point inside a
+    /// face's box always lands in a cell that lists the face.
+    fn col(&self, x: f64) -> usize {
+        ((x - self.x0) * self.inv_cell).floor().clamp(0.0, (self.nx - 1) as f64) as usize
+    }
+
+    fn row(&self, y: f64) -> usize {
+        ((y - self.y0) * self.inv_cell).floor().clamp(0.0, (self.ny - 1) as f64) as usize
+    }
+
+    /// Terrain elevation at `(x, y)`: identical to
+    /// `terrain_z_at(positions, faces, x, y)`.
+    pub fn z_at(&self, x: f64, y: f64) -> Option<f64> {
+        if !(x.is_finite() && y.is_finite()) {
+            return terrain_z_at(self.positions, self.faces, x, y);
+        }
+        let c = self.row(y) * self.nx + self.col(x);
+        self.items[self.start[c] as usize..self.start[c + 1] as usize]
+            .iter()
+            .find_map(|&f| face_z(self.positions, &self.faces[f as usize], x, y))
+    }
+}
+
 /// Steepest-descent data for one terrain face.
 #[derive(Debug, Clone, Copy)]
 pub struct FaceFlow {
@@ -1293,6 +1483,69 @@ mod tests {
         assert!((z - (3.3 + 9.4)).abs() < 1e-9);
         assert!(terrain_z_at(&pos, &faces, -1.0, 5.0).is_none());
         assert!(terrain_z_at(&pos, &faces, 5.0, 11.0).is_none());
+    }
+
+    /// Indexed lookup vs the linear-scan oracle, bit for bit, at `pts`.
+    fn assert_index_matches_scan(pos: &[DVec3], faces: &[[u32; 3]], pts: &[(f64, f64)]) {
+        let idx = TerrainIndex::new(pos, faces);
+        for &(x, y) in pts {
+            assert_eq!(
+                idx.z_at(x, y).map(f64::to_bits),
+                terrain_z_at(pos, faces, x, y).map(f64::to_bits),
+                "({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn terrain_index_matches_scan_on_vertices_edges_and_outside() {
+        // Non-planar so the two faces sharing an edge give different bits
+        // unless the first (lowest-numbered) one is picked.
+        let (pos, faces) = grid_terrain(12, 60.0, |x, y| (x * 0.37).sin() * 3.0 + y * y * 0.01);
+        let mut pts: Vec<(f64, f64)> = pos.iter().map(|p| (p.x, p.y)).collect();
+        for f in &faces {
+            for e in 0..3 {
+                let (a, b) = (pos[f[e] as usize], pos[f[(e + 1) % 3] as usize]);
+                pts.push(((a.x + b.x) / 2.0, (a.y + b.y) / 2.0));
+                // Just outside / inside the edge, within the 1e-9 tolerance.
+                pts.push((a.x + 1e-10, a.y - 1e-10));
+                pts.push((a.x - 1e-8, a.y + 1e-8));
+            }
+        }
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..5_000 {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let u = (s >> 11) as f64 / (1u64 << 53) as f64;
+            let v = (s.rotate_left(29) >> 11) as f64 / (1u64 << 53) as f64;
+            pts.push((u * 80.0 - 10.0, v * 80.0 - 10.0));
+        }
+        pts.extend([(f64::NAN, 1.0), (f64::INFINITY, 5.0), (-1e300, 1e300), (60.0, 60.0)]);
+        assert_index_matches_scan(&pos, &faces, &pts);
+    }
+
+    #[test]
+    fn terrain_index_keeps_scan_order_for_overlaps_slivers_and_bad_faces() {
+        // Overlapping faces (the later one must lose), a near-degenerate
+        // sliver, a zero-area face and a face with a non-finite vertex.
+        let pos = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 1.0),
+            DVec3::new(0.0, 10.0, 2.0),
+            DVec3::new(10.0, 10.0, 7.0),
+            DVec3::new(5.0, 5.0 + 1e-7, 9.0),
+            DVec3::new(f64::NAN, 3.0, 0.0),
+        ];
+        let faces = vec![[1, 3, 2], [0, 1, 2], [0, 3, 4], [0, 3, 3], [0, 5, 1], [0, 1, 3]];
+        let mut pts = Vec::new();
+        for i in 0..=40 {
+            for j in 0..=40 {
+                pts.push((i as f64 * 0.3 - 1.0, j as f64 * 0.3 - 1.0));
+            }
+        }
+        pts.extend([(5.0, 5.0), (2.5, 2.5 + 5e-8), (7.5, 7.5), (10.0, 0.0)]);
+        assert_index_matches_scan(&pos, &faces, &pts);
+        let idx = TerrainIndex::new(&pos, &[]);
+        assert!(idx.z_at(1.0, 1.0).is_none(), "empty terrain");
     }
 
     #[test]
