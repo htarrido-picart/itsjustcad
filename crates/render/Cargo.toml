@@ -16,6 +16,9 @@ bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
+# upload_bench: process CPU time and wgpu buffer / bind-group counters.
+libc = "0.2"
+wgpu = { workspace = true, features = ["counters"] }
 itsjustcad-commands.workspace = true
 pollster = "0.4"
 naga = { version = "29", features = ["wgsl-in"] }

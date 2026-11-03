@@ -2877,6 +2877,7 @@ dependencies = [
  "itsjustcad-doc",
  "kernel-curve",
  "kernel-mesh",
+ "libc",
  "naga",
  "pollster",
  "wgpu",

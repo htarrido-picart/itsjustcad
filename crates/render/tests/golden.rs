@@ -206,7 +206,7 @@ fn make_renderer(
     camera: &OrbitCamera,
 ) -> SceneRenderer {
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
-    renderer.set_meshes(&ctx.device, &meshes, 0);
+    renderer.set_meshes(&ctx.device, &ctx.queue, &meshes, 0);
     if !lines.is_empty() {
         let data = itsjustcad_render::SceneData {
             meshes: vec![],
@@ -245,7 +245,7 @@ fn golden_single_box_dark() {
     };
 
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
-    renderer.set_meshes(&ctx.device, &[(mesh.to_render(), theme.mesh(), [0.5, 0.0])], 0);
+    renderer.set_meshes(&ctx.device, &ctx.queue, &[(mesh.to_render(), theme.mesh(), [0.5, 0.0])], 0);
     let aspect = W as f32 / H as f32;
     let cam = itsjustcad_render::camera_uniform(camera.view_proj(aspect), camera.eye());
     renderer.write_camera(&ctx.device, &ctx.queue, 0, &cam);
@@ -349,4 +349,71 @@ fn golden_empty_dark() {
     let renderer = make_renderer(&ctx, vec![], vec![], &camera);
     let img = render_to_image(&ctx, &renderer, theme);
     check_or_bless(&img, "empty-dark");
+}
+
+/// Boxes with feature edges, a profile ribbon, a curve and a point cloud:
+/// one entry per object kind the renderer batches (#269).
+fn batched_scene(boxes: usize, mesh: [f32; 4], ink: [f32; 4]) -> itsjustcad_render::SceneData {
+    let to_f32 = |v: DVec3| [v.x as f32, v.y as f32, v.z as f32];
+    let mut data = itsjustcad_render::SceneData {
+        meshes: vec![],
+        lines: vec![(vec![[-6.0, -4.0, 0.0], [-2.0, -5.0, 0.5], [2.0, -4.0, 0.0]], ink, 0.18)],
+        edges: vec![],
+        profile_edges: vec![],
+        points: vec![(vec![[0.0, 5.0, 0.0], [1.0, 5.0, 0.5], [2.0, 5.0, 1.0]], ink)],
+        underlay: None,
+        basemap: None,
+        show_lineweights: false,
+    };
+    for i in 0..boxes {
+        let b = kernel_mesh::make_box(
+            DVec3::new(-5.0 + 3.0 * i as f64, -1.0, 0.0),
+            DVec3::new(2.0, 2.0, 1.0 + i as f64),
+        );
+        let edges: Vec<[f32; 3]> = kernel_mesh::feature_edges(&b)
+            .iter()
+            .flat_map(|(a, b)| [to_f32(*a), to_f32(*b)])
+            .collect();
+        data.profile_edges.push((edges[..4].to_vec(), ink, 0.03));
+        data.edges.push((edges, ink, 0.18));
+        data.meshes.push((b.to_render(), mesh, [0.5, 0.0]));
+    }
+    data
+}
+
+/// #269: re-uploading into existing shared buffers — a color-only change
+/// (parameters rewritten in place), a shrink and a regrow — renders exactly
+/// like a fresh renderer given the final scene.
+#[test]
+#[ignore = "golden"]
+fn golden_reupload_matches_fresh() {
+    let ctx = GpuContext::new();
+    let theme = Theme::Dark;
+    let camera = OrbitCamera { distance: 18.0, yaw: -0.6, pitch: 0.55, ..OrbitCamera::default() };
+    let cam = itsjustcad_render::camera_uniform(camera.view_proj(W as f32 / H as f32), camera.eye());
+    let selected = theme.selected();
+    let render = |renderer: &mut SceneRenderer| {
+        renderer.write_camera(&ctx.device, &ctx.queue, 0, &cam);
+        render_to_image(&ctx, renderer, theme)
+    };
+
+    let mut fresh = SceneRenderer::new(&ctx.device, FORMAT);
+    fresh.set_scene(&ctx.device, &ctx.queue, &batched_scene(3, selected, theme.curve()), 0);
+    let expected = render(&mut fresh);
+
+    let mut reused = SceneRenderer::new(&ctx.device, FORMAT);
+    for scene in [
+        batched_scene(3, theme.mesh(), theme.curve()),
+        batched_scene(3, selected, theme.curve()), // recolor only
+        batched_scene(1, theme.mesh(), selected),  // shrink
+        batched_scene(3, selected, theme.curve()), // regrow
+    ] {
+        reused.set_scene(&ctx.device, &ctx.queue, &scene, 0);
+    }
+    assert!(render(&mut reused) == expected, "re-upload differs from a fresh upload");
+
+    // The recolor must actually show: the base colors render differently.
+    let mut base = SceneRenderer::new(&ctx.device, FORMAT);
+    base.set_scene(&ctx.device, &ctx.queue, &batched_scene(3, theme.mesh(), theme.curve()), 0);
+    assert!(render(&mut base) != expected);
 }
