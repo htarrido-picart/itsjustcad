@@ -106,6 +106,92 @@ impl Bvh {
         out
     }
 
+    /// Does `test` accept any primitive whose AABB the ray `origin + t*dir`
+    /// meets at some `t` in `[0, max_t]`? `test(i)` is the caller's exact test
+    /// for primitive `i` (including its own `t` limits); traversal stops at the
+    /// first `true`. Allocation-free for trees up to 64 deep.
+    pub fn ray_any_hit(
+        &self,
+        origin: DVec3,
+        dir: DVec3,
+        max_t: f64,
+        mut test: impl FnMut(u32) -> bool,
+    ) -> bool {
+        let mut hit = false;
+        self.traverse(origin, dir, max_t, |prims| {
+            if prims.iter().any(|&i| test(i)) {
+                hit = true;
+                return None;
+            }
+            Some(max_t)
+        });
+        hit
+    }
+
+    /// Closest primitive along the ray `origin + t*dir`: `test(i)` returns the
+    /// exact hit `t` of primitive `i`, or `None` on a miss. Returns `(i, t)` of
+    /// the smallest `t ≤ max_t`; on exact ties the primitive tested first wins,
+    /// in the same order as [`Bvh::ray_candidates`]. Boxes entered strictly
+    /// beyond the best hit so far are skipped. Allocation-free for trees up to
+    /// 64 deep.
+    pub fn ray_closest_hit(
+        &self,
+        origin: DVec3,
+        dir: DVec3,
+        max_t: f64,
+        mut test: impl FnMut(u32) -> Option<f64>,
+    ) -> Option<(u32, f64)> {
+        let mut best: Option<(u32, f64)> = None;
+        self.traverse(origin, dir, max_t, |prims| {
+            for &i in prims {
+                if let Some(t) = test(i)
+                    && best.map_or(t <= max_t, |(_, bt)| t < bt)
+                {
+                    best = Some((i, t));
+                }
+            }
+            Some(best.map_or(max_t, |(_, bt)| bt))
+        });
+        best
+    }
+
+    /// Depth-first ray traversal in [`Bvh::ray_candidates`] order. `leaf` gets
+    /// each reached leaf's primitives and returns the new pruning bound, or
+    /// `None` to stop. Boxes whose entry `t` is strictly greater than the bound
+    /// (initially `max_t`) are skipped.
+    fn traverse(
+        &self,
+        origin: DVec3,
+        dir: DVec3,
+        max_t: f64,
+        mut leaf: impl FnMut(&[u32]) -> Option<f64>,
+    ) {
+        if self.is_empty() {
+            return;
+        }
+        let inv = dir.recip();
+        let mut bound = max_t;
+        let mut stack = NodeStack::new(self.root as u32);
+        while let Some(n) = stack.pop() {
+            let n = n as usize;
+            match ray_aabb(origin, inv, self.node_bounds(n)) {
+                Some(entry) if entry > bound => continue,
+                None => continue,
+                Some(_) => {}
+            }
+            match &self.nodes[n] {
+                Node::Leaf { start, count } => match leaf(&self.prims[*start..*start + *count]) {
+                    Some(b) => bound = b,
+                    None => return,
+                },
+                Node::Internal { left, right, .. } => {
+                    stack.push(*left);
+                    stack.push(*right);
+                }
+            }
+        }
+    }
+
     /// Indices of every primitive whose AABB overlaps the query box. Order is
     /// unspecified. Used to cull osnap/box-select candidates to a screen region
     /// once the caller has mapped that region back to a world AABB.
@@ -268,6 +354,40 @@ fn ray_aabb(origin: DVec3, inv_dir: DVec3, b: Aabb) -> Option<f64> {
     (t_max >= t_min.max(0.0)).then_some(t_min.max(0.0))
 }
 
+/// Traversal stack: 64 inline slots (deeper than any median-split tree over
+/// realistic inputs) with a heap spill that keeps LIFO order if exceeded.
+struct NodeStack {
+    inline: [u32; 64],
+    len: usize,
+    spill: Vec<u32>,
+}
+
+impl NodeStack {
+    fn new(root: u32) -> Self {
+        let mut s = Self { inline: [0; 64], len: 0, spill: Vec::new() };
+        s.push(root);
+        s
+    }
+
+    fn push(&mut self, n: u32) {
+        if self.len < self.inline.len() {
+            self.inline[self.len] = n;
+            self.len += 1;
+        } else {
+            self.spill.push(n);
+        }
+    }
+
+    /// Spilled entries were pushed while the inline slots were full, so they
+    /// are always on top.
+    fn pop(&mut self) -> Option<u32> {
+        self.spill.pop().or_else(|| {
+            self.len = self.len.checked_sub(1)?;
+            Some(self.inline[self.len])
+        })
+    }
+}
+
 fn aabb_overlap(a: Aabb, b: Aabb) -> bool {
     a.min.x <= b.max.x
         && a.max.x >= b.min.x
@@ -308,27 +428,20 @@ impl TriBvh {
     /// not be normalized. Used for sun-occlusion: true = a triangle shadows the
     /// point. Only culled candidate triangles get the exact Möller–Trumbore test.
     pub fn ray_occluded(&self, origin: DVec3, dir: DVec3) -> bool {
-        for i in self.bvh.ray_candidates(origin, dir) {
+        self.bvh.ray_any_hit(origin, dir, f64::INFINITY, |i| {
             let [a, b, c] = self.tris[i as usize];
-            if ray_triangle(origin, dir, a, b, c).is_some() {
-                return true;
-            }
-        }
-        false
+            ray_triangle(origin, dir, a, b, c).is_some()
+        })
     }
 
     /// Nearest ray/triangle hit distance `t > eps` along `dir`, or `None`.
     pub fn ray_hit(&self, origin: DVec3, dir: DVec3) -> Option<f64> {
-        let mut best: Option<f64> = None;
-        for i in self.bvh.ray_candidates(origin, dir) {
-            let [a, b, c] = self.tris[i as usize];
-            if let Some(t) = ray_triangle(origin, dir, a, b, c)
-                && best.is_none_or(|bt| t < bt)
-            {
-                best = Some(t);
-            }
-        }
-        best
+        self.bvh
+            .ray_closest_hit(origin, dir, f64::INFINITY, |i| {
+                let [a, b, c] = self.tris[i as usize];
+                ray_triangle(origin, dir, a, b, c)
+            })
+            .map(|(_, t)| t)
     }
 }
 
@@ -530,6 +643,155 @@ mod tests {
         let tris = random_tris(&mut Rng(7), 30_000);
         let tb = TriBvh::build(tris.clone());
         assert_same_tree(&tb.bvh, &Bvh::build_serial(&tri_boxes(&tris)));
+    }
+
+    /// The pre-#300 collect-then-test path: the oracle `ray_closest_hit` must
+    /// reproduce bit for bit (same winner on exact ties).
+    fn oracle_closest(
+        bvh: &Bvh,
+        o: DVec3,
+        d: DVec3,
+        max_t: f64,
+        mut test: impl FnMut(u32) -> Option<f64>,
+    ) -> Option<(u32, f64)> {
+        let mut best: Option<(u32, f64)> = None;
+        for i in bvh.ray_candidates(o, d) {
+            if let Some(t) = test(i)
+                && best.map_or(t <= max_t, |(_, bt)| t < bt)
+            {
+                best = Some((i, t));
+            }
+        }
+        best
+    }
+
+    fn bits(h: Option<(u32, f64)>) -> Option<(u32, u64)> {
+        h.map(|(i, t)| (i, t.to_bits()))
+    }
+
+    /// Closest and any hit against the oracle for one ray at several `max_t`,
+    /// including exactly the oracle's hit `t` and its neighbouring floats.
+    fn check_ray(tb: &TriBvh, o: DVec3, d: DVec3) {
+        let test = |i: u32| {
+            let [a, b, c] = tb.tris[i as usize];
+            ray_triangle(o, d, a, b, c)
+        };
+        let full = oracle_closest(&tb.bvh, o, d, f64::INFINITY, test);
+        let mut limits = vec![f64::INFINITY, 0.0, 1.0, 40.0];
+        if let Some((_, t)) = full {
+            limits.extend([t, t.next_down(), t.next_up()]);
+        }
+        for max_t in limits {
+            assert_eq!(
+                bits(tb.bvh.ray_closest_hit(o, d, max_t, test)),
+                bits(oracle_closest(&tb.bvh, o, d, max_t, test)),
+                "closest o={o} d={d} max_t={max_t}"
+            );
+            let shadow = |i| test(i).is_some_and(|t| t < max_t);
+            let oracle_any = tb.bvh.ray_candidates(o, d).into_iter().any(shadow);
+            assert_eq!(tb.bvh.ray_any_hit(o, d, max_t, shadow), oracle_any, "any o={o} d={d} max_t={max_t}");
+        }
+        assert_eq!(tb.ray_hit(o, d).map(f64::to_bits), full.map(|(_, t)| t.to_bits()));
+        assert_eq!(tb.ray_occluded(o, d), full.is_some());
+    }
+
+    /// Axis-aligned rays and rays with zero components (infinite reciprocals).
+    const PARALLEL_DIRS: [DVec3; 8] = [
+        DVec3::X,
+        DVec3::NEG_X,
+        DVec3::Y,
+        DVec3::NEG_Y,
+        DVec3::Z,
+        DVec3::NEG_Z,
+        DVec3::new(1.0, 1.0, 0.0),
+        DVec3::new(0.0, -1.0, 1.0),
+    ];
+
+    #[test]
+    fn traversal_matches_oracle_on_random_soups() {
+        let mut rng = Rng(0x5eed_0300_b0b0_0001);
+        for n in [1, 3, 4, 5, 64, 2000] {
+            let tb = TriBvh::build(random_tris(&mut rng, n));
+            for _ in 0..400 {
+                // Origins inside and outside the soup's boxes.
+                let o = rng.v(-60.0, 60.0);
+                let d = rng.v(-1.0, 1.0);
+                if d.length_squared() > 1e-6 {
+                    check_ray(&tb, o, d);
+                }
+                check_ray(&tb, o, PARALLEL_DIRS[(rng.next_u64() % 8) as usize]);
+            }
+        }
+    }
+
+    #[test]
+    fn traversal_matches_oracle_with_exact_ties() {
+        // Unit-square grid of coplanar triangles on several z levels, every
+        // triangle duplicated: rays through shared edges/vertices and through
+        // duplicates hit several triangles at the same t.
+        let mut tris = Vec::new();
+        for z in [0.0, 1.0, 1.0, 2.5] {
+            for i in 0..12 {
+                for j in 0..12 {
+                    let p = DVec3::new(i as f64, j as f64, z);
+                    let t0 = [p, p + DVec3::X, p + DVec3::Y];
+                    let t1 = [p + DVec3::X, p + DVec3::new(1.0, 1.0, 0.0), p + DVec3::Y];
+                    tris.extend([t0, t1, t0]);
+                }
+            }
+        }
+        let tb = TriBvh::build(tris);
+        let mut rng = Rng(0x7135_0300_0000_0002);
+        for _ in 0..3000 {
+            // Integer/half-integer origins hit edges and vertices exactly.
+            let o = DVec3::new(
+                (rng.next_u64() % 26) as f64 * 0.5,
+                (rng.next_u64() % 26) as f64 * 0.5,
+                [-1.0, 0.0, 0.5, 1.0, 3.0][(rng.next_u64() % 5) as usize],
+            );
+            let d = match rng.next_u64() % 3 {
+                0 => PARALLEL_DIRS[(rng.next_u64() % 8) as usize],
+                1 => DVec3::new(0.0, 0.0, if o.z > 1.0 { -1.0 } else { 1.0 }),
+                _ => rng.v(-1.0, 1.0),
+            };
+            if d.length_squared() > 1e-6 {
+                check_ray(&tb, o, d);
+            }
+        }
+    }
+
+    #[test]
+    fn node_stack_spills_to_heap_in_lifo_order() {
+        let mut s = NodeStack::new(0);
+        for n in 1..200 {
+            s.push(n);
+        }
+        assert!(!s.spill.is_empty());
+        let popped: Vec<u32> = std::iter::from_fn(|| s.pop()).collect();
+        assert_eq!(popped, (0..200).rev().collect::<Vec<_>>());
+        // Interleaved pushes/pops across the inline/heap boundary.
+        let mut s = NodeStack::new(0);
+        let mut model = vec![0];
+        let mut rng = Rng(9);
+        for k in 1..5000 {
+            if rng.next_u64().is_multiple_of(3) {
+                assert_eq!(s.pop(), model.pop());
+            } else {
+                s.push(k);
+                model.push(k);
+            }
+        }
+        while let Some(n) = model.pop() {
+            assert_eq!(s.pop(), Some(n));
+        }
+        assert_eq!(s.pop(), None);
+    }
+
+    #[test]
+    fn empty_tree_any_and_closest_hit_find_nothing() {
+        let bvh = Bvh::build(&[]);
+        assert!(!bvh.ray_any_hit(DVec3::ZERO, DVec3::X, f64::INFINITY, |_| true));
+        assert!(bvh.ray_closest_hit(DVec3::ZERO, DVec3::X, f64::INFINITY, |_| Some(1.0)).is_none());
     }
 
     #[test]
