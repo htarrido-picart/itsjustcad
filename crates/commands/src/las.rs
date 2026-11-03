@@ -4,14 +4,14 @@
 //! Minimal LAS 1.2–1.4 parser for point-cloud import, with LAZ decompression.
 //!
 //! Reads the public header block to extract scale/offset and the number of
-//! point records, then decodes X/Y/Z integer triples from point formats 0–3
-//! (which all share the same first 20 bytes: X i32, Y i32, Z i32, intensity u16,
-//! flags/bits, classification, ...).  Returns `(positions, decimation_stride)`.
+//! point records, then decodes X/Y/Z integer triples from point formats 0–10
+//! (which all start with X i32, Y i32, Z i32).  Returns `(positions, decimation_stride)`.
 //!
 //! Compressed LAZ (point format with bit 7 set) is handled through the pure-Rust
 //! `laz` crate (laz-rs, Apache-2.0): the "laszip encoded" VLR (record 22204) is
 //! located, its payload parsed into a [`laz::LazVlr`], and records are
 //! decompressed chunk-wise so decimation never materializes the whole cloud.
+//! Chunks decode in parallel, a bounded batch at a time (#271).
 
 use glam::DVec3;
 use rayon::prelude::*;
@@ -29,7 +29,7 @@ pub enum LasError {
     LazVlrMissing,
     #[error("LAZ decompression failed: {0}")]
     Laz(String),
-    #[error("unsupported point data format {0} (supported: 0–3)")]
+    #[error("unsupported point data format {0} (supported: 0–10)")]
     UnsupportedFormat(u8),
     #[error("LAS header version {major}.{minor} is not 1.2–1.4")]
     UnsupportedVersion { major: u8, minor: u8 },
@@ -79,7 +79,7 @@ pub fn parse(data: &[u8]) -> Result<LasPoints, LasError> {
     // uncompressed record layout.
     let is_laz = point_format & 0x80 != 0;
     let raw_format = point_format & 0x7f;
-    if raw_format > 3 {
+    if raw_format > 10 {
         return Err(LasError::UnsupportedFormat(raw_format));
     }
 
@@ -133,7 +133,7 @@ pub fn parse(data: &[u8]) -> Result<LasPoints, LasError> {
     let offset = DVec3::new(ox, oy, oz);
 
     if is_laz {
-        return parse_laz(data, header_size, point_offset, total_records, scale, offset);
+        return parse_laz(data, header_size, point_offset, total_records, raw_format, scale, offset);
     }
 
     let point_data = &data[point_offset..];
@@ -206,7 +206,112 @@ fn find_laszip_vlr(data: &[u8], header_size: usize) -> Option<&[u8]> {
     None
 }
 
-/// Decompress a LAZ point stream, keeping every `stride`-th record.
+/// Chunks decoded per parallel batch, as a multiple of the thread count:
+/// enough to keep every core busy while capping memory at about
+/// `LAZ_CHUNKS_PER_THREAD * threads` decoded chunks.
+const LAZ_CHUNKS_PER_THREAD: usize = 2;
+
+/// Decompress a LAZ point stream across cores, keeping every `stride`-th
+/// record. Output is identical to [`parse_laz_seq`].
+///
+/// LAZ chunks (about 50,000 points each) decode independently, so chunks run
+/// in parallel, [`LAZ_CHUNKS_PER_THREAD`] per thread per batch; each task
+/// decodes one chunk and keeps the global multiples of `stride` inside it.
+/// Point formats 6–10 (layered) decode X/Y/Z only. A file the parallel path
+/// cannot read whole (no chunk table, truncated or corrupt chunk) goes to
+/// [`parse_laz_seq`], so partial-file behaviour stays the same.
+fn parse_laz(
+    data: &[u8],
+    header_size: usize,
+    point_offset: usize,
+    total_records: u64,
+    raw_format: u8,
+    scale: DVec3,
+    offset: DVec3,
+) -> Result<LasPoints, LasError> {
+    let seq = || parse_laz_seq(data, header_size, point_offset, total_records, scale, offset);
+    let payload = find_laszip_vlr(data, header_size).ok_or(LasError::LazVlrMissing)?;
+    let vlr = laz::LazVlr::from_buffer(payload).map_err(|e| LasError::Laz(e.to_string()))?;
+    let record_len = vlr.items_size() as usize;
+    if record_len < 12 {
+        return seq();
+    }
+
+    let mut cursor = std::io::Cursor::new(data);
+    cursor.set_position(point_offset as u64);
+    let Ok(table) = laz::laszip::ChunkTable::read_from(&mut cursor, &vlr) else {
+        return seq();
+    };
+    let selection = if raw_format >= 6 {
+        laz::DecompressionSelection::xy_returns_channel().decompress_z()
+    } else {
+        laz::DecompressionSelection::all()
+    };
+
+    let record_count = usize::try_from(total_records).unwrap_or(usize::MAX);
+    let stride = (record_count / MAX_POINTS).max(1);
+
+    // (byte range, first record index, record count) per chunk, clamped to
+    // `record_count`: a fixed-size table reports the full chunk size even
+    // for the short last chunk.
+    let mut jobs = Vec::with_capacity(table.len());
+    let (mut at, mut first) = (cursor.position() as usize, 0usize);
+    for entry in &table {
+        if first >= record_count {
+            break;
+        }
+        let count = (entry.point_count as usize).min(record_count - first);
+        let end = at.saturating_add(entry.byte_count as usize);
+        if end > data.len() {
+            return seq();
+        }
+        jobs.push((at..end, first, count, *entry));
+        at = end;
+        first += count;
+    }
+    if first < record_count {
+        return seq();
+    }
+
+    let batch = LAZ_CHUNKS_PER_THREAD * rayon::current_num_threads();
+    let mut positions = Vec::with_capacity(record_count.div_ceil(stride));
+    for group in jobs.chunks(batch) {
+        let decoded: Result<Vec<Vec<DVec3>>, laz::LasZipError> = group
+            .par_iter()
+            .map(|(bytes, first, count, entry)| {
+                let mut out = vec![0u8; count * record_len];
+                let entry = laz::laszip::ChunkTableEntry {
+                    point_count: *count as u64,
+                    byte_count: entry.byte_count,
+                };
+                laz::par_decompress_selective(
+                    &data[bytes.clone()],
+                    &mut out,
+                    &vlr,
+                    &[entry],
+                    selection,
+                )?;
+                let mut kept = Vec::new();
+                let mut i = first.next_multiple_of(stride);
+                while i < first + count {
+                    let base = (i - first) * record_len;
+                    kept.push(decode_xyz(&out[base..base + 12], scale, offset));
+                    i += stride;
+                }
+                Ok(kept)
+            })
+            .collect();
+        let Ok(decoded) = decoded else {
+            return seq();
+        };
+        positions.extend(decoded.into_iter().flatten());
+    }
+
+    Ok(LasPoints { positions, stride, total_records })
+}
+
+/// Decompress a LAZ point stream on one thread, keeping every `stride`-th
+/// record. The reference for [`parse_laz`] and its fallback.
 ///
 /// The cursor spans the whole file (the chunk table offset written at the
 /// start of the point data is an absolute file position) and is seeked to
@@ -214,7 +319,7 @@ fn find_laszip_vlr(data: &[u8], header_size: usize) -> Option<&[u8]> {
 /// [`LAZ_BATCH`]-sized batches; a decompression error mid-stream keeps the
 /// points already decoded (truncated files still import what they can) but an
 /// error before any point decodes is reported.
-fn parse_laz(
+fn parse_laz_seq(
     data: &[u8],
     header_size: usize,
     point_offset: usize,
@@ -450,9 +555,85 @@ mod tests {
     #[test]
     fn unsupported_format_rejected() {
         let mut data = make_las(1, 0.001, 0.0);
-        data[104] = 6;
+        data[104] = 11;
         let err = parse(&data).unwrap_err();
-        assert!(matches!(err, LasError::UnsupportedFormat(6)));
+        assert!(matches!(err, LasError::UnsupportedFormat(11)));
+    }
+
+    /// Header size, point offset and record count of a test LAZ file.
+    fn laz_header(data: &[u8]) -> (usize, usize, u64) {
+        let header_size = u16::from_le_bytes([data[94], data[95]]) as usize;
+        let point_offset = u32::from_le_bytes(data[96..100].try_into().unwrap()) as usize;
+        let total = if data[25] >= 4 {
+            u64::from_le_bytes(data[247..255].try_into().unwrap())
+        } else {
+            u32::from_le_bytes(data[107..111].try_into().unwrap()) as u64
+        };
+        (header_size, point_offset, total)
+    }
+
+    fn laz_seq(data: &[u8]) -> LasPoints {
+        let (h, p, n) = laz_header(data);
+        parse_laz_seq(data, h, p, n, DVec3::splat(0.01), DVec3::splat(5.0)).unwrap()
+    }
+
+    /// Run the parallel and sequential LAZ paths on the same file.
+    fn laz_both(data: &[u8]) -> (LasPoints, LasPoints) {
+        let (h, p, n) = laz_header(data);
+        let (s, o) = (DVec3::splat(0.01), DVec3::splat(5.0));
+        let par = parse_laz(data, h, p, n, data[104] & 0x7f, s, o).unwrap();
+        (par, laz_seq(data))
+    }
+
+    #[test]
+    fn laz_parallel_matches_sequential() {
+        // Small chunks force many chunks; n > MAX_POINTS forces stride > 1,
+        // and stride does not divide the chunk size, so kept points straddle
+        // chunk boundaries at shifting offsets.
+        let cases = [(0u8, 1_000, 64), (3, 450_123, 7_001), (6, 450_123, 7_001), (7, 2_500, 333)];
+        for (fmt, n, chunk) in cases {
+            let data = super::testutil::make_laz_with(n, fmt, chunk, 0.01, 5.0);
+            let (par, seq) = laz_both(&data);
+            assert_eq!(par.stride, seq.stride, "format {fmt}");
+            assert_eq!(par.positions, seq.positions, "format {fmt}");
+            assert_eq!(par.positions.len(), (n as usize).div_ceil(par.stride), "format {fmt}");
+            if n as usize > MAX_POINTS {
+                assert!(par.stride > 1);
+            }
+            // Full parse goes through the parallel path too.
+            assert_eq!(parse(&data).unwrap().positions.len(), par.positions.len());
+        }
+    }
+
+    /// Timing, not a check: `cargo test --release -p commands --lib
+    /// las::tests::laz_decode_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn laz_decode_bench() {
+        for fmt in [3u8, 6] {
+            for n in [5_000_000u32, 15_000_000] {
+                let data = super::testutil::make_laz_with(n, fmt, 50_000, 0.01, 5.0);
+                let t = std::time::Instant::now();
+                let seq = laz_seq(&data);
+                let t_seq = t.elapsed();
+                let t = std::time::Instant::now();
+                let par = parse(&data).unwrap();
+                let t_par = t.elapsed();
+                assert_eq!(par.positions, seq.positions);
+                eprintln!("format {fmt} {n} points: seq {t_seq:.2?}  par {t_par:.2?}");
+            }
+        }
+    }
+
+    #[test]
+    fn laz_truncated_falls_back_to_sequential() {
+        // Header claims more records than the chunks hold: the parallel path
+        // bails and the sequential one keeps the whole batches it decoded.
+        let mut data = super::testutil::make_laz_with(20_000, 0, 1_000, 0.01, 5.0);
+        data[107..111].copy_from_slice(&30_000u32.to_le_bytes());
+        let (par, seq) = laz_both(&data);
+        assert_eq!(par.positions, seq.positions);
+        assert!(!par.positions.is_empty());
     }
 
     #[test]
@@ -534,26 +715,46 @@ pub(crate) mod testutil {
     /// Build a real LAZ file: LAS 1.2 header + laszip VLR + laz-compressed
     /// format-0 records at (i, 2i, 3i) integer grid coordinates.
     pub(crate) fn make_laz(n: u32, scale: f64, offset: f64) -> Vec<u8> {
+        make_laz_with(n, 0, 50_000, scale, offset)
+    }
+
+    /// [`make_laz`] for any point `format` (0–10) and fixed `chunk_size`.
+    /// Formats 6+ get a LAS 1.4 header. Non-XYZ fields vary per point so
+    /// every compressed layer carries data.
+    pub(crate) fn make_laz_with(
+        n: u32,
+        format: u8,
+        chunk_size: u32,
+        scale: f64,
+        offset: f64,
+    ) -> Vec<u8> {
         use std::io::Write;
 
-        let items = laz::LazItemRecordBuilder::new()
-            .add_item(laz::LazItemType::Point10)
+        let vlr = laz::LazVlrBuilder::default()
+            .with_point_format(format, 0)
+            .unwrap()
+            .with_fixed_chunk_size(chunk_size)
             .build();
-        let vlr = laz::LazVlr::from_laz_items(items);
+        let rec_len = vlr.items_size() as usize;
         let mut payload = Vec::new();
         vlr.write_to(&mut payload).unwrap();
 
-        let point_offset = 227 + 54 + payload.len();
-        let mut data = vec![0u8; 227];
+        let header: usize = if format >= 6 { 375 } else { 227 };
+        let point_offset = header + 54 + payload.len();
+        let mut data = vec![0u8; header];
         data[0..4].copy_from_slice(b"LASF");
         data[24] = 1;
-        data[25] = 2;
-        data[94..96].copy_from_slice(&227u16.to_le_bytes());
+        data[25] = if format >= 6 { 4 } else { 2 };
+        data[94..96].copy_from_slice(&(header as u16).to_le_bytes());
         data[96..100].copy_from_slice(&(point_offset as u32).to_le_bytes());
         data[100..104].copy_from_slice(&1u32.to_le_bytes()); // one VLR
-        data[104] = 0x80; // LAZ bit | format 0
-        data[105..107].copy_from_slice(&20u16.to_le_bytes());
-        data[107..111].copy_from_slice(&n.to_le_bytes());
+        data[104] = 0x80 | format; // LAZ bit | format
+        data[105..107].copy_from_slice(&(rec_len as u16).to_le_bytes());
+        if format >= 6 {
+            data[247..255].copy_from_slice(&(n as u64).to_le_bytes());
+        } else {
+            data[107..111].copy_from_slice(&n.to_le_bytes());
+        }
         for &off in &[131usize, 139, 147] {
             data[off..off + 8].copy_from_slice(&scale.to_le_bytes());
         }
@@ -575,13 +776,21 @@ pub(crate) mod testutil {
 
         // Compress raw format-0 records into the same stream; the compressor
         // records absolute stream positions, matching a real file's layout.
-        let mut records = Vec::with_capacity(n as usize * 20);
-        for i in 0..n as i32 {
-            let mut rec = [0u8; 20];
+        let mut records = vec![0u8; n as usize * rec_len];
+        for (i, rec) in records.chunks_exact_mut(rec_len).enumerate() {
+            let i = i as i32;
             rec[0..4].copy_from_slice(&i.to_le_bytes());
             rec[4..8].copy_from_slice(&(2 * i).to_le_bytes());
             rec[8..12].copy_from_slice(&(3 * i).to_le_bytes());
-            records.extend_from_slice(&rec);
+            rec[12..14].copy_from_slice(&(i as u16).to_le_bytes()); // intensity
+            if format >= 6 {
+                rec[14] = 0x11; // return 1 of 1
+                rec[16] = (i % 7) as u8; // classification
+                rec[22..30].copy_from_slice(&(i as f64 * 0.5).to_le_bytes()); // GPS time
+            } else {
+                rec[14] = 0x09; // return 1 of 1
+                rec[15] = (i % 7) as u8; // classification
+            }
         }
         let mut cursor = std::io::Cursor::new(data);
         cursor.set_position(point_offset as u64);
