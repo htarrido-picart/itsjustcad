@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 glam.workspace = true
+rayon.workspace = true
 serde.workspace = true

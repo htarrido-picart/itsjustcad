@@ -17,7 +17,7 @@ use crate::Aabb;
 
 /// A node in the median-split tree. Leaves hold a contiguous slice of the
 /// reordered primitive index list; internal nodes hold two child node indices.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Node {
     Leaf { start: usize, count: usize },
     Internal { bounds: Aabb, left: u32, right: u32 },
@@ -46,12 +46,24 @@ impl Bvh {
     /// an empty tree whose queries return nothing.
     pub fn build(boxes: &[Aabb]) -> Self {
         let mut prims: Vec<u32> = (0..boxes.len() as u32).collect();
+        if boxes.is_empty() {
+            return Self { nodes: Vec::new(), leaf_bounds: Vec::new(), prims, root: usize::MAX };
+        }
+        let (nodes, leaf_bounds) = build_subtree_par(boxes, &mut prims, 0);
+        Self { nodes, leaf_bounds, prims, root: 0 }
+    }
+
+    /// Single-threaded build: the reference the parallel [`Bvh::build`] must
+    /// reproduce node for node.
+    #[cfg(test)]
+    fn build_serial(boxes: &[Aabb]) -> Self {
+        let mut prims: Vec<u32> = (0..boxes.len() as u32).collect();
         let mut nodes = Vec::new();
         let mut leaf_bounds = Vec::new();
         let root = if boxes.is_empty() {
             usize::MAX
         } else {
-            build_node(boxes, &mut prims, 0, boxes.len(), &mut nodes, &mut leaf_bounds)
+            build_node(boxes, &mut prims, 0, &mut nodes, &mut leaf_bounds)
         };
         Self { nodes, leaf_bounds, prims, root }
     }
@@ -121,35 +133,30 @@ impl Bvh {
     }
 }
 
-/// Recursively partition `prims[start..end]` by median centroid on the widest
-/// axis. Returns the created node's index.
-fn build_node(
-    boxes: &[Aabb],
-    prims: &mut [u32],
-    start: usize,
-    end: usize,
-    nodes: &mut Vec<Node>,
-    leaf_bounds: &mut Vec<Aabb>,
-) -> usize {
-    let bounds = prims[start..end]
+/// Ranges at least this large build their two subtrees in parallel; smaller
+/// ones recurse serially. Big enough that task overhead stays negligible.
+const PAR_THRESHOLD: usize = 4096;
+
+/// Bounds of `prims` and, unless it becomes a leaf, the median split position
+/// within it (after partitioning `prims` in place by centroid on the widest
+/// axis). Shared by the serial and parallel builders so both make the exact
+/// same decisions.
+fn partition(boxes: &[Aabb], prims: &mut [u32]) -> (Aabb, Option<usize>) {
+    let bounds = prims
         .iter()
         .map(|&i| boxes[i as usize])
         .reduce(Aabb::union)
         .expect("non-empty range");
-    let count = end - start;
+    let count = prims.len();
     if count <= LEAF_SIZE {
-        let idx = nodes.len();
-        nodes.push(Node::Leaf { start, count });
-        leaf_bounds.push(bounds);
-        return idx;
+        return (bounds, None);
     }
 
-    // Split on the axis with the largest centroid spread; fall back to a leaf
-    // if all centroids coincide (degenerate, e.g. many coincident primitives).
+    // Split on the axis with the largest centroid spread.
     let centroid = |i: u32| boxes[i as usize].center();
     let mut cmin = DVec3::splat(f64::INFINITY);
     let mut cmax = DVec3::splat(f64::NEG_INFINITY);
-    for &i in &prims[start..end] {
+    for &i in prims.iter() {
         let c = centroid(i);
         cmin = cmin.min(c);
         cmax = cmax.max(c);
@@ -163,28 +170,92 @@ fn build_node(
         2
     };
     if extent[axis] <= 0.0 {
-        let idx = nodes.len();
-        nodes.push(Node::Leaf { start, count });
-        leaf_bounds.push(bounds);
-        return idx;
+        // All centroids coincide on every axis: splitting cannot separate
+        // them, so stop here to avoid infinite recursion on duplicates.
+        return (bounds, None);
     }
 
-    let mid = start + count / 2;
-    // Partition around the median centroid on `axis` (nth_element style).
-    prims[start..end].select_nth_unstable_by(count / 2, |&a, &b| {
+    // Median split: partially sort so the median centroid sits at count/2.
+    // `select_nth_unstable_by` is deterministic for a given slice, so the
+    // parallel builder reproduces the serial partition exactly.
+    prims.select_nth_unstable_by(count / 2, |&a, &b| {
         centroid(a)[axis]
             .partial_cmp(&centroid(b)[axis])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    (bounds, Some(count / 2))
+}
 
-    // Reserve this node's slot before recursing so children get later indices.
+/// Serially build the subtree over `prims` (which sits at `base` in the full
+/// primitive list) into `nodes`, pre-order: node, left subtree, right subtree.
+/// Returns the created node's index.
+fn build_node(
+    boxes: &[Aabb],
+    prims: &mut [u32],
+    base: usize,
+    nodes: &mut Vec<Node>,
+    leaf_bounds: &mut Vec<Aabb>,
+) -> usize {
+    let count = prims.len();
+    let (bounds, split) = partition(boxes, prims);
+    // Reserve this node's slot before recursing so children get later indices;
+    // it stays a leaf unless split.
     let idx = nodes.len();
-    nodes.push(Node::Leaf { start: 0, count: 0 }); // placeholder
+    nodes.push(Node::Leaf { start: base, count });
     leaf_bounds.push(bounds);
-    let left = build_node(boxes, prims, start, mid, nodes, leaf_bounds);
-    let right = build_node(boxes, prims, mid, end, nodes, leaf_bounds);
-    nodes[idx] = Node::Internal { bounds, left: left as u32, right: right as u32 };
+    if let Some(mid) = split {
+        let (lp, rp) = prims.split_at_mut(mid);
+        let left = build_node(boxes, lp, base, nodes, leaf_bounds);
+        let right = build_node(boxes, rp, base + mid, nodes, leaf_bounds);
+        nodes[idx] = Node::Internal { bounds, left: left as u32, right: right as u32 };
+    }
     idx
+}
+
+/// A subtree built on its own, with node indices local to its arrays (root 0).
+type Subtree = (Vec<Node>, Vec<Aabb>);
+
+/// Parallel counterpart of [`build_node`]: same pre-order layout, so the
+/// result is identical to the serial build. Large ranges build both children
+/// concurrently into their own arrays, then append them (left, then right)
+/// behind the parent with child indices rebased.
+fn build_subtree_par(boxes: &[Aabb], prims: &mut [u32], base: usize) -> Subtree {
+    let mut nodes = Vec::new();
+    let mut leaf_bounds = Vec::new();
+    if prims.len() < PAR_THRESHOLD {
+        build_node(boxes, prims, base, &mut nodes, &mut leaf_bounds);
+        return (nodes, leaf_bounds);
+    }
+    let count = prims.len();
+    let (bounds, split) = partition(boxes, prims);
+    nodes.push(Node::Leaf { start: base, count });
+    leaf_bounds.push(bounds);
+    if let Some(mid) = split {
+        let (lp, rp) = prims.split_at_mut(mid);
+        let (l, r) = rayon::join(
+            || build_subtree_par(boxes, lp, base),
+            || build_subtree_par(boxes, rp, base + mid),
+        );
+        let left = append_subtree(&mut nodes, &mut leaf_bounds, l);
+        let right = append_subtree(&mut nodes, &mut leaf_bounds, r);
+        nodes[0] = Node::Internal { bounds, left: left as u32, right: right as u32 };
+    }
+    (nodes, leaf_bounds)
+}
+
+/// Append `sub` to `nodes`, rebasing its internal child indices; returns the
+/// index its root landed at.
+fn append_subtree(nodes: &mut Vec<Node>, leaf_bounds: &mut Vec<Aabb>, sub: Subtree) -> usize {
+    let offset = nodes.len();
+    let shift = offset as u32;
+    nodes.extend(sub.0.into_iter().map(|n| match n {
+        Node::Internal { bounds, left, right } => {
+            Node::Internal { bounds, left: left + shift, right: right + shift }
+        }
+        leaf => leaf,
+    }));
+    leaf_bounds.extend(sub.1);
+    offset
 }
 
 /// Slab test with a precomputed reciprocal direction. Returns the near hit
@@ -216,8 +287,9 @@ pub struct TriBvh {
 
 impl TriBvh {
     pub fn build(tris: Vec<[DVec3; 3]>) -> Self {
+        use rayon::prelude::*;
         let boxes: Vec<Aabb> = tris
-            .iter()
+            .par_iter()
             .map(|t| Aabb::from_points(t.iter().copied()))
             .collect();
         let bvh = Bvh::build(&boxes);
@@ -412,6 +484,52 @@ mod tests {
         assert!(tb.is_empty());
         assert!(!tb.ray_occluded(DVec3::ZERO, DVec3::Z));
         assert!(tb.ray_hit(DVec3::ZERO, DVec3::Z).is_none());
+    }
+
+    fn assert_same_tree(a: &Bvh, b: &Bvh) {
+        assert_eq!(a.root, b.root);
+        assert_eq!(a.prims, b.prims);
+        assert_eq!(a.nodes, b.nodes);
+        assert_eq!(a.leaf_bounds.len(), b.leaf_bounds.len());
+        for (x, y) in a.leaf_bounds.iter().zip(&b.leaf_bounds) {
+            // Bitwise, so -0.0 vs 0.0 or NaN payloads would also be caught.
+            assert_eq!(x.min.to_array().map(f64::to_bits), y.min.to_array().map(f64::to_bits));
+            assert_eq!(x.max.to_array().map(f64::to_bits), y.max.to_array().map(f64::to_bits));
+        }
+    }
+
+    fn tri_boxes(tris: &[[DVec3; 3]]) -> Vec<Aabb> {
+        tris.iter().map(|t| Aabb::from_points(t.iter().copied())).collect()
+    }
+
+    #[test]
+    fn parallel_build_matches_serial_oracle_on_random_soups() {
+        let mut rng = Rng(0xfeed_beef_0bad_cafe);
+        // Spans below, at and far above the parallel threshold.
+        for n in [0, 1, 5, PAR_THRESHOLD - 1, PAR_THRESHOLD, PAR_THRESHOLD + 1, 50_000, 200_003] {
+            let boxes = tri_boxes(&random_tris(&mut rng, n));
+            assert_same_tree(&Bvh::build(&boxes), &Bvh::build_serial(&boxes));
+        }
+    }
+
+    #[test]
+    fn parallel_build_matches_serial_oracle_with_ties_and_duplicates() {
+        // A flat grid (many equal centroids per axis, zero z extent) plus
+        // coincident duplicates: stresses the median-select tie handling and
+        // the degenerate-extent leaf.
+        let mut boxes = Vec::new();
+        for i in 0..300 {
+            for j in 0..300 {
+                let p = DVec3::new((i % 37) as f64, j as f64, 0.0);
+                boxes.push(Aabb::from_points([p, p + DVec3::new(1.0, 1.0, 0.0)]));
+            }
+        }
+        boxes.extend(std::iter::repeat_n(boxes[17], 20_000));
+        assert_same_tree(&Bvh::build(&boxes), &Bvh::build_serial(&boxes));
+
+        let tris = random_tris(&mut Rng(7), 30_000);
+        let tb = TriBvh::build(tris.clone());
+        assert_same_tree(&tb.bvh, &Bvh::build_serial(&tri_boxes(&tris)));
     }
 
     #[test]
