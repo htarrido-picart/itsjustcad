@@ -1,0 +1,13 @@
+== raytrace busy=9393
+  7.7%    726 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c1ccc
+  5.6%    525 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c1c8c
+  4.7%    442 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c1d78
+  3.2%    301 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c1cd4
+  2.9%    270 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c1c74
+  1.9%    177 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c219c
+  1.9%    177 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c214c
+  1.7%    160 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c2194
+  1.4%    136 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c1c94
+  1.0%     97 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c1df8
+  1.0%     91 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c1cb0
+  0.6%     58 rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter:  mod.rs:432 0x1047c1da8

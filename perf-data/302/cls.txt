@@ -1,0 +1,44 @@
+== sunhours20 busy=9822 bvh-build=37.5% traversal=31.2% other=23.9% triangle=7.4%
+    8.4% _platform_memcmp
+    6.2% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::get::<itsjustcad_doc::object::Objec
+    2.7% _platform_memmove
+    2.2% getentropy
+    1.0% itsjustcad_commands::exec::scene_triangles
+    0.7% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::Scen
+    0.6% DYLD-STUB$$memcmp
+    0.5% _xzm_free_tc
+    0.2% _kernelrpc_mach_vm_deallocate_trap
+    0.2% <itsjustcad_doc::object::Geometry>::aabb
+== facesunhours busy=4370 traversal=64.8% other=18.8% triangle=13.6% bvh-build=2.8%
+    8.4% getentropy
+    1.8% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::Scen
+    1.6% _platform_memmove
+    1.0% _platform_memcmp
+    0.8% _xzm_free_tc
+    0.8% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::get::<itsjustcad_doc::object::Objec
+    0.3% _xzm_malloc_tc
+    0.3% <&itsjustcad_commands::exec::face_lit_slots::{closure#0} as core::ops::function::FnMut<(&[glam::f64::dvec3::DVec3; 3],)>>::call_mut
+    0.3% itsjustcad_commands::exec::exec_face_sun_hours
+    0.3% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::insert
+== radiation busy=18607 traversal=77.8% triangle=16.3% other=5.2% bvh-build=0.7%
+    2.0% getentropy
+    0.6% <&itsjustcad_commands::exec::face_radiation_scores::{closure#0} as core::ops::function::FnMut<(&[glam::f64::dvec3::DVec3; 3],)>>::call_mut
+    0.5% _platform_memmove
+    0.4% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::Scen
+    0.3% _platform_memcmp
+    0.2% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::get::<itsjustcad_doc::object::Objec
+    0.2% _xzm_free_tc
+    0.1% <alloc::raw_vec::RawVecInner>::deallocate
+    0.1% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::insert
+    0.1% _xzm_malloc_tc
+== raytrace busy=9350 traversal=53.0% triangle=23.6% other=22.0% bvh-build=1.3%
+   12.2% rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter::enumerate::EnumerateProducer<rayon::slice::IterMutProducer<glam::f64::dvec3::DV
+    3.2% _platform_memmove
+    2.4% pow
+    0.6% itsjustcad_raytrace::tonemap::linear_to_srgb8
+    0.6% __sincos_stret
+    0.5% itsjustcad_raytrace::resolve
+    0.4% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::get::<itsjustcad_doc::object::Objec
+    0.3% ???
+    0.3% _platform_memcmp
+    0.2% <alloc::raw_vec::RawVecInner>::deallocate
