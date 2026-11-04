@@ -1363,6 +1363,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn object_ids_are_random_v4_and_distinct_across_threads() {
+        let ids: Vec<ObjectId> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| (0..1000).map(|_| ObjectId::new()).collect::<Vec<_>>()))
+                .collect();
+            workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+        });
+        for id in &ids {
+            assert_eq!(id.0.get_version(), Some(uuid::Version::Random));
+            assert_eq!(id.0.get_variant(), uuid::Variant::RFC4122);
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "ids repeat across threads");
+    }
+
+    #[test]
     fn edge_tags_load_absent_and_follow_similar_geometry() {
         let square = |k: f64| {
             Geometry::Curve(Curve::Polyline {

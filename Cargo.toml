@@ -35,7 +35,7 @@ wgpu = "29"
 glam = { version = "0.30", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "fast-rng", "serde"] }
 thiserror = "2"
 anyhow = "1"
 # Data-parallel hot loops (MIT OR Apache-2.0 — license-clean). Deterministic
