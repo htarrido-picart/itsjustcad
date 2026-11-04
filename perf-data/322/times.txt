@@ -1,0 +1,9 @@
+load load real=0.50 cpu=0.26 cores=0.52 load=3.35 15.57 14.65
+hw facesunhours real=0.69 cpu=1.52 cores=2.20 load=3.35 15.57 14.65
+cpu facesunhours real=0.76 cpu=2.95 cores=3.88 load=3.35 15.57 14.65
+load load real=0.22 cpu=0.21 cores=0.95 load=3.35 15.57 14.65
+hw facesunhours real=0.69 cpu=1.61 cores=2.33 load=3.35 15.57 14.65
+cpu facesunhours real=0.76 cpu=2.96 cores=3.89 load=3.35 15.57 14.65
+load load real=0.22 cpu=0.21 cores=0.95 load=3.35 15.57 14.65
+hw facesunhours real=0.69 cpu=1.52 cores=2.20 load=3.35 15.57 14.65
+cpu facesunhours real=0.76 cpu=2.96 cores=3.89 load=3.24 15.34 14.58

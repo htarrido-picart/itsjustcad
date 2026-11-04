@@ -1,0 +1,5 @@
+x load_save real=0.39 cpu=0.34 cores=0.87 load=1.89 12.05 13.38
+x fsh_save real=1.38 cpu=2.07 cores=1.50 load=1.81 11.86 13.31
+x fsh_undo real=39.36 cpu=40.16 cores=1.02 load=1.81 11.86 13.31
+x load_dxf real=0.31 cpu=0.87 cores=2.81 load=1.55 9.43 12.25
+x fsh_dxf real=1.05 cpu=3.90 cores=3.71 load=1.55 9.43 12.25

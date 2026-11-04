@@ -1,0 +1,15 @@
+T322 gather_faces 7.8
+T322 scene_triangles 14.1
+T322 bvh_build 51.0
+T322 sun_dirs 51.0
+hwrt: shader compile 46.5 ms
+hwrt: 569116 tris; pack 9.0 ms, AS build 26.8 ms
+hwrt: 7206875 rays in 87.7 ms; GPU 44.5 ms (CPU waited 7.0 ms); 5476574 certain on GPU, 1285 leaf-confirmed, 12 uncertain-confirmed; CPU re-run 8 (0.0001%: 8 uncertain, 0 not on GPU), re-run CPU time 0.0 ms
+T322 face_lit_slots 236.9
+T322 samples 244.1
+T322 ids 250.4
+T322 insert 468.6
+T322 report 481.5
+T322 stats 482.3
+T322 session_run_total 482.9
+T322 drop_session 59.3

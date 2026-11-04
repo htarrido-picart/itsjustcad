@@ -1,0 +1,12 @@
+T322 gather_faces 7.6
+T322 scene_triangles 14.0
+T322 bvh_build 50.3
+T322 sun_dirs 50.3
+T322 face_lit_slots 240.2
+T322 samples 246.7
+T322 ids 253.0
+T322 insert 469.6
+T322 report 483.1
+T322 stats 483.9
+T322 session_run_total 484.5
+T322 drop_session 58.6

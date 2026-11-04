@@ -1,0 +1,9 @@
+hwrt=itsjustcad_hwrt|hwrt/src
+rays-cpu=ray_occluded|face_lit_one|face_lit_slots
+bvh-build=bvh\.rs|sah_split|aabb\.rs
+drop=drop_in_place<itsjustcad_commands::exec::Session|main\.rs:24[0-9]
+report=build_analysis_report|facing_label
+ids=ObjectId>::new|uuid|Uuid
+insert=exec\.rs:95[4-8][0-9]|Document>::insert
+fsh-other=exec_face_sun_hours|scene_triangles
+load=load_file|load_open_session|replay

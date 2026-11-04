@@ -1,0 +1,130 @@
+diff --git a/crates/app/src/headless.rs b/crates/app/src/headless.rs
+index 7ceeea7..92cf6ea 100644
+--- a/crates/app/src/headless.rs
++++ b/crates/app/src/headless.rs
+@@ -339,7 +339,9 @@ pub fn run_script_lines(
+                 // echo query results to stdout — this makes DWG/DXF round-trips
+                 // and workdir listings scriptable/testable (M-dwg-bridge finding).
+                 let is_query = !cmd.is_logged();
++                let __t=std::time::Instant::now();
+                 let outcome = session.run(cmd).map_err(|e| (line.clone(), e.to_string()))?;
++                eprintln!("T322 session_run_total {:.1}", __t.elapsed().as_secs_f64()*1e3);
+                 if is_query && !outcome.message.is_empty() {
+                     println!("{}", outcome.message);
+                 }
+diff --git a/crates/app/src/main.rs b/crates/app/src/main.rs
+index c547be1..2c246a0 100644
+--- a/crates/app/src/main.rs
++++ b/crates/app/src/main.rs
+@@ -239,6 +239,8 @@ fn run_headless_mode(args: &CliArgs) -> i32 {
+         println!("wrote {shot}");
+     }
+ 
++    let __t=std::time::Instant::now(); drop(session);
++    eprintln!("T322 drop_session {:.1}", __t.elapsed().as_secs_f64()*1e3);
+     0
+ }
+ 
+diff --git a/crates/commands/src/exec.rs b/crates/commands/src/exec.rs
+index 639f710..c0057c9 100644
+--- a/crates/commands/src/exec.rs
++++ b/crates/commands/src/exec.rs
+@@ -9451,6 +9451,7 @@ fn exec_face_sun_hours(
+     })?;
+     // Fresh runs (and ops logged since #284) score locked layers too; older
+     // logged ops replay as they ran, skipping them.
++    let __t=std::time::Instant::now();
+     let include_locked = include_locked || ids.is_none();
+     let target_ids =
+         if include_locked { resolve_read(doc, &targets)? } else { resolve(doc, &targets)? };
+@@ -9467,6 +9468,7 @@ fn exec_face_sun_hours(
+             }
+         }
+     }
++    eprintln!("T322 gather_faces {:.1}", __t.elapsed().as_secs_f64()*1e3);
+     if faces.is_empty() {
+         return Err(ExecError::Invalid(
+             "facesunhours needs a selected mesh (extrude or box first, then select)".into(),
+@@ -9475,18 +9477,22 @@ fn exec_face_sun_hours(
+ 
+     // Occlusion is tested against the whole scene (so neighbouring massing and
+     // the surface's own object can shade it).
+-    let tri_bvh = kernel_mesh::TriBvh::build(
+-        scene_triangles(doc)
+-            .into_iter()
+-            .map(|t| {
+-                [
+-                    DVec3::from_array(t[0]),
+-                    DVec3::from_array(t[1]),
+-                    DVec3::from_array(t[2]),
+-                ]
+-            })
+-            .collect(),
+-    );
++    let __st: Vec<[DVec3; 3]> = scene_triangles(doc).into_iter().map(|t| [DVec3::from_array(t[0]), DVec3::from_array(t[1]), DVec3::from_array(t[2])]).collect();
++    eprintln!("T322 scene_triangles {:.1}", __t.elapsed().as_secs_f64()*1e3);
++    let __t2=std::time::Instant::now(); let tri_bvh = kernel_mesh::TriBvh::build(__st);
++    eprintln!("T322 bvh_build {:.1}", __t.elapsed().as_secs_f64()*1e3);
++//T322     let tri_bvh = kernel_mesh::TriBvh::build(
++//T322         scene_triangles(doc)
++//T322             .into_iter()
++//T322             .map(|t| {
++//T322                 [
++//T322                     DVec3::from_array(t[0]),
++//T322                     DVec3::from_array(t[1]),
++//T322                     DVec3::from_array(t[2]),
++//T322                 ]
++//T322             })
++//T322             .collect(),
++//T322     );
+ 
+     // Sun directions (up only) every 30 min of the date.
+     let mut sun_dirs: Vec<DVec3> = Vec::new();
+@@ -9517,7 +9523,9 @@ fn exec_face_sun_hours(
+     // sun is on the lit side of the face (dot(normal, sun) > 0); a downward- or
+     // away-facing surface can't see that sun position at all. Faces are
+     // independent → parallel per-face scoring (ordered collect, integer counts).
++    eprintln!("T322 sun_dirs {:.1}", __t.elapsed().as_secs_f64()*1e3);
+     let scored = face_lit_slots(&faces, &sun_dirs, &tri_bvh);
++    eprintln!("T322 face_lit_slots {:.1}", __t.elapsed().as_secs_f64()*1e3);
+     let mut hours: Vec<f64> = Vec::with_capacity(faces.len());
+     let mut samples: Vec<(f64, DVec3, String)> = Vec::with_capacity(faces.len());
+     let mut max_h = 0.0f64;
+@@ -9528,11 +9536,13 @@ fn exec_face_sun_hours(
+         hours.push(h);
+     }
+ 
++    eprintln!("T322 samples {:.1}", __t.elapsed().as_secs_f64()*1e3);
+     let new_ids: Vec<ObjectId> = match ids {
+         Some(ids) if ids.len() == faces.len() => ids,
+         _ => (0..faces.len()).map(|_| ObjectId::new()).collect(),
+     };
+ 
++    eprintln!("T322 ids {:.1}", __t.elapsed().as_secs_f64()*1e3);
+     let mut layers_created = Vec::new();
+     if !doc.layers.contains_key(ANALYSIS_LAYER) {
+         doc.layers
+@@ -9570,6 +9580,7 @@ fn exec_face_sun_hours(
+     }
+     // Structured summary for the deck's `report` command (per-face sun-hours
+     // with facings, so the LLM can critique glazing/amenity placement).
++    eprintln!("T322 insert {:.1}", __t.elapsed().as_secs_f64()*1e3);
+     doc.analysis_reports.insert(
+         "facesunhours".to_string(),
+         build_analysis_report(
+@@ -9579,6 +9590,7 @@ fn exec_face_sun_hours(
+             samples,
+         ),
+     );
++    eprintln!("T322 report {:.1}", __t.elapsed().as_secs_f64()*1e3);
+     doc.generation += 1;
+ 
+     let n = hours.len() as f64;
+@@ -9587,6 +9599,7 @@ fn exec_face_sun_hours(
+     let min_h = hours.iter().cloned().fold(f64::INFINITY, f64::min);
+     let daylight = itsjustcad_solar::daylight_hours(year, month, day, loc.lat_deg);
+ 
++    eprintln!("T322 stats {:.1}", __t.elapsed().as_secs_f64()*1e3);
+     Ok((
+         Command::FaceSunHours {
+             targets,

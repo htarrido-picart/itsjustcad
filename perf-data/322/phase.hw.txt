@@ -1,0 +1,64 @@
+== hw busy=1300 samples(ms CPU)
+hwrt            547  42.1%
+         127 {closure#1}<[glam::f64::dvec3::DVec3; 3], (usize, glam::f64::dvec3::DVec3, glam::f64::dvec3::DVec3), itsjustca
+          87 {closure#0}<[glam::f64::dvec3::DVec3; 3], (usize, glam::f64::dvec3::DVec3, glam::f64::dvec3::DVec3), itsjustca
+          70 {closure#3}<[glam::f64::dvec3::DVec3; 3], (usize, glam::f64::dvec3::DVec3, glam::f64::dvec3::DVec3), itsjustca
+          63 {closure#0}<&mut dyn core::ops::function::FnMut<(glam::f64::dvec3::DVec3, glam::f64::dvec3::DVec3), Output=boo
+          20 {closure#0}<&glam::f64::dvec3::DVec3, usize, usize, core::iter::adapters::filter::{impl#3}::count::to_usize::{
+          20 same (in itsjustcad) (caster.rs:401)
+other           184  14.2%
+         151 _dyld_start <- ?
+           6 iokit_user_client_trap <- ?
+           4 _RNvMs8_NtCs82bkzJTnnvS_15crossbeam_deque5dequeINtB5_7StealerNtNtCsay5tvPR6HW1_10rayon_core3job6JobRefE5stealB
+           3 start <- ?
+           3 {closure#0} (in itsjustcad) (mod.rs:97)
+           2 __mmap <- std::sys::pal::unix::stack_overflow::imp::get_stack (in itsjustcad) (stack_overflow.rs
+insert          176  13.5%
+          60 _RINvMs0_NtNtNtCs8Hh7wWMBHrQ_5alloc11collections5btree6searchINtNtB8_4node7NodeRefNtNtBZ_6marker3MutNtNtCsLcgD
+          41 _platform_memmove <- _RNvMsJ_NtNtNtCs8Hh7wWMBHrQ_5alloc11collections5btree4nodeINtB5_6HandleINtB5_7NodeRefNtNtB5_6marker3MutNtNtCsL
+          10 _platform_memcmp <- compare<u8> (in itsjustcad) (cmp.rs:339)
+           8 next<itsjustcad_doc::object::ObjectId> (in itsjustcad) (macros.rs:180)
+           8 write<core::option::Option<core::ptr::non_null::NonNull<alloc::collections::btree::node::InternalNode<itsjustc
+           6 _platform_memmove <- split_leaf_data<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btr
+load            176  13.5%
+          25 _platform_memcmp <- compare<u8> (in itsjustcad) (cmp.rs:339)
+          20 find_key_index<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_do
+          16 peek (in itsjustcad) (read.rs:562)
+           6 cmp (in itsjustcad) (cmp.rs:2239)
+           6 __psynch_mutexwait <- <std::sys::pal::unix::sync::mutex::Mutex>::lock (in itsjustcad) (mutex.rs:80)
+           5 _RINvXs5_NtCsbc8LrVNDhjC_10serde_json2deQINtB6_12DeserializerNtNtB8_4read7StrReadENtNtCs1kVmtDV6QGT_10serde_co
+bvh-build       139  10.7%
+          24 sah_split (in itsjustcad) (bvh.rs:748)
+          10 _platform_memmove <- append_elements_unreserved<kernel_mesh::aabb::Aabb, alloc::alloc::Global> (in itsjustcad) (mod.rs:2986)
+           8 sah_split (in itsjustcad) (bvh.rs:0)
+           8 max (in itsjustcad) (dvec3.rs:289)
+           7 sah_split (in itsjustcad) (bvh.rs:744)
+           6 min (in itsjustcad) (dvec3.rs:275)
+drop             40   3.1%
+          12 _xzm_free_tc <- drop_in_place<itsjustcad_doc::object::SceneObject> (in itsjustcad) (mod.rs:842)
+           5 _xzm_free_tc <- drop<[u32; 3], alloc::alloc::Global> (in itsjustcad) (mod.rs:425)
+           5 __xzm_xzone_free_to_freelist_chunk <- drop<itsjustcad_doc::object::ObjectId, alloc::alloc::Global> (in itsjustcad) (mod.rs:425)
+           4 _xzm_free_tc <- drop_glue<core::option::Option<alloc::vec::Vec<itsjustcad_doc::object::EdgeTag, alloc::alloc::Global>>> (in it
+           3 __xzm_xzone_free_to_freelist_chunk <- drop_in_place<itsjustcad_doc::object::SceneObject> (in itsjustcad) (mod.rs:842)
+           2 <alloc::raw_vec::RawVecInner>::deallocate (in itsjustcad) + 0
+fsh-other        15   1.2%
+           2 next<itsjustcad_doc::object::ObjectId> (in itsjustcad) (macros.rs:180)
+           2 itsjustcad_commands::exec::exec_face_sun_hours (in itsjustcad) (exec.rs:9467)
+           2 _platform_memcmp <- compare<u8> (in itsjustcad) (cmp.rs:339)
+           2 DYLD-STUB$$memcmp (in itsjustcad) + 4
+           2 write<[[f64; 3]; 3]> (in itsjustcad) (mod.rs:1963)
+           1 itsjustcad_commands::exec::exec_face_sun_hours (in itsjustcad) (exec.rs:9466)
+report           13   1.0%
+           5 add<(f64, glam::f64::dvec3::DVec3, alloc::string::String)> (in itsjustcad) (mut_ptr.rs:970)
+           1 _platform_memmove <- spec_next<usize> (in itsjustcad) (range.rs:1100)
+           1 copy_nonoverlapping<(f64, glam::f64::dvec3::DVec3, alloc::string::String)> (in itsjustcad) (mod.rs:573)
+           1 {closure#0} (in itsjustcad) (exec.rs:5231)
+           1 max (in itsjustcad) (f64.rs:1091)
+           1 __xzm_xzone_free_to_freelist_chunk <- drop_glue<[(f64, glam::f64::dvec3::DVec3, alloc::string::String)]> (in itsjustcad) (mod.rs:847)
+ids               5   0.4%
+           4 add_xor_rot<4> (in itsjustcad) (neon.rs:125)
+           1 <uuid::Uuid>::new_v4 (in itsjustcad) (v4.rs:39)
+rays-cpu          5   0.4%
+           3 write<[glam::f64::dvec3::DVec3; 2]> (in itsjustcad) (mod.rs:1963)
+           1 push_mut<usize, alloc::alloc::Global> (in itsjustcad) (mod.rs:1038)
+           1 _platform_memmove <- append_elements_unreserved<kernel_mesh::csg::Polygon, alloc::alloc::Global> (in itsjustcad) (mod.rs:2986)
