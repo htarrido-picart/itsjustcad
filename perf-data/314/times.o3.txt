@@ -1,0 +1,15 @@
+o3 load real=0.62 cpu=0.25 cores=0.40 load=2.05 2.44 2.00
+o3 load real=0.21 cpu=0.20 cores=0.95 load=2.05 2.44 2.00
+o3 load real=0.21 cpu=0.20 cores=0.95 load=2.05 2.44 2.00
+o3 sunhours real=0.28 cpu=0.56 cores=2.00 load=2.05 2.44 2.00
+o3 sunhours real=0.28 cpu=0.56 cores=2.00 load=2.05 2.44 2.00
+o3 sunhours real=0.28 cpu=0.56 cores=2.00 load=2.05 2.44 2.00
+o3 facesunhours real=0.75 cpu=2.84 cores=3.79 load=1.96 2.41 1.99
+o3 facesunhours real=0.75 cpu=2.84 cores=3.79 load=1.96 2.41 1.99
+o3 facesunhours real=0.76 cpu=2.85 cores=3.75 load=1.96 2.41 1.99
+o3 radiation real=1.49 cpu=11.50 cores=7.72 load=1.96 2.41 1.99
+o3 radiation real=1.49 cpu=11.52 cores=7.73 load=1.96 2.41 1.99
+o3 radiation real=1.49 cpu=11.53 cores=7.74 load=2.93 2.61 2.06
+o3 raytrace real=1.05 cpu=5.61 cores=5.34 load=2.93 2.61 2.06
+o3 raytrace real=1.06 cpu=5.61 cores=5.29 load=2.93 2.61 2.06
+o3 raytrace real=1.06 cpu=5.60 cores=5.28 load=2.93 2.61 2.06

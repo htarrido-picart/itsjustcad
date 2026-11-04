@@ -1,0 +1,8 @@
+#!/bin/zsh
+# usage: run.sh <profile> <verb> <n>  -> prints wall, user+sys, cpu%, load per run
+S=${0:A:h}; B=$S/target/$1/itsjustcad
+for i in $(seq 1 $3); do
+  L=$(uptime | sed 's/.*averages: //')
+  /usr/bin/time -p $B --open $S/site.json --run $S/$2.script --headless > $S/out.$1.$2.txt 2> $S/time.tmp
+  awk -v v=$2 -v p=$1 -v l="$L" '/^real/{r=$2}/^user/{u=$2}/^sys/{s=$2}END{printf "%s %s real=%.2f cpu=%.2f cores=%.2f load=%s\n",p,v,r,u+s,(u+s)/r,l}' $S/time.tmp
+done

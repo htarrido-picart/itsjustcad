@@ -1,0 +1,1 @@
+sample load (1-min avg before each samp.sh): sunhours20 2.83, facesunhours 2.68, radiation 2.68, raytrace 2.68

@@ -1,0 +1,20 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index b3cdc43..7ea21a2 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -95,6 +95,15 @@ codegen-units = 1
+ panic = "abort"
+ opt-level = "s"
+ 
++[profile.release.package.kernel-mesh]
++opt-level = 3
++[profile.release.package.itsjustcad-raytrace]
++opt-level = 3
++[profile.release.package.itsjustcad-solar]
++opt-level = 3
++[profile.release.package.itsjustcad-commands]
++opt-level = 3
++
+ # ── Fast local iteration (previews + dist testing) ──────────────────────────
+ # macOS: keep debuginfo in the .o files (skip the slow dsymutil dSYM pack).
+ [profile.dev]

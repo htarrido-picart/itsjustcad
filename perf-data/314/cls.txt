@@ -1,0 +1,76 @@
+== release sunhours20 busy=6519 merged-addr=47.2% bvh-build=45.6% other=28.0% traversal=21.6% triangle=4.9%
+   10.1% _platform_memcmp
+    8.9% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::get::<itsjustcad_doc::object::Objec
+    2.9% _platform_memmove
+    1.2% DYLD-STUB$$memcmp
+    1.0% itsjustcad_commands::exec::scene_triangles
+    0.8% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::Scen
+    0.4% _xzm_free_tc
+    0.2% <kernel_mesh::mesh::Mesh>::aabb
+    0.2% _kernelrpc_mach_vm_deallocate_trap
+    0.1% <itsjustcad_doc::object::Geometry>::aabb
+    4.4% find_key_index<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal, itsjustcad_doc::object::ObjectId> (in itsjustcad) (search.rs:226)|search_node<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::colle
+    4.4% next<itsjustcad_doc::object::ObjectId> (in itsjustcad) (macros.rs:180)|next<core::slice::iter::Iter<itsjustcad_doc::object::ObjectId>> (in itsjustcad) (enumerate.rs:80)|find_key_index<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal, itsjustcad_doc::object::ObjectId> (in it
+    0.6% DYLD-STUB$$memcmp (in itsjustcad) + 4
+    0.6% DYLD-STUB$$memcmp (in itsjustcad) + 0
+    0.4% push_mut<[[f64; 3]; 3], alloc::alloc::Global> (in itsjustcad) (mod.rs:1038)|push<[[f64; 3]; 3], alloc::alloc::Global> (in itsjustcad) (mod.rs:996)|itsjustcad_commands::exec::scene_triangles (in itsjustcad) (exec.rs:4949)
+    0.4% write<[[f64; 3]; 3]> (in itsjustcad) (mod.rs:1963)|push_mut<[[f64; 3]; 3], alloc::alloc::Global> (in itsjustcad) (mod.rs:1037)|push<[[f64; 3]; 3], alloc::alloc::Global> (in itsjustcad) (mod.rs:996)|itsjustcad_commands::exec::scene_triangles (in itsjustcad) (exec.rs:4949)
+    0.3% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal>>::find_key_index::<itsjustcad_doc::object::ObjectId> (in itsjustcad) (search.rs:226)
+    0.3% compare<u8> (in itsjustcad) (cmp.rs:339)|cmp<u8> (in itsjustcad) (cmp.rs:40)|cmp<[u8]> (in itsjustcad) (cmp.rs:2409)|cmp<u8, 16> (in itsjustcad) (mod.rs:439)|cmp (in itsjustcad) (lib.rs:467)|cmp (in itsjustcad) (object.rs:14)|_RINvMs0_NtNtNtCs8Hh7wWMBHrQ_5alloc11collections5btree6searchINtNtB8_4node7NodeRefNtNtBZ_6marker3MutNtNtCsLcgDq4XDFq_14itsjustcad_doc6object8ObjectIdNtB1B_11SceneObjectNtB1j_
+== release facesunhours busy=2366 merged-addr=58.0% traversal=59.8% other=17.6% triangle=17.4% bvh-build=5.2%
+    3.4% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::Scen
+    3.3% _platform_memmove
+    1.4% _platform_memcmp
+    1.3% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::get::<itsjustcad_doc::object::Objec
+    1.1% _xzm_free_tc
+    0.6% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::insert
+    0.6% <&itsjustcad_commands::exec::face_lit_slots::{closure#0} as core::ops::function::FnMut<(&[glam::f64::dvec3::DVec3; 3],)>>::call_mut
+    0.5% itsjustcad_commands::exec::exec_face_sun_hours
+    0.4% <alloc::raw_vec::RawVecInner>::deallocate
+    0.3% __xzm_xzone_free_to_freelist_chunk
+    1.4% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal>>::find_key_index::<itsjustcad_doc::object::ObjectId> (in itsjustcad) (search.rs:226)
+    1.3% cmp (in itsjustcad) (cmp.rs:2239)|compare<u8> (in itsjustcad) (cmp.rs:343)|cmp<u8> (in itsjustcad) (cmp.rs:40)|cmp<[u8]> (in itsjustcad) (cmp.rs:2409)|cmp<u8, 16> (in itsjustcad) (mod.rs:439)|cmp (in itsjustcad) (lib.rs:467)|cmp (in itsjustcad) (object.rs:14)|_RINvMs0_NtNtNtCs8Hh7wWMBHrQ_5alloc11collections5btree6searchINtNtB8_4node7NodeRefNtNtBZ_6marker3MutNtNtCsLcgDq4XDFq_14itsjustcad_doc6object
+    0.7% find_key_index<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal, itsjustcad_doc::object::ObjectId> (in itsjustcad) (search.rs:226)|search_node<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::colle
+    0.4% next<itsjustcad_doc::object::ObjectId> (in itsjustcad) (macros.rs:180)|next<core::slice::iter::Iter<itsjustcad_doc::object::ObjectId>> (in itsjustcad) (enumerate.rs:80)|find_key_index<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal, itsjustcad_doc::object::ObjectId> (in it
+    0.3% next<itsjustcad_doc::object::ObjectId> (in itsjustcad) (macros.rs:180)|next<core::slice::iter::Iter<itsjustcad_doc::object::ObjectId>> (in itsjustcad) (enumerate.rs:80)|<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal>>::find_key_index::<itsjustcad_doc::object::ObjectId> (in itsjustcad
+    0.3% write<core::option::Option<core::ptr::non_null::NonNull<alloc::collections::btree::node::InternalNode<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>>> (in itsjustcad) (mod.rs:1963)|write<core::option::Option<core::ptr::non_null::NonNull<alloc::collections::btree::node::InternalNode<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>>> (in itsjustcad) (m
+    0.3% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal>>::find_key_index::<itsjustcad_doc::object::ObjectId> (in itsjustcad) (search.rs:233)
+    0.3% insert<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::alloc::Global> (in itsjustcad) (node.rs:0)|insert_recursing<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::alloc::Global, alloc::collections::btree::map::entry::{impl#6}::insert_entry::{closure_env#0}<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::alloc
+== release radiation busy=9706 merged-addr=74.7% traversal=74.6% triangle=18.6% other=5.5% bvh-build=1.3%
+    1.1% <&itsjustcad_commands::exec::face_radiation_scores::{closure#0} as core::ops::function::FnMut<(&[glam::f64::dvec3::DVec3; 3],)>>::call_mut
+    0.8% _platform_memmove
+    0.7% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::Scen
+    0.4% _platform_memcmp
+    0.3% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::get::<itsjustcad_doc::object::Objec
+    0.3% <alloc::raw_vec::RawVecInner>::deallocate
+    0.3% _xzm_free_tc
+    0.2% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::insert
+    0.1% __xzm_xzone_free_to_freelist_chunk
+    0.1% itsjustcad_commands::exec::exec_radiation
+    0.5% face_irradiation<itsjustcad_commands::exec::face_radiation_one::{closure_env#0}> (in itsjustcad) (lib.rs:0)|face_radiation_one (in itsjustcad) (exec.rs:5052)|{closure#0} (in itsjustcad) (exec.rs:5094)|<&itsjustcad_commands::exec::face_radiation_scores::{closure#0} as core::ops::function::FnMut<(&[glam::f64::dvec3::DVec3; 3],)>>::call_mut (in
+    0.3% <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal>>::find_key_index::<itsjustcad_doc::object::ObjectId> (in itsjustcad) (search.rs:226)
+    0.3% cmp (in itsjustcad) (cmp.rs:2239)|compare<u8> (in itsjustcad) (cmp.rs:343)|cmp<u8> (in itsjustcad) (cmp.rs:40)|cmp<[u8]> (in itsjustcad) (cmp.rs:2409)|cmp<u8, 16> (in itsjustcad) (mod.rs:439)|cmp (in itsjustcad) (lib.rs:467)|cmp (in itsjustcad) (object.rs:14)|_RINvMs0_NtNtNtCs8Hh7wWMBHrQ_5alloc11collections5btree6searchINtNtB8_4node7NodeRefNtNtBZ_6marker3MutNtNtCsLcgDq4XDFq_14itsjustcad_doc6object
+    0.3% face_irradiation<itsjustcad_commands::exec::face_radiation_one::{closure_env#0}> (in itsjustcad) (lib.rs:531)|face_radiation_one (in itsjustcad) (exec.rs:5052)|{closure#0} (in itsjustcad) (exec.rs:5094)|<&itsjustcad_commands::exec::face_radiation_scores::{closure#0} as core::ops::function::FnMut<(&[glam::f64::dvec3::DVec3; 3],)>>::call_mut (
+    0.2% find_key_index<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal, itsjustcad_doc::object::ObjectId> (in itsjustcad) (search.rs:226)|search_node<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::colle
+    0.2% face_irradiation<itsjustcad_commands::exec::face_radiation_one::{closure_env#0}> (in itsjustcad) (lib.rs:533)|face_radiation_one (in itsjustcad) (exec.rs:5052)|{closure#0} (in itsjustcad) (exec.rs:5094)|<&itsjustcad_commands::exec::face_radiation_scores::{closure#0} as core::ops::function::FnMut<(&[glam::f64::dvec3::DVec3; 3],)>>::call_mut (
+    0.1% next<itsjustcad_doc::object::ObjectId> (in itsjustcad) (macros.rs:180)|next<core::slice::iter::Iter<itsjustcad_doc::object::ObjectId>> (in itsjustcad) (enumerate.rs:80)|find_key_index<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal, itsjustcad_doc::object::ObjectId> (in it
+    0.1% <alloc::raw_vec::RawVecInner>::deallocate (in itsjustcad) + 0
+== release raytrace busy=4927 merged-addr=29.8% traversal=59.6% other=19.1% triangle=18.8% bvh-build=2.5%
+    6.6% rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter::enumerate::EnumerateProducer<rayon::slice::IterMutProducer<glam::f64::dvec3::DV
+    4.2% pow
+    1.2% __sincos_stret
+    1.1% itsjustcad_raytrace::tonemap::linear_to_srgb8
+    0.8% ???
+    0.7% itsjustcad_raytrace::resolve
+    0.6% _platform_memcmp
+    0.6% <alloc::collections::btree::map::BTreeMap<itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject>>::get::<itsjustcad_doc::object::Objec
+    0.3% <alloc::raw_vec::RawVecInner>::deallocate
+    0.2% _platform_memmove
+    2.3% radiance (in itsjustcad) (f64.rs:0)|{closure#0} (in itsjustcad) (lib.rs:217)|call_mut<((usize, &mut glam::f64::dvec3::DVec3)), itsjustcad_raytrace::render_pass::{closure_env#0}> (in itsjustcad) (function.rs:274)|{closure#0}<(usize, &mut glam::f64::dvec3::DVec3), &itsjustcad_raytrace::render_pass::{closure_env#0}> (in itsjustcad) (iterator.rs:884)|fold<core::ops::range::Range<usize>, core::slice::i
+    0.5% clamp (in itsjustcad) (f64.rs:1596)|itsjustcad_raytrace::tonemap::linear_to_srgb8 (in itsjustcad) (tonemap.rs:49)
+    0.4% find_key_index<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::collections::btree::node::marker::LeafOrInternal, itsjustcad_doc::object::ObjectId> (in itsjustcad) (search.rs:226)|search_node<alloc::collections::btree::node::marker::Immut, itsjustcad_doc::object::ObjectId, itsjustcad_doc::object::SceneObject, alloc::colle
+    0.4% next_u64 (in itsjustcad) (rng.rs:43)|f01 (in itsjustcad) (rng.rs:54)|cosine_hemisphere (in itsjustcad) (material.rs:130)|scatter (in itsjustcad) (material.rs:155)|radiance (in itsjustcad) (lib.rs:146)|{closure#0} (in itsjustcad) (lib.rs:217)|call_mut<((usize, &mut glam::f64::dvec3::DVec3)), itsjustcad_raytrace::render_pass::{closure_env#0}> (in itsjustcad) (function.rs:274)|{closure#0}<(usize, &mu
+    0.3% {closure#0} (in itsjustcad) (tonemap.rs:37)|aces (in itsjustcad) (tonemap.rs:38)|apply (in itsjustcad) (tonemap.rs:25)|to_srgb8 (in itsjustcad) (tonemap.rs:54)|itsjustcad_raytrace::resolve (in itsjustcad) (lib.rs:227)
+    0.3% to_srgb8 (in itsjustcad) (tonemap.rs:57)|itsjustcad_raytrace::resolve (in itsjustcad) (lib.rs:227)
+    0.3% clamp (in itsjustcad) (f64.rs:1596)|itsjustcad_raytrace::tonemap::linear_to_srgb8 (in itsjustcad) (tonemap.rs:43)
+    0.2% ray (in itsjustcad) (camera.rs:54)|{closure#0} (in itsjustcad) (lib.rs:216)|call_mut<((usize, &mut glam::f64::dvec3::DVec3)), itsjustcad_raytrace::render_pass::{closure_env#0}> (in itsjustcad) (function.rs:274)|{closure#0}<(usize, &mut glam::f64::dvec3::DVec3), &itsjustcad_raytrace::render_pass::{closure_env#0}> (in itsjustcad) (iterator.rs:884)|fold<core::ops::range::Range<usize>, core::slice::it
