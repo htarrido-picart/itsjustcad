@@ -819,9 +819,9 @@ impl Session {
             // before the generic logged path, so replay never needs the pack
             // table or disk (the CutFill original_z precedent). Ops replayed
             // from a saved log already carry `rules: Some(..)` and skip this.
-            Command::CodeCheck { pack, story, rules: None, ids } => {
+            Command::CodeCheck { pack, story, rules: None, ids, skip_analysis } => {
                 let rules = self.check_pack(&pack)?.rules.clone();
-                self.run(Command::CodeCheck { pack, story, rules: Some(rules), ids })
+                self.run(Command::CodeCheck { pack, story, rules: Some(rules), ids, skip_analysis })
             }
             Command::CheckRulesList => Ok(self.checkrules_list()),
             Command::CutCheck {
@@ -4792,7 +4792,8 @@ fn section_meshes(
     Ok((new_ids, layers_created, meshes))
 }
 
-/// Layer for the sunlight-hours heatmap overlay.
+/// Layer for analysis overlays (sun-hours heatmaps, radiation, curvature
+/// hairs, flow arrows). See [`skipped_overlay`].
 const ANALYSIS_LAYER: &str = "analysis";
 
 /// Curvature comb: sample the target curve's curvature and draw one hair line
@@ -4895,11 +4896,50 @@ fn exec_curvature_graph(
     ))
 }
 
-/// Collect every mesh's world-space triangles as `[a,b,c]` f64 vertex triples.
-/// Used by both shadow projection and sun-hours ray-casting.
-fn scene_triangles(doc: &Document) -> Vec<[[f64; 3]; 3]> {
+/// `true` when `obj` is an analysis overlay (on [`ANALYSIS_LAYER`]). With
+/// `skip_analysis` set, analysis verbs leave these out as targets, occluders
+/// and grid bounds (#326), so a rerun never scores or is shaded by the last
+/// run's output.
+fn skipped_overlay(obj: &SceneObject, skip_analysis: bool) -> bool {
+    skip_analysis && obj.layer == ANALYSIS_LAYER
+}
+
+/// An analysis verb's resolved targets minus skipped overlays (explicitly
+/// chosen ids included). Errors when only overlays were chosen.
+fn analysis_targets(
+    doc: &Document,
+    ids: Vec<ObjectId>,
+    skip_analysis: bool,
+    verb: &str,
+) -> Result<Vec<ObjectId>, ExecError> {
+    let kept: Vec<ObjectId> = ids
+        .iter()
+        .copied()
+        .filter(|id| !doc.get(*id).is_some_and(|o| skipped_overlay(o, skip_analysis)))
+        .collect();
+    if kept.is_empty() && !ids.is_empty() {
+        return Err(ExecError::Invalid(format!(
+            "{verb}: every target is on the '{ANALYSIS_LAYER}' layer; analysis overlays are \
+             not re-analysed"
+        )));
+    }
+    Ok(kept)
+}
+
+/// Scene bounds without skipped overlays; [`Document::scene_aabb`] when none.
+fn analysis_scene_aabb(doc: &Document, skip_analysis: bool) -> Option<kernel_mesh::Aabb> {
+    doc.objects()
+        .filter(|o| !skipped_overlay(o, skip_analysis))
+        .map(|o| doc.geometry_aabb(&o.geometry))
+        .reduce(kernel_mesh::Aabb::union)
+}
+
+/// Collect every mesh's world-space triangles as `[a,b,c]` f64 vertex triples,
+/// minus skipped overlays. Used by sun-hours, radiation and codecheck
+/// ray-casting.
+fn scene_triangles(doc: &Document, skip_analysis: bool) -> Vec<[[f64; 3]; 3]> {
     let mut tris = Vec::new();
-    for obj in doc.objects() {
+    for obj in doc.objects().filter(|o| !skipped_overlay(o, skip_analysis)) {
         if let Geometry::Mesh(m) = &obj.geometry {
             let pos = m.positions();
             for f in m.faces() {
@@ -5476,14 +5516,19 @@ fn exec_codecheck(
     story: Option<String>,
     rules: Option<Vec<crate::checkengine::CheckRule>>,
     ids: Option<Vec<ObjectId>>,
+    skip_analysis: bool,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
     use crate::checkengine::{self, COMPLIANCE_LAYER};
+    // Fresh runs (and ops logged since #326) skip analysis overlays; older
+    // logged ops replay as they ran, reading them.
+    let skip_analysis = skip_analysis || ids.is_none();
+
     // Session::run embeds the rules before the logged path; a missing list can
     // only mean a hand-edited file, so fail loudly rather than re-resolving.
     let rules = rules.ok_or_else(|| {
         ExecError::Invalid("codecheck op carries no rules (hand-edited file?)".into())
     })?;
-    let tris: Vec<[DVec3; 3]> = scene_triangles(doc)
+    let tris: Vec<[DVec3; 3]> = scene_triangles(doc, skip_analysis)
         .into_iter()
         .map(|t| {
             [
@@ -5521,6 +5566,7 @@ fn exec_codecheck(
             story,
             rules: Some(rules),
             ids: Some(new_ids.clone()),
+            skip_analysis,
         },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome { message, created: new_ids },
@@ -5551,7 +5597,12 @@ fn exec_shadow_study(
     from_min: u32,
     to_min: u32,
     step_min: u32,
+    skip_analysis: bool,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    // Fresh runs (and ops logged since #326) skip analysis overlays; older
+    // logged ops replay as they ran, reading them.
+    let skip_analysis = skip_analysis || ids.is_none();
+
     let loc = doc.location.ok_or_else(|| {
         ExecError::Invalid(
             "no location set — run `sun <lat> <lon> <date> <time>` or `location <lat> <lon>`, \
@@ -5564,7 +5615,10 @@ fn exec_shadow_study(
     }
 
     let mut object_pts: Vec<Vec<[f64; 3]>> = Vec::new();
-    for obj in doc.objects().filter(|o| o.layer != "terrain") {
+    for obj in doc
+        .objects()
+        .filter(|o| o.layer != "terrain" && !skipped_overlay(o, skip_analysis))
+    {
         if let Geometry::Mesh(m) = &obj.geometry {
             object_pts.push(m.positions().iter().map(|p| [p.x, p.y, p.z]).collect());
         }
@@ -5690,6 +5744,7 @@ fn exec_shadow_study(
             from_min,
             to_min,
             step_min,
+            skip_analysis,
         },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
@@ -5832,6 +5887,7 @@ fn exec_radiation(
     path: String,
     bins: Option<Vec<[f64; 2]>>,
     include_locked: bool,
+    skip_analysis: bool,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
     let loc = doc.location.ok_or_else(|| {
         ExecError::Invalid(
@@ -5856,6 +5912,10 @@ fn exec_radiation(
     let include_locked = include_locked || ids.is_none();
     let target_ids =
         if include_locked { resolve_read(doc, &targets)? } else { resolve(doc, &targets)? };
+    // Fresh runs (and ops logged since #326) skip analysis overlays; older
+    // logged ops replay as they ran, reading them.
+    let skip_analysis = skip_analysis || ids.is_none();
+    let target_ids = analysis_targets(doc, target_ids, skip_analysis, "radiation")?;
 
     // World-space triangles of the selected faces (what we score + color).
     let mut faces: Vec<[DVec3; 3]> = Vec::new();
@@ -5877,7 +5937,7 @@ fn exec_radiation(
 
     // Occlusion tested against the whole scene.
     let tri_bvh = kernel_mesh::TriBvh::build(
-        scene_triangles(doc)
+        scene_triangles(doc, skip_analysis)
             .into_iter()
             .map(|t| {
                 [
@@ -5961,6 +6021,7 @@ fn exec_radiation(
             path,
             bins: Some(bins),
             include_locked,
+            skip_analysis,
         },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
@@ -9223,7 +9284,12 @@ fn exec_sun_hours(
     month: u32,
     day: u32,
     spacing: f64,
+    skip_analysis: bool,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
+    // Fresh runs (and ops logged since #326) skip analysis overlays; older
+    // logged ops replay as they ran, reading them.
+    let skip_analysis = skip_analysis || ids.is_none();
+
     let loc = doc.location.ok_or_else(|| {
         ExecError::Invalid(
             "no location set — run `sun <lat> <lon> <date> <time>` or `location <lat> <lon>`, \
@@ -9234,13 +9300,13 @@ fn exec_sun_hours(
     if spacing <= 0.0 {
         return Err(ExecError::Invalid("grid spacing must be > 0".into()));
     }
-    let aabb = doc.scene_aabb().ok_or_else(|| {
+    let aabb = analysis_scene_aabb(doc, skip_analysis).ok_or_else(|| {
         ExecError::Invalid("sunhours needs geometry to bound the ground grid".into())
     })?;
     // Build a BVH over the scene triangles so each cell/sun ray only tests the
     // triangles whose boxes it crosses instead of the whole soup.
     let tri_bvh = kernel_mesh::TriBvh::build(
-        scene_triangles(doc)
+        scene_triangles(doc, skip_analysis)
             .into_iter()
             .map(|t| {
                 [
@@ -9363,7 +9429,7 @@ fn exec_sun_hours(
     doc.generation += 1;
 
     Ok((
-        Command::SunHours { ids: Some(new_ids.clone()), year, month, day, spacing },
+        Command::SunHours { ids: Some(new_ids.clone()), year, month, day, spacing, skip_analysis },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
             message: format!(
@@ -9385,6 +9451,7 @@ fn exec_sun_hours(
 /// `sunhours` (ground grid) but samples the actual faces instead of a plane, so
 /// tilted/vertical surfaces get an honest count and self-shadowing is handled by
 /// testing against the whole scene (including the surface's own object).
+#[allow(clippy::too_many_arguments)]
 fn exec_face_sun_hours(
     doc: &mut Document,
     targets: Selector,
@@ -9393,6 +9460,7 @@ fn exec_face_sun_hours(
     month: u32,
     day: u32,
     include_locked: bool,
+    skip_analysis: bool,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
     let loc = doc.location.ok_or_else(|| {
         ExecError::Invalid(
@@ -9406,6 +9474,10 @@ fn exec_face_sun_hours(
     let include_locked = include_locked || ids.is_none();
     let target_ids =
         if include_locked { resolve_read(doc, &targets)? } else { resolve(doc, &targets)? };
+    // Fresh runs (and ops logged since #326) skip analysis overlays; older
+    // logged ops replay as they ran, reading them.
+    let skip_analysis = skip_analysis || ids.is_none();
+    let target_ids = analysis_targets(doc, target_ids, skip_analysis, "facesunhours")?;
 
     // World-space triangles of the *selected* faces only (what we score + color).
     let mut faces: Vec<[DVec3; 3]> = Vec::new();
@@ -9428,7 +9500,7 @@ fn exec_face_sun_hours(
     // Occlusion is tested against the whole scene (so neighbouring massing and
     // the surface's own object can shade it).
     let tri_bvh = kernel_mesh::TriBvh::build(
-        scene_triangles(doc)
+        scene_triangles(doc, skip_analysis)
             .into_iter()
             .map(|t| {
                 [
@@ -9547,6 +9619,7 @@ fn exec_face_sun_hours(
             month,
             day,
             include_locked,
+            skip_analysis,
         },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
@@ -14596,18 +14669,37 @@ fn apply_forward(
             ))
         }
         Command::Climate { path, data } => exec_climate(doc, path, data),
-        Command::ShadowStudy { ids, stamp_mesh, year, month, day, from_min, to_min, step_min } => {
-            exec_shadow_study(doc, ids, stamp_mesh, year, month, day, from_min, to_min, step_min)
-        }
-        Command::SunHours { ids, year, month, day, spacing } => {
-            exec_sun_hours(doc, ids, year, month, day, spacing)
+        Command::ShadowStudy {
+            ids,
+            stamp_mesh,
+            year,
+            month,
+            day,
+            from_min,
+            to_min,
+            step_min,
+            skip_analysis,
+        } => exec_shadow_study(
+            doc,
+            ids,
+            stamp_mesh,
+            year,
+            month,
+            day,
+            from_min,
+            to_min,
+            step_min,
+            skip_analysis,
+        ),
+        Command::SunHours { ids, year, month, day, spacing, skip_analysis } => {
+            exec_sun_hours(doc, ids, year, month, day, spacing, skip_analysis)
         }
         Command::SunPath { ids, year, radius } => exec_sun_path(doc, ids, year, radius),
-        Command::Radiation { targets, ids, path, bins, include_locked } => {
-            exec_radiation(doc, targets, ids, path, bins, include_locked)
+        Command::Radiation { targets, ids, path, bins, include_locked, skip_analysis } => {
+            exec_radiation(doc, targets, ids, path, bins, include_locked, skip_analysis)
         }
-        Command::FaceSunHours { targets, ids, year, month, day, include_locked } => {
-            exec_face_sun_hours(doc, targets, ids, year, month, day, include_locked)
+        Command::FaceSunHours { targets, ids, year, month, day, include_locked, skip_analysis } => {
+            exec_face_sun_hours(doc, targets, ids, year, month, day, include_locked, skip_analysis)
         }
         Command::Contours { interval, major_every, ids } => {
             exec_contours(doc, interval, major_every, ids)
@@ -14694,8 +14786,8 @@ fn apply_forward(
         ),
         Command::FlowArrows { n, ids } => exec_flow_arrows(doc, n, ids),
         Command::Ponding { ids } => exec_ponding(doc, ids),
-        Command::CodeCheck { pack, story, rules, ids } => {
-            exec_codecheck(doc, pack, story, rules, ids)
+        Command::CodeCheck { pack, story, rules, ids, skip_analysis } => {
+            exec_codecheck(doc, pack, story, rules, ids, skip_analysis)
         }
         Command::CutCheck { preset, targets, layers, units, thickness, material, limits, ids } => {
             exec_cutcheck(doc, preset, targets, layers, units, thickness, material, limits, ids)
@@ -18255,7 +18347,7 @@ mod tests {
             run(&mut s, &format!("box {x},{y},0 4,4,{h}"));
         }
         let loc = GeoLocation { lat_deg: 40.71, lon_deg: -74.01, tz_hours: -5.0 };
-        let tris: Vec<[DVec3; 3]> = scene_triangles(&s.doc)
+        let tris: Vec<[DVec3; 3]> = scene_triangles(&s.doc, true)
             .into_iter()
             .map(|t| {
                 [
@@ -24023,6 +24115,108 @@ mod tests {
         assert!(!saved.contains("include_locked"), "legacy op re-saves unchanged: {saved}");
     }
 
+    /// Two boxes, one shading the other, with a location set.
+    fn sun_scene() -> Session {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "box 6,0,0 4,4,12");
+        run(&mut s, "location 40.0 0.0 0");
+        s
+    }
+
+    fn report_json(s: &Session, key: &str) -> String {
+        serde_json::to_string(&s.doc.analysis_reports[key]).unwrap()
+    }
+
+    /// #326: a second run neither scores the first run's overlays nor lets
+    /// them shade the scene, so it reports exactly what the first did.
+    #[test]
+    fn facesunhours_second_run_ignores_its_overlays() {
+        let mut s = sun_scene();
+        let first = run(&mut s, "facesunhours all 2024-06-21");
+        let r1 = report_json(&s, "facesunhours");
+        let second = run(&mut s, "facesunhours all 2024-06-21");
+        assert_eq!(first.created.len(), 24);
+        assert_eq!(second.created.len(), 24, "{}", second.message);
+        assert_eq!(report_json(&s, "facesunhours"), r1);
+        assert_eq!(first.message, second.message);
+        assert_replay_stable(&s);
+    }
+
+    #[test]
+    fn radiation_second_run_ignores_its_overlays() {
+        let path = write_synth_epw("twice.epw");
+        let mut s = sun_scene();
+        run(&mut s, &format!("import {}", path.display()));
+        let first = run(&mut s, &format!("radiation all {}", path.display()));
+        let r1 = report_json(&s, "radiation");
+        let second = run(&mut s, &format!("radiation all {}", path.display()));
+        assert_eq!(second.created.len(), first.created.len(), "{}", second.message);
+        assert_eq!(report_json(&s, "radiation"), r1);
+        assert_replay_stable(&s);
+    }
+
+    /// Overlays from an earlier analysis change neither the sunhours grid
+    /// (bounds, occluders) nor the shadowstudy casters.
+    #[test]
+    fn sunhours_and_shadowstudy_ignore_analysis_overlays() {
+        let study = |s: &mut Session| {
+            let sun = run(s, "sunhours 2024-06-21 2");
+            let sun_report = report_json(s, "sunhours");
+            let shadows = run(s, "shadowstudy 2024-06-21 10:00 14:00 120");
+            let hulls: Vec<_> =
+                shadows.created.iter().map(|id| s.doc.get(*id).unwrap().geometry.clone()).collect();
+            (sun.message, sun_report, shadows.message, hulls)
+        };
+        let clean = study(&mut sun_scene());
+        let mut s = sun_scene();
+        run(&mut s, "facesunhours all 2024-06-21");
+        assert_eq!(study(&mut s), clean);
+        assert_replay_stable(&s);
+    }
+
+    /// Explicitly chosen overlays are skipped too: analysing only overlays is
+    /// an error, not a feedback loop.
+    #[test]
+    fn analysis_of_only_overlays_is_rejected() {
+        let mut s = sun_scene();
+        let overlays = run(&mut s, "facesunhours all 2024-06-21").created;
+        let err = s
+            .run(Command::FaceSunHours {
+                targets: Selector::Ids { ids: overlays },
+                ids: None,
+                year: 2024,
+                month: 6,
+                day: 21,
+                include_locked: true,
+                skip_analysis: true,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("'analysis' layer"), "{err}");
+    }
+
+    /// Ops logged before #326 carry no `skip_analysis`: replay still scores
+    /// and occludes with overlays, so existing documents rebuild unchanged.
+    #[test]
+    fn analysis_ops_logged_before_326_replay_unchanged() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "location 40.0 0.0 0");
+        run(&mut s, "facesunhours all 2024-06-21");
+        let mut log = s.save_log();
+        let legacy: Command = serde_json::from_str(
+            r#"{"cmd":"face_sun_hours","targets":{"sel":"all"},"ids":[],"year":2024,"month":6,"day":21,"include_locked":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(legacy, Command::FaceSunHours { skip_analysis: false, .. }));
+        log.push(legacy);
+        let replayed = Session::replay(log).unwrap();
+        let r = &replayed.doc.analysis_reports["facesunhours"];
+        assert_eq!(r.count, 24, "legacy op scores the box and the first overlays");
+        let saved = serde_json::to_string(replayed.save_log().last().unwrap()).unwrap();
+        assert!(!saved.contains("skip_analysis"), "legacy op re-saves unchanged: {saved}");
+    }
+
     #[test]
     fn measure_verbs_read_locked_layers() {
         let mut s = Session::default();
@@ -27754,9 +27948,9 @@ mod tests {
         // nothing here — instead verify the canopy participates in the scene
         // triangle set used by every occlusion analysis.
         let mut s = Session::default();
-        let before = scene_triangles(&s.doc).len();
+        let before = scene_triangles(&s.doc, true).len();
         run(&mut s, "plant spruce 0,0");
-        let after = scene_triangles(&s.doc).len();
+        let after = scene_triangles(&s.doc, true).len();
         assert!(after > before, "plant mesh must join the occlusion scene");
     }
 
@@ -32016,7 +32210,7 @@ mod tests {
         let path = std::env::var("BVH_SITE_FIXTURE").expect("BVH_SITE_FIXTURE");
         let s = crate::io::load_file(std::path::Path::new(&path)).expect("load site");
         let tris: Vec<[DVec3; 3]> =
-            scene_triangles(&s.doc).iter().map(|t| t.map(DVec3::from_array)).collect();
+            scene_triangles(&s.doc, true).iter().map(|t| t.map(DVec3::from_array)).collect();
         let bvh = kernel_mesh::TriBvh::build(tris.clone());
         let loc = GeoLocation { lat_deg: 40.71, lon_deg: -74.01, tz_hours: -5.0 };
         let mut sun_dirs = Vec::new();
@@ -32069,7 +32263,7 @@ mod tests {
         let path = std::env::var("BVH_SITE_FIXTURE").expect("BVH_SITE_FIXTURE");
         let s = crate::io::load_file(std::path::Path::new(&path)).expect("load site");
         let tris: Vec<[DVec3; 3]> =
-            scene_triangles(&s.doc).iter().map(|t| t.map(DVec3::from_array)).collect();
+            scene_triangles(&s.doc, true).iter().map(|t| t.map(DVec3::from_array)).collect();
         let boxes: Vec<kernel_mesh::Aabb> =
             tris.iter().map(|t| kernel_mesh::Aabb::from_points(t.iter().copied())).collect();
         let t0 = std::time::Instant::now();

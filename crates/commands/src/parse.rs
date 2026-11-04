@@ -2083,6 +2083,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                     from_min,
                     to_min,
                     step_min: step_min as u32,
+                    skip_analysis: true,
                 })
             }
             _ => wrong("shadowstudy", "YYYY-MM-DD from-HH:MM to-HH:MM step-min", &args),
@@ -2101,14 +2102,22 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 _ => return wrong("sunhours", "YYYY-MM-DD [grid-spacing]", &args),
             };
             let (year, month, day) = parse_date(date)?;
-            Ok(Command::SunHours { ids: None, year, month, day, spacing })
+            Ok(Command::SunHours { ids: None, year, month, day, spacing, skip_analysis: true })
         }
         // facesunhours <selector> <YYYY-MM-DD>
         "facesunhours" => {
             let (targets, rest) = selector(&args, "facesunhours")?;
             let [date] = take::<1>("facesunhours", "a YYYY-MM-DD date after the selector", rest)?;
             let (year, month, day) = parse_date(date)?;
-            Ok(Command::FaceSunHours { targets, ids: None, year, month, day, include_locked: true })
+            Ok(Command::FaceSunHours {
+                targets,
+                ids: None,
+                year,
+                month,
+                day,
+                include_locked: true,
+                skip_analysis: true,
+            })
         }
         // radiation <selector> <path.epw>
         // climate <path.epw> | climate off
@@ -2137,6 +2146,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 path: rest.join(" "),
                 bins: None,
                 include_locked: true,
+                skip_analysis: true,
             })
         }
         // sunpath [radius] [year]
@@ -2181,12 +2191,14 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 story: None,
                 rules: None,
                 ids: None,
+                skip_analysis: true,
             }),
             [pack, story] => Ok(Command::CodeCheck {
                 pack: (*pack).to_string(),
                 story: Some((*story).to_string()),
                 rules: None,
                 ids: None,
+                skip_analysis: true,
             }),
             _ => wrong("codecheck", "a pack name and optionally a story name", &args),
         },

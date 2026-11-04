@@ -1283,6 +1283,12 @@ pub enum Command {
         to_min: u32,
         /// Step between stamps, minutes (> 0).
         step_min: u32,
+        /// Leave the `analysis` overlay layer out as targets and occluders
+        /// (#326), explicitly chosen ids included. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay
+        /// keeps reading overlays so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_analysis: bool,
     },
     /// Sunlight-hours heatmap: sample a ground grid over the scene bbox, ray-cast
     /// toward the sun every 30 min of the day, and emit a colored mesh overlay on
@@ -1297,6 +1303,12 @@ pub enum Command {
         day: u32,
         /// Grid spacing in meters (> 0).
         spacing: f64,
+        /// Leave the `analysis` overlay layer out as targets and occluders
+        /// (#326), explicitly chosen ids included. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay
+        /// keeps reading overlays so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_analysis: bool,
     },
     /// Annual radiation (insolation) study: for the selected meshes, weight
     /// each face's beam exposure by the EPW file's hourly Direct-Normal
@@ -1323,6 +1335,12 @@ pub enum Command {
         /// overlays don't change.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         include_locked: bool,
+        /// Leave the `analysis` overlay layer out as targets and occluders
+        /// (#326), explicitly chosen ids included. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay
+        /// keeps reading overlays so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_analysis: bool,
     },
     /// Sun-path diagram: draw the yearly sun-path dome for the document's
     /// location as polylines on the `sunpath` layer — seven date arcs (Dec 21 →
@@ -1361,6 +1379,12 @@ pub enum Command {
         /// overlays don't change.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         include_locked: bool,
+        /// Leave the `analysis` overlay layer out as targets and occluders
+        /// (#326), explicitly chosen ids included. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay
+        /// keeps reading overlays so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_analysis: bool,
     },
     // -- underlay (raster reference image on the ground plane) --
     /// Place a raster image (PNG) on the ground plane. `height` is `None` when
@@ -1705,6 +1729,12 @@ pub enum Command {
         rules: Option<Vec<crate::checkengine::CheckRule>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ids: Option<Vec<ObjectId>>,
+        /// Leave the `analysis` overlay layer out as targets and occluders
+        /// (#326), explicitly chosen ids included. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay
+        /// keeps reading overlays so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_analysis: bool,
     },
     /// Fabrication preflight over the cut-profile contour set (see
     /// [`crate::cutcheck`]). `thickness` is in `units`. `limits` is `None`
