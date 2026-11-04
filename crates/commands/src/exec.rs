@@ -5664,8 +5664,8 @@ fn exec_shadow_study(
         }
     }
 
-    for ((layer, geometry), id) in objects.into_iter().zip(&new_ids) {
-        doc.insert(SceneObject {
+    doc.insert_many(objects.into_iter().zip(&new_ids).map(|((layer, geometry), id)| {
+        SceneObject {
             visible: true,
             id: *id,
             name: None,
@@ -5676,8 +5676,8 @@ fn exec_shadow_study(
             edge_tags: None,
             street: None,
             geometry,
-        });
-    }
+        }
+    }));
 
     let samples: Vec<(f64, DVec3, String)> = stamp_hulls
         .iter()
@@ -23741,6 +23741,7 @@ mod tests {
                 Geometry::Curve(Curve::Polyline { points: pts.clone(), closed: true })
             );
         }
+        assert_eq!(replayed.doc.last_ids(4), ids, "creation order follows the recorded ids");
         let r = replayed.doc.analysis_reports.get("shadowstudy").unwrap();
         assert_eq!(r.count, 4);
         let resaved = serde_json::to_string(replayed.save_log().last().unwrap()).unwrap();

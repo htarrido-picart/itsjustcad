@@ -655,6 +655,23 @@ impl Document {
         self.objects.insert(obj.id, obj);
     }
 
+    /// Insert `objs` in order with ONE generation bump (none when empty).
+    /// Objects and creation order end up exactly as after calling
+    /// [`Self::insert`] on each; only the generation count differs. Readers of
+    /// `generation` compare it for equality, never count objects by it.
+    pub fn insert_many(&mut self, objs: impl IntoIterator<Item = SceneObject>) {
+        let objs = objs.into_iter();
+        self.creation_order.reserve(objs.size_hint().0);
+        let before = self.creation_order.len();
+        for obj in objs {
+            self.creation_order.push(obj.id);
+            self.objects.insert(obj.id, obj);
+        }
+        if self.creation_order.len() > before {
+            self.generation += 1;
+        }
+    }
+
     /// Re-insert a previously removed object at its former position in the
     /// creation order (undo of delete).
     pub fn restore(&mut self, obj: SceneObject, order_index: usize) {
@@ -1287,5 +1304,26 @@ mod tests {
         let g3 = doc.generation;
         doc.restore(obj, index);
         assert!(doc.generation > g3, "restore bumps");
+    }
+
+    #[test]
+    fn insert_many_matches_repeated_insert_with_one_generation_bump() {
+        let mut one = Document::default();
+        one.insert(obj_at(Some("seed"), DVec3::ZERO));
+        let mut many = one.clone();
+        let batch: Vec<SceneObject> =
+            (0..5).map(|i| obj_at(None, DVec3::new(i as f64, 0.0, 0.0))).collect();
+        let g0 = many.generation;
+        for o in batch.clone() {
+            one.insert(o);
+        }
+        many.insert_many(batch);
+        assert_eq!(many.generation, g0 + 1, "one bump per batch");
+        many.generation = one.generation;
+        assert_eq!(many, one, "same objects and creation order");
+
+        let g1 = many.generation;
+        many.insert_many(Vec::new());
+        assert_eq!(many.generation, g1, "empty batch does not bump");
     }
 }
