@@ -227,7 +227,7 @@ Solar and radiation studies. `curvature` (a NURBS analysis) also lives on the `a
 | `sun` | `sun <lat> <lon> <YYYY-MM-DD> <HH:MM>` — solar lighting direction (NOAA SPA) |
 | `sunoff` | revert to headlight shading |
 | `location` | `location <lat> <lon> [tz-hours]` — observer location for the studies below |
-| `shadowstudy` | `shadowstudy <date> <from> <to> <step-min>` — ground shadows per time step |
+| `shadowstudy` | `shadowstudy <date> <from> <to> <step-min>` — ground shadows per time step, one filled mesh per stamp on `shadows-HH:MM` |
 | `sunhours` | `sunhours <date> [grid-spacing]` — ground sun-hours heatmap (occlusion ray-cast) |
 | `facesunhours` | `facesunhours <selector> <date>` — per-face insolation on the selected mesh |
 | `radiation` | `radiation <selector> <path.epw>` — annual kWh/m²·yr per face from EPW DNI/DHI |

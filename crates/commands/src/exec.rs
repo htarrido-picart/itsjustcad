@@ -5555,14 +5555,22 @@ fn exec_codecheck(
 
 /// Ground-shadow study. For each time stamp, compute the sun direction from the
 /// document location and project every mesh's silhouette onto `z=0` along the
-/// sun. Each object's projected points are reduced to their 2D convex hull and
-/// emitted as one closed polygon on a `shadows-HH:MM` layer (translucent dark
-/// fill). Convex-hull-per-object is a pragmatic first slice: concave footprints
+/// sun. Each object's projected points are reduced to their 2D convex hull.
+/// Convex-hull-per-object is a pragmatic first slice: concave footprints
 /// over-cover, but the sun-path envelope reads correctly for massing.
+///
+/// Output (`stamp_mesh`): one flat mesh per daylight stamp on its
+/// `shadows-HH:MM` layer (translucent dark fill), every hull fan-triangulated
+/// with upward normals. Exports draw only the hull outlines: the fan diagonals
+/// are coplanar interior edges, not feature edges. Legacy commands
+/// (`stamp_mesh == false`, logs written before the flag) emit one closed
+/// polyline per hull instead, so old files replay to identical objects. The
+/// `shadowstudy` analysis report is per hull either way.
 #[allow(clippy::too_many_arguments)]
 fn exec_shadow_study(
     doc: &mut Document,
     ids: Option<Vec<ObjectId>>,
+    stamp_mesh: bool,
     year: i32,
     month: u32,
     day: u32,
@@ -5581,10 +5589,6 @@ fn exec_shadow_study(
         return Err(ExecError::Invalid("step must be > 0 minutes".into()));
     }
 
-    // Per-object world-space vertices (grouped so each object gets its own hull).
-    // Terrain meshes (layer "terrain", as the landscape verbs identify them)
-    // are the ground, not occluders: their site-wide hull would swamp every
-    // building shadow (#285). The ground plane stays flat at z = 0.
     let mut object_pts: Vec<Vec<[f64; 3]>> = Vec::new();
     for obj in doc.objects().filter(|o| o.layer != "terrain") {
         if let Geometry::Mesh(m) = &obj.geometry {
@@ -5597,80 +5601,92 @@ fn exec_shadow_study(
         ));
     }
 
-    // Build (layer, polygon) for every stamp where the sun is up. Stamps are
-    // independent time frames → parallel over stamps (ordered collect + the
-    // sequential flatten below keep polygon order identical to the old loop).
-    struct Poly {
-        layer: String,
-        pts: Vec<DVec3>,
-    }
-    // Inclusive stamps from `from_min` to `to_min` at `step_min` spacing.
     let stamps: Vec<u32> = (from_min..=to_min).step_by(step_min as usize).collect();
     let per_stamp = shadow_stamp_hulls(&stamps, year, month, day, loc, &object_pts);
-    let mut polys: Vec<Poly> = Vec::new();
+    // Daylight stamps with at least one hull: (layer, hulls at z = 0).
+    let mut stamp_hulls: Vec<(String, Vec<Vec<DVec3>>)> = Vec::new();
     let mut stamps_up = 0usize;
     for (&t, hulls) in stamps.iter().zip(&per_stamp) {
         let Some(hulls) = hulls else { continue };
         stamps_up += 1;
-        let layer = format!("shadows-{}", fmt_hhmm(t));
-        for hull in hulls {
-            polys.push(Poly {
-                layer: layer.clone(),
-                pts: hull.iter().map(|h| DVec3::new(h[0], h[1], 0.0)).collect(),
-            });
+        if hulls.is_empty() {
+            continue;
         }
+        let hulls = hulls
+            .iter()
+            .map(|hull| hull.iter().map(|h| DVec3::new(h[0], h[1], 0.0)).collect())
+            .collect();
+        stamp_hulls.push((format!("shadows-{}", fmt_hhmm(t)), hulls));
     }
+    let n_hulls: usize = stamp_hulls.iter().map(|(_, h)| h.len()).sum();
 
-    if polys.is_empty() {
+    if n_hulls == 0 {
         return Err(ExecError::Invalid(format!(
             "sun is below the horizon for the whole window on {year}-{month:02}-{day:02} \
              at this location — no ground shadows"
         )));
     }
 
-    let new_ids: Vec<ObjectId> = match ids {
-        Some(ids) if ids.len() == polys.len() => ids,
-        _ => (0..polys.len()).map(|_| ObjectId::new()).collect(),
+    // One object per stamp (mesh) or per hull (legacy polyline), in stamp order.
+    let objects: Vec<(&str, Geometry)> = if stamp_mesh {
+        stamp_hulls
+            .iter()
+            .map(|(layer, hulls)| (layer.as_str(), Geometry::Mesh(shadow_stamp_mesh(hulls))))
+            .collect()
+    } else {
+        stamp_hulls
+            .iter()
+            .flat_map(|(layer, hulls)| {
+                hulls.iter().map(move |pts| {
+                    let curve = Curve::Polyline { points: pts.clone(), closed: true };
+                    (layer.as_str(), Geometry::Curve(curve))
+                })
+            })
+            .collect()
     };
 
-    // Ensure each distinct shadow layer exists with a translucent dark fill.
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == objects.len() => ids,
+        _ => (0..objects.len()).map(|_| ObjectId::new()).collect(),
+    };
+
     let mut layers_created = Vec::new();
-    for p in &polys {
-        if !doc.layers.contains_key(&p.layer) {
+    for (layer, _) in &stamp_hulls {
+        if !doc.layers.contains_key(layer) {
             doc.layers.insert(
-                p.layer.clone(),
+                layer.clone(),
                 LayerStyle {
                     color: Some([0.1, 0.1, 0.15, 0.35]),
                     ..LayerStyle::default()
                 },
             );
-            layers_created.push(p.layer.clone());
+            layers_created.push(layer.clone());
         }
     }
 
-    for (poly, id) in polys.iter().zip(&new_ids) {
+    for ((layer, geometry), id) in objects.into_iter().zip(&new_ids) {
         doc.insert(SceneObject {
             visible: true,
             id: *id,
             name: None,
-            layer: poly.layer.clone(),
+            layer: layer.to_string(),
             color: None,
             material: None,
             lineweight_mm: None,
             edge_tags: None,
             street: None,
-            geometry: Geometry::Curve(Curve::Polyline { points: poly.pts.clone(), closed: true }),
+            geometry,
         });
     }
-    // Structured summary for the deck's `report` command: one sample per
-    // shadow polygon — value = ground area covered, tag = its "HH:MM" stamp —
-    // so the LLM can flag when the massing overshadows most.
-    let samples: Vec<(f64, DVec3, String)> = polys
+
+    let samples: Vec<(f64, DVec3, String)> = stamp_hulls
         .iter()
-        .map(|p| {
-            let centroid = p.pts.iter().copied().sum::<DVec3>() / p.pts.len().max(1) as f64;
-            let stamp = p.layer.strip_prefix("shadows-").unwrap_or(&p.layer).to_string();
-            (shoelace_area(&p.pts), centroid, stamp)
+        .flat_map(|(layer, hulls)| {
+            let stamp = layer.strip_prefix("shadows-").unwrap_or(layer);
+            hulls.iter().map(move |pts| {
+                let centroid = pts.iter().copied().sum::<DVec3>() / pts.len().max(1) as f64;
+                (shoelace_area(pts), centroid, stamp.to_string())
+            })
         })
         .collect();
     doc.analysis_reports.insert(
@@ -5689,9 +5705,11 @@ fn exec_shadow_study(
     doc.generation += 1;
 
     let n_layers = layers_created.len();
+    let what = if stamp_mesh { "stamp mesh(es)" } else { "polygon object(s)" };
     Ok((
         Command::ShadowStudy {
             ids: Some(new_ids.clone()),
+            stamp_mesh,
             year,
             month,
             day,
@@ -5702,13 +5720,36 @@ fn exec_shadow_study(
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
             message: format!(
-                "shadowstudy {year}-{month:02}-{day:02}: {} polygon(s) across {stamps_up} \
-                 daylight stamp(s) on {n_layers} 'shadows-HH:MM' layer(s)",
+                "shadowstudy {year}-{month:02}-{day:02}: {n_hulls} shadow polygon(s) as {} \
+                 {what} across {stamps_up} daylight stamp(s) on {n_layers} 'shadows-HH:MM' \
+                 layer(s)",
                 new_ids.len()
             ),
             created: new_ids,
         },
     ))
+}
+
+/// One flat shadow mesh for a stamp: every convex hull (z = 0) fan-triangulated
+/// from its first vertex, wound counter-clockwise in XY so normals face up.
+fn shadow_stamp_mesh(hulls: &[Vec<DVec3>]) -> kernel_mesh::Mesh {
+    let n_pts: usize = hulls.iter().map(Vec::len).sum();
+    let mut positions = Vec::with_capacity(n_pts);
+    let mut faces = Vec::with_capacity(n_pts);
+    for hull in hulls {
+        let base = positions.len() as u32;
+        let signed2: f64 = hull
+            .iter()
+            .zip(hull.iter().cycle().skip(1))
+            .map(|(p, q)| p.x * q.y - q.x * p.y)
+            .sum();
+        positions.extend_from_slice(hull);
+        for i in 1..hull.len().saturating_sub(1) as u32 {
+            let (b, c) = (base + i, base + i + 1);
+            faces.push(if signed2 >= 0.0 { [base, b, c] } else { [base, c, b] });
+        }
+    }
+    kernel_mesh::Mesh::new(positions, faces)
 }
 
 /// Annual radiation (insolation) study. Per selected face: beam kWh weighted
@@ -14603,8 +14644,8 @@ fn apply_forward(
             ))
         }
         Command::Climate { path, data } => exec_climate(doc, path, data),
-        Command::ShadowStudy { ids, year, month, day, from_min, to_min, step_min } => {
-            exec_shadow_study(doc, ids, year, month, day, from_min, to_min, step_min)
+        Command::ShadowStudy { ids, stamp_mesh, year, month, day, from_min, to_min, step_min } => {
+            exec_shadow_study(doc, ids, stamp_mesh, year, month, day, from_min, to_min, step_min)
         }
         Command::SunHours { ids, year, month, day, spacing } => {
             exec_sun_hours(doc, ids, year, month, day, spacing)
@@ -23566,25 +23607,26 @@ mod tests {
         // Two stamps: 12:00 and 14:00 UTC (both daylight in June at NY).
         let out = run(&mut s, "shadowstudy 2024-06-21 12:00 14:00 120");
         assert!(!out.created.is_empty(), "shadows created: {}", out.message);
-        // One object per stamp (one box → one hull polygon per stamp).
+        // One object per stamp.
         assert_eq!(out.created.len(), 2, "{}", out.message);
-        // Each created object is a closed polygon on a shadows-HH:MM layer at z=0.
+        // Each created object is a flat stamp mesh on a shadows-HH:MM layer at z=0.
         for id in &out.created {
             let obj = s.doc.get(*id).unwrap();
             assert!(obj.layer.starts_with("shadows-"), "layer={}", obj.layer);
             match &obj.geometry {
-                Geometry::Curve(Curve::Polyline { points, closed }) => {
-                    assert!(*closed && points.len() >= 3);
+                Geometry::Mesh(m) => {
+                    let points = m.positions();
+                    assert!(points.len() >= 3 && !m.faces().is_empty());
                     assert!(points.iter().all(|p| p.z.abs() < 1e-9), "on ground");
                     // Shadow is offset from the box footprint (sun not at zenith),
                     // so some projected point has |x| or |y| beyond the 0..4 box.
                     let spread = points.iter().any(|p| p.x < -1e-6 || p.y < -1e-6 || p.x > 4.0 + 1e-6 || p.y > 4.0 + 1e-6);
                     assert!(spread, "shadow should extend past the footprint");
                 }
-                g => panic!("expected closed polyline, got {g:?}"),
+                g => panic!("expected stamp mesh, got {g:?}"),
             }
         }
-        // Undo removes every polygon and the shadow layers.
+        // Undo removes every stamp mesh and the shadow layers.
         s.run(crate::Command::Undo).unwrap();
         assert_eq!(s.doc.len(), before, "shadows removed on undo");
         assert!(
@@ -23607,6 +23649,102 @@ mod tests {
             "shadowstudy log must be replay-stable"
         );
         assert_eq!(s.doc.len(), replayed.doc.len());
+    }
+
+    /// Each stamp is one flat mesh holding every caster's hull: fan triangles
+    /// with upward normals, and exports see only the hull outlines (the fan
+    /// diagonals are coplanar interior edges, not feature edges).
+    #[test]
+    fn shadowstudy_one_mesh_per_stamp() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "box 30,30,0 4,4,6");
+        run(&mut s, "sun 40.71 -74.01 2024-06-21 16:58");
+        let out = run(&mut s, "shadowstudy 2024-06-21 12:00 14:00 120");
+        assert_eq!(out.created.len(), 2, "one object per stamp: {}", out.message);
+        let mut layers = Vec::new();
+        for id in &out.created {
+            let obj = s.doc.get(*id).unwrap();
+            layers.push(obj.layer.clone());
+            let Geometry::Mesh(m) = &obj.geometry else { panic!("expected stamp mesh") };
+            let pos = m.positions();
+            for f in m.faces() {
+                let [a, b, c] = f.map(|i| pos[i as usize]);
+                assert!((b - a).cross(c - a).z > 0.0, "upward normal");
+            }
+            // Two disjoint convex hulls of n_i vertices: n_i - 2 fan triangles each.
+            assert_eq!(m.faces().len(), pos.len() - 4, "two fans");
+            // Export (svg/dxf/pdf) edges are exactly each hull's own outline: the
+            // fan diagonals are shared by two coplanar triangles, so never drawn.
+            let edges = kernel_mesh::feature_edges(m);
+            let mut per_hull: Vec<(DVec3, DVec3)> = Vec::new();
+            for apex in [m.faces()[0][0], m.faces().last().unwrap()[0]] {
+                let fan: Vec<[u32; 3]> =
+                    m.faces().iter().copied().filter(|f| f[0] == apex).collect();
+                let outline = kernel_mesh::feature_edges(&kernel_mesh::Mesh::new(pos.to_vec(), fan));
+                assert!(outline.len() >= 3);
+                per_hull.extend(outline);
+            }
+            let key = |e: &(DVec3, DVec3)| [e.0.x, e.0.y, e.1.x, e.1.y].map(f64::to_bits);
+            let (mut got, mut want) = (edges.clone(), per_hull);
+            got.sort_by_key(key);
+            want.sort_by_key(key);
+            assert_eq!(got, want, "stamp mesh exports the hull outlines only");
+            assert!(edges.iter().all(|(a, b)| a.z.abs() < 1e-9 && b.z.abs() < 1e-9));
+        }
+        assert_eq!(layers, ["shadows-12:00", "shadows-14:00"]);
+    }
+
+    /// A `shadow_study` op written before the `stamp_mesh` flag existed
+    /// replays the legacy output exactly: one closed polyline per hull with the
+    /// recorded ids, and re-saves without the flag.
+    #[test]
+    fn shadowstudy_legacy_log_replays_polylines() {
+        let ids: Vec<ObjectId> = (0..4).map(|_| ObjectId::new()).collect();
+        let legacy = format!(
+            r#"{{"cmd":"shadow_study","ids":{},"year":2024,"month":6,"day":21,"from_min":720,"to_min":840,"step_min":120}}"#,
+            serde_json::to_string(&ids).unwrap()
+        );
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "box 30,30,0 4,4,6");
+        run(&mut s, "sun 40.71 -74.01 2024-06-21 16:58");
+        let mut log = s.save_log();
+        log.push(serde_json::from_str(&legacy).unwrap());
+        let replayed = Session::replay(log).unwrap();
+
+        let loc = replayed.doc.location.unwrap();
+        let object_pts: Vec<Vec<[f64; 3]>> = replayed
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Mesh(m) => Some(m.positions().iter().map(|p| [p.x, p.y, p.z]).collect()),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<(String, Vec<DVec3>)> = [720u32, 840]
+            .iter()
+            .zip(shadow_stamp_hulls(&[720, 840], 2024, 6, 21, loc, &object_pts))
+            .flat_map(|(&t, hulls)| {
+                hulls.unwrap().into_iter().map(move |h| {
+                    let pts = h.iter().map(|p| DVec3::new(p[0], p[1], 0.0)).collect();
+                    (format!("shadows-{}", fmt_hhmm(t)), pts)
+                })
+            })
+            .collect();
+        assert_eq!(expected.len(), 4);
+        for (id, (layer, pts)) in ids.iter().zip(&expected) {
+            let obj = replayed.doc.get(*id).expect("recorded id reused");
+            assert_eq!(&obj.layer, layer);
+            assert_eq!(
+                obj.geometry,
+                Geometry::Curve(Curve::Polyline { points: pts.clone(), closed: true })
+            );
+        }
+        let r = replayed.doc.analysis_reports.get("shadowstudy").unwrap();
+        assert_eq!(r.count, 4);
+        let resaved = serde_json::to_string(replayed.save_log().last().unwrap()).unwrap();
+        assert_eq!(resaved, legacy, "legacy op re-saves byte-identical");
     }
 
     /// Write a synthetic EPW (NYC-ish location; DNI 500 / DHI 100 for ending
@@ -24170,12 +24308,14 @@ mod tests {
     fn shadowstudy_stores_report_with_time_stamps() {
         let mut s = Session::default();
         run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "box 20,20,0 4,4,6");
         run(&mut s, "location 40.71 0.0 0");
         let out = run(&mut s, "shadowstudy 2024-06-21 09:00 15:00 180");
         let r = s.doc.analysis_reports.get("shadowstudy").expect("report stored");
         assert_eq!(r.kind, "shadowstudy");
         assert_eq!(r.unit, "m2");
-        assert_eq!(r.count, out.created.len(), "one sample per shadow polygon");
+        assert_eq!(out.created.len(), 3, "one object per stamp");
+        assert_eq!(r.count, 2 * out.created.len(), "one sample per shadow hull, not per object");
         assert!(r.context.contains("09:00") && r.context.contains("15:00"));
         // Every sample is tagged with its HH:MM stamp and covers real area.
         for smp in r.lowest.iter().chain(&r.highest) {
@@ -25206,10 +25346,8 @@ mod tests {
             out.created
                 .iter()
                 .map(|id| match &s.doc.get(*id).unwrap().geometry {
-                    Geometry::Curve(Curve::Polyline { points, .. }) => {
-                        points.iter().map(|p| [p.x, p.y, p.z]).collect()
-                    }
-                    g => panic!("expected polyline, got {g:?}"),
+                    Geometry::Mesh(m) => m.positions().iter().map(|p| [p.x, p.y, p.z]).collect(),
+                    g => panic!("expected stamp mesh, got {g:?}"),
                 })
                 .collect()
         };

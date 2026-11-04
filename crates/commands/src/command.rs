@@ -1259,14 +1259,21 @@ pub enum Command {
         data: Option<itsjustcad_doc::Climate>,
     },
     /// Ground shadow study: for each time step across a day, project every mesh
-    /// silhouette onto the ground (`z=0`) along the sun direction and emit the
-    /// projected convex hull as a closed polygon on a per-time `shadows-HH:MM`
-    /// layer. Requires a document location (set via `sun` or EPW import).
+    /// silhouette onto the ground (`z=0`) along the sun direction and emit one
+    /// flat mesh per stamp holding every projected convex hull (fan-triangulated)
+    /// on a per-time `shadows-HH:MM` layer. Requires a document location (set via
+    /// `sun` or EPW import).
     ShadowStudy {
-        /// Ids of the created shadow polygons, filled in on first exec and
-        /// reused on replay so the op-log reproduces identical objects.
+        /// Ids of the created shadow objects (one per daylight stamp; one per
+        /// hull for legacy commands), filled in on first exec and reused on
+        /// replay so the op-log reproduces identical objects.
         #[serde(default)]
         ids: Option<Vec<ObjectId>>,
+        /// Output-format version flag: `true` emits one mesh per stamp. Logs
+        /// written before it existed deserialize as `false` and replay the
+        /// legacy one-closed-polyline-per-hull output exactly.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stamp_mesh: bool,
         /// Date the sun positions are computed for.
         year: i32,
         month: u32,

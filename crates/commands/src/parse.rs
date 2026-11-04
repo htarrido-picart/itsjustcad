@@ -2076,6 +2076,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 }
                 Ok(Command::ShadowStudy {
                     ids: None,
+                    stamp_mesh: true,
                     year,
                     month,
                     day,
