@@ -22,7 +22,7 @@ mod stairs;
 mod structsection;
 
 pub use aabb::Aabb;
-pub use bvh::{ray_triangle, Bvh, TraversalStats, TriBvh};
+pub use bvh::{ray_triangle, Bvh, TraversalStats, TriBvh, RAY_TRIANGLE_EPS};
 pub use csg::{csg_difference, csg_intersection, csg_union, signed_volume, weld};
 pub use delaunay::triangulate;
 pub use earcut::{earcut, signed_area};

@@ -1,0 +1,19 @@
+[package]
+name = "itsjustcad-hwrt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kernel-mesh.workspace = true
+glam.workspace = true
+rayon.workspace = true
+
+# Metal ray tracing (#317): macOS and Mac Catalyst only. Every other target
+# (iOS devices, Linux, Windows) builds without any Apple dependency and uses
+# the CPU path. objc2 0.6 / objc2-metal 0.3 are already in the lockfile
+# through wgpu and crates/app.
+[target.'cfg(any(target_os = "macos", all(target_os = "ios", target_abi = "macabi")))'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"

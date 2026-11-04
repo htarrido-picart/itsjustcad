@@ -482,6 +482,12 @@ struct SkyBin {
 }
 
 impl AnnualSky {
+    /// The sun directions [`AnnualSky::face_irradiation`] may pass to its
+    /// occlusion callback, in bin order.
+    pub fn sun_directions(&self) -> impl Iterator<Item = [f64; 3]> + '_ {
+        self.bins.iter().filter_map(|b| b.sun)
+    }
+
     pub fn new(bins: &RadiationBins, year: i32, lat_deg: f64, lon_deg: f64, tz_hours: f64) -> Self {
         assert_eq!(bins.len(), 288, "bins must be 12 months x 24 hours");
         let mut out = Vec::new();
