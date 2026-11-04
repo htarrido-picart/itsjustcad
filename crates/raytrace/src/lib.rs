@@ -464,22 +464,25 @@ fn submit(scene: &Scene, hw: Option<&itsjustcad_hwrt::Tracer>, pieces: &[Piece])
 /// Tone-map an HDR accumulation buffer (summed over `samples` passes) to an RGBA
 /// image.
 fn resolve(accum: &[DVec3], samples: u32, s: &Settings) -> Image {
+    // Each pixel is a pure function of its own accumulator, with no
+    // cross-pixel reduction, so the parallel split is byte-identical to the
+    // serial loop (#321).
     let inv = 1.0 / samples.max(1) as f64;
     let mut pixels = vec![0u8; accum.len() * 4];
-    for (i, c) in accum.iter().enumerate() {
+    pixels.par_chunks_mut(4).zip(accum.par_iter()).with_min_len(4096).for_each(|(p, c)| {
         let [r, g, b] = tonemap::to_srgb8(*c * inv, s.tonemap);
-        pixels[i * 4] = r;
-        pixels[i * 4 + 1] = g;
-        pixels[i * 4 + 2] = b;
-        pixels[i * 4 + 3] = 255;
-    }
+        p.copy_from_slice(&[r, g, b, 255]);
+    });
     Image { width: s.width, height: s.height, pixels }
 }
 
 /// Render the scene to a finished image (all samples, no intermediate callback).
+///
+/// Only the final image is tone-mapped: no one sees the intermediate ones
+/// (#321).
 pub fn render(scene: &Scene, cam: &Camera, settings: &Settings) -> Image {
     let dummy = AtomicBool::new(false);
-    render_progressive(scene, cam, settings, |_| {}, &dummy)
+    accumulate(scene, cam, settings, None, &dummy)
 }
 
 /// Progressive render: accumulate `samples_per_pixel` passes, invoking
@@ -491,6 +494,18 @@ pub fn render_progressive(
     cam: &Camera,
     settings: &Settings,
     mut on_pass: impl FnMut(PassResult<'_>),
+    cancel: &AtomicBool,
+) -> Image {
+    accumulate(scene, cam, settings, Some(&mut on_pass), cancel)
+}
+
+/// The pass loop behind [`render`] and [`render_progressive`]. Intermediate
+/// images are resolved only when `on_pass` is given.
+fn accumulate(
+    scene: &Scene,
+    cam: &Camera,
+    settings: &Settings,
+    mut on_pass: Option<&mut dyn FnMut(PassResult<'_>)>,
     cancel: &AtomicBool,
 ) -> Image {
     let n = (settings.width as usize) * (settings.height as usize);
@@ -509,8 +524,10 @@ pub fn render_progressive(
             None => render_pass(scene, cam, settings, sample, &mut accum),
         }
         done = sample + 1;
-        let image = resolve(&accum, done, settings);
-        on_pass(PassResult { passes_done: done, passes_total: total, image: &image });
+        if let Some(on_pass) = on_pass.as_mut() {
+            let image = resolve(&accum, done, settings);
+            on_pass(PassResult { passes_done: done, passes_total: total, image: &image });
+        }
     }
     if let Some(hw) = hw {
         hw.report();
@@ -691,5 +708,46 @@ mod tests {
         );
         assert!(count <= 3, "cancel should stop the loop quickly: {count} passes");
         assert_eq!(img.pixels.len(), 24 * 16 * 4);
+    }
+
+    /// The parallel resolve is the serial per-pixel tone map, byte for byte,
+    /// on both operators and across zero, HDR and odd sample counts.
+    #[test]
+    fn parallel_resolve_matches_serial() {
+        let s = Settings { width: 37, height: 23, ..Default::default() };
+        let n = (s.width * s.height) as usize;
+        let accum: Vec<DVec3> = (0..n)
+            .map(|i| {
+                let t = i as f64;
+                DVec3::new((t * 0.37).sin().abs() * 9.0, (t * 0.011).powi(2), if i % 7 == 0 { 0.0 } else { t * 1e-3 })
+            })
+            .collect();
+        for tonemap in [ToneMap::Reinhard, ToneMap::Aces] {
+            let s = Settings { tonemap, ..s };
+            for samples in [0, 1, 3, 48] {
+                let inv = 1.0 / samples.max(1) as f64;
+                let mut want = Vec::with_capacity(n * 4);
+                for c in &accum {
+                    want.extend(tonemap::to_srgb8(*c * inv, tonemap));
+                    want.push(255);
+                }
+                let got = resolve(&accum, samples, &s);
+                assert_eq!((got.width, got.height), (s.width, s.height));
+                assert_eq!(got.pixels, want);
+            }
+        }
+    }
+
+    /// Cancelling `render_progressive` before the first pass still returns a
+    /// full-size black frame.
+    #[test]
+    fn cancel_before_first_pass_returns_black_frame() {
+        let (scene, cam) = box_scene();
+        let s = Settings { width: 12, height: 8, samples_per_pixel: 4, max_bounces: 2, ..Default::default() };
+        let cancel = AtomicBool::new(true);
+        let mut called = false;
+        let img = render_progressive(&scene, &cam, &s, |_| called = true, &cancel);
+        assert!(!called);
+        assert!(img.pixels.chunks(4).all(|p| p == [0, 0, 0, 255]));
     }
 }
