@@ -7,7 +7,7 @@
 //!
 //! Acceleration reuse: we build a [`kernel_mesh::Bvh`] over per-triangle AABBs
 //! (the same median-split tree the picker and solar sun-hours use) and query
-//! `ray_candidates`, then run the exact Möller–Trumbore test from
+//! `ray_closest_hit` / `ray_any_hit` with the exact Möller–Trumbore test from
 //! `kernel_mesh::ray_triangle`. We keep our own triangle vertex/normal/material
 //! arrays alongside so a hit yields the shading normal and material — the doc
 //! `Bvh`/`TriBvh` alone return only a distance.
@@ -187,20 +187,15 @@ impl Scene {
     }
 
     /// Nearest hit along `origin + t*dir`, `t > eps`. `dir` should be unit for
-    /// `t` to be a true distance. Reuses the kernel BVH candidate cull, then the
-    /// exact per-triangle test.
+    /// `t` to be a true distance. Closest-hit BVH traversal with the exact
+    /// per-triangle test.
     pub fn intersect(&self, origin: DVec3, dir: DVec3) -> Option<Hit> {
-        let mut best: Option<(f64, usize)> = None;
-        for i in self.bvh.ray_candidates(origin, dir) {
+        let best = self.bvh.ray_closest_hit(origin, dir, f64::INFINITY, |i| {
             let tri = &self.tris[i as usize];
-            if let Some(t) = ray_triangle(origin, dir, tri.v0, tri.v1, tri.v2)
-                && best.is_none_or(|(bt, _)| t < bt)
-            {
-                best = Some((t, i as usize));
-            }
-        }
-        best.map(|(t, i)| {
-            let tri = &self.tris[i];
+            ray_triangle(origin, dir, tri.v0, tri.v1, tri.v2)
+        });
+        best.map(|(i, t)| {
+            let tri = &self.tris[i as usize];
             // Orient the geometric normal against the ray so shading is
             // front-facing (double-sided surfaces).
             let mut n = tri.n;
@@ -220,15 +215,10 @@ impl Scene {
     /// shadow rays (next-event estimation to the sun). `dir` need not be unit;
     /// `max_t` is in units of `dir`.
     pub fn occluded(&self, origin: DVec3, dir: DVec3, max_t: f64) -> bool {
-        for i in self.bvh.ray_candidates(origin, dir) {
+        self.bvh.ray_any_hit(origin, dir, max_t, |i| {
             let tri = &self.tris[i as usize];
-            if let Some(t) = ray_triangle(origin, dir, tri.v0, tri.v1, tri.v2)
-                && t < max_t
-            {
-                return true;
-            }
-        }
-        false
+            ray_triangle(origin, dir, tri.v0, tri.v1, tri.v2).is_some_and(|t| t < max_t)
+        })
     }
 }
 

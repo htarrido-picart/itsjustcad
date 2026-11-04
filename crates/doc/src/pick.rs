@@ -220,20 +220,12 @@ pub fn pick_object_where(
     }
 
     let bvh = kernel_mesh::Bvh::build(&boxes);
-    let mut best: Option<(f64, ObjectId)> = None;
-    for i in bvh.ray_candidates(origin, dir) {
+    let best = bvh.ray_closest_hit(origin, dir, f64::INFINITY, |i| {
         let i = i as usize;
-        if seen[i] {
-            continue;
-        }
         let bb = boxes[i];
-        if let Some(t) = ray_aabb(origin, dir, bb.min, bb.max)
-            && best.is_none_or(|(bt, _)| t < bt)
-        {
-            best = Some((t, visible[i].id));
-        }
-    }
-    best.map(|(_, id)| id)
+        (!seen[i]).then(|| ray_aabb(origin, dir, bb.min, bb.max)).flatten()
+    });
+    best.map(|(i, _)| visible[i as usize].id)
 }
 
 #[cfg(test)]

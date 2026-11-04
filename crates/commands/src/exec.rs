@@ -31918,4 +31918,68 @@ mod tests {
             serde_json::to_string(&replayed.save_log()).unwrap()
         );
     }
+
+    /// #300 oracle on a real site: `ray_closest_hit` / `ray_any_hit` must match
+    /// the collect-then-test path over `ray_candidates` bit for bit. Needs a
+    /// site document: `BVH_SITE_FIXTURE=/path/site.json cargo test --release
+    /// -p itsjustcad-commands bvh_traversal_matches_oracle_on_site -- --ignored`.
+    #[test]
+    #[ignore = "needs BVH_SITE_FIXTURE"]
+    fn bvh_traversal_matches_oracle_on_site_fixture() {
+        let path = std::env::var("BVH_SITE_FIXTURE").expect("BVH_SITE_FIXTURE");
+        let s = crate::io::load_file(std::path::Path::new(&path)).expect("load site");
+        let tris: Vec<[DVec3; 3]> =
+            scene_triangles(&s.doc).iter().map(|t| t.map(DVec3::from_array)).collect();
+        let boxes: Vec<kernel_mesh::Aabb> =
+            tris.iter().map(|t| kernel_mesh::Aabb::from_points(t.iter().copied())).collect();
+        let bvh = kernel_mesh::Bvh::build(&boxes);
+        let aabb = s.doc.scene_aabb().expect("site geometry");
+        let mut rng = 0x5173_0300_u64;
+        let mut f = |lo: f64, hi: f64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            lo + (rng >> 11) as f64 / (1u64 << 53) as f64 * (hi - lo)
+        };
+        let (lo, hi) = (aabb.min, aabb.max);
+        let (mut hits, mut rays) = (0, 0);
+        for k in 0..200_000 {
+            let o = DVec3::new(f(lo.x, hi.x), f(lo.y, hi.y), f(lo.z, hi.z));
+            let d = match k % 4 {
+                // Sun-like rays from just above the ground.
+                0 => DVec3::new(f(-1.0, 1.0), f(-1.0, 1.0), f(0.05, 1.0)),
+                1 => [DVec3::X, DVec3::NEG_Y, DVec3::Z, DVec3::NEG_Z][(k / 4) % 4],
+                _ => DVec3::new(f(-1.0, 1.0), f(-1.0, 1.0), f(-1.0, 1.0)),
+            };
+            let o = if k % 4 == 0 { DVec3::new(o.x, o.y, lo.z + 1e-4) } else { o };
+            let test = |i: u32| {
+                let [a, b, c] = tris[i as usize];
+                kernel_mesh::ray_triangle(o, d, a, b, c)
+            };
+            let mut oracle: Option<(u32, f64)> = None;
+            for i in bvh.ray_candidates(o, d) {
+                if let Some(t) = test(i)
+                    && oracle.is_none_or(|(_, bt)| t < bt)
+                {
+                    oracle = Some((i, t));
+                }
+            }
+            let got = bvh.ray_closest_hit(o, d, f64::INFINITY, test);
+            assert_eq!(
+                got.map(|(i, t)| (i, t.to_bits())),
+                oracle.map(|(i, t)| (i, t.to_bits())),
+                "closest o={o} d={d}"
+            );
+            assert_eq!(bvh.ray_any_hit(o, d, f64::INFINITY, |i| test(i).is_some()), oracle.is_some());
+            if let Some((_, t)) = oracle {
+                // Shadow ray capped at the hit: only strictly nearer hits count.
+                let shadow = |i| test(i).is_some_and(|u| u < t);
+                let any = bvh.ray_candidates(o, d).into_iter().any(shadow);
+                assert_eq!(bvh.ray_any_hit(o, d, t, shadow), any, "any o={o} d={d} max_t={t}");
+                hits += 1;
+            }
+            rays += 1;
+        }
+        eprintln!("site oracle: {} tris, {rays} rays, {hits} hits", tris.len());
+    }
 }
