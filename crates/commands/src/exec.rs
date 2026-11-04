@@ -5007,7 +5007,7 @@ fn tri_centroid_normal(tri: &[DVec3; 3]) -> (DVec3, DVec3) {
 fn face_lit_one(
     tri: &[DVec3; 3],
     sun_dirs: &[DVec3],
-    bvh: &kernel_mesh::TriBvh,
+    mut occluded: impl FnMut(DVec3, DVec3) -> bool,
 ) -> (usize, DVec3, DVec3) {
     let (centroid, normal) = tri_centroid_normal(tri);
     // Lift the origin off the surface along the normal so the face's own
@@ -5015,7 +5015,7 @@ fn face_lit_one(
     let origin = centroid + normal * 1e-3;
     let lit = sun_dirs
         .iter()
-        .filter(|&&dir| normal.dot(dir) > 0.0 && !bvh.ray_occluded(origin, dir))
+        .filter(|&&dir| normal.dot(dir) > 0.0 && !occluded(origin, dir))
         .count();
     (lit, centroid, normal)
 }
@@ -5026,7 +5026,13 @@ fn face_lit_slots(
     sun_dirs: &[DVec3],
     bvh: &kernel_mesh::TriBvh,
 ) -> Vec<(usize, DVec3, DVec3)> {
-    faces.par_iter().map(|tri| face_lit_one(tri, sun_dirs, bvh)).collect()
+    if let Some(hw) = itsjustcad_hwrt::ShadowCaster::new(bvh, Some(sun_dirs)) {
+        return hw.map(bvh, faces, |tri, occ| face_lit_one(tri, sun_dirs, occ));
+    }
+    faces
+        .par_iter()
+        .map(|tri| face_lit_one(tri, sun_dirs, |o, d| bvh.ray_occluded(o, d)))
+        .collect()
 }
 
 /// Sequential reference for [`face_lit_slots`] (determinism oracle).
@@ -5036,7 +5042,10 @@ fn face_lit_slots_seq(
     sun_dirs: &[DVec3],
     bvh: &kernel_mesh::TriBvh,
 ) -> Vec<(usize, DVec3, DVec3)> {
-    faces.iter().map(|tri| face_lit_one(tri, sun_dirs, bvh)).collect()
+    faces
+        .iter()
+        .map(|tri| face_lit_one(tri, sun_dirs, |o, d| bvh.ray_occluded(o, d)))
+        .collect()
 }
 
 /// Per-face annual insolation for `radiation`: kWh/m²·yr, centroid, normal.
@@ -5045,12 +5054,12 @@ fn face_lit_slots_seq(
 fn face_radiation_one(
     tri: &[DVec3; 3],
     sky: &itsjustcad_solar::AnnualSky,
-    bvh: &kernel_mesh::TriBvh,
+    mut occluded: impl FnMut(DVec3, DVec3) -> bool,
 ) -> (f64, DVec3, DVec3) {
     let (centroid, normal) = tri_centroid_normal(tri);
     let origin = centroid + normal * 1e-3;
     let k = sky.face_irradiation(normal.to_array(), |s| {
-        bvh.ray_occluded(origin, DVec3::new(s[0], s[1], s[2]))
+        occluded(origin, DVec3::new(s[0], s[1], s[2]))
     });
     (k, centroid, normal)
 }
@@ -5089,9 +5098,13 @@ fn face_radiation_scores(
 ) -> Vec<(f64, DVec3, DVec3)> {
     let sky =
         itsjustcad_solar::AnnualSky::new(bins, year, loc.lat_deg, loc.lon_deg, loc.tz_hours);
+    let suns: Vec<DVec3> = sky.sun_directions().map(DVec3::from_array).collect();
+    if let Some(hw) = itsjustcad_hwrt::ShadowCaster::new(bvh, Some(&suns)) {
+        return hw.map(bvh, faces, |tri, occ| face_radiation_one(tri, &sky, occ));
+    }
     faces
         .par_iter()
-        .map(|tri| face_radiation_one(tri, &sky, bvh))
+        .map(|tri| face_radiation_one(tri, &sky, |o, d| bvh.ray_occluded(o, d)))
         .collect()
 }
 
@@ -32055,6 +32068,58 @@ mod tests {
             serde_json::to_string(&log).unwrap(),
             serde_json::to_string(&replayed.save_log()).unwrap()
         );
+    }
+
+    /// #317 on a real site: `facesunhours` and `radiation` per-face results
+    /// with hardware ray tracing equal the CPU path bit for bit. Skips when
+    /// the GPU gate fails. `BVH_SITE_FIXTURE=/path/site.json cargo test
+    /// --release -p itsjustcad-commands hwrt_matches_cpu_on_site -- --ignored`.
+    #[test]
+    #[ignore = "needs BVH_SITE_FIXTURE"]
+    fn hwrt_matches_cpu_on_site_fixture() {
+        let path = std::env::var("BVH_SITE_FIXTURE").expect("BVH_SITE_FIXTURE");
+        let s = crate::io::load_file(std::path::Path::new(&path)).expect("load site");
+        let tris: Vec<[DVec3; 3]> =
+            scene_triangles(&s.doc).iter().map(|t| t.map(DVec3::from_array)).collect();
+        let bvh = kernel_mesh::TriBvh::build(tris.clone());
+        let loc = GeoLocation { lat_deg: 40.71, lon_deg: -74.01, tz_hours: -5.0 };
+        let mut sun_dirs = Vec::new();
+        for slot in 0..48 {
+            let utc = (slot as f64 * 30.0 - loc.tz_hours * 60.0).rem_euclid(1440.0);
+            let pos = itsjustcad_solar::solar_position(
+                2024, 6, 21, (utc / 60.0) as u32, (utc % 60.0) as u32, loc.lat_deg, loc.lon_deg,
+            );
+            if pos.altitude_deg > 0.0 {
+                let d = itsjustcad_solar::sun_direction(pos.azimuth_deg, pos.altitude_deg);
+                sun_dirs.push(DVec3::new(d[0] as f64, d[1] as f64, d[2] as f64));
+            }
+        }
+        let bins: itsjustcad_solar::RadiationBins = (0..288)
+            .map(|i| if (6..19).contains(&(i % 24)) { [600.0, 90.0] } else { [0.0, 0.0] })
+            .collect();
+        let sky = itsjustcad_solar::AnnualSky::new(&bins, 2026, loc.lat_deg, loc.lon_deg, loc.tz_hours);
+        let cpu_occ = |o, d| bvh.ray_occluded(o, d);
+
+        let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+        let mut mix = |v: u64| digest = (digest ^ v).wrapping_mul(0x0100_0000_01b3);
+        let Some(hw) = itsjustcad_hwrt::ShadowCaster::new(&bvh, Some(&sun_dirs)) else {
+            eprintln!("no hardware ray tracing: skipped");
+            return;
+        };
+        let gpu = hw.map(&bvh, &tris, |t, occ| face_lit_one(t, &sun_dirs, occ));
+        let cpu: Vec<_> = tris.par_iter().map(|t| face_lit_one(t, &sun_dirs, cpu_occ)).collect();
+        assert!(gpu == cpu, "facesunhours differs");
+        gpu.iter().for_each(|r| mix(r.0 as u64));
+        let suns: Vec<DVec3> = sky.sun_directions().map(DVec3::from_array).collect();
+        let hw = itsjustcad_hwrt::ShadowCaster::new(&bvh, Some(&suns)).expect("caster");
+        let gpu = hw.map(&bvh, &tris, |t, occ| face_radiation_one(t, &sky, occ));
+        let cpu: Vec<_> = tris.par_iter().map(|t| face_radiation_one(t, &sky, cpu_occ)).collect();
+        assert!(
+            gpu.iter().zip(&cpu).all(|(a, b)| a.0.to_bits() == b.0.to_bits() && a.1 == b.1 && a.2 == b.2),
+            "radiation differs"
+        );
+        gpu.iter().for_each(|r| mix(r.0.to_bits()));
+        eprintln!("hwrt site: {} tris, digest {digest:016x}", tris.len());
     }
 
     /// #300 oracle on a real site: `ray_closest_hit` / `ray_any_hit` must match

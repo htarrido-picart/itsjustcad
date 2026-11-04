@@ -89,6 +89,9 @@ pub struct Bvh {
     root: u32,
     /// Largest coordinate magnitude in the tree (∞ if unbounded).
     reach: f64,
+    /// `prim_leaf[i]`: index into [`Bvh::leaves`] of the leaf holding
+    /// primitive `i` (for [`Bvh::ray_reaches_prim`]).
+    prim_leaf: Vec<u32>,
 }
 
 /// Max primitives per leaf. Small leaves keep traversal shallow; too small and
@@ -129,13 +132,26 @@ impl Bvh {
     /// Collapse a binary tree (root at node 0) to 4-wide nodes, pre-order.
     fn collapse(bin: BinTree) -> Self {
         let mut out =
-            Self { nodes: Vec::new(), leaves: Vec::new(), prims: Vec::new(), root: EMPTY, reach: 0.0 };
+            Self {
+                nodes: Vec::new(),
+                leaves: Vec::new(),
+                prims: Vec::new(),
+                root: EMPTY,
+                reach: 0.0,
+                prim_leaf: Vec::new(),
+            };
         if !bin.nodes.is_empty() {
             let b = bin.node_bounds(0);
             out.reach = b.min.abs().max(b.max.abs()).max_element();
             out.root = out.collapse_node(&bin, 0);
         }
         out.prims = bin.prims;
+        out.prim_leaf = vec![0; out.prims.len()];
+        for (li, l) in out.leaves.iter().enumerate() {
+            for &p in &out.prims[l.start as usize..(l.start + l.count) as usize] {
+                out.prim_leaf[p as usize] = li as u32;
+            }
+        }
         out
     }
 
@@ -220,6 +236,22 @@ impl Bvh {
         test: impl FnMut(u32) -> bool,
     ) -> bool {
         self.any_hit_tally(origin, dir, max_t, test, &mut ())
+    }
+
+    /// Does `ray_any_hit(origin, dir, f64::INFINITY, test)` reach primitive
+    /// `prim`, i.e. would it call `test(prim)` if no earlier primitive were
+    /// accepted? True exactly when `prim`'s leaf passes the same `f64` slab
+    /// test the traversal admits leaves with: the `f32` inner-node pruning
+    /// never drops a leaf that test admits (see the module docs). So
+    /// `ray_reaches_prim(o, d, i) && test(i)` implies `ray_any_hit` is true.
+    pub fn ray_reaches_prim(&self, origin: DVec3, dir: DVec3, prim: u32) -> bool {
+        ray_aabb(origin, dir.recip(), self.prim_leaf_bounds(prim)).is_some_and(|t| t <= f64::INFINITY)
+    }
+
+    /// The exact box of the leaf holding primitive `prim`: the box
+    /// [`Bvh::ray_reaches_prim`] tests.
+    pub fn prim_leaf_bounds(&self, prim: u32) -> Aabb {
+        self.leaves[self.prim_leaf[prim as usize] as usize].bounds
     }
 
     /// [`Bvh::ray_any_hit`] that also adds its traversal work to `stats`.
@@ -915,6 +947,31 @@ impl TriBvh {
         self.tris.len()
     }
 
+    /// The triangles, in the index order [`TriBvh::ray_hits_prim`] uses.
+    pub fn triangles(&self) -> &[[DVec3; 3]] {
+        &self.tris
+    }
+
+    /// Does [`TriBvh::ray_occluded`]'s traversal reach triangle `i`? See
+    /// [`Bvh::ray_reaches_prim`].
+    pub fn ray_reaches_prim(&self, origin: DVec3, dir: DVec3, i: u32) -> bool {
+        self.bvh.ray_reaches_prim(origin, dir, i)
+    }
+
+    /// The box [`TriBvh::ray_reaches_prim`] tests for triangle `i`.
+    pub fn prim_leaf_bounds(&self, i: u32) -> Aabb {
+        self.bvh.prim_leaf_bounds(i)
+    }
+
+    /// Would [`TriBvh::ray_occluded`] accept triangle `i`? True only when its
+    /// traversal reaches `i` and the exact test hits it, so a `true` here
+    /// implies `ray_occluded(origin, dir)` is `true`, bit for bit. Lets a
+    /// hardware ray tracer's candidate be confirmed with one exact test.
+    pub fn ray_hits_prim(&self, origin: DVec3, dir: DVec3, i: u32) -> bool {
+        let [a, b, c] = self.tris[i as usize];
+        self.bvh.ray_reaches_prim(origin, dir, i) && ray_triangle(origin, dir, a, b, c).is_some()
+    }
+
     /// Does any triangle block the ray `origin + t*dir`, `t > eps`? `dir` need
     /// not be normalized. Used for sun-occlusion: true = a triangle shadows the
     /// point. Only culled candidate triangles get the exact Möller–Trumbore test.
@@ -936,11 +993,14 @@ impl TriBvh {
     }
 }
 
+/// The tolerance [`ray_triangle`] uses on `|det|`, the barycentrics and `t`.
+pub const RAY_TRIANGLE_EPS: f64 = 1e-9;
+
 /// Möller–Trumbore ray/triangle intersection in f64 doc space. Returns the ray
 /// parameter `t > eps` at the hit (distance along `dir`), or `None` on a miss.
 /// `dir` need not be normalized; `t` is in units of `dir`'s length.
 pub fn ray_triangle(origin: DVec3, dir: DVec3, v0: DVec3, v1: DVec3, v2: DVec3) -> Option<f64> {
-    const EPS: f64 = 1e-9;
+    const EPS: f64 = RAY_TRIANGLE_EPS;
     let e1 = v1 - v0;
     let e2 = v2 - v0;
     let pvec = dir.cross(e2);
@@ -1046,6 +1106,32 @@ mod tests {
             }
             let brute = brute_hit(&tris, o, d).is_some();
             assert_eq!(brute, bvh.ray_occluded(o, d), "occlusion mismatch o={o} d={d}");
+        }
+    }
+
+    /// `ray_occluded` is exactly "some triangle passes `ray_hits_prim`": the
+    /// single-candidate confirmation a hardware ray tracer relies on (#317).
+    #[test]
+    fn ray_hits_prim_characterises_ray_occluded() {
+        let mut rng = Rng(0x317_317_317);
+        let mut tris = random_tris(&mut rng, 400);
+        // Shared edges and an axis-aligned (zero-thickness box) fan.
+        for k in 0..30 {
+            let x = k as f64;
+            tris.push([DVec3::new(x, 0.0, 0.0), DVec3::new(x + 1.0, 0.0, 0.0), DVec3::new(x, 1.0, 0.0)]);
+            tris.push([DVec3::new(x + 1.0, 0.0, 0.0), DVec3::new(x + 1.0, 1.0, 0.0), DVec3::new(x, 1.0, 0.0)]);
+        }
+        let tb = TriBvh::build(tris.clone());
+        for k in 0..4000 {
+            let o = rng.v(-50.0, 50.0);
+            let d = match k % 3 {
+                0 => rng.v(-1.0, 1.0),
+                1 => [DVec3::X, DVec3::NEG_Y, DVec3::Z, DVec3::NEG_Z][k % 4],
+                _ => DVec3::new(rng.f(-1.0, 1.0), rng.f(-1.0, 1.0), 1e-12),
+            };
+            let o = if k % 5 == 0 { DVec3::new(rng.f(0.0, 30.0), rng.f(0.0, 1.0), -1.0) } else { o };
+            let any = (0..tris.len() as u32).any(|i| tb.ray_hits_prim(o, d, i));
+            assert_eq!(any, tb.ray_occluded(o, d), "o={o} d={d}");
         }
     }
 

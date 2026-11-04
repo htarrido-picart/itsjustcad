@@ -16,6 +16,7 @@ itsjustcad-constraints.workspace = true
 itsjustcad-doc.workspace = true
 itsjustcad-solar.workspace = true
 kernel-mesh.workspace = true
+itsjustcad-hwrt.workspace = true
 kernel-curve.workspace = true
 kernel-occt = { workspace = true }
 subdivision.workspace = true
