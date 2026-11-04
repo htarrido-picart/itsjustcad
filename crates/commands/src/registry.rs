@@ -812,7 +812,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "shadowstudy",
             usage: "shadowstudy <YYYY-MM-DD> <from-HH:MM> <to-HH:MM> <step-min>",
-            summary: "Cast ground shadows of every mesh onto z=0 for each time step across a day, one closed polygon (projected convex hull per object) per stamp on 'shadows-HH:MM' layers. Needs a location (sun/location/EPW). Example: shadowstudy 2024-06-21 09:00 15:00 120",
+            summary: "Cast ground shadows of every mesh onto z=0 for each time step across a day, one flat filled mesh per stamp (holding every object's projected convex hull) on its 'shadows-HH:MM' layer; `report shadowstudy` lists each hull's area. Needs a location (sun/location/EPW). Example: shadowstudy 2024-06-21 09:00 15:00 120",
             category: Category::Analyze,
         },
         CommandSpec {
