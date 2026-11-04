@@ -10,6 +10,7 @@ license.workspace = true
 glam.workspace = true
 rayon.workspace = true
 kernel-mesh.workspace = true
+itsjustcad-hwrt.workspace = true
 itsjustcad-doc.workspace = true
 itsjustcad-solar.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }

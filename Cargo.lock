@@ -2872,6 +2872,7 @@ dependencies = [
  "glam 0.30.10",
  "image",
  "itsjustcad-doc",
+ "itsjustcad-hwrt",
  "itsjustcad-solar",
  "kernel-mesh",
  "rayon",

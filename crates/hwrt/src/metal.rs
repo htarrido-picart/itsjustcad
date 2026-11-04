@@ -2,9 +2,8 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 //! Metal plumbing: the device gate, runtime shader compilation, bounding-box
-//! acceleration structures and batched compute dispatch. Kept generic so a
-//! closest-hit kernel (#318) can reuse [`Gpu`], [`Gpu::pipeline`],
-//! [`Gpu::build_box_accel`] and [`Gpu::dispatch`].
+//! and triangle acceleration structures and batched compute dispatch, shared
+//! by [`crate::ShadowCaster`] (#317) and [`crate::Tracer`] (#318).
 //!
 //! Device: `MTLCreateSystemDefaultDevice`, not wgpu's `MTLDevice`. Analysis
 //! commands run in `itsjustcad-commands`, which also runs headless (CLI,
@@ -28,9 +27,9 @@ use objc2_foundation::{NSArray, NSString};
 use objc2_metal::{
     MTLAccelerationStructure, MTLAccelerationStructureBoundingBoxGeometryDescriptor,
     MTLAccelerationStructureCommandEncoder, MTLAccelerationStructureGeometryDescriptor,
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLAccelerationStructureTriangleGeometryDescriptor, MTLAttributeFormat, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary, MTLMathMode,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLGPUFamily, MTLLibrary, MTLMathMode,
     MTLPrimitiveAccelerationStructureDescriptor, MTLResourceOptions, MTLSize,
 };
 
@@ -121,9 +120,27 @@ impl Gpu {
         geo.setBoundingBoxCount(count);
         // SAFETY: 24 = size_of(MTLAxisAlignedBoundingBox), the buffer's layout.
         unsafe { geo.setBoundingBoxStride(24) };
+        self.build_accel(Retained::into_super(geo))
+    }
+
+    /// Build a primitive acceleration structure over `count` triangles stored
+    /// as consecutive packed `float3` vertices (36 bytes per triangle, no
+    /// index buffer). Opaque, so `intersector` closest/any-hit queries run in
+    /// hardware. Blocks until built.
+    pub fn build_triangle_accel(&self, vertices: &Buffer, count: usize) -> Result<Accel, String> {
+        let geo = MTLAccelerationStructureTriangleGeometryDescriptor::descriptor();
+        geo.setVertexBuffer(Some(vertices));
+        geo.setVertexFormat(MTLAttributeFormat::Float3);
+        geo.setVertexStride(12);
+        geo.setTriangleCount(count);
+        geo.setOpaque(true);
+        self.build_accel(Retained::into_super(geo))
+    }
+
+    fn build_accel(&self, geo: Retained<MTLAccelerationStructureGeometryDescriptor>) -> Result<Accel, String> {
         let desc = MTLPrimitiveAccelerationStructureDescriptor::descriptor();
         let geos: Retained<NSArray<MTLAccelerationStructureGeometryDescriptor>> =
-            NSArray::from_retained_slice(&[Retained::into_super(geo)]);
+            NSArray::from_retained_slice(&[geo]);
         desc.setGeometryDescriptors(Some(&geos));
         let sizes = self.device.accelerationStructureSizesWithDescriptor(&desc);
         let accel = self
@@ -147,29 +164,43 @@ impl Gpu {
     /// `buffers[k]` binds at index `k + 1` (index 0 is the acceleration
     /// structure); `n` itself is passed as a `uint` after the buffers.
     pub fn dispatch(&self, pipe: &Pipeline, accel: &Accel, buffers: &[&Buffer], n: u32) -> Result<Job, String> {
+        self.dispatch_all(accel, &[(pipe, buffers, n)])
+    }
+
+    /// [`Gpu::dispatch`] for several independent kernels in one command
+    /// buffer and one concurrent encoder, so they may overlap on the GPU and
+    /// cost one round trip. Dispatches with `n == 0` are skipped.
+    pub fn dispatch_all(&self, accel: &Accel, work: &[(&Pipeline, &[&Buffer], u32)]) -> Result<Job, String> {
         let cb = self.queue.commandBuffer().ok_or("no command buffer")?;
-        let enc = cb.computeCommandEncoder().ok_or("no compute encoder")?;
-        enc.setComputePipelineState(pipe);
-        let width = pipe.threadExecutionWidth().max(1);
-        let group = (width * 2).min(pipe.maxTotalThreadsPerThreadgroup()).max(1);
-        // SAFETY: indices match the kernel signature; buffers outlive the
-        // command buffer because the caller keeps them with the [`Job`].
-        unsafe {
-            enc.setAccelerationStructure_atBufferIndex(Some(accel), 0);
-            for (k, b) in buffers.iter().enumerate() {
-                enc.setBuffer_offset_atIndex(Some(b), 0, k + 1);
+        let enc = cb
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+            .ok_or("no compute encoder")?;
+        for &(pipe, buffers, n) in work {
+            if n == 0 {
+                continue;
             }
-            let nn = n;
-            enc.setBytes_length_atIndex(
-                NonNull::from(&nn).cast::<c_void>(),
-                std::mem::size_of::<u32>(),
-                buffers.len() + 1,
+            enc.setComputePipelineState(pipe);
+            let width = pipe.threadExecutionWidth().max(1);
+            let group = (width * 2).min(pipe.maxTotalThreadsPerThreadgroup()).max(1);
+            // SAFETY: indices match the kernel signature; buffers outlive the
+            // command buffer because the caller keeps them with the [`Job`].
+            unsafe {
+                enc.setAccelerationStructure_atBufferIndex(Some(accel), 0);
+                for (k, b) in buffers.iter().enumerate() {
+                    enc.setBuffer_offset_atIndex(Some(b), 0, k + 1);
+                }
+                let nn = n;
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&nn).cast::<c_void>(),
+                    std::mem::size_of::<u32>(),
+                    buffers.len() + 1,
+                );
+            }
+            enc.dispatchThreads_threadsPerThreadgroup(
+                MTLSize { width: n.max(1) as usize, height: 1, depth: 1 },
+                MTLSize { width: group, height: 1, depth: 1 },
             );
         }
-        enc.dispatchThreads_threadsPerThreadgroup(
-            MTLSize { width: n.max(1) as usize, height: 1, depth: 1 },
-            MTLSize { width: group, height: 1, depth: 1 },
-        );
         enc.endEncoding();
         cb.commit();
         Ok(Job { cb })

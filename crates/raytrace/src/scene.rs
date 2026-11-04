@@ -11,9 +11,18 @@
 //! `kernel_mesh::ray_triangle`. We keep our own triangle vertex/normal/material
 //! arrays alongside so a hit yields the shading normal and material — the doc
 //! `Bvh`/`TriBvh` alone return only a distance.
+//!
+//! Hardware ray tracing (#318): on an Apple9 GPU the batched queries
+//! ([`Scene::submit`] / [`Scene::finish`]) run on
+//! [`itsjustcad_hwrt::Tracer`] in f32; everywhere else, and with
+//! `ITSJUSTCAD_HWRT=cpu`, they map [`Scene::intersect`] / [`Scene::occluded`].
+
+use std::sync::OnceLock;
 
 use glam::DVec3;
+use itsjustcad_hwrt::Tracer;
 use kernel_mesh::{ray_triangle, Aabb, Bvh};
+use rayon::prelude::*;
 
 use crate::material::Material;
 
@@ -94,6 +103,12 @@ impl Sky {
     }
 }
 
+/// Rays started by [`Scene::submit`].
+pub(crate) enum Pending {
+    Hw(itsjustcad_hwrt::Batch),
+    Cpu,
+}
+
 /// The complete ray-traceable scene.
 pub struct Scene {
     tris: Vec<Tri>,
@@ -103,6 +118,8 @@ pub struct Scene {
     pub sky: Sky,
     /// World-space AABB of all geometry (for camera framing / epsilon scaling).
     pub bounds: Option<Aabb>,
+    /// The GPU scene, built on first use by a batched render.
+    hw: OnceLock<Option<Tracer>>,
 }
 
 /// A coarse lobe classification the integrator uses to decide whether to run
@@ -177,7 +194,7 @@ impl SceneBuilder {
                     .expect("non-empty"),
             )
         };
-        Scene { tris: self.tris, materials: self.materials, bvh, sun, sky, bounds }
+        Scene { tris: self.tris, materials: self.materials, bvh, sun, sky, bounds, hw: OnceLock::new() }
     }
 }
 
@@ -194,21 +211,99 @@ impl Scene {
             let tri = &self.tris[i as usize];
             ray_triangle(origin, dir, tri.v0, tri.v1, tri.v2)
         });
-        best.map(|(i, t)| {
-            let tri = &self.tris[i as usize];
-            // Orient the geometric normal against the ray so shading is
-            // front-facing (double-sided surfaces).
-            let mut n = tri.n;
-            if n.dot(dir) > 0.0 {
-                n = -n;
+        best.map(|(i, t)| self.hit_on(origin, dir, i, t))
+    }
+
+    /// The hit on triangle `i` at `t`, front-facing.
+    fn hit_on(&self, origin: DVec3, dir: DVec3, i: u32, t: f64) -> Hit {
+        let tri = &self.tris[i as usize];
+        // Orient the geometric normal against the ray so shading is
+        // front-facing (double-sided surfaces).
+        let mut n = tri.n;
+        if n.dot(dir) > 0.0 {
+            n = -n;
+        }
+        Hit {
+            t,
+            point: origin + dir * t,
+            normal: n,
+            material: self.materials[tri.mat as usize],
+        }
+    }
+
+    /// The hardware ray tracer for this scene, or `None` when unavailable
+    /// or forced off (`ITSJUSTCAD_HWRT=cpu`). Builds it on first call.
+    pub(crate) fn hw(&self) -> Option<&Tracer> {
+        self.hw
+            .get_or_init(|| {
+                Tracer::new(self.tris.len(), |i| {
+                    let t = &self.tris[i];
+                    [t.v0, t.v1, t.v2]
+                })
+            })
+            .as_ref()
+    }
+
+    /// Start the closest hit for each ray in `rays` and the unbounded
+    /// occlusion test for each in `shadows` (both lists of pieces): one GPU
+    /// round trip on `hw`, else nothing until [`Scene::finish`] runs them on
+    /// the CPU.
+    pub(crate) fn submit(&self, hw: Option<&Tracer>, rays: &[&[[DVec3; 2]]], shadows: &[&[[DVec3; 2]]]) -> Pending {
+        match hw {
+            Some(hw) => Pending::Hw(hw.submit(rays, shadows)),
+            None => Pending::Cpu,
+        }
+    }
+
+    /// Finish a [`Scene::submit`] of the same `rays` and `shadows`: the
+    /// closest `(triangle, t)` per ray into `hits` (f32 `t` on the GPU, the
+    /// exact one on the CPU; turn one into a [`Hit`] with [`Scene::hit_at`])
+    /// and `occluded(o, d, ∞)` per shadow ray into `occ`, pieces flattened.
+    pub(crate) fn finish(
+        &self,
+        hw: Option<&Tracer>,
+        p: Pending,
+        rays: &[&[[DVec3; 2]]],
+        shadows: &[&[[DVec3; 2]]],
+        hits: &mut [Option<(u32, f32)>],
+        occ: &mut [bool],
+    ) {
+        if let (Pending::Hw(b), Some(hw)) = (p, hw) {
+            return hw.finish(b, hits, occ);
+        }
+        let mut hs = hits;
+        let mut os = occ;
+        let mut work = Vec::with_capacity(rays.len());
+        for (r, sh) in rays.iter().zip(shadows) {
+            let (h, ht) = std::mem::take(&mut hs).split_at_mut(r.len());
+            let (o, ot) = std::mem::take(&mut os).split_at_mut(sh.len());
+            (hs, os) = (ht, ot);
+            work.push((*r, *sh, h, o));
+        }
+        work.into_par_iter().for_each(|(r, sh, h, o)| {
+            for (h, &[o, d]) in h.iter_mut().zip(r) {
+                *h = self
+                    .bvh
+                    .ray_closest_hit(o, d, f64::INFINITY, |i| {
+                        let tri = &self.tris[i as usize];
+                        ray_triangle(o, d, tri.v0, tri.v1, tri.v2)
+                    })
+                    .map(|(i, t)| (i, t as f32));
             }
-            Hit {
-                t,
-                point: origin + dir * t,
-                normal: n,
-                material: self.materials[tri.mat as usize],
+            for (b, &[o, d]) in o.iter_mut().zip(sh) {
+                *b = self.occluded(o, d, f64::INFINITY);
             }
-        })
+        });
+    }
+
+    /// The hit on triangle `i` found at `t32` by [`Scene::closest_batch`].
+    /// `t` is recomputed with the exact f64 test on that one triangle, so a
+    /// hit on the primitive [`Scene::intersect`] picks is its hit bit for bit;
+    /// `t32` stands in only when f64 rejects what f32 accepted.
+    pub(crate) fn hit_at(&self, origin: DVec3, dir: DVec3, i: u32, t32: f32) -> Hit {
+        let v = &self.tris[i as usize];
+        let t = ray_triangle(origin, dir, v.v0, v.v1, v.v2).unwrap_or(t32 as f64);
+        self.hit_on(origin, dir, i, t)
     }
 
     /// Is the segment from `origin` toward `dir` blocked before `max_t`? Used for

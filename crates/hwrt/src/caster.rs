@@ -23,10 +23,6 @@ const SHADER: &str = include_str!("shadow.metal");
 /// around 50 MB for `radiation`.
 const ITEMS_PER_BATCH: usize = 8192;
 
-fn stats_enabled() -> bool {
-    std::env::var_os("ITSJUSTCAD_HWRT_STATS").is_some_and(|v| !v.is_empty() && v != "0")
-}
-
 /// The shadow pipeline, compiled once per process.
 fn pipeline(gpu: &Gpu) -> Option<&'static Shared<Pipeline>> {
     static PIPE: OnceLock<Option<Shared<Pipeline>>> = OnceLock::new();
@@ -34,7 +30,7 @@ fn pipeline(gpu: &Gpu) -> Option<&'static Shared<Pipeline>> {
         let t = Instant::now();
         match gpu.pipeline(SHADER, "shadow_any_hit") {
             Ok(p) => {
-                if stats_enabled() {
+                if crate::stats_enabled() {
                     eprintln!("hwrt: shader compile {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
                 }
                 Some(Shared(p))
@@ -108,7 +104,7 @@ impl ShadowCaster {
                 return None;
             }
         };
-        if stats_enabled() {
+        if crate::stats_enabled() {
             eprintln!(
                 "hwrt: {} tris; pack {:.1} ms, AS build {:.1} ms",
                 tris.len(),
@@ -161,7 +157,7 @@ impl ShadowCaster {
         if let Some(p) = pending.take() {
             out.extend(self.finish(bvh, p, &f, &tally, &mut gpu_s, &mut wait_s));
         }
-        if stats_enabled() {
+        if crate::stats_enabled() {
             let g = |a: &AtomicU64| a.load(Relaxed);
             let rays = g(&tally.rays).max(1) as f64;
             let rerun = g(&tally.rechecked) + g(&tally.cpu_only);
