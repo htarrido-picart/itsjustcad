@@ -678,6 +678,79 @@ impl Document {
         Some((obj, index))
     }
 
+    /// Batched `remove`: the same result as calling `remove` on each id in
+    /// order and keeping the `Some`s (missing and repeated ids are skipped,
+    /// each index is the one that sequential call would have returned), in
+    /// one pass over the creation order instead of one per id.
+    pub fn remove_many(&mut self, ids: &[ObjectId]) -> Vec<(SceneObject, usize)> {
+        let mut objs = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(obj) = self.objects.remove(id) {
+                self.selection.remove(id);
+                objs.push(obj);
+            }
+        }
+        if objs.is_empty() {
+            return Vec::new();
+        }
+        self.generation += 1;
+        let mut pos: std::collections::HashMap<ObjectId, usize> =
+            objs.iter().map(|o| (o.id, usize::MAX)).collect();
+        for (i, id) in self.creation_order.iter().enumerate() {
+            if let Some(p) = pos.get_mut(id) {
+                *p = i;
+            }
+        }
+        self.creation_order.retain(|id| !pos.contains_key(id));
+        // Sequential index = original position minus earlier-removed ids that
+        // sat before it.
+        let mut removed = Fenwick::new(self.creation_order.len() + objs.len());
+        objs.into_iter()
+            .map(|obj| {
+                let p = pos[&obj.id];
+                assert!(p != usize::MAX, "creation_order consistent with objects");
+                let index = p - removed.prefix(p);
+                removed.add(p);
+                (obj, index)
+            })
+            .collect()
+    }
+
+    /// Batched undo of `remove_many` / a sequential remove loop: the same
+    /// result as `restore(obj.clone(), index)` over `objs` in REVERSE order
+    /// (clamping included), in one rebuild of the creation order.
+    pub fn restore_many(&mut self, objs: &[(SceneObject, usize)]) {
+        if objs.is_empty() {
+            return;
+        }
+        self.generation += 1;
+        let m = self.creation_order.len();
+        let len = m + objs.len();
+        // Insert t (t-th applied, i.e. objs reversed) lands at index
+        // min(idx, m + t) of a list of length m + t. Walking inserts from last
+        // to first, each takes the index-th still-free final slot; the
+        // pre-existing ids fill the remaining slots in their order.
+        let mut free = Fenwick::ones(len);
+        let mut slots: Vec<Option<ObjectId>> = vec![None; len];
+        for (t, (obj, index)) in objs.iter().enumerate() {
+            // objs[t] is applied at step objs.len() - 1 - t.
+            let step = objs.len() - 1 - t;
+            let slot = free.find_nth((*index).min(m + step));
+            free.remove(slot);
+            slots[slot] = Some(obj.id);
+        }
+        let mut old = self.creation_order.drain(..);
+        let order: Vec<ObjectId> = slots
+            .into_iter()
+            .map(|s| s.unwrap_or_else(|| old.next().expect("slot count matches")))
+            .collect();
+        drop(old);
+        self.creation_order = order;
+        for (obj, _) in objs.iter().rev() {
+            self.objects.insert(obj.id, obj.clone());
+        }
+    }
+
     pub fn sheet(&self, name: &str) -> Option<&Sheet> {
         self.sheets.iter().find(|s| s.name == name)
     }
@@ -769,6 +842,62 @@ fn block_geometry_aabb(g: &BlockGeometry) -> Aabb {
 }
 
 /// Pure pick expansion: `id` plus the members of every group containing it.
+/// Fenwick tree of 0/1 marks over `0..n` slots, for the batched
+/// remove/restore index arithmetic.
+struct Fenwick(Vec<u32>);
+
+impl Fenwick {
+    fn new(n: usize) -> Self {
+        Fenwick(vec![0; n + 1])
+    }
+
+    /// Every slot marked, built in O(n).
+    fn ones(n: usize) -> Self {
+        Fenwick((0..=n).map(|i| i.isolate_lowest_one() as u32).collect())
+    }
+
+    fn update(&mut self, slot: usize, delta: u32) {
+        let mut i = slot + 1;
+        while i < self.0.len() {
+            self.0[i] = self.0[i].wrapping_add(delta);
+            i += i.isolate_lowest_one();
+        }
+    }
+
+    fn add(&mut self, slot: usize) {
+        self.update(slot, 1);
+    }
+
+    fn remove(&mut self, slot: usize) {
+        self.update(slot, u32::MAX);
+    }
+
+    /// Marked slots in `0..end`.
+    fn prefix(&self, end: usize) -> usize {
+        let (mut i, mut sum) = (end, 0usize);
+        while i > 0 {
+            sum += self.0[i] as usize;
+            i -= i.isolate_lowest_one();
+        }
+        sum
+    }
+
+    /// The `n`-th (0-based) marked slot.
+    fn find_nth(&self, n: usize) -> usize {
+        let (mut pos, mut rest) = (0usize, n);
+        let mut step = (self.0.len() - 1).checked_ilog2().map_or(0, |b| 1usize << b);
+        while step > 0 {
+            let next = pos + step;
+            if next < self.0.len() && (self.0[next] as usize) <= rest {
+                pos = next;
+                rest -= self.0[next] as usize;
+            }
+            step >>= 1;
+        }
+        pos
+    }
+}
+
 /// One pass only — overlapping groups do not chain transitively.
 pub fn expand_to_group(
     groups: &BTreeMap<String, BTreeSet<ObjectId>>,
@@ -1287,5 +1416,99 @@ mod tests {
         let g3 = doc.generation;
         doc.restore(obj, index);
         assert!(doc.generation > g3, "restore bumps");
+    }
+
+    /// Deterministic xorshift so the randomized tests need no dev-dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    fn random_doc(rng: &mut Rng) -> (Document, Vec<ObjectId>) {
+        let mut doc = Document::default();
+        let n = rng.below(40);
+        let ids: Vec<_> = (0..n)
+            .map(|_| {
+                let o = obj_at(None, DVec3::ZERO);
+                let id = o.id;
+                doc.insert(o);
+                id
+            })
+            .collect();
+        for g in 0..rng.below(3) {
+            let members = ids.iter().filter(|_| rng.below(3) == 0).copied().collect();
+            doc.groups.insert(format!("g{g}"), members);
+        }
+        doc.selection = ids.iter().filter(|_| rng.below(2) == 0).copied().collect();
+        (doc, ids)
+    }
+
+    fn same_but_generation(a: &Document, b: &Document) -> bool {
+        let mut b = b.clone();
+        b.generation = a.generation;
+        *a == b
+    }
+
+    #[test]
+    fn remove_many_matches_sequential_remove() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..500 {
+            let (doc, ids) = random_doc(&mut rng);
+            // Random subset in random order, plus repeats and a missing id.
+            let mut targets: Vec<ObjectId> = Vec::new();
+            for _ in 0..rng.below(ids.len() + 2) {
+                targets.push(if ids.is_empty() || rng.below(10) == 0 {
+                    ObjectId::new()
+                } else {
+                    ids[rng.below(ids.len())]
+                });
+            }
+            let mut seq = doc.clone();
+            let seq_out: Vec<_> = targets.iter().filter_map(|id| seq.remove(*id)).collect();
+            let mut bat = doc.clone();
+            let bat_out = bat.remove_many(&targets);
+            assert_eq!(bat_out, seq_out);
+            assert!(same_but_generation(&seq, &bat));
+            assert_eq!(bat.generation > doc.generation, !bat_out.is_empty());
+
+            // Undo: batched restore == sequential reverse restore == original
+            // order and objects (selection is not restored by either).
+            let mut seq_undo = seq.clone();
+            for (obj, index) in seq_out.iter().rev() {
+                seq_undo.restore(obj.clone(), *index);
+            }
+            bat.restore_many(&bat_out);
+            assert!(same_but_generation(&seq_undo, &bat));
+            assert_eq!(bat.all_ids(), doc.all_ids(), "undo restores original positions");
+
+            // Redo round trip.
+            let redo = bat.remove_many(&targets);
+            assert_eq!(redo, bat_out);
+            assert!(same_but_generation(&seq, &bat));
+        }
+    }
+
+    #[test]
+    fn restore_many_matches_sequential_restore_with_clamping() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for _ in 0..500 {
+            let (doc, _) = random_doc(&mut rng);
+            let objs: Vec<(SceneObject, usize)> = (0..rng.below(20))
+                .map(|_| (obj_at(None, DVec3::ZERO), rng.below(doc.len() + 30)))
+                .collect();
+            let mut seq = doc.clone();
+            for (obj, index) in objs.iter().rev() {
+                seq.restore(obj.clone(), *index);
+            }
+            let mut bat = doc.clone();
+            bat.restore_many(&objs);
+            assert!(same_but_generation(&seq, &bat));
+            assert_eq!(bat.generation > doc.generation, !objs.is_empty());
+        }
     }
 }

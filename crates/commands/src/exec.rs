@@ -1052,10 +1052,7 @@ impl Session {
             Inverse::DeleteCreated(ids) => {
                 // Redo replays the forward op (ids already filled in the log),
                 // recreating identical objects — no snapshot needed here.
-                let ids = ids.clone();
-                for id in ids {
-                    self.doc.remove(id);
-                }
+                self.doc.remove_many(ids);
             }
             Inverse::MoveBack { ids, delta } => {
                 for id in ids {
@@ -1065,14 +1062,10 @@ impl Session {
                 }
             }
             Inverse::Restore(objs) => {
-                for (obj, index) in objs.iter().rev() {
-                    self.doc.restore(obj.clone(), *index);
-                }
+                self.doc.restore_many(objs);
             }
             Inverse::RestoreWithLinks { removed, links } => {
-                for (obj, index) in removed.iter().rev() {
-                    self.doc.restore(obj.clone(), *index);
-                }
+                self.doc.restore_many(removed);
                 for (src, link) in links {
                     self.doc.subdivision_links.insert(*src, link.clone());
                 }
@@ -1093,9 +1086,7 @@ impl Session {
                 }
             }
             Inverse::CreatedAndGeometry { created, snapshots } => {
-                for id in created.clone() {
-                    self.doc.remove(id);
-                }
+                self.doc.remove_many(created);
                 for (id, geometry) in snapshots.clone() {
                     if let Some(obj) = self.doc.get_mut(id) {
                         obj.geometry = geometry;
@@ -1103,25 +1094,19 @@ impl Session {
                 }
             }
             Inverse::CreatedAndGroup { created, group } => {
-                for id in created.clone() {
-                    self.doc.remove(id);
-                }
+                self.doc.remove_many(created);
                 self.doc.groups.remove(group);
                 self.doc.generation += 1;
             }
             Inverse::CreatedOnLayer { created, layers_created } => {
-                for id in created.clone() {
-                    self.doc.remove(id);
-                }
+                self.doc.remove_many(created);
                 for name in layers_created.clone() {
                     self.doc.layers.remove(&name);
                     self.doc.generation += 1;
                 }
             }
             Inverse::CreatedOnLayerLinked { created, layers_created, link_sources } => {
-                for id in created.clone() {
-                    self.doc.remove(id);
-                }
+                self.doc.remove_many(created);
                 for name in layers_created.clone() {
                     self.doc.layers.remove(&name);
                 }
@@ -1133,12 +1118,8 @@ impl Session {
                 self.doc.generation += 1;
             }
             Inverse::LotRefreshed { source, created, restored, prev_link } => {
-                for id in created.clone() {
-                    self.doc.remove(id);
-                }
-                for (obj, index) in restored.iter().rev() {
-                    self.doc.restore(obj.clone(), *index);
-                }
+                self.doc.remove_many(created);
+                self.doc.restore_many(restored);
                 self.doc.subdivision_links.insert(*source, (**prev_link).clone());
                 self.doc.generation += 1;
             }
@@ -1386,12 +1367,8 @@ impl Session {
                 self.doc.generation += 1;
             }
             Inverse::Frozen { snapshots, created, consumed, bakes } => {
-                for id in created.clone() {
-                    self.doc.remove(id);
-                }
-                for (obj, index) in consumed.iter().rev() {
-                    self.doc.restore(obj.clone(), *index);
-                }
+                self.doc.remove_many(created);
+                self.doc.restore_many(consumed);
                 for (key, def) in bakes {
                     self.doc.blocks.insert(key.clone(), def.clone());
                 }
@@ -1403,16 +1380,12 @@ impl Session {
                 self.doc.generation += 1;
             }
             Inverse::CreatedAndBake { created, block_key } => {
-                for id in created.clone() {
-                    self.doc.remove(id);
-                }
+                self.doc.remove_many(created);
                 self.doc.blocks.remove(block_key);
                 self.doc.generation += 1;
             }
             Inverse::XrefAttached { created, name, prev_block, prev_path } => {
-                for id in created.clone() {
-                    self.doc.remove(id);
-                }
+                self.doc.remove_many(created);
                 match prev_block {
                     Some(defs) => {
                         self.doc.blocks.insert(name.clone(), defs.clone());
@@ -1434,9 +1407,7 @@ impl Session {
             Inverse::XrefDetached { name, path, def, instances } => {
                 self.doc.blocks.insert(name.clone(), def.clone());
                 self.doc.xrefs.insert(name.clone(), path.clone());
-                for (obj, index) in instances.iter().rev() {
-                    self.doc.restore(obj.clone(), *index);
-                }
+                self.doc.restore_many(instances);
                 self.doc.generation += 1;
             }
             Inverse::ParamBlockSet { id, prev_geometry, block_key, prev_bake } => {
@@ -1447,13 +1418,8 @@ impl Session {
                 self.doc.generation += 1;
             }
             Inverse::Replace { created, consumed } => {
-                let created = created.clone();
-                for id in created {
-                    self.doc.remove(id);
-                }
-                for (obj, index) in consumed.iter().rev() {
-                    self.doc.restore(obj.clone(), *index);
-                }
+                self.doc.remove_many(created);
+                self.doc.restore_many(consumed);
             }
             Inverse::SectionDef { name, prev } => {
                 match prev {
@@ -4118,12 +4084,7 @@ fn replace_with_result(
         )));
     }
     let volume = kernel_mesh::signed_volume(&result);
-    let mut consumed = Vec::new();
-    for id in input_ids {
-        if let Some(pair) = doc.remove(*id) {
-            consumed.push(pair);
-        }
-    }
+    let consumed = doc.remove_many(input_ids);
     let id = id.unwrap_or_default();
     doc.insert(SceneObject {
         visible: true,
@@ -6328,12 +6289,7 @@ fn rederive_link(
 
     // Snapshot + remove the OLD produced children (for undo) up front; the
     // generators below mint fresh ids regardless of kind.
-    let mut restored: Vec<(SceneObject, usize)> = Vec::new();
-    for id in &link.produced {
-        if let Some(removed) = doc.remove(*id) {
-            restored.push(removed);
-        }
-    }
+    let restored = doc.remove_many(&link.produced);
 
     // Re-derive by kind: Lots → derive_subdivision/insert_lots (produced = lots),
     // Site → generate_site/insert_site (produced = roads ++ blocks).
@@ -7215,11 +7171,7 @@ fn exec_lot_remove(
     let mut removed = Vec::new();
     for src in &sources {
         let link = doc.subdivision_links.remove(src).expect("source has a link");
-        for child in &link.produced {
-            if let Some(pair) = doc.remove(*child) {
-                removed.push(pair);
-            }
-        }
+        removed.extend(doc.remove_many(&link.produced));
         links.push((*src, link));
     }
     refresh_fields(doc);
@@ -12129,12 +12081,7 @@ fn apply_forward(
                 Some(ids) if ids.len() == rings.len() => ids,
                 _ => rings.iter().map(|_| ObjectId::new()).collect(),
             };
-            let mut consumed: Vec<(SceneObject, usize)> = Vec::new();
-            for cid in &consumed_ids {
-                if let Some((obj, index)) = doc.remove(*cid) {
-                    consumed.push((obj, index));
-                }
-            }
+            let consumed = doc.remove_many(&consumed_ids);
             for (ring, rid) in rings.iter().zip(&new_ids) {
                 let points: Vec<DVec3> =
                     ring.iter().map(|p| DVec3::new(p[0], p[1], seed_z)).collect();
@@ -12650,10 +12597,13 @@ fn apply_forward(
                 Some(ids) if ids.len() == total => ids,
                 _ => (0..total).map(|_| ObjectId::new()).collect(),
             };
-            let mut consumed = Vec::with_capacity(jobs.len());
+            // Remove all sources first (appended contours never shift their
+            // recorded indices), in one pass over the creation order.
+            let ids: Vec<ObjectId> = jobs.iter().map(|(id, _)| *id).collect();
+            let consumed = doc.remove_many(&ids);
+            assert_eq!(consumed.len(), jobs.len(), "resolved");
             let mut next = created.iter();
-            for (id, curves) in jobs {
-                let (obj, index) = doc.remove(id).expect("resolved");
+            for ((obj, _), (_, curves)) in consumed.iter().zip(jobs) {
                 for c in curves {
                     doc.insert(SceneObject {
                         visible: true,
@@ -12668,7 +12618,6 @@ fn apply_forward(
                         geometry: Geometry::Curve(c),
                     });
                 }
-                consumed.push((obj, index));
             }
             let mut message = format!(
                 "outlined {} text object(s) -> {total} closed contour(s) (font Hack)",
@@ -13359,16 +13308,11 @@ fn apply_forward(
                         )
                     })?;
             let closed = joined.is_closed();
-            let mut consumed = Vec::new();
             let (name, layer) = {
                 let first = doc.get(ids[0]).expect("resolved");
                 (first.name.clone(), first.layer.clone())
             };
-            for cid in &ids {
-                if let Some(pair) = doc.remove(*cid) {
-                    consumed.push(pair);
-                }
-            }
+            let consumed = doc.remove_many(&ids);
             let id = id.unwrap_or_default();
             doc.insert(SceneObject {
                 id,
@@ -13836,12 +13780,7 @@ fn apply_forward(
             for (src, _) in &removed_links {
                 doc.subdivision_links.remove(src);
             }
-            let mut removed = Vec::new();
-            for id in &to_remove {
-                if let Some(pair) = doc.remove(*id) {
-                    removed.push(pair);
-                }
-            }
+            let removed = doc.remove_many(&to_remove);
             // Re-evaluate fields AFTER removal so a count/area field reflects the
             // deletion. Fields whose referent just vanished keep their last-good
             // text (eval failure is ignored by refresh_fields).
@@ -16118,11 +16057,13 @@ fn apply_forward(
                 Some(ids) if ids.len() == total => ids,
                 _ => (0..total).map(|_| ObjectId::new()).collect(),
             };
-            let mut consumed = Vec::with_capacity(baked.len());
+            // Remove all instances first so each recorded index is the
+            // pre-freeze slot (appended bakes never shift them).
+            let ids: Vec<ObjectId> = baked.iter().map(|(inst, _)| inst.id).collect();
+            let consumed = doc.remove_many(&ids);
+            assert_eq!(consumed.len(), baked.len(), "resolved");
             let mut next = created.iter();
             for (inst, geometries) in baked {
-                // Remove first so the recorded index is the pre-freeze slot.
-                consumed.push(doc.remove(inst.id).expect("resolved"));
                 for geometry in geometries {
                     let id = *next.next().expect("created ids cover all geometries");
                     doc.insert(SceneObject {
@@ -16318,12 +16259,7 @@ fn apply_forward(
                 .filter(|o| matches!(&o.geometry, Geometry::Instance { block, source: None, .. } if *block == name))
                 .map(|o| o.id)
                 .collect();
-            let mut instances = Vec::new();
-            for id in ids {
-                if let Some(pair) = doc.remove(id) {
-                    instances.push(pair);
-                }
-            }
+            let instances = doc.remove_many(&ids);
             let def = doc.blocks.remove(&name).unwrap_or_default();
             doc.xrefs.remove(&name);
             doc.generation += 1;
