@@ -32071,8 +32071,15 @@ mod tests {
             scene_triangles(&s.doc).iter().map(|t| t.map(DVec3::from_array)).collect();
         let boxes: Vec<kernel_mesh::Aabb> =
             tris.iter().map(|t| kernel_mesh::Aabb::from_points(t.iter().copied())).collect();
+        let t0 = std::time::Instant::now();
         let bvh = kernel_mesh::Bvh::build(&boxes);
+        let build_ms = t0.elapsed().as_secs_f64() * 1e3;
         let aabb = s.doc.scene_aabb().expect("site geometry");
+        let mut closest_stats = kernel_mesh::TraversalStats::default();
+        let mut any_stats = kernel_mesh::TraversalStats::default();
+        // FNV-1a over every result: equal across tree builds iff all agree.
+        let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+        let mut mix = |v: u64| digest = (digest ^ v).wrapping_mul(0x0100_0000_01b3);
         let mut rng = 0x5173_0300_u64;
         let mut f = |lo: f64, hi: f64| {
             rng ^= rng << 13;
@@ -32104,21 +32111,45 @@ mod tests {
                 }
             }
             let got = bvh.ray_closest_hit(o, d, f64::INFINITY, test);
+            let counted = bvh.ray_closest_hit_counted(o, d, f64::INFINITY, test, &mut closest_stats);
+            assert_eq!(counted, got);
+            let any = bvh.ray_any_hit(o, d, f64::INFINITY, |i| test(i).is_some());
+            let counted = bvh.ray_any_hit_counted(
+                o,
+                d,
+                f64::INFINITY,
+                |i| test(i).is_some(),
+                &mut any_stats,
+            );
+            assert_eq!(counted, any);
+            mix(got.map_or(u64::MAX, |(i, t)| u64::from(i) ^ t.to_bits().rotate_left(32)));
+            mix(u64::from(any));
             assert_eq!(
                 got.map(|(i, t)| (i, t.to_bits())),
                 oracle.map(|(i, t)| (i, t.to_bits())),
                 "closest o={o} d={d}"
             );
-            assert_eq!(bvh.ray_any_hit(o, d, f64::INFINITY, |i| test(i).is_some()), oracle.is_some());
+            assert_eq!(any, oracle.is_some());
             if let Some((_, t)) = oracle {
                 // Shadow ray capped at the hit: only strictly nearer hits count.
                 let shadow = |i| test(i).is_some_and(|u| u < t);
                 let any = bvh.ray_candidates(o, d).into_iter().any(shadow);
                 assert_eq!(bvh.ray_any_hit(o, d, t, shadow), any, "any o={o} d={d} max_t={t}");
+                mix(u64::from(any));
                 hits += 1;
             }
             rays += 1;
         }
-        eprintln!("site oracle: {} tris, {rays} rays, {hits} hits", tris.len());
+        eprintln!("site oracle: {} tris, {rays} rays, {hits} hits, digest {digest:016x}", tris.len());
+        // Work per ray, for comparing tree builds (#311).
+        let per = |n: u64| n as f64 / rays as f64;
+        eprintln!(
+            "site bvh: build {build_ms:.1} ms; closest {:.1} visits / {:.1} box tests per ray; \
+             any {:.1} visits / {:.1} box tests per ray",
+            per(closest_stats.nodes_visited),
+            per(closest_stats.box_tests),
+            per(any_stats.nodes_visited),
+            per(any_stats.box_tests),
+        );
     }
 }
