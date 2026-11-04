@@ -64,7 +64,8 @@ impl Draw {
 /// anything touches the GPU.
 #[derive(Default, Debug, PartialEq)]
 pub(crate) struct Staged {
-    /// Flat vertex floats (`[x, y, z]` or `[x, y, z, nx, ny, nz]` per vertex).
+    /// Flat vertex floats (`[x, y, z]`, `[x, y, z, nx, ny, nz]` or, for
+    /// per-face-coloured meshes, `[x, y, z, nx, ny, nz, r, g, b]` per vertex).
     pub vertices: Vec<f32>,
     pub indices: Vec<u32>,
     pub draws: Vec<Draw>,
@@ -94,6 +95,37 @@ impl Staged {
         for (p, n) in positions.iter().zip(normals) {
             self.vertices.extend_from_slice(p);
             self.vertices.extend_from_slice(n);
+        }
+        self.draws.push(Draw {
+            first: self.indices.len() as u32,
+            count: indices.len() as u32,
+            base_vertex,
+            slot: self.params.len() as u32,
+        });
+        self.indices.extend_from_slice(indices);
+        self.params.push(params);
+    }
+
+    /// Append a flat triangle mesh drawn one colour per face (#327): each
+    /// vertex interleaves position, normal and its face's RGB (9 floats).
+    /// Corners come three per face, as `Mesh::to_render` emits them, so vertex
+    /// `i` takes `face_colors[i / 3]`. Meshes with no triangles are skipped.
+    pub fn push_face_mesh(
+        &mut self,
+        positions: &[[f32; 3]],
+        normals: &[[f32; 3]],
+        face_colors: &[[f32; 3]],
+        indices: &[u32],
+        params: ObjectParams,
+    ) {
+        if indices.is_empty() {
+            return;
+        }
+        let base_vertex = (self.vertices.len() / 9) as i32;
+        for (i, (p, n)) in positions.iter().zip(normals).enumerate() {
+            self.vertices.extend_from_slice(p);
+            self.vertices.extend_from_slice(n);
+            self.vertices.extend_from_slice(&face_colors[i / 3]);
         }
         self.draws.push(Draw {
             first: self.indices.len() as u32,
@@ -372,6 +404,22 @@ mod tests {
             ]
         );
         assert_eq!(s.params, vec![p(0.1), p(0.3)]);
+    }
+
+    #[test]
+    fn face_meshes_carry_each_face_colour_on_its_three_corners() {
+        let mut s = Staged::default();
+        let quad = [[0.0; 3], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0; 3], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+        let n = [[0.0, 0.0, 1.0]; 6];
+        let rgb = [[0.0, 0.15, 1.0], [1.0, 0.15, 0.0]];
+        s.push_face_mesh(&quad[..3], &n[..3], &rgb[..1], &[0, 1, 2], p(0.1));
+        s.push_face_mesh(&quad, &n, &rgb, &[0, 1, 2, 3, 4, 5], p(0.2));
+        assert_eq!(s.vertices.len(), 9 * 9);
+        assert_eq!(s.draws[1], Draw { first: 3, count: 6, base_vertex: 3, slot: 1 });
+        let colour = |v: usize| &s.vertices[v * 9 + 6..v * 9 + 9];
+        assert_eq!(colour(2), &rgb[0]);
+        assert_eq!(colour(5), &rgb[0], "second mesh, first face");
+        assert_eq!(colour(6), &rgb[1], "second mesh, second face");
     }
 
     #[test]

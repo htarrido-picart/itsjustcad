@@ -41,6 +41,7 @@ fn box_obj(min: DVec3, size: DVec3, layer: &str) -> SceneObject {
         lineweight_mm: None,
         edge_tags: None,
         street: None,
+        face_values: None,
         geometry: Geometry::Mesh(kernel_mesh::make_box(min, size)),
     }
 }

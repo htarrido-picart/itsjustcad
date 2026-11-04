@@ -75,6 +75,7 @@ fn main() {
                 (box_a.to_render(), mesh_color, [0.5, 0.0]),
                 (box_b.to_render(), mesh_color, [0.5, 0.0]),
             ],
+            face_meshes: vec![],
             lines: vec![],
             edges: vec![(edges_a, edge_color, 0.18), (edges_b, edge_color, 0.18)],
             profile_edges: vec![],

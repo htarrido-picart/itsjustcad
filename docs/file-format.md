@@ -79,7 +79,7 @@ Compliance and analysis reports are summaries for critique, never certified resu
 ---
 
 ## Checkpoint sidecar (optional)
-Alongside `myfile.itsjustcad.json` the app writes `myfile.itsjustcad.json.checkpoint` (checkpoint version 3) — a compact JSON snapshot of the derived document plus the core version that wrote it, the op count it reflects, and a hash of those ops. On open it is used only when its checkpoint and core versions match this build and its ops are a prefix of the file's log; the document is then seeded from the snapshot and only the newer ops are replayed. Anything else falls back to a full replay. This is a pure cache: deleting it is always safe, and a stale or unreadable checkpoint is silently ignored. See [FORMAT.md](../FORMAT.md#checkpoint-sidecar-optional-fast-open-cache) for the fields and rules.
+Alongside `myfile.itsjustcad.json` the app writes `myfile.itsjustcad.json.checkpoint` (checkpoint version 4) — a compact JSON snapshot of the derived document plus the core version that wrote it, the op count it reflects, and a hash of those ops. On open it is used only when its checkpoint and core versions match this build and its ops are a prefix of the file's log; the document is then seeded from the snapshot and only the newer ops are replayed. Anything else falls back to a full replay. This is a pure cache: deleting it is always safe, and a stale or unreadable checkpoint is silently ignored. See [FORMAT.md](../FORMAT.md#checkpoint-sidecar-optional-fast-open-cache) for the fields and rules.
 
 ---
 

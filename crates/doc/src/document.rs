@@ -1039,6 +1039,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Mesh(mesh),
         }
     }
@@ -1055,6 +1056,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Line { a, b }),
         }
     }
@@ -1130,6 +1132,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Annotation(Annotation::LinearDim {
                 a: DimAnchor::Object { id: lid, which: EndpointRef::Start, last: DVec3::ZERO },
                 b: DimAnchor::Object {

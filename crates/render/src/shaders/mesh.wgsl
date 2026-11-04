@@ -52,6 +52,37 @@ fn vs_main(in: VsIn) -> VsOut {
     return out;
 }
 
+// Per-face-coloured meshes (#327): the vertex carries its face's RGB, which
+// replaces `object.color.rgb`; alpha and material still come from the object.
+// Every face has its own three corners, so the colour is constant per face.
+struct VsFaceIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+};
+
+struct VsFaceOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    @location(1) world: vec3<f32>,
+    @location(2) @interpolate(flat) color: vec3<f32>,
+};
+
+@vertex
+fn vs_face(in: VsFaceIn) -> VsFaceOut {
+    var out: VsFaceOut;
+    out.clip = camera.view_proj * vec4(in.position, 1.0);
+    out.normal = in.normal;
+    out.world = in.position;
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_face(in: VsFaceOut) -> @location(0) vec4<f32> {
+    return shade_fill(in.normal, in.world, in.color);
+}
+
 // Hemispheric ambient fill: sky colour when the normal faces up, ground colour
 // when it faces down, blended by the up-facing fraction. This is the ambient
 // FLOOR — even a face turned fully away from the key light gets sky/ground
@@ -71,18 +102,23 @@ fn working_key_dir() -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = normalize(in.normal);
+    return shade_fill(in.normal, in.world, object.color.rgb);
+}
+
+// Lit fill of base colour `base`; alpha and material come from the object.
+fn shade_fill(normal: vec3<f32>, world: vec3<f32>, base: vec3<f32>) -> vec4<f32> {
+    let n = normalize(normal);
 
     // Pencil mode: misc.x < 0 signals hidden-line paper-white fill.
     if (camera.misc.x < 0.0) {
-        let l = normalize(camera.eye.xyz - in.world);
+        let l = normalize(camera.eye.xyz - world);
         let lambert = max(dot(n, l), 0.0);
         let shade = 0.90 + 0.07 * lambert;
         return vec4(shade, shade, shade * 0.98, 1.0);
     }
 
     let mode = camera.light.x;
-    let view_dir = normalize(camera.eye.xyz - in.world);
+    let view_dir = normalize(camera.eye.xyz - world);
     let ambient = hemispheric_ambient(n);
 
     // Pick the key-light direction: Sun mode uses the real solar vector when it
@@ -99,7 +135,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // deliberately gentle (0.55) so the ambient floor dominates and no face
     // crushes to black. Result is a matte, readable surface.
     let diffuse = ambient + 0.55 * key;
-    var lit = object.color.rgb * diffuse;
+    var lit = base * diffuse;
 
     // Presentation mode only: Blinn-Phong specular from the material presets.
     if (mode == 2.0) {
@@ -110,10 +146,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let shininess = mix(4.0, 256.0, 1.0 - roughness);
         let spec_strength = mix(0.15, 0.9, 1.0 - roughness);
         let spec = pow(n_dot_h, shininess) * spec_strength * key;
-        let spec_tint = mix(vec3(1.0, 1.0, 1.0), object.color.rgb, metallic);
+        let spec_tint = mix(vec3(1.0, 1.0, 1.0), base, metallic);
         // Metals have little diffuse; dielectrics keep the matte base.
         let diffuse_amt = mix(1.0, 0.25, metallic);
-        lit = object.color.rgb * diffuse * diffuse_amt + spec_tint * spec;
+        lit = base * diffuse * diffuse_amt + spec_tint * spec;
     }
 
     return vec4(lit, object.color.a * camera.misc.x);

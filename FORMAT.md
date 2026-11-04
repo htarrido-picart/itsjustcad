@@ -380,20 +380,26 @@ gracefully. Every new command or field must add such a test.
 ## Checkpoint sidecar (optional fast-open cache)
 
 Saving `<file>` also writes `<file>.checkpoint`, a compact JSON snapshot of the
-derived document plus the ops it reflects (checkpoint version **3**):
+derived document plus the ops it reflects (checkpoint version **4**):
 
 ```json
-{"mydrafter_checkpoint": 3, "core": "0.8.0", "op_count": 42,
+{"mydrafter_checkpoint": 4, "core": "0.8.0", "op_count": 42,
  "ops_hash": "<16 hex digits>", "doc": { … Document snapshot … }}
 ```
 
 | field | notes |
 | --- | --- |
-| `mydrafter_checkpoint` | checkpoint version, versioned independently of the op-log; currently **3** |
+| `mydrafter_checkpoint` | checkpoint version, versioned independently of the op-log; currently **4** |
 | `core` | core build version that wrote it (`CARGO_PKG_VERSION`) |
 | `op_count` | number of forward ops the snapshot reflects |
 | `ops_hash` | FNV-1a 64 hash (16 hex digits) of the first `op_count` ops serialized as JSON |
 | `doc` | the Document snapshot |
+
+Version 4 (#327) lets a snapshot object carry optional per-face values,
+`"face_values": {"values": [<f32 per face>], "min": <f32>, "max": <f32>,
+"ramp": "blue_red"}`, drawn one ramp colour per face. Objects without them omit
+the key and serialize exactly as in version 3. The values are used only while
+they match the object's mesh face count.
 
 On open, the checkpoint is used only when **all** of these hold: it parses,
 `mydrafter_checkpoint` equals this build's checkpoint version, `core` equals

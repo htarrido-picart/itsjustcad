@@ -210,6 +210,7 @@ fn make_renderer(
     if !lines.is_empty() {
         let data = itsjustcad_render::SceneData {
             meshes: vec![],
+            face_meshes: vec![],
             lines,
             edges: vec![],
             profile_edges: vec![],
@@ -320,6 +321,7 @@ fn golden_underlay_dark() {
     };
     let data = itsjustcad_render::SceneData {
         meshes: vec![],
+        face_meshes: vec![],
         lines: vec![],
         edges: vec![],
         profile_edges: vec![],
@@ -357,6 +359,7 @@ fn batched_scene(boxes: usize, mesh: [f32; 4], ink: [f32; 4]) -> itsjustcad_rend
     let to_f32 = |v: DVec3| [v.x as f32, v.y as f32, v.z as f32];
     let mut data = itsjustcad_render::SceneData {
         meshes: vec![],
+        face_meshes: vec![],
         lines: vec![(vec![[-6.0, -4.0, 0.0], [-2.0, -5.0, 0.5], [2.0, -4.0, 0.0]], ink, 0.18)],
         edges: vec![],
         profile_edges: vec![],
@@ -416,4 +419,59 @@ fn golden_reupload_matches_fresh() {
     let mut base = SceneRenderer::new(&ctx.device, FORMAT);
     base.set_scene(&ctx.device, &ctx.queue, &batched_scene(3, theme.mesh(), theme.curve()), 0);
     assert!(render(&mut base) != expected);
+}
+
+/// #327: a two-face mesh with two values renders one ramp colour per face.
+#[test]
+#[ignore = "golden"]
+fn face_values_render_one_colour_per_face() {
+    let ctx = GpuContext::new();
+    let theme = Theme::Dark;
+    // A flat 8 x 8 quad on the ground, split along x = 0 into two faces seen
+    // from straight above: left face low (blue), right face high (red).
+    let quad = kernel_mesh::Mesh::new(
+        vec![
+            DVec3::new(-4.0, -4.0, 0.0),
+            DVec3::new(0.0, -4.0, 0.0),
+            DVec3::new(0.0, 4.0, 0.0),
+            DVec3::new(-4.0, 4.0, 0.0),
+            DVec3::new(4.0, -4.0, 0.0),
+            DVec3::new(4.0, 4.0, 0.0),
+        ],
+        vec![[0, 1, 2], [0, 2, 3], [1, 4, 5], [1, 5, 2]],
+    );
+    let fv = itsjustcad_doc::FaceValues {
+        values: vec![0.0, 0.0, 10.0, 10.0],
+        min: 0.0,
+        max: 10.0,
+        ramp: itsjustcad_doc::Ramp::BlueRed,
+    };
+    let rgb: Vec<[f32; 3]> = fv.values.iter().map(|&v| fv.color(v)).collect();
+    let data = itsjustcad_render::SceneData {
+        meshes: vec![],
+        face_meshes: vec![(quad.to_render(), rgb, theme.mesh(), [0.5, 0.0])],
+        lines: vec![],
+        edges: vec![],
+        profile_edges: vec![],
+        points: vec![],
+        underlay: None,
+        basemap: None,
+        show_lineweights: false,
+    };
+    let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
+    renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);
+    let camera = OrbitCamera { distance: 14.0, yaw: 0.0, pitch: 1.5, ..OrbitCamera::default() };
+    let cam = itsjustcad_render::camera_uniform(camera.view_proj(W as f32 / H as f32), camera.eye());
+    renderer.write_camera(&ctx.device, &ctx.queue, 0, &cam);
+    let img = render_to_image(&ctx, &renderer, theme);
+
+    // Count clearly blue and clearly red pixels: each face must cover a fair
+    // share of the image whatever way the camera maps world x to the screen.
+    let count = |f: fn([i32; 3]) -> bool| {
+        img.pixels().filter(|p| f([p.0[0], p.0[1], p.0[2]].map(i32::from))).count()
+    };
+    let blue = count(|[r, _, b]| b - r > 120);
+    let red = count(|[r, _, b]| r - b > 120);
+    let min = (W * H / 20) as usize;
+    assert!(blue > min && red > min, "blue {blue} px, red {red} px, want > {min} each");
 }

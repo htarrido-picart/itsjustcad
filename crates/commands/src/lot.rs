@@ -676,6 +676,7 @@ pub fn insert_lots(doc: &mut Document, bake: &LotBake, ids: &[ObjectId]) {
             lineweight_mm: None,
             edge_tags: bake.lots.get(k).and_then(|l| edge_tags_of(l, true)),
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -827,6 +828,7 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
                 fingerprint: itsjustcad_doc::geometry_fingerprint(&geometry),
                 ..info.clone()
             }),
+            face_values: None,
             geometry,
         });
     }
@@ -846,6 +848,7 @@ pub fn insert_site(doc: &mut Document, bake: &SiteBake, road_ids: &[ObjectId], b
             lineweight_mm: None,
             edge_tags: edge_tags_of(block, false),
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -952,6 +955,7 @@ pub fn insert_setbacks(doc: &mut Document, bake: &SetbackBake, ids: &[ObjectId])
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -1327,6 +1331,7 @@ pub fn insert_open_space(doc: &mut Document, bake: &OpenSpaceBake, ids: &[Object
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(polygon_to_curve(poly, bake.z)),
         });
     }
@@ -1529,6 +1534,7 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(polygon_to_curve(&b.footprint, b.z)),
         });
         // The building solid (3D mesh, roof included). The name carries the
@@ -1549,6 +1555,7 @@ pub fn insert_buildings(doc: &mut Document, bake: &BuildingBake, ids: &[ObjectId
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Mesh(b.mass.clone()),
         });
     }
