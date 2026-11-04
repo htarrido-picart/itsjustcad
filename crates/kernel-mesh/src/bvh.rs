@@ -130,10 +130,11 @@ impl Bvh {
 
     /// Closest primitive along the ray `origin + t*dir`: `test(i)` returns the
     /// exact hit `t` of primitive `i`, or `None` on a miss. Returns `(i, t)` of
-    /// the smallest `t ≤ max_t`; on exact ties the primitive tested first wins,
-    /// in the same order as [`Bvh::ray_candidates`]. Boxes entered strictly
-    /// beyond the best hit so far are skipped. Allocation-free for trees up to
-    /// 64 deep.
+    /// the smallest `t ≤ max_t`; on exact ties the lowest primitive index wins,
+    /// so the result depends only on the primitives, never on tree layout or
+    /// traversal order. Boxes entered strictly beyond the best hit so far are
+    /// skipped; a box entered exactly at it is still visited, since it may
+    /// hold a lower-index tie. Allocation-free for trees up to 64 deep.
     pub fn ray_closest_hit(
         &self,
         origin: DVec3,
@@ -145,7 +146,7 @@ impl Bvh {
         self.traverse(origin, dir, max_t, |prims| {
             for &i in prims {
                 if let Some(t) = test(i)
-                    && best.map_or(t <= max_t, |(_, bt)| t < bt)
+                    && best.map_or(t <= max_t, |(bi, bt)| t < bt || (t == bt && i < bi))
                 {
                     best = Some((i, t));
                 }
@@ -645,9 +646,24 @@ mod tests {
         assert_same_tree(&tb.bvh, &Bvh::build_serial(&tri_boxes(&tris)));
     }
 
-    /// The pre-#300 collect-then-test path: the oracle `ray_closest_hit` must
-    /// reproduce bit for bit (same winner on exact ties).
+    /// Brute force over [`Bvh::ray_candidates`]: smallest `t ≤ max_t`, exact
+    /// ties to the lowest primitive index. `ray_closest_hit` must reproduce it
+    /// bit for bit.
     fn oracle_closest(
+        bvh: &Bvh,
+        o: DVec3,
+        d: DVec3,
+        max_t: f64,
+        mut test: impl FnMut(u32) -> Option<f64>,
+    ) -> Option<(u32, f64)> {
+        bvh.ray_candidates(o, d)
+            .into_iter()
+            .filter_map(|i| test(i).filter(|&t| t <= max_t).map(|t| (i, t)))
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+    }
+
+    /// The pre-#310 rule: exact ties to the first candidate in traversal order.
+    fn first_in_order_closest(
         bvh: &Bvh,
         o: DVec3,
         d: DVec3,
@@ -663,6 +679,27 @@ mod tests {
             }
         }
         best
+    }
+
+    /// The same tree with every internal node's children swapped at random and
+    /// every leaf's primitives rotated: a different traversal order over
+    /// identical boxes.
+    fn shuffled(bvh: &Bvh, rng: &mut Rng) -> Bvh {
+        let mut out = bvh.clone();
+        for node in &mut out.nodes {
+            match node {
+                Node::Internal { left, right, .. } => {
+                    if rng.next_u64().is_multiple_of(2) {
+                        std::mem::swap(left, right);
+                    }
+                }
+                Node::Leaf { start, count } => {
+                    let k = (rng.next_u64() % *count as u64) as usize;
+                    out.prims[*start..*start + *count].rotate_left(k);
+                }
+            }
+        }
+        out
     }
 
     fn bits(h: Option<(u32, f64)>) -> Option<(u32, u64)> {
@@ -682,11 +719,18 @@ mod tests {
             limits.extend([t, t.next_down(), t.next_up()]);
         }
         for max_t in limits {
-            assert_eq!(
-                bits(tb.bvh.ray_closest_hit(o, d, max_t, test)),
-                bits(oracle_closest(&tb.bvh, o, d, max_t, test)),
-                "closest o={o} d={d} max_t={max_t}"
-            );
+            let got = tb.bvh.ray_closest_hit(o, d, max_t, test);
+            assert_eq!(bits(got), bits(oracle_closest(&tb.bvh, o, d, max_t, test)), "closest o={o} d={d} max_t={max_t}");
+            // Against the pre-#310 rule: same `t` always, same winner unless
+            // another primitive hits at exactly that `t`.
+            let old = first_in_order_closest(&tb.bvh, o, d, max_t, test);
+            assert_eq!(got.map(|h| h.1.to_bits()), old.map(|h| h.1.to_bits()));
+            if let Some((_, t)) = got {
+                let at_t = tb.bvh.ray_candidates(o, d).into_iter().filter(|&i| test(i) == Some(t)).count();
+                if at_t == 1 {
+                    assert_eq!(got, old, "non-tie winner changed o={o} d={d} max_t={max_t}");
+                }
+            }
             let shadow = |i| test(i).is_some_and(|t| t < max_t);
             let oracle_any = tb.bvh.ray_candidates(o, d).into_iter().any(shadow);
             assert_eq!(tb.bvh.ray_any_hit(o, d, max_t, shadow), oracle_any, "any o={o} d={d} max_t={max_t}");
@@ -756,6 +800,103 @@ mod tests {
             };
             if d.length_squared() > 1e-6 {
                 check_ray(&tb, o, d);
+            }
+        }
+    }
+
+    /// Exact-tie scenes: coplanar grids duplicated in place (the same triangle
+    /// at several indices), rays down shared edges and through shared
+    /// vertices. Returns the soup and rays that hit it.
+    fn tie_scene(rng: &mut Rng) -> (Vec<[DVec3; 3]>, Vec<(DVec3, DVec3)>) {
+        let mut tris = Vec::new();
+        for z in [0.0, 1.0, 1.0, 2.5] {
+            for i in 0..12 {
+                for j in 0..12 {
+                    let p = DVec3::new(i as f64, j as f64, z);
+                    let t0 = [p, p + DVec3::X, p + DVec3::Y];
+                    let t1 = [p + DVec3::X, p + DVec3::new(1.0, 1.0, 0.0), p + DVec3::Y];
+                    tris.extend([t0, t1, t0, t1]);
+                }
+            }
+        }
+        let mut rays = Vec::new();
+        for _ in 0..3000 {
+            // Grid vertices (x.0, y.0), edge midpoints and the shared diagonal
+            // (x.5, y.5), cast straight down/up or obliquely.
+            let o = DVec3::new(
+                (rng.next_u64() % 26) as f64 * 0.5,
+                (rng.next_u64() % 26) as f64 * 0.5,
+                [-1.0, 0.5, 1.5, 3.0][(rng.next_u64() % 4) as usize],
+            );
+            let d = match rng.next_u64() % 3 {
+                0 => DVec3::new(0.0, 0.0, if o.z > 1.0 { -1.0 } else { 1.0 }),
+                1 => DVec3::new(0.25, 0.5, if o.z > 1.0 { -1.0 } else { 1.0 }),
+                _ => rng.v(-1.0, 1.0),
+            };
+            if d.length_squared() > 1e-6 {
+                rays.push((o, d));
+            }
+        }
+        (tris, rays)
+    }
+
+    #[test]
+    fn closest_hit_breaks_exact_ties_by_lowest_index() {
+        let (tris, rays) = tie_scene(&mut Rng(0x7135_0310_0000_0001));
+        let tb = TriBvh::build(tris.clone());
+        let mut ties = 0;
+        for (o, d) in rays {
+            let test = |i: u32| {
+                let [a, b, c] = tris[i as usize];
+                ray_triangle(o, d, a, b, c)
+            };
+            let Some((i, t)) = tb.bvh.ray_closest_hit(o, d, f64::INFINITY, test) else { continue };
+            let at_t: Vec<u32> = (0..tris.len() as u32).filter(|&k| test(k) == Some(t)).collect();
+            assert_eq!(at_t.first(), Some(&i), "o={o} d={d}");
+            assert!((0..tris.len() as u32).all(|k| test(k).is_none_or(|u| u >= t)));
+            ties += usize::from(at_t.len() > 1);
+        }
+        assert!(ties > 1000, "only {ties} tie rays");
+    }
+
+    #[test]
+    fn closest_hit_is_independent_of_tree_layout() {
+        let mut rng = Rng(0x7135_0310_0000_0002);
+        let (tie_tris, tie_rays) = tie_scene(&mut rng);
+        let soup = random_tris(&mut rng, 2000);
+        let soup_rays: Vec<_> = (0..2000).map(|_| (rng.v(-60.0, 60.0), rng.v(-1.0, 1.0))).collect();
+        for (tris, rays) in [(tie_tris, tie_rays), (soup, soup_rays)] {
+            let tb = TriBvh::build(tris.clone());
+            let layouts: Vec<Bvh> = (0..4).map(|_| shuffled(&tb.bvh, &mut rng)).collect();
+            assert!(layouts.iter().any(|b| b.prims != tb.bvh.prims || b.nodes != tb.bvh.nodes));
+            // A permuted input builds a different tree; reversing its result
+            // index must land on the same primitive.
+            let mut perm: Vec<u32> = (0..tris.len() as u32).collect();
+            for k in (1..perm.len()).rev() {
+                perm.swap(k, (rng.next_u64() % (k as u64 + 1)) as usize);
+            }
+            let permuted = Bvh::build(&tri_boxes(&perm.iter().map(|&p| tris[p as usize]).collect::<Vec<_>>()));
+            for (o, d) in rays {
+                let test = |i: u32| {
+                    let [a, b, c] = tris[i as usize];
+                    ray_triangle(o, d, a, b, c)
+                };
+                let want = bits(tb.bvh.ray_closest_hit(o, d, f64::INFINITY, test));
+                for b in &layouts {
+                    assert_eq!(bits(b.ray_closest_hit(o, d, f64::INFINITY, test)), want, "o={o} d={d}");
+                }
+                // Permuted build, same primitive indices: rank by original index.
+                let got = permuted
+                    .ray_closest_hit(o, d, f64::INFINITY, |p| test(perm[p as usize]))
+                    .map(|(p, t)| (perm[p as usize], t));
+                let at_t = want.map(|(_, tb)| {
+                    (0..tris.len() as u32).filter(|&k| test(k).map(f64::to_bits) == Some(tb)).count()
+                });
+                if at_t == Some(1) || want.is_none() {
+                    assert_eq!(bits(got), want, "permuted o={o} d={d}");
+                } else {
+                    assert_eq!(got.map(|h| h.1.to_bits()), want.map(|h| h.1));
+                }
             }
         }
     }

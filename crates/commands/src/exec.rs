@@ -32058,7 +32058,8 @@ mod tests {
     }
 
     /// #300 oracle on a real site: `ray_closest_hit` / `ray_any_hit` must match
-    /// the collect-then-test path over `ray_candidates` bit for bit. Needs a
+    /// the collect-then-test path over `ray_candidates` bit for bit, exact `t`
+    /// ties to the lowest primitive index (#310). Needs a
     /// site document: `BVH_SITE_FIXTURE=/path/site.json cargo test --release
     /// -p itsjustcad-commands bvh_traversal_matches_oracle_on_site -- --ignored`.
     #[test]
@@ -32097,7 +32098,7 @@ mod tests {
             let mut oracle: Option<(u32, f64)> = None;
             for i in bvh.ray_candidates(o, d) {
                 if let Some(t) = test(i)
-                    && oracle.is_none_or(|(_, bt)| t < bt)
+                    && oracle.is_none_or(|(bi, bt)| t < bt || (t == bt && i < bi))
                 {
                     oracle = Some((i, t));
                 }
