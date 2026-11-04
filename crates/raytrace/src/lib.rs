@@ -14,6 +14,12 @@
 //! reports intermediate frames through a callback with a cancel flag, ready for
 //! the part-2 GUI window.
 //!
+//! Hardware ray tracing (#318): where `itsjustcad_hwrt::Tracer` is available
+//! (Apple9 GPU, not `ITSJUSTCAD_HWRT=cpu`) each pass runs as a wavefront
+//! (`render_pass_batched`) with f32 closest-hit and shadow rays on the GPU.
+//! The image is not logged state, so GPU answers are used directly (#261
+//! item 3); it stays deterministic run to run on one machine.
+//!
 //! Reuse (no reinvention):
 //!   * `kernel_mesh::{Bvh, ray_triangle, Aabb}` — acceleration + exact test;
 //!   * `itsjustcad_doc::{Document, ObjectMaterial, SunPosition, GeoLocation}` —
@@ -103,64 +109,109 @@ pub struct PassResult<'a> {
     pub image: &'a Image,
 }
 
-/// Trace one primary ray through the scene and return its linear radiance.
-fn radiance(scene: &Scene, mut origin: DVec3, mut dir: DVec3, max_bounces: u32, rng: &mut Rng) -> DVec3 {
-    let mut throughput = DVec3::ONE;
-    let mut result = DVec3::ZERO;
-    // Surface offset to avoid self-intersection ("shadow acne"), scaled to the
-    // scene size so it works at building and millimetre scales alike.
-    let eps = scene
+/// One path's running state between bounces.
+#[derive(Clone, Copy)]
+struct PathState {
+    origin: DVec3,
+    dir: DVec3,
+    throughput: DVec3,
+    result: DVec3,
+}
+
+/// A next-event shadow ray toward the sun and the light it adds if clear.
+#[derive(Clone, Copy)]
+struct Shadow {
+    ray: [DVec3; 2],
+    light: DVec3,
+}
+
+/// Surface offset to avoid self-intersection ("shadow acne"), scaled to the
+/// scene size so it works at building and millimetre scales alike.
+fn surface_eps(scene: &Scene) -> f64 {
+    scene
         .bounds
         .map(|b| (b.size().length() * 1e-6).max(1e-6))
-        .unwrap_or(1e-6);
+        .unwrap_or(1e-6)
+}
 
-    for bounce in 0..=max_bounces {
-        let Some(hit) = scene.intersect(origin, dir) else {
-            // Escaped to the sky — add its radiance and stop.
-            result += throughput * scene.sky.radiance(dir);
-            break;
-        };
+/// Shade one bounce given the ray's `hit`: add sky or emission, sample the
+/// sun (the caller traces the returned shadow ray and adds its light when
+/// clear), and scatter. Returns the shadow ray and whether the path goes on.
+/// Shared by the per-pixel CPU integrator and the batched one, so both
+/// draw the same random numbers in the same order.
+fn step(
+    scene: &Scene,
+    s: &mut PathState,
+    hit: Option<scene::Hit>,
+    bounce: u32,
+    eps: f64,
+    rng: &mut Rng,
+) -> (Option<Shadow>, bool) {
+    let Some(hit) = hit else {
+        // Escaped to the sky — add its radiance and stop.
+        s.result += s.throughput * scene.sky.radiance(s.dir);
+        return (None, false);
+    };
 
-        // Emissive surfaces radiate directly (area lights).
-        if hit.material.is_emissive() {
-            result += throughput * hit.material.emission;
-        }
+    // Emissive surfaces radiate directly (area lights).
+    if hit.material.is_emissive() {
+        s.result += s.throughput * hit.material.emission;
+    }
 
-        let p = hit.point + hit.normal * eps;
+    let p = hit.point + hit.normal * eps;
 
-        // Next-event estimation: sample the sun for direct light on diffuse
-        // surfaces (specular bounces sample it implicitly via the BSDF).
-        if let (scene::Bsdf::Diffuse, Some(sun)) = (bsdf_kind(&hit.material), scene.sun) {
-            let ldir = sun_sample_dir(sun, rng);
-            let ndl = hit.normal.dot(ldir);
-            if ndl > 0.0 && !scene.occluded(p, ldir, f64::INFINITY) {
-                // Lambertian BRDF = albedo / π; the solid-angle weight of the
-                // sun disc is folded into its radiance (treated as a bright
-                // directional source), so direct = albedo * radiance * cos.
-                result += throughput * hit.material.albedo * sun.radiance
-                    * (ndl / std::f64::consts::PI);
-            }
-        }
-
-        // Sample the BSDF for the next bounce.
-        let Some(scat) = hit.material.scatter(dir, hit.normal, rng) else {
-            break;
-        };
-        throughput *= scat.attenuation;
-        origin = p;
-        dir = scat.dir;
-
-        // Russian roulette after a few bounces: kill low-throughput paths
-        // unbiasedly.
-        if bounce >= 3 {
-            let q = throughput.max_element().clamp(0.05, 0.95);
-            if rng.f01() > q {
-                break;
-            }
-            throughput /= q;
+    // Next-event estimation: sample the sun for direct light on diffuse
+    // surfaces (specular bounces sample it implicitly via the BSDF).
+    let mut shadow = None;
+    if let (scene::Bsdf::Diffuse, Some(sun)) = (bsdf_kind(&hit.material), scene.sun) {
+        let ldir = sun_sample_dir(sun, rng);
+        let ndl = hit.normal.dot(ldir);
+        if ndl > 0.0 {
+            // Lambertian BRDF = albedo / π; the solid-angle weight of the
+            // sun disc is folded into its radiance (treated as a bright
+            // directional source), so direct = albedo * radiance * cos.
+            let light = s.throughput * hit.material.albedo * sun.radiance * (ndl / std::f64::consts::PI);
+            shadow = Some(Shadow { ray: [p, ldir], light });
         }
     }
-    result
+
+    // Sample the BSDF for the next bounce.
+    let Some(scat) = hit.material.scatter(s.dir, hit.normal, rng) else {
+        return (shadow, false);
+    };
+    s.throughput *= scat.attenuation;
+    s.origin = p;
+    s.dir = scat.dir;
+
+    // Russian roulette after a few bounces: kill low-throughput paths
+    // unbiasedly.
+    if bounce >= 3 {
+        let q = s.throughput.max_element().clamp(0.05, 0.95);
+        if rng.f01() > q {
+            return (shadow, false);
+        }
+        s.throughput /= q;
+    }
+    (shadow, true)
+}
+
+/// Trace one primary ray through the scene and return its linear radiance.
+fn radiance(scene: &Scene, origin: DVec3, dir: DVec3, max_bounces: u32, rng: &mut Rng) -> DVec3 {
+    let mut s = PathState { origin, dir, throughput: DVec3::ONE, result: DVec3::ZERO };
+    let eps = surface_eps(scene);
+    for bounce in 0..=max_bounces {
+        let hit = scene.intersect(s.origin, s.dir);
+        let (shadow, more) = step(scene, &mut s, hit, bounce, eps, rng);
+        if let Some(sh) = shadow
+            && !scene.occluded(sh.ray[0], sh.ray[1], f64::INFINITY)
+        {
+            s.result += sh.light;
+        }
+        if !more {
+            break;
+        }
+    }
+    s.result
 }
 
 // Local mirror of the material's lobe so the integrator can special-case
@@ -194,28 +245,220 @@ fn sun_sample_dir(sun: Sun, rng: &mut Rng) -> DVec3 {
     (u * (sin_t * phi.cos()) + v * (sin_t * phi.sin()) + w * cos_t).normalize()
 }
 
+/// The primary ray and RNG stream for pixel `idx` of pass `sample`.
+fn primary(cam: &Camera, s: &Settings, sample: u32, idx: usize) -> (DVec3, Rng) {
+    let w = s.width as usize;
+    let h = s.height as usize;
+    let px = idx % w;
+    let py = idx / w;
+    let mut rng = Rng::new(idx as u64, sample as u64, s.seed);
+    // Jitter within the pixel for anti-aliasing.
+    let jx = rng.f01();
+    let jy = rng.f01();
+    let u = (px as f64 + jx) / w as f64;
+    // Image row 0 is the top; camera t=0 is the bottom → flip.
+    let v = 1.0 - (py as f64 + jy) / h as f64;
+    (cam.ray(u, v), rng)
+}
+
 /// Render a single accumulation pass into `accum` (HDR sums), deterministically.
 /// Each pixel seeds its own RNG stream from (pixel, sample, global seed), so the
 /// ordered `rayon` map is byte-identical to a sequential run.
 fn render_pass(scene: &Scene, cam: &Camera, s: &Settings, sample: u32, accum: &mut [DVec3]) {
-    let w = s.width as usize;
-    let h = s.height as usize;
     accum
         .par_iter_mut()
         .enumerate()
         .for_each(|(idx, cell)| {
-            let px = idx % w;
-            let py = idx / w;
-            let mut rng = Rng::new(idx as u64, sample as u64, s.seed);
-            // Jitter within the pixel for anti-aliasing.
-            let jx = rng.f01();
-            let jy = rng.f01();
-            let u = (px as f64 + jx) / w as f64;
-            // Image row 0 is the top; camera t=0 is the bottom → flip.
-            let v = 1.0 - (py as f64 + jy) / h as f64;
-            let dir = cam.ray(u, v);
+            let (dir, mut rng) = primary(cam, s, sample, idx);
             *cell += radiance(scene, cam.origin(), dir, s.max_bounces, &mut rng);
         });
+}
+
+/// One wavefront path: its state, RNG stream and shadow ray in flight.
+struct Path {
+    state: PathState,
+    rng: Rng,
+    shadow: Option<Shadow>,
+}
+
+/// Pixels per wavefront lane. A pass splits into at least two lanes so the
+/// CPU shades one while the GPU traces the other; this caps a lane's GPU
+/// buffers at 12 MB of rays.
+const LANE: usize = 1 << 19;
+
+/// Pixels per parallel task (a [`Piece`] at the first bounce).
+const TASK: usize = 4096;
+
+/// The rays one task hands to the next bounce: path indices (ascending)
+/// and their rays. Pieces of a lane cover disjoint, ascending path ranges,
+/// so each can be shaded by its own task with no shared mutable state.
+#[derive(Default)]
+struct Piece {
+    /// Paths whose next ray is in flight, and those rays.
+    live: Vec<u32>,
+    rays: Vec<[DVec3; 2]>,
+    /// Paths whose shadow ray is in flight, and those rays.
+    lit: Vec<u32>,
+    shadows: Vec<[DVec3; 2]>,
+}
+
+impl Piece {
+    fn clear(&mut self) {
+        self.live.clear();
+        self.rays.clear();
+        self.lit.clear();
+        self.shadows.clear();
+    }
+
+    /// The path range this piece touches.
+    fn span(&self) -> Option<std::ops::Range<usize>> {
+        let lo = self.live.first().into_iter().chain(self.lit.first()).min()?;
+        let hi = self.live.last().into_iter().chain(self.lit.last()).max()?;
+        Some(*lo as usize..*hi as usize + 1)
+    }
+}
+
+/// One lane's paths (one per pixel, in pixel order) and its reusable
+/// buffers, so a pass allocates (and page-faults) almost nothing after the
+/// first.
+#[derive(Default)]
+struct Lane {
+    paths: Vec<Path>,
+    /// The pieces in flight, and spares for the next bounce.
+    cur: Vec<Piece>,
+    spare: Vec<Piece>,
+    hits: Vec<Option<(u32, f32)>>,
+    occ: Vec<bool>,
+}
+
+/// Buffers reused by every [`render_pass_batched`] of one render.
+#[derive(Default)]
+struct Wavefront {
+    lanes: Vec<Lane>,
+}
+
+/// [`render_pass`] as a wavefront: every live path's next ray is traced in
+/// one batch per lane, with the previous bounce's shadow rays riding along,
+/// so the GPU gets whole-lane batches (one round trip per bounce) instead
+/// of per-ray round trips, and lanes alternate so the CPU shades one while
+/// the GPU traces another. Per path it runs the same [`step`]s with the
+/// same RNG stream, adding each sun sample before the next bounce's light,
+/// so with `hw = None` it is byte-identical to [`render_pass`].
+fn render_pass_batched(
+    scene: &Scene,
+    hw: Option<&itsjustcad_hwrt::Tracer>,
+    cam: &Camera,
+    s: &Settings,
+    sample: u32,
+    accum: &mut [DVec3],
+    wf: &mut Wavefront,
+) {
+    let eps = surface_eps(scene);
+    let origin = cam.origin();
+    let n = accum.len();
+    let lanes = n.div_ceil(LANE).max(2).min(n.max(1));
+    let per = n.div_ceil(lanes);
+    wf.lanes.resize_with(lanes, Lane::default);
+    // Start every lane: primary rays, no shadows yet.
+    let mut pending: Vec<Option<scene::Pending>> = Vec::with_capacity(lanes);
+    for (l, lane) in wf.lanes.iter_mut().enumerate() {
+        let start = (l * per).min(n);
+        let len = ((l + 1) * per).min(n) - start;
+        (start..start + len)
+            .into_par_iter()
+            .map(|idx| {
+                let (dir, rng) = primary(cam, s, sample, idx);
+                let state = PathState { origin, dir, throughput: DVec3::ONE, result: DVec3::ZERO };
+                Path { state, rng, shadow: None }
+            })
+            .collect_into_vec(&mut lane.paths);
+        lane.cur.resize_with(len.div_ceil(TASK), Piece::default);
+        let paths = &lane.paths;
+        lane.cur.par_iter_mut().enumerate().for_each(|(c, pc)| {
+            pc.clear();
+            let r = c * TASK..((c + 1) * TASK).min(len);
+            pc.live.extend(r.clone().map(|i| i as u32));
+            pc.rays.extend(paths[r].iter().map(|p| [p.state.origin, p.state.dir]));
+        });
+        pending.push(Some(submit(scene, hw, &lane.cur)));
+    }
+    let mut bounce = vec![0u32; lanes];
+    while pending.iter().any(Option::is_some) {
+        for (l, lane) in wf.lanes.iter_mut().enumerate() {
+            let Some(p) = pending[l].take() else { continue };
+            let Lane { paths, cur, spare, hits, occ } = lane;
+            hits.resize(cur.iter().map(|pc| pc.rays.len()).sum(), None);
+            occ.resize(cur.iter().map(|pc| pc.shadows.len()).sum(), false);
+            let rays: Vec<&[[DVec3; 2]]> = cur.iter().map(|pc| &pc.rays[..]).collect();
+            let shadows: Vec<&[[DVec3; 2]]> = cur.iter().map(|pc| &pc.shadows[..]).collect();
+            scene.finish(hw, p, &rays, &shadows, hits, occ);
+            let b = bounce[l];
+            bounce[l] += 1;
+            let last = b >= s.max_bounces;
+            // Pair each piece with its disjoint slice of paths and answers.
+            let mut tasks = Vec::with_capacity(cur.len());
+            let (mut rest, mut base) = (&mut paths[..], 0usize);
+            let (mut hs, mut os) = (&hits[..], &occ[..]);
+            for pc in cur.iter() {
+                let (h, ht) = hs.split_at(pc.rays.len());
+                let (o, ot) = os.split_at(pc.shadows.len());
+                (hs, os) = (ht, ot);
+                let Some(span) = pc.span() else { continue };
+                let (_, tail) = std::mem::take(&mut rest).split_at_mut(span.start - base);
+                let (mine, tail) = tail.split_at_mut(span.len());
+                tasks.push((mine, span.start, pc, h, o));
+                rest = tail;
+                base = span.end;
+            }
+            spare.resize_with(tasks.len(), Piece::default);
+            tasks.into_par_iter().zip(spare.par_iter_mut()).for_each(|((ps, base, pc, h, o), next)| {
+                next.clear();
+                // The previous bounce's sun light, before this bounce's.
+                for (&i, &occluded) in pc.lit.iter().zip(o) {
+                    let p = &mut ps[i as usize - base];
+                    if let Some(sh) = p.shadow.take()
+                        && !occluded
+                    {
+                        p.state.result += sh.light;
+                    }
+                }
+                for (&i, h) in pc.live.iter().zip(h) {
+                    let p = &mut ps[i as usize - base];
+                    let hit = h.map(|(tri, t)| scene.hit_at(p.state.origin, p.state.dir, tri, t));
+                    let (shadow, more) = step(scene, &mut p.state, hit, b, eps, &mut p.rng);
+                    if let Some(sh) = shadow {
+                        p.shadow = shadow;
+                        next.lit.push(i);
+                        next.shadows.push(sh.ray);
+                    }
+                    if more && !last {
+                        next.live.push(i);
+                        next.rays.push([p.state.origin, p.state.dir]);
+                    }
+                }
+            });
+            std::mem::swap(cur, spare);
+            if cur.iter().any(|pc| !pc.live.is_empty() || !pc.lit.is_empty()) {
+                pending[l] = Some(submit(scene, hw, cur));
+            }
+        }
+    }
+    let mut start = 0;
+    for lane in &wf.lanes[..lanes] {
+        let len = lane.paths.len();
+        accum[start..start + len]
+            .par_iter_mut()
+            .zip(lane.paths.par_iter())
+            .for_each(|(c, p)| *c += p.state.result);
+        start += len;
+    }
+}
+
+/// [`Scene::submit`] for every piece's rays and shadow rays.
+fn submit(scene: &Scene, hw: Option<&itsjustcad_hwrt::Tracer>, pieces: &[Piece]) -> scene::Pending {
+    let rays: Vec<&[[DVec3; 2]]> = pieces.iter().map(|pc| &pc.rays[..]).collect();
+    let shadows: Vec<&[[DVec3; 2]]> = pieces.iter().map(|pc| &pc.shadows[..]).collect();
+    scene.submit(hw, &rays, &shadows)
 }
 
 /// Tone-map an HDR accumulation buffer (summed over `samples` passes) to an RGBA
@@ -254,14 +497,23 @@ pub fn render_progressive(
     let mut accum = vec![DVec3::ZERO; n];
     let total = settings.samples_per_pixel.max(1);
     let mut done = 0u32;
+    // Hardware ray tracing when available (#318); the CPU path otherwise.
+    let hw = scene.hw();
+    let mut wf = Wavefront::default();
     for sample in 0..total {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        render_pass(scene, cam, settings, sample, &mut accum);
+        match hw {
+            Some(_) => render_pass_batched(scene, hw, cam, settings, sample, &mut accum, &mut wf),
+            None => render_pass(scene, cam, settings, sample, &mut accum),
+        }
         done = sample + 1;
         let image = resolve(&accum, done, settings);
         on_pass(PassResult { passes_done: done, passes_total: total, image: &image });
+    }
+    if let Some(hw) = hw {
+        hw.report();
     }
     // Ensure the returned image reflects however many passes actually ran
     // (even zero, if cancelled before the first pass → a black frame).
@@ -383,6 +635,40 @@ mod tests {
         // samples deterministically).
         let one_shot = render(&scene, &cam, &s);
         assert_eq!(final_img.pixels, one_shot.pixels);
+    }
+
+    /// The wavefront pass on the CPU backend is the per-pixel pass, bit for
+    /// bit: same steps, same RNG streams, same accumulation order.
+    #[test]
+    fn batched_cpu_pass_is_byte_identical() {
+        let (scene, cam) = box_scene();
+        let s = Settings { width: 128, height: 80, samples_per_pixel: 1, max_bounces: 6, ..Default::default() };
+        let n = (s.width * s.height) as usize;
+        for sample in 0..3 {
+            let mut a = vec![DVec3::ZERO; n];
+            let mut b = vec![DVec3::ZERO; n];
+            render_pass(&scene, &cam, &s, sample, &mut a);
+            render_pass_batched(&scene, None, &cam, &s, sample, &mut b, &mut Wavefront::default());
+            assert!(a.iter().zip(&b).all(|(x, y)| x.to_array().map(f64::to_bits) == y.to_array().map(f64::to_bits)));
+        }
+    }
+
+    /// On hardware ray tracing the image matches the CPU's closely.
+    #[test]
+    fn hw_render_matches_cpu() {
+        let (scene, cam) = box_scene();
+        let Some(hw) = scene.hw() else { return };
+        let s = Settings { width: 80, height: 50, samples_per_pixel: 4, max_bounces: 4, ..Default::default() };
+        let n = (s.width * s.height) as usize;
+        let (mut a, mut b) = (vec![DVec3::ZERO; n], vec![DVec3::ZERO; n]);
+        let mut wf = Wavefront::default();
+        for sample in 0..s.samples_per_pixel {
+            render_pass(&scene, &cam, &s, sample, &mut a);
+            render_pass_batched(&scene, Some(hw), &cam, &s, sample, &mut b, &mut wf);
+        }
+        let (a, b) = (resolve(&a, 4, &s), resolve(&b, 4, &s));
+        let diff = a.pixels.chunks(4).zip(b.pixels.chunks(4)).filter(|(x, y)| x != y).count();
+        assert!(diff <= n / 100, "{diff} of {n} pixels differ");
     }
 
     #[test]
