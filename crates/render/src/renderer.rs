@@ -395,11 +395,20 @@ pub struct UnderlayData {
 /// or a strip depending on the consuming pass.
 pub type LineEntry = (Vec<[f32; 3]>, [f32; 4], f32);
 
+/// One per-face-coloured mesh (#327): `(mesh, per-face rgb, rgba,
+/// [roughness, metallic])`. See [`SceneData::face_meshes`].
+pub type FaceMeshEntry = (RenderMesh, Vec<[f32; 3]>, [f32; 4], [f32; 2]);
+
 /// CPU-side scene snapshot handed to the renderer when the document changes.
 pub struct SceneData {
     /// `(mesh, rgba, [roughness, metallic])`. The material scalars default to
     /// `[0.5, 0.0]` (mid-rough dielectric) when the object has no `material2`.
     pub meshes: Vec<(RenderMesh, [f32; 4], [f32; 2])>,
+    /// Meshes drawn one colour per face (#327): `(mesh, per-face rgb, rgba,
+    /// [roughness, metallic])`. The rgb list holds one entry per triangle of
+    /// the flat [`RenderMesh`] (three corners each); the rgba supplies alpha.
+    /// Kept apart from `meshes` so ordinary meshes keep their vertex layout.
+    pub face_meshes: Vec<FaceMeshEntry>,
     /// Line strips: consecutive points, `closed` handled by repeating the seam
     /// point on the CPU side. The `f32` is the effective lineweight in mm
     /// (per-object override or layer weight, whichever wins). Used to generate
@@ -434,6 +443,10 @@ pub struct SceneRenderer {
     mesh_pipeline: wgpu::RenderPipeline,
     /// Mesh fill without depth writes, for the transparent display modes.
     mesh_xray_pipeline: wgpu::RenderPipeline,
+    /// The two mesh fills for per-face-coloured meshes (#327): the vertex
+    /// carries its face's colour.
+    face_pipeline: wgpu::RenderPipeline,
+    face_xray_pipeline: wgpu::RenderPipeline,
     curve_pipeline: wgpu::RenderPipeline,
     /// LineList variant of the curve pipeline for mesh feature edges.
     edge_pipeline: wgpu::RenderPipeline,
@@ -467,6 +480,8 @@ pub struct SceneRenderer {
     underlay_pipeline: wgpu::RenderPipeline,
     underlay_layout: wgpu::BindGroupLayout,
     meshes: Batch,
+    /// Per-face-coloured meshes, 9 floats per vertex (#327).
+    face_meshes: Batch,
     lines: Batch,
     edges: Batch,
     /// Profile / silhouette edges tessellated into fat-line ribbon meshes so
@@ -569,82 +584,57 @@ impl SceneRenderer {
             bind_group_layouts: &[Some(&camera_layout), Some(&object_layout)],
             immediate_size: 0,
         });
-        let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh_pipeline"),
-            layout: Some(&mesh_layout),
-            vertex: wgpu::VertexState {
-                module: &mesh_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 24, // 3 f32 position + 3 f32 normal
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &mesh_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // Same shading, but no depth writes and no culling: transparent modes
-        // must not occlude, and back faces keep x-ray solids readable.
-        let mesh_xray_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh_xray_pipeline"),
-            layout: Some(&mesh_layout),
-            vertex: wgpu::VertexState {
-                module: &mesh_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 24,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &mesh_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        // Mesh fills. The xray variant has no depth writes and no culling:
+        // transparent modes must not occlude, and back faces keep x-ray solids
+        // readable. The face variant reads a per-vertex face colour (#327).
+        let mesh_fill = |label: &str, xray: bool, face: bool| {
+            let plain = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+            let colored = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&mesh_layout),
+                vertex: wgpu::VertexState {
+                    module: &mesh_shader,
+                    entry_point: Some(if face { "vs_face" } else { "vs_main" }),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        // 3 f32 position + 3 f32 normal (+ 3 f32 face rgb)
+                        array_stride: if face { 36 } else { 24 },
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: if face { &colored } else { &plain },
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &mesh_shader,
+                    entry_point: Some(if face { "fs_face" } else { "fs_main" }),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: if xray {
+                    wgpu::PrimitiveState::default()
+                } else {
+                    wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() }
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(!xray),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let mesh_pipeline = mesh_fill("mesh_pipeline", false, false);
+        let mesh_xray_pipeline = mesh_fill("mesh_xray_pipeline", true, false);
+        let face_pipeline = mesh_fill("face_pipeline", false, true);
+        let face_xray_pipeline = mesh_fill("face_xray_pipeline", true, true);
 
         let curve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("curve_shader"),
@@ -959,6 +949,8 @@ impl SceneRenderer {
             grid_pipeline,
             mesh_pipeline,
             mesh_xray_pipeline,
+            face_pipeline,
+            face_xray_pipeline,
             curve_pipeline,
             edge_pipeline,
             fat_pipeline,
@@ -975,6 +967,7 @@ impl SceneRenderer {
             underlay_pipeline,
             underlay_layout,
             meshes: Batch::new("meshes"),
+            face_meshes: Batch::new("face_meshes"),
             lines: Batch::new("curves"),
             edges: Batch::new("edges"),
             profile_ribbons: Batch::new("profile_ribbons"),
@@ -1046,6 +1039,12 @@ impl SceneRenderer {
         generation: u64,
     ) {
         self.meshes.set(device, queue, stage_meshes(&scene.meshes));
+        let mut faces = Staged::default();
+        for (mesh, rgb, color, rm) in &scene.face_meshes {
+            let params = ObjectParams { color: *color, material: [rm[0], rm[1], 0.0, 0.0] };
+            faces.push_face_mesh(&mesh.positions, &mesh.normals, rgb, &mesh.indices, params);
+        }
+        self.face_meshes.set(device, queue, faces);
 
         // Curves: strips for the hairline pass, plus LineList copies of the
         // same strips for the fat-stroke pass.
@@ -1114,6 +1113,7 @@ impl SceneRenderer {
         }
         let Self {
             meshes,
+            face_meshes,
             edges,
             profile_ribbons,
             curve_segments,
@@ -1123,13 +1123,13 @@ impl SceneRenderer {
             object_layout,
             ..
         } = self;
-        let params = [&*meshes, &*edges, &*profile_ribbons, &*curve_segments, &*lines, &*point_clouds]
+        let params = [&*meshes, &*edges, &*profile_ribbons, &*curve_segments, &*lines, &*point_clouds, &*face_meshes]
             .into_iter()
             .flat_map(|b| b.params.iter());
         scene_params.write(device, queue, object_layout, params);
     }
 
-    fn scene_batches_mut(&mut self) -> [&mut Batch; 6] {
+    fn scene_batches_mut(&mut self) -> [&mut Batch; 7] {
         [
             &mut self.meshes,
             &mut self.edges,
@@ -1137,6 +1137,7 @@ impl SceneRenderer {
             &mut self.curve_segments,
             &mut self.lines,
             &mut self.point_clouds,
+            &mut self.face_meshes,
         ]
     }
 
@@ -1288,6 +1289,14 @@ impl SceneRenderer {
                 &self.mesh_xray_pipeline
             });
             draw_indexed(render_pass, &self.meshes, scene);
+            if !self.face_meshes.draws.is_empty() {
+                render_pass.set_pipeline(if mode.depth_writes() {
+                    &self.face_pipeline
+                } else {
+                    &self.face_xray_pipeline
+                });
+                draw_indexed(render_pass, &self.face_meshes, scene);
+            }
         }
 
         // Shaded draws edges by default but can be turned off; other modes

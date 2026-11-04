@@ -245,6 +245,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline {
                 points: pts.iter().map(|&(x, y)| DVec3::new(x, y, 0.0)).collect(),
                 closed,

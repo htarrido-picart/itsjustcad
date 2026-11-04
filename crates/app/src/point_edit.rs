@@ -527,6 +527,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline {
                 points,
                 closed: false,

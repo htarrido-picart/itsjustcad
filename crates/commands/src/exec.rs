@@ -3185,6 +3185,7 @@ fn insert_curve(
         lineweight_mm: None,
         edge_tags: None,
         street: None,
+        face_values: None,
         geometry: Geometry::Curve(curve),
     });
     let outcome = ApplyOutcome {
@@ -3755,6 +3756,7 @@ fn mesh_object(doc: &mut Document, id: Option<ObjectId>, mesh: kernel_mesh::Mesh
         lineweight_mm: None,
         edge_tags: None,
         street: None,
+        face_values: None,
         geometry: Geometry::Mesh(mesh),
     });
     id
@@ -3796,6 +3798,7 @@ fn parametric_object(
         lineweight_mm: None,
         edge_tags: None,
         street: None,
+        face_values: None,
         geometry: Geometry::Parametric {
             generator,
             params,
@@ -4096,6 +4099,7 @@ fn replace_with_result(
         lineweight_mm: None,
         edge_tags: None,
         street: None,
+        face_values: None,
         geometry: Geometry::Mesh(result),
     });
     Ok((
@@ -4772,6 +4776,7 @@ fn section_meshes(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline { points, closed }),
         });
     }
@@ -4786,6 +4791,7 @@ fn section_meshes(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -4865,6 +4871,7 @@ fn exec_curvature_graph(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(c),
         });
     };
@@ -5403,6 +5410,7 @@ fn place_markers(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
         });
     }
@@ -5703,6 +5711,7 @@ fn exec_shadow_study(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry,
         });
     }
@@ -5978,7 +5987,7 @@ fn exec_radiation(
 
     for ((tri, &k), id) in faces.iter().zip(&kwh).zip(&new_ids) {
         let frac = if max_k > 0.0 { k / max_k } else { 0.0 };
-        let color = [frac as f32, 0.15, (1.0 - frac) as f32];
+        let color = itsjustcad_doc::Ramp::BlueRed.color(frac);
         let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
         let nlen = normal.length();
         if nlen > 1e-12 {
@@ -5999,6 +6008,7 @@ fn exec_radiation(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -8525,6 +8535,7 @@ fn exec_contours(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline {
                 points: line.points.clone(),
                 closed: line.closed,
@@ -8734,6 +8745,7 @@ fn exec_flow_arrows(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline { points: pts, closed: false }),
         });
     }
@@ -8827,6 +8839,7 @@ fn exec_ponding(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline { points: circle, closed: true }),
         });
     }
@@ -8935,6 +8948,7 @@ fn exec_site_path(
         lineweight_mm: None,
         edge_tags: None,
         street: None,
+        face_values: None,
         geometry: Geometry::Mesh(kernel_mesh::Mesh::new(positions, faces)),
     });
     doc.generation += 1;
@@ -9248,6 +9262,7 @@ fn exec_sun_path(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline {
                 points: line.pts.clone(),
                 closed: line.closed,
@@ -9394,7 +9409,7 @@ fn exec_sun_hours(
     for ((x, y, hours), id) in cells.iter().zip(&new_ids) {
         let frac = if max_h > 0.0 { hours / max_h } else { 0.0 };
         // blue (few hours) → red (most hours)
-        let color = [frac as f32, 0.15, (1.0 - frac) as f32];
+        let color = itsjustcad_doc::Ramp::BlueRed.color(frac);
         let corners = vec![
             DVec3::new(x - half, y - half, 0.0),
             DVec3::new(x + half, y - half, 0.0),
@@ -9412,6 +9427,7 @@ fn exec_sun_hours(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -9566,7 +9582,7 @@ fn exec_face_sun_hours(
 
     for ((tri, &h), id) in faces.iter().zip(&hours).zip(&new_ids) {
         let frac = if max_h > 0.0 { h / max_h } else { 0.0 };
-        let color = [frac as f32, 0.15, (1.0 - frac) as f32];
+        let color = itsjustcad_doc::Ramp::BlueRed.color(frac);
         // Overlay copy of the face, nudged toward the sky along its normal so it
         // renders just above the source surface instead of z-fighting with it.
         let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
@@ -9589,6 +9605,7 @@ fn exec_face_sun_hours(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Mesh(mesh),
         });
     }
@@ -9706,6 +9723,7 @@ fn elevation_meshes(
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(Curve::Polyline { points: vec![a, b], closed: false }),
         });
     }
@@ -10565,6 +10583,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(kernel_mesh::make_box(corner, size)),
             });
             Ok((
@@ -10607,6 +10626,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(extrude_profile(&profile2d, base_z, height)),
             });
             Ok((
@@ -10655,6 +10675,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -10720,6 +10741,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(mesh),
             });
             let message = if n_guides > 0 {
@@ -10770,6 +10792,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -10811,6 +10834,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -10849,6 +10873,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -10894,6 +10919,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -10934,6 +10960,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -11785,6 +11812,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Curve(rebuilt),
             });
             Ok((
@@ -11841,6 +11869,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Annotation(Annotation::LinearDim {
                     a: anchor_a,
                     b: anchor_b,
@@ -11882,6 +11911,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Annotation(Annotation::AngularDim {
                     vertex,
                     p1,
@@ -11916,6 +11946,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Annotation(Annotation::Text {
                     pos,
                     text: text.clone(),
@@ -11950,6 +11981,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Annotation(Annotation::Field {
                     pos,
                     expr: expr.clone(),
@@ -12043,6 +12075,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Annotation(Annotation::Hatch {
                     boundary,
                     pattern: pattern.clone(),
@@ -12168,6 +12201,7 @@ fn apply_forward(
                     lineweight_mm: None,
                     edge_tags: None,
                     street: None,
+                    face_values: None,
                     geometry: Geometry::Curve(Curve::Polyline { points, closed: true }),
                 });
             }
@@ -12212,6 +12246,7 @@ fn apply_forward(
                     lineweight_mm: None,
                     edge_tags: None,
                     street: None,
+                    face_values: None,
                     geometry: Geometry::Annotation(Annotation::LinearDim {
                         a: DimAnchor::Free(*a),
                         b: DimAnchor::Free(*b),
@@ -12338,6 +12373,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(mesh),
             });
             let path = if exact {
@@ -12617,6 +12653,7 @@ fn apply_forward(
                         lineweight_mm: e.obj.lineweight_mm,
                         edge_tags: None,
                         street: None,
+                        face_values: None,
                         geometry: Geometry::Curve(seg),
                     });
                 }
@@ -12688,6 +12725,7 @@ fn apply_forward(
                         lineweight_mm: obj.lineweight_mm,
                         edge_tags: None,
                         street: None,
+                        face_values: None,
                         geometry: Geometry::Curve(c),
                     });
                 }
@@ -12927,6 +12965,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Annotation(Annotation::LinearDim {
                     a: anchor_a,
                     b: anchor_b,
@@ -13014,6 +13053,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Points { positions },
             });
             Ok((
@@ -13057,6 +13097,7 @@ fn apply_forward(
                     lineweight_mm: None,
                     edge_tags: None,
                     street: None,
+                    face_values: None,
                     geometry: Geometry::Curve(piece),
                 });
             }
@@ -13168,6 +13209,7 @@ fn apply_forward(
                         lineweight_mm: None,
                         edge_tags: None,
                         street: None,
+                        face_values: None,
                         geometry: Geometry::Curve(cur),
                     });
                     extended += 1;
@@ -13220,6 +13262,7 @@ fn apply_forward(
                         lineweight_mm: None,
                         edge_tags: None,
                         street: None,
+                        face_values: None,
                         geometry: Geometry::Curve(piece.clone()),
                     });
                 }
@@ -13313,6 +13356,7 @@ fn apply_forward(
                     lineweight_mm: None,
                     edge_tags: None,
                     street: None,
+                    face_values: None,
                     geometry: Geometry::Curve(piece.clone()),
                 });
             }
@@ -13397,6 +13441,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Curve(joined),
             });
             Ok((
@@ -13483,6 +13528,7 @@ fn apply_forward(
                     lineweight_mm: None,
                     edge_tags: None,
                     street: None,
+                    face_values: None,
                     geometry: Geometry::Curve(joined),
                 });
                 return Ok((
@@ -13523,6 +13569,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Curve(arc),
             });
             Ok((
@@ -13584,6 +13631,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Curve(bevel),
             });
             Ok((
@@ -13655,6 +13703,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Curve(offset),
             });
             Ok((
@@ -15722,6 +15771,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Mesh(mesh),
             });
             Ok((
@@ -15754,6 +15804,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Points { positions: positions.clone() },
             });
             Ok((
@@ -15849,6 +15900,7 @@ fn apply_forward(
                     lineweight_mm: None,
                     edge_tags: None,
                     street: None,
+                    face_values: None,
                     geometry: Geometry::Instance {
                         block: key.clone(),
                         position,
@@ -15885,6 +15937,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Instance {
                     block: name.clone(),
                     position,
@@ -16168,6 +16221,7 @@ fn apply_forward(
                         lineweight_mm: inst.lineweight_mm,
                         edge_tags: None,
                         street: None,
+                        face_values: None,
                         geometry,
                     });
                 }
@@ -16286,6 +16340,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Instance {
                     block: name.clone(),
                     position: pos,
@@ -16446,6 +16501,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry,
             });
             doc.generation += 1;
@@ -16809,6 +16865,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Frame {
                     kind,
                     a,
@@ -16873,6 +16930,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Area {
                     kind,
                     boundary: boundary.clone(),
@@ -16956,6 +17014,7 @@ fn apply_forward(
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Curve(Curve::Polyline { points: centerline, closed: false }),
             });
             let runs = layout
@@ -17160,6 +17219,7 @@ fn apply_forward(
                     lineweight_mm: None,
                     edge_tags: None,
                     street: None,
+                    face_values: None,
                     geometry: Geometry::Area {
                         kind: AreaKind::Wall,
                         boundary,

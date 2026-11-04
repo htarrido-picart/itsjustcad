@@ -32,9 +32,9 @@ pub use object::{
     angle_degrees, angular_arc_points, angular_dim_segments, Annotation, AreaKind, BlockGeometry,
     ClipRect, DimAnchor,
     default_layer_color,
-    EdgeTag, EndpointRef, FieldExpr, FrameKind, Geometry,
+    EdgeTag, EndpointRef, FaceValues, FieldExpr, FrameKind, Geometry,
     HatchPattern, HatchPatternDef, LayerStyle, LineType, MaterialPreset, ObjectId, ObjectMaterial,
-    ParamBlockDef, ParamBlockParam, PatLine, SceneObject, StreetClass, StreetInfo, DEFAULT_LAYER,
+    ParamBlockDef, ParamBlockParam, PatLine, Ramp, SceneObject, StreetClass, StreetInfo, DEFAULT_LAYER,
     geometry_fingerprint,
 };
 pub use param_schema::{

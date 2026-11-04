@@ -28,7 +28,12 @@ pub(crate) fn header_version_ok(v: &serde_json::Value, current: u32) -> bool {
 ///
 /// v3 (#217): adds the writing core version and a hash of the ops the
 /// snapshot reflects, so a snapshot older than its log can seed a tail replay.
-pub const CHECKPOINT_VERSION: u32 = 3;
+///
+/// v4 (#327): snapshot objects may carry per-face values
+/// (`SceneObject::face_values`). A v3 snapshot still parses (the field is
+/// serde-default), but older builds would drop the values, so the version
+/// marks the schema change.
+pub const CHECKPOINT_VERSION: u32 = 4;
 
 /// The core build a checkpoint was written by. A checkpoint from any other
 /// build is ignored: replay output may differ between builds.
@@ -1045,6 +1050,39 @@ mod tests {
         let o = open(&json, Some(&v.to_string()));
         assert!(!o.from_checkpoint, "format mismatch");
         assert_eq!(o.session.doc, s.doc);
+    }
+
+    #[test]
+    fn checkpoint_carries_face_values_and_omits_them_when_absent() {
+        use itsjustcad_doc::{FaceValues, Geometry, Ramp};
+        let mut s = built_session();
+        let json = to_json(&s);
+        let plain = checkpoint_json(&s);
+        assert!(!plain.contains("face_values"), "objects without values omit the key");
+        let o = open(&json, Some(&plain));
+        assert!(o.from_checkpoint);
+        assert_eq!(checkpoint_json(&o.session), plain, "re-snapshot byte-identical");
+
+        let (id, faces) = s
+            .doc
+            .objects()
+            .find_map(|o| match &o.geometry {
+                Geometry::Mesh(m) => Some((o.id, m.faces().len())),
+                _ => None,
+            })
+            .unwrap();
+        let fv = FaceValues {
+            values: (0..faces).map(|i| i as f32).collect(),
+            min: 0.0,
+            max: (faces - 1) as f32,
+            ramp: Ramp::BlueRed,
+        };
+        s.doc.get_mut(id).unwrap().face_values = Some(fv.clone());
+        let cp = checkpoint_json(&s);
+        let o = open(&json, Some(&cp));
+        assert!(o.from_checkpoint);
+        assert_eq!(o.session.doc.get(id).unwrap().face_values, Some(fv));
+        assert_eq!(checkpoint_json(&o.session), cp, "per-face snapshot round trip");
     }
 
     #[test]

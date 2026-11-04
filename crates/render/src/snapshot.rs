@@ -356,6 +356,7 @@ pub fn snapshot_in_context(
     let mode = cms.color_mode;
     let mut scene = SceneData {
         meshes: Vec::new(),
+        face_meshes: Vec::new(),
         lines: Vec::new(),
         edges: Vec::new(),
         profile_edges: Vec::new(),
@@ -406,6 +407,7 @@ pub fn snapshot_in_context(
             scene.profile_edges.len(),
             scene.points.len(),
             deferred_source_lines.len(),
+            scene.face_meshes.len(),
         );
         match &obj.geometry {
             // Strut-lattice parametric generators (spaceframe/geodesic/
@@ -442,7 +444,14 @@ pub fn snapshot_in_context(
             | Geometry::Parametric { mesh, .. } => {
                 let (color, rm) =
                     resolve_mesh_material(obj, layer_color, theme, selected, mode);
-                scene.meshes.push((mesh.to_render(), color, rm));
+                // Per-face values (#327) colour each face, unless selection or
+                // a by-type/random colour mode asks for one colour per object.
+                let per_face = !selected
+                    && matches!(mode, ColorMode::ByLayer | ColorMode::ByObject);
+                match obj.face_colors().filter(|_| per_face) {
+                    Some(rgb) => scene.face_meshes.push((mesh.to_render(), rgb, color, rm)),
+                    None => scene.meshes.push((mesh.to_render(), color, rm)),
+                }
                 // Feature edges for the wireframe/x-ray/ghosted display modes.
                 let edge_color = if selected { theme.selected() } else { theme.curve() };
                 if cms.profile_edges {
@@ -725,6 +734,13 @@ pub fn snapshot_in_context(
             scene.meshes[before.0..]
                 .iter_mut()
                 .for_each(|m| f(&mut m.1));
+            for m in &mut scene.face_meshes[before.6..] {
+                f(&mut m.2);
+                for rgb in &mut m.1 {
+                    let [r, g, b, _] = fade_color([rgb[0], rgb[1], rgb[2], 1.0], theme);
+                    *rgb = [r, g, b];
+                }
+            }
             scene.lines[before.1..].iter_mut().for_each(|l| f(&mut l.1));
             scene.edges[before.2..].iter_mut().for_each(|l| f(&mut l.1));
             scene.profile_edges[before.3..]
@@ -799,11 +815,37 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Mesh(mesh),
         };
         let id = obj.id;
         doc.insert(obj);
         id
+    }
+
+    #[test]
+    fn face_values_draw_per_face_unless_selected_or_by_type() {
+        let mut doc = Document::default();
+        let id = insert_tri(&mut doc, itsjustcad_doc::DEFAULT_LAYER);
+        doc.get_mut(id).unwrap().face_values = Some(itsjustcad_doc::FaceValues {
+            values: vec![1.0],
+            min: 0.0,
+            max: 1.0,
+            ramp: itsjustcad_doc::Ramp::BlueRed,
+        });
+        let scene = snapshot(&doc, Theme::Dark);
+        assert!(scene.meshes.is_empty());
+        assert_eq!(scene.face_meshes.len(), 1);
+        assert_eq!(scene.face_meshes[0].1, vec![[1.0, 0.15, 0.0]]);
+
+        let by_type = ColorModeSnapshot { color_mode: ColorMode::ByType, ..Default::default() };
+        let scene = snapshot_with_mode(&doc, Theme::Dark, by_type);
+        assert_eq!((scene.meshes.len(), scene.face_meshes.len()), (1, 0));
+
+        doc.selection.insert(id);
+        let scene = snapshot(&doc, Theme::Dark);
+        assert_eq!((scene.meshes.len(), scene.face_meshes.len()), (1, 0));
+        assert_eq!(scene.meshes[0].1, Theme::Dark.selected());
     }
 
     #[test]
@@ -847,6 +889,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Parametric {
                 generator: cn,
                 params: cn_params.clone(),
@@ -871,6 +914,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Parametric {
                 generator: gd,
                 params: gd_params.clone(),
@@ -918,6 +962,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Mesh(kernel_mesh::make_box(
                 DVec3::ZERO,
                 DVec3::new(2.0, 1.0, 3.0),
@@ -950,6 +995,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Mesh(kernel_mesh::make_box(
                 DVec3::ZERO,
                 DVec3::new(2.0, 1.0, 3.0),
@@ -1010,6 +1056,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square.clone(),
                 pattern: itsjustcad_doc::HatchPattern::Solid,
@@ -1030,6 +1077,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Hatch {
                 boundary: square,
                 pattern: itsjustcad_doc::HatchPattern::Lines { angle_deg: 0.0, spacing: 0.5 },
@@ -1058,6 +1106,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::LinearDim {
                 a: itsjustcad_doc::DimAnchor::Free(DVec3::ZERO),
                 b: itsjustcad_doc::DimAnchor::Free(DVec3::X),
@@ -1080,6 +1129,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Annotation(itsjustcad_doc::Annotation::Text {
                 pos: DVec3::ZERO,
                 text: "note".into(),
@@ -1216,6 +1266,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Instance {
                 block: "tri".to_string(),
                 position: DVec3::new(5.0, 0.0, 0.0),
@@ -1252,6 +1303,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Instance {
                 block: "tri".to_string(),
                 position: DVec3::new(5.0, 0.0, 0.0),
@@ -1342,6 +1394,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Instance {
                 block: "quad".into(),
                 position: DVec3::ZERO,
@@ -1400,6 +1453,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
                 points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
                 closed: true,
@@ -1438,6 +1492,7 @@ mod tests {
             lineweight_mm: None,
             edge_tags: None,
             street: None,
+            face_values: None,
             geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
                 points: vec![DVec3::ZERO, DVec3::X],
                 closed: false,
@@ -1479,6 +1534,7 @@ mod tests {
                 lineweight_mm: None,
                 edge_tags: None,
                 street: None,
+                face_values: None,
                 geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
                     points: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
                     closed: false,

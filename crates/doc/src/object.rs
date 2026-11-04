@@ -1245,6 +1245,50 @@ impl StreetClass {
     }
 }
 
+/// Colour ramp mapping a normalized value `t` in `[0, 1]` to RGB (#327).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Ramp {
+    /// Blue (low) to red (high), `[t, 0.15, 1 - t]`: the `facesunhours` and
+    /// `radiation` overlay ramp.
+    #[default]
+    BlueRed,
+}
+
+impl Ramp {
+    /// RGB at `t`, clamped to `[0, 1]`; NaN reads as 0.
+    pub fn color(self, t: f64) -> [f32; 3] {
+        let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+        match self {
+            Ramp::BlueRed => [t as f32, 0.15, (1.0 - t) as f32],
+        }
+    }
+}
+
+/// Per-face scalar values of a mesh object (an analysis result, #327),
+/// drawn one colour per face through `ramp` over `[min, max]`. The values are
+/// stored, not the colours, so a legend or re-colouring can read them back.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FaceValues {
+    /// One value per mesh face, in face order.
+    pub values: Vec<f32>,
+    /// Value at the low end of the ramp.
+    pub min: f32,
+    /// Value at the high end of the ramp.
+    pub max: f32,
+    #[serde(default)]
+    pub ramp: Ramp,
+}
+
+impl FaceValues {
+    /// Ramp colour of `v`. A degenerate range (`max <= min`) maps to the low end.
+    pub fn color(&self, v: f32) -> [f32; 3] {
+        let span = f64::from(self.max) - f64::from(self.min);
+        let t = if span > 0.0 { (f64::from(v) - f64::from(self.min)) / span } else { 0.0 };
+        self.ramp.color(t)
+    }
+}
+
 /// Street identity of a generated road centerline (#143 phase 4). `id` is the
 /// `street_id` the lot/block [`EdgeTag`]s carry, unique within one site link.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1313,10 +1357,24 @@ pub struct SceneObject {
     /// old JSON loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub street: Option<StreetInfo>,
+    /// Per-face values of a mesh result (#327). `None` (the default, and
+    /// omitted on write) draws the object in its single resolved colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_values: Option<FaceValues>,
     pub geometry: Geometry,
 }
 
 impl SceneObject {
+    /// One ramp colour per face of the object's mesh, when it carries
+    /// [`FaceValues`] that still match the mesh (one value per face). An edit
+    /// that changed the face count makes the values read as absent.
+    pub fn face_colors(&self) -> Option<Vec<[f32; 3]>> {
+        let fv = self.face_values.as_ref()?;
+        let mesh = self.geometry.mesh()?;
+        (fv.values.len() == mesh.faces().len() && !fv.values.is_empty())
+            .then(|| fv.values.iter().map(|&v| fv.color(v)).collect())
+    }
+
     /// True for a generated road whose geometry no longer matches its bake.
     pub fn street_edited(&self) -> bool {
         self.street
@@ -1376,6 +1434,43 @@ mod tests {
         }
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "ids repeat across threads");
+    }
+
+    #[test]
+    fn face_values_load_absent_round_trip_and_colour_per_face() {
+        // Pre-#327 object JSON loads without values and re-saves byte-identical.
+        let quad = Mesh::new(
+            vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+            vec![[0, 1, 2], [0, 2, 3]],
+        );
+        let old = format!(
+            r#"{{"id":"{}","name":null,"layer":"0","visible":true,"color":[1.0,0.5,0.0],"geometry":{}}}"#,
+            ObjectId::new().0,
+            serde_json::to_string(&Geometry::Mesh(quad.clone())).unwrap()
+        );
+        let mut obj: SceneObject = serde_json::from_str(&old).unwrap();
+        assert_eq!(obj.face_values, None);
+        assert_eq!(obj.face_colors(), None);
+        assert_eq!(serde_json::to_string(&obj).unwrap(), old);
+
+        let fv = FaceValues { values: vec![0.0, 4.0], min: 0.0, max: 4.0, ramp: Ramp::BlueRed };
+        obj.face_values = Some(fv.clone());
+        let json = serde_json::to_string(&obj).unwrap();
+        assert!(json.contains(r#""face_values":{"values":[0.0,4.0],"min":0.0,"max":4.0,"ramp":"blue_red"}"#), "{json}");
+        let back: SceneObject = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, obj);
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        assert_eq!(obj.face_colors(), Some(vec![[0.0, 0.15, 1.0], [1.0, 0.15, 0.0]]));
+
+        // Ramp clamps, and a flat range maps to the low end.
+        assert_eq!(fv.color(9.0), [1.0, 0.15, 0.0]);
+        assert_eq!(fv.color(-1.0), [0.0, 0.15, 1.0]);
+        let flat = FaceValues { min: 2.0, max: 2.0, ..fv };
+        assert_eq!(flat.color(2.0), [0.0, 0.15, 1.0]);
+
+        // Values that no longer match the face count read as absent.
+        obj.geometry = Geometry::Mesh(Mesh::new(quad.positions().to_vec(), vec![[0, 1, 2]]));
+        assert_eq!(obj.face_colors(), None);
     }
 
     #[test]
