@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! Bounding-volume hierarchy: a median-split AABB tree for accelerating ray
+//! Bounding-volume hierarchy: a binned-SAH AABB tree for accelerating ray
 //! and proximity queries over collections of primitives. Zero dependencies
 //! beyond `glam`; pure f64 document space.
 //!
@@ -15,7 +15,7 @@ use glam::DVec3;
 
 use crate::Aabb;
 
-/// A node in the median-split tree. Leaves hold a contiguous slice of the
+/// A node in the tree. Leaves hold a contiguous slice of the
 /// reordered primitive index list; internal nodes hold two child node indices.
 #[derive(Clone, Debug, PartialEq)]
 enum Node {
@@ -115,10 +115,35 @@ impl Bvh {
         origin: DVec3,
         dir: DVec3,
         max_t: f64,
+        test: impl FnMut(u32) -> bool,
+    ) -> bool {
+        self.any_hit_tally(origin, dir, max_t, test, &mut ())
+    }
+
+    /// [`Bvh::ray_any_hit`] that also adds its traversal work to `stats`.
+    /// For tests and benchmarks; the plain query compiles the counting out.
+    #[doc(hidden)]
+    pub fn ray_any_hit_counted(
+        &self,
+        origin: DVec3,
+        dir: DVec3,
+        max_t: f64,
+        test: impl FnMut(u32) -> bool,
+        stats: &mut TraversalStats,
+    ) -> bool {
+        self.any_hit_tally(origin, dir, max_t, test, stats)
+    }
+
+    fn any_hit_tally(
+        &self,
+        origin: DVec3,
+        dir: DVec3,
+        max_t: f64,
         mut test: impl FnMut(u32) -> bool,
+        tally: &mut impl Tally,
     ) -> bool {
         let mut hit = false;
-        self.traverse(origin, dir, max_t, |prims| {
+        self.traverse(origin, dir, max_t, tally, |prims| {
             if prims.iter().any(|&i| test(i)) {
                 hit = true;
                 return None;
@@ -140,10 +165,35 @@ impl Bvh {
         origin: DVec3,
         dir: DVec3,
         max_t: f64,
+        test: impl FnMut(u32) -> Option<f64>,
+    ) -> Option<(u32, f64)> {
+        self.closest_hit_tally(origin, dir, max_t, test, &mut ())
+    }
+
+    /// [`Bvh::ray_closest_hit`] that also adds its traversal work to `stats`.
+    /// For tests and benchmarks; the plain query compiles the counting out.
+    #[doc(hidden)]
+    pub fn ray_closest_hit_counted(
+        &self,
+        origin: DVec3,
+        dir: DVec3,
+        max_t: f64,
+        test: impl FnMut(u32) -> Option<f64>,
+        stats: &mut TraversalStats,
+    ) -> Option<(u32, f64)> {
+        self.closest_hit_tally(origin, dir, max_t, test, stats)
+    }
+
+    fn closest_hit_tally(
+        &self,
+        origin: DVec3,
+        dir: DVec3,
+        max_t: f64,
         mut test: impl FnMut(u32) -> Option<f64>,
+        tally: &mut impl Tally,
     ) -> Option<(u32, f64)> {
         let mut best: Option<(u32, f64)> = None;
-        self.traverse(origin, dir, max_t, |prims| {
+        self.traverse(origin, dir, max_t, tally, |prims| {
             for &i in prims {
                 if let Some(t) = test(i)
                     && best.map_or(t <= max_t, |(bi, bt)| t < bt || (t == bt && i < bi))
@@ -159,12 +209,13 @@ impl Bvh {
     /// Depth-first ray traversal in [`Bvh::ray_candidates`] order. `leaf` gets
     /// each reached leaf's primitives and returns the new pruning bound, or
     /// `None` to stop. Boxes whose entry `t` is strictly greater than the bound
-    /// (initially `max_t`) are skipped.
+    /// (initially `max_t`) are skipped. `tally` sees every box test.
     fn traverse(
         &self,
         origin: DVec3,
         dir: DVec3,
         max_t: f64,
+        tally: &mut impl Tally,
         mut leaf: impl FnMut(&[u32]) -> Option<f64>,
     ) {
         if self.is_empty() {
@@ -175,10 +226,13 @@ impl Bvh {
         let mut stack = NodeStack::new(self.root as u32);
         while let Some(n) = stack.pop() {
             let n = n as usize;
-            match ray_aabb(origin, inv, self.node_bounds(n)) {
-                Some(entry) if entry > bound => continue,
-                None => continue,
-                Some(_) => {}
+            let entered = match ray_aabb(origin, inv, self.node_bounds(n)) {
+                Some(entry) => entry <= bound,
+                None => false,
+            };
+            tally.box_test(entered);
+            if !entered {
+                continue;
             }
             match &self.nodes[n] {
                 Node::Leaf { start, count } => match leaf(&self.prims[*start..*start + *count]) {
@@ -220,13 +274,40 @@ impl Bvh {
     }
 }
 
+/// Ray traversal work, summed over the queries it was passed to.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TraversalStats {
+    /// Ray/box slab tests performed.
+    pub box_tests: u64,
+    /// Nodes whose box the ray entered within the pruning bound (visited).
+    pub nodes_visited: u64,
+}
+
+/// Sink for traversal counters; `()` discards them at zero cost.
+trait Tally {
+    fn box_test(&mut self, entered: bool);
+}
+
+impl Tally for () {
+    #[inline(always)]
+    fn box_test(&mut self, _: bool) {}
+}
+
+impl Tally for TraversalStats {
+    fn box_test(&mut self, entered: bool) {
+        self.box_tests += 1;
+        self.nodes_visited += u64::from(entered);
+    }
+}
+
 /// Ranges at least this large build their two subtrees in parallel; smaller
 /// ones recurse serially. Big enough that task overhead stays negligible.
 const PAR_THRESHOLD: usize = 4096;
 
-/// Bounds of `prims` and, unless it becomes a leaf, the median split position
-/// within it (after partitioning `prims` in place by centroid on the widest
-/// axis). Shared by the serial and parallel builders so both make the exact
+/// Bounds of `prims` and, unless it becomes a leaf, the split position within
+/// it (after partitioning `prims` in place by centroid on the widest centroid
+/// axis: binned SAH, median as fallback). Shared by the serial and parallel builders so both make the exact
 /// same decisions.
 fn partition(boxes: &[Aabb], prims: &mut [u32]) -> (Aabb, Option<usize>) {
     let bounds = prims
@@ -262,15 +343,110 @@ fn partition(boxes: &[Aabb], prims: &mut [u32]) -> (Aabb, Option<usize>) {
         return (bounds, None);
     }
 
-    // Median split: partially sort so the median centroid sits at count/2.
-    // `select_nth_unstable_by` is deterministic for a given slice, so the
-    // parallel builder reproduces the serial partition exactly.
+    if let Some(mid) = sah_split(boxes, prims, axis, cmin[axis], extent[axis], bounds) {
+        return (bounds, mid);
+    }
+
+    // No usable SAH split (zero-area bounds, or non-finite centroids put
+    // everything in one bin): median split. `select_nth_unstable_by` is
+    // deterministic for a given slice, so the parallel builder reproduces the
+    // serial partition exactly.
     prims.select_nth_unstable_by(count / 2, |&a, &b| {
         centroid(a)[axis]
             .partial_cmp(&centroid(b)[axis])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     (bounds, Some(count / 2))
+}
+
+/// Centroid bins for the SAH sweep along the split axis.
+const SAH_BINS: usize = 16;
+/// Cost of one box test, in units of one primitive test, for the SAH.
+const SAH_BOX_COST: f64 = 1.0;
+/// Ranges larger than this are always split, even when the SAH would rather
+/// keep them as one leaf.
+const MAX_LEAF_SIZE: usize = 16;
+
+/// Half the surface area of `b`: the SAH's (scaled) chance that a random ray
+/// through the parent also crosses `b`.
+fn half_area(b: Aabb) -> f64 {
+    let d = b.max - b.min;
+    d.x * d.y + d.y * d.z + d.z * d.x
+}
+
+/// Binned surface-area-heuristic split of `prims` (bounds `bounds`, centroids
+/// spanning `[lo, lo + extent]` on `axis`, `extent > 0`). Partitions `prims`
+/// in place and returns `Some(Some(mid))` to split at `mid`, `Some(None)` to
+/// keep a leaf (only when that is cheaper and the range is small enough), or
+/// `None` when the SAH has no usable split. Deterministic: equal costs pick
+/// the lowest bin boundary, and the partition is a fixed in-order pass.
+fn sah_split(
+    boxes: &[Aabb],
+    prims: &mut [u32],
+    axis: usize,
+    lo: f64,
+    extent: f64,
+    bounds: Aabb,
+) -> Option<Option<usize>> {
+    let parent = half_area(bounds);
+    if !(parent > 0.0 && parent.is_finite()) {
+        return None;
+    }
+    let scale = SAH_BINS as f64 / extent;
+    let bin = |i: u32| {
+        let c = boxes[i as usize].center()[axis];
+        // Saturating cast: NaN lands in bin 0, overflow in the last bin.
+        (((c - lo) * scale) as usize).min(SAH_BINS - 1)
+    };
+    let mut counts = [0usize; SAH_BINS];
+    let mut bin_bounds: [Option<Aabb>; SAH_BINS] = [None; SAH_BINS];
+    for &i in prims.iter() {
+        let k = bin(i);
+        let b = boxes[i as usize];
+        counts[k] += 1;
+        bin_bounds[k] = Some(bin_bounds[k].map_or(b, |a| a.union(b)));
+    }
+    let grow = |acc: Option<Aabb>, b: Option<Aabb>| match (acc, b) {
+        (Some(a), Some(b)) => Some(a.union(b)),
+        (a, b) => a.or(b),
+    };
+
+    // right[k]: area × count of bins k.. (the right side of boundary k).
+    let mut right = [0.0; SAH_BINS];
+    let (mut acc, mut n) = (None, 0);
+    for k in (1..SAH_BINS).rev() {
+        acc = grow(acc, bin_bounds[k]);
+        n += counts[k];
+        right[k] = acc.map_or(0.0, half_area) * n as f64;
+    }
+    let count = prims.len();
+    let mut best: Option<(f64, usize)> = None;
+    let (mut acc, mut n) = (None, 0);
+    for k in 1..SAH_BINS {
+        acc = grow(acc, bin_bounds[k - 1]);
+        n += counts[k - 1];
+        if n == 0 || n == count {
+            continue;
+        }
+        let cost = acc.map_or(0.0, half_area) * n as f64 + right[k];
+        if best.is_none_or(|(c, _)| cost < c) {
+            best = Some((cost, k));
+        }
+    }
+    let (cost, k) = best?;
+    // Split: one box test, then each side's primitives weighted by the chance
+    // of entering it. Leaf: every primitive tested. Both scaled by `parent`.
+    if count <= MAX_LEAF_SIZE && SAH_BOX_COST * parent + cost >= count as f64 * parent {
+        return Some(None);
+    }
+    let mut mid = 0;
+    for j in 0..count {
+        if bin(prims[j]) < k {
+            prims.swap(mid, j);
+            mid += 1;
+        }
+    }
+    Some(Some(mid))
 }
 
 /// Serially build the subtree over `prims` (which sits at `base` in the full
@@ -355,8 +531,8 @@ fn ray_aabb(origin: DVec3, inv_dir: DVec3, b: Aabb) -> Option<f64> {
     (t_max >= t_min.max(0.0)).then_some(t_min.max(0.0))
 }
 
-/// Traversal stack: 64 inline slots (deeper than any median-split tree over
-/// realistic inputs) with a heap spill that keeps LIFO order if exceeded.
+/// Traversal stack: 64 inline slots (deeper than any tree over realistic
+/// inputs) with a heap spill that keeps LIFO order if exceeded.
 struct NodeStack {
     inline: [u32; 64],
     len: usize,
@@ -629,8 +805,8 @@ mod tests {
     #[test]
     fn parallel_build_matches_serial_oracle_with_ties_and_duplicates() {
         // A flat grid (many equal centroids per axis, zero z extent) plus
-        // coincident duplicates: stresses the median-select tie handling and
-        // the degenerate-extent leaf.
+        // coincident duplicates: stresses SAH bin ties and the
+        // degenerate-extent leaf.
         let mut boxes = Vec::new();
         for i in 0..300 {
             for j in 0..300 {
@@ -644,6 +820,58 @@ mod tests {
         let tris = random_tris(&mut Rng(7), 30_000);
         let tb = TriBvh::build(tris.clone());
         assert_same_tree(&tb.bvh, &Bvh::build_serial(&tri_boxes(&tris)));
+    }
+
+    #[test]
+    fn build_is_identical_for_any_thread_count() {
+        let boxes = tri_boxes(&random_tris(&mut Rng(0x0311_5a40), 100_000));
+        let reference = Bvh::build_serial(&boxes);
+        for threads in [1, 2, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            assert_same_tree(&pool.install(|| Bvh::build(&boxes)), &reference);
+        }
+    }
+
+    #[test]
+    fn sah_keeps_clusters_apart_and_handles_degenerate_extents() {
+        // Two tight clusters far apart with 1:9 counts: a median split would
+        // cut the big cluster; the SAH cuts the empty gap between them.
+        let mut rng = Rng(0x0311_c105);
+        let mut tris = random_tris(&mut rng, 10_000);
+        for t in &mut tris[..1000] {
+            for v in t.iter_mut() {
+                *v += DVec3::new(1e4, 0.0, 0.0);
+            }
+        }
+        let bvh = Bvh::build(&tri_boxes(&tris));
+        let Node::Internal { left, right, .. } = bvh.nodes[bvh.root] else { panic!("leaf root") };
+        let size = |n: u32| match bvh.nodes[n as usize] {
+            Node::Leaf { count, .. } => count,
+            _ => {
+                let b = bvh.node_bounds(n as usize);
+                tris.iter().filter(|t| t.iter().all(|&v| v.cmpge(b.min).all() && v.cmple(b.max).all())).count()
+            }
+        };
+        assert_eq!((size(left), size(right)), (9000, 1000));
+
+        // Zero-area bounds (collinear points) fall back to the median split
+        // instead of one huge leaf; infinite boxes do not panic.
+        let line: Vec<Aabb> = (0..1000)
+            .map(|i| Aabb::from_points([DVec3::new(i as f64, 0.0, 0.0)]))
+            .collect();
+        let bvh = Bvh::build(&line);
+        assert!(bvh.nodes.iter().all(|n| !matches!(n, Node::Leaf { count, .. } if *count > LEAF_SIZE)));
+        let q = Aabb::from_points([DVec3::new(10.0, -1.0, -1.0), DVec3::new(12.0, 1.0, 1.0)]);
+        let exact = |bvh: &Bvh, boxes: &[Aabb]| {
+            let mut hits = bvh.box_candidates(q);
+            hits.retain(|&i| aabb_overlap(boxes[i as usize], q));
+            hits.sort_unstable();
+            hits
+        };
+        assert_eq!(exact(&bvh, &line), vec![10, 11, 12]);
+        let mut wild = line.clone();
+        wild.push(Aabb::from_points([DVec3::splat(f64::NEG_INFINITY), DVec3::splat(f64::INFINITY)]));
+        assert_eq!(exact(&Bvh::build(&wild), &wild), vec![10, 11, 12, 1000]);
     }
 
     /// Brute force over [`Bvh::ray_candidates`]: smallest `t ≤ max_t`, exact
