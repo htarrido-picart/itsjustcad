@@ -42,6 +42,10 @@ anyhow = "1"
 # use only: ordered `collect` with per-item math identical to sequential —
 # never parallel float reductions (op-log replay invariant).
 rayon = "1"
+# Portable 4-lane f32 SIMD for the BVH box tests (#312): NEON on aarch64, SSE
+# on x86_64. Zlib OR Apache-2.0 OR MIT. Our release profile is opt-level "s",
+# where LLVM does not auto-vectorize, so plain `[f32; 4]` loops stay scalar.
+wide = "1.7"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util"] }
