@@ -363,6 +363,10 @@ pub struct Document {
     pub hatch_patterns: BTreeMap<String, HatchPatternDef>,
     /// Bumped on every mutation; render caches key off this.
     pub generation: u64,
+    /// Per-object pick boxes (#301), dropped by every object mutation. Not
+    /// keyed on `generation`: a selection change bumps that on every click.
+    #[serde(skip)]
+    pub(crate) pick_boxes: crate::pick::PickBoxes,
 }
 
 impl Default for Document {
@@ -408,6 +412,7 @@ impl Default for Document {
             active_plot_style: None,
             hatch_patterns: BTreeMap::new(),
             generation: 0,
+            pick_boxes: Default::default(),
         }
     }
 }
@@ -577,19 +582,28 @@ impl Document {
         }
         if n > 0 {
             self.generation += 1;
+            self.pick_boxes.invalidate();
         }
         n
+    }
+
+    /// Every object in id order: a plain map walk, cheaper than the
+    /// creation-order [`Document::objects`] (one lookup per object).
+    pub(crate) fn objects_by_id(&self) -> impl Iterator<Item = &SceneObject> {
+        self.objects.values()
     }
 
     /// Mutable iterator over every object (unordered). Bumps the generation so
     /// callers need not remember to; used by bulk edits like layer rename/delete.
     pub fn objects_mut(&mut self) -> impl Iterator<Item = &mut SceneObject> {
         self.generation += 1;
+        self.pick_boxes.invalidate();
         self.objects.values_mut()
     }
 
     pub fn get_mut(&mut self, id: ObjectId) -> Option<&mut SceneObject> {
         self.generation += 1;
+        self.pick_boxes.invalidate();
         self.objects.get_mut(&id)
     }
 
@@ -651,6 +665,7 @@ impl Document {
 
     pub fn insert(&mut self, obj: SceneObject) {
         self.generation += 1;
+        self.pick_boxes.invalidate();
         self.creation_order.push(obj.id);
         self.objects.insert(obj.id, obj);
     }
@@ -659,6 +674,7 @@ impl Document {
     /// creation order (undo of delete).
     pub fn restore(&mut self, obj: SceneObject, order_index: usize) {
         self.generation += 1;
+        self.pick_boxes.invalidate();
         let index = order_index.min(self.creation_order.len());
         self.creation_order.insert(index, obj.id);
         self.objects.insert(obj.id, obj);
@@ -668,6 +684,7 @@ impl Document {
     pub fn remove(&mut self, id: ObjectId) -> Option<(SceneObject, usize)> {
         let obj = self.objects.remove(&id)?;
         self.generation += 1;
+        self.pick_boxes.invalidate();
         self.selection.remove(&id);
         let index = self
             .creation_order
@@ -694,6 +711,7 @@ impl Document {
             return Vec::new();
         }
         self.generation += 1;
+        self.pick_boxes.invalidate();
         let mut pos: std::collections::HashMap<ObjectId, usize> =
             objs.iter().map(|o| (o.id, usize::MAX)).collect();
         for (i, id) in self.creation_order.iter().enumerate() {
@@ -724,6 +742,7 @@ impl Document {
             return;
         }
         self.generation += 1;
+        self.pick_boxes.invalidate();
         let m = self.creation_order.len();
         let len = m + objs.len();
         // Insert t (t-th applied, i.e. objs reversed) lands at index

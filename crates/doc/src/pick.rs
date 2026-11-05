@@ -11,6 +11,8 @@
 //! no longer wins a tap that merely lands inside it. Everything else falls back
 //! to the nearest bounding box the ray crosses.
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use glam::{DVec3, Mat4, Vec2, Vec4};
 
 use crate::{Document, Geometry, ObjectId};
@@ -170,22 +172,88 @@ pub fn pick_object_where(
     dir: DVec3,
     keep: impl Fn(&crate::SceneObject) -> bool,
 ) -> Option<ObjectId> {
-    let visible: Vec<_> = doc
+    // Boxes come from the cache; an instance's box reads `blocks`, which
+    // mutate without touching the objects, so it is computed per click. The
+    // objects are walked in map order (a creation-order walk is one map
+    // lookup per object, most of a click's cost) and put back in creation
+    // order by rank, so ties resolve exactly as before.
+    let cached = doc.pick_boxes.get(doc);
+    // `layer_visible` without a map lookup per object.
+    let hidden: Vec<&str> =
+        doc.layers.iter().filter(|(_, l)| !l.visible).map(|(n, _)| n.as_str()).collect();
+    let mut slots = vec![None; cached.len()];
+    for (o, &(rank, bb)) in doc.objects_by_id().zip(cached.iter()) {
+        if rank != u32::MAX && o.visible && !hidden.contains(&o.layer.as_str()) && keep(o) {
+            let bb = match o.geometry {
+                Geometry::Instance { .. } => doc.geometry_aabb(&o.geometry),
+                _ => bb,
+            };
+            slots[rank as usize] = Some((o, bb));
+        }
+    }
+    let cands: Vec<_> = slots.into_iter().flatten().collect();
+    pick_among(&cands, vp, size, pos, |seen| {
+        // Linear scan: on the site fixture (46k objects) it costs less than
+        // a BVH build per click (#301). Strict `<` keeps the lowest index on
+        // an exact tie, as `Bvh::ray_closest_hit` does (#310).
+        let mut best: Option<(usize, f64)> = None;
+        for (i, (_, bb)) in cands.iter().enumerate() {
+            if let Some(t) = (!seen[i]).then(|| ray_aabb(origin, dir, bb.min, bb.max)).flatten()
+                && best.is_none_or(|(_, bt)| t < bt)
+            {
+                best = Some((i, t));
+            }
+        }
+        best.map(|(i, _)| i)
+    })
+}
+
+/// The pre-#301 [`pick_object_where`]: boxes gathered and a BVH built on
+/// every call. Kept as the oracle the cached pick must match.
+#[doc(hidden)]
+pub fn pick_object_where_fresh(
+    doc: &Document,
+    vp: Mat4,
+    size: Vec2,
+    pos: Vec2,
+    origin: DVec3,
+    dir: DVec3,
+    keep: impl Fn(&crate::SceneObject) -> bool,
+) -> Option<ObjectId> {
+    let cands: Vec<_> = doc
         .objects()
         .filter(|o| o.visible && doc.layer_visible(&o.layer) && keep(o))
+        .map(|o| (o, doc.geometry_aabb(&o.geometry)))
         .collect();
-    let boxes: Vec<_> = visible
-        .iter()
-        .map(|o| doc.geometry_aabb(&o.geometry))
-        .collect();
+    pick_among(&cands, vp, size, pos, |seen| {
+        let boxes: Vec<_> = cands.iter().map(|&(_, bb)| bb).collect();
+        let bvh = kernel_mesh::Bvh::build(&boxes);
+        let best = bvh.ray_closest_hit(origin, dir, f64::INFINITY, |i| {
+            let i = i as usize;
+            let bb = boxes[i];
+            (!seen[i]).then(|| ray_aabb(origin, dir, bb.min, bb.max)).flatten()
+        });
+        best.map(|(i, _)| i as usize)
+    })
+}
 
+/// The pick among `cands` (eligible objects and their world boxes, in
+/// creation order): the nearest curve within its pick band, else the index
+/// `nearest_box` returns, given which candidates the curve pass already saw.
+fn pick_among(
+    cands: &[(&crate::SceneObject, kernel_mesh::Aabb)],
+    vp: Mat4,
+    size: Vec2,
+    pos: Vec2,
+    nearest_box: impl FnOnce(&[bool]) -> Option<usize>,
+) -> Option<ObjectId> {
     // Nearest line within PICK_PX; failing that, the road whose right-of-way
     // holds the tap (nearest centreline), so a block edge along a road still
     // wins a tap right on it.
     let mut near: Option<(f32, ObjectId)> = None;
     let mut road: Option<(f32, ObjectId)> = None;
-    let mut seen = vec![false; visible.len()];
-    for (i, o) in visible.iter().enumerate() {
+    let mut seen = vec![false; cands.len()];
+    for (i, &(o, bb)) in cands.iter().enumerate() {
         let Geometry::Curve(c) = &o.geometry else {
             continue;
         };
@@ -193,7 +261,7 @@ pub fn pick_object_where(
         // Cheap reject: a plain curve whose screen box (grown by the band)
         // misses the click can't be picked, by its line or by its box.
         if half_width.is_none()
-            && screen_box(vp, size, boxes[i]).is_some_and(|(lo, hi)| {
+            && screen_box(vp, size, bb).is_some_and(|(lo, hi)| {
                 let (lo, hi) = (lo - Vec2::splat(PICK_PX), hi + Vec2::splat(PICK_PX));
                 pos.x < lo.x || pos.y < lo.y || pos.x > hi.x || pos.y > hi.y
             })
@@ -218,14 +286,64 @@ pub fn pick_object_where(
     if let Some((_, id)) = near.or(road) {
         return Some(id);
     }
+    nearest_box(&seen).map(|i| cands[i].0.id)
+}
 
-    let bvh = kernel_mesh::Bvh::build(&boxes);
-    let best = bvh.ray_closest_hit(origin, dir, f64::INFINITY, |i| {
-        let i = i as usize;
-        let bb = boxes[i];
-        (!seen[i]).then(|| ray_aabb(origin, dir, bb.min, bb.max)).flatten()
-    });
-    best.map(|(i, _)| visible[i as usize].id)
+/// Creation-order rank and world box of every object, in
+/// [`Document::objects_by_id`] order, for picking (#301). Built on first use
+/// and dropped by every object mutation (`Document` calls
+/// [`PickBoxes::invalidate`]). An instance's box is a placeholder: it depends
+/// on `blocks`, so [`pick_object_where`] computes it per click.
+#[derive(Default)]
+pub(crate) struct PickBoxes(Mutex<Option<RankedBoxes>>);
+
+/// `(creation-order rank, world box)` per object, in id order.
+type RankedBoxes = Arc<[(u32, kernel_mesh::Aabb)]>;
+
+impl PickBoxes {
+    pub(crate) fn invalidate(&mut self) {
+        *self.0.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    fn get(&self, doc: &Document) -> RankedBoxes {
+        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.get_or_insert_with(|| {
+            let rank: std::collections::HashMap<ObjectId, u32> =
+                doc.objects().enumerate().map(|(i, o)| (o.id, i as u32)).collect();
+            doc.objects_by_id()
+                .map(|o| {
+                    let bb = match o.geometry {
+                        Geometry::Instance { .. } => o.geometry.aabb(),
+                        _ => doc.geometry_aabb(&o.geometry),
+                    };
+                    // An object missing from the creation order is never
+                    // walked by `objects`, so it is never picked.
+                    (rank.get(&o.id).copied().unwrap_or(u32::MAX), bb)
+                })
+                .collect()
+        })
+        .clone()
+    }
+}
+
+/// A cache, not document state: clones start cold, and it never makes two
+/// documents differ.
+impl Clone for PickBoxes {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for PickBoxes {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for PickBoxes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PickBoxes")
+    }
 }
 
 #[cfg(test)]
@@ -329,5 +447,109 @@ mod tests {
         let road = add(&mut doc, road);
         assert_eq!(pick(&doc, 118.0, 100.0), Some(road));
         assert_eq!(pick(&doc, 125.0, 100.0), None);
+    }
+
+    fn tri(x: f64, y: f64, z: f64, w: f64) -> SceneObject {
+        let mesh = kernel_mesh::Mesh::new(
+            vec![DVec3::new(x, y, z), DVec3::new(x + w, y, z), DVec3::new(x, y + w, z)],
+            vec![[0, 1, 2]],
+        );
+        SceneObject { geometry: Geometry::Mesh(mesh), ..poly(&[], false) }
+    }
+
+    /// Every click of a grid over the top view through the cached pick and
+    /// the pre-#301 rebuild, unfiltered and filtered to meshes; returns the
+    /// picks. Each call also warms the cache, so the next mutation must
+    /// invalidate it.
+    fn assert_cached_matches_fresh(doc: &Document) -> Vec<Option<ObjectId>> {
+        let (vp, size) = top();
+        let meshes = |o: &SceneObject| matches!(o.geometry, Geometry::Mesh(_));
+        let mut out = Vec::new();
+        for i in 0..40 {
+            for j in 0..40 {
+                let pos = Vec2::new(i as f32 * 5.0 + 1.0, j as f32 * 5.0 + 1.0);
+                let o = DVec3::new((pos.x / 100.0 - 1.0) as f64, (1.0 - pos.y / 100.0) as f64, 0.5);
+                let d = DVec3::NEG_Z;
+                let all = pick_object(doc, vp, size, pos, o, d);
+                assert_eq!(all, pick_object_where_fresh(doc, vp, size, pos, o, d, |_| true), "{pos}");
+                let m = pick_object_where(doc, vp, size, pos, o, d, meshes);
+                assert_eq!(m, pick_object_where_fresh(doc, vp, size, pos, o, d, meshes), "{pos}");
+                out.extend([all, m]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cached_pick_matches_fresh_across_document_mutations() {
+        let mut doc = Document::default();
+        // Exact depth ties (same z, overlapping) resolve by creation order.
+        let a = add(&mut doc, tri(-0.8, -0.8, 0.0, 1.2));
+        let b = add(&mut doc, tri(-0.6, -0.6, 0.0, 1.2));
+        let c = add(&mut doc, tri(-0.2, -0.9, -0.3, 1.0));
+        add(&mut doc, poly(&[(-0.9, 0.5), (0.9, 0.5)], false));
+        add(&mut doc, poly(&[(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5)], true));
+        let before = assert_cached_matches_fresh(&doc);
+
+        // Sinking `a` below `b` through `get_mut` hands `b` their overlap.
+        if let Some(Geometry::Mesh(m)) = doc.get_mut(a).map(|o| &mut o.geometry) {
+            *m = kernel_mesh::Mesh::new(
+                m.positions().iter().map(|p| *p + DVec3::new(0.0, 0.0, -0.2)).collect(),
+                m.faces().to_vec(),
+            );
+        }
+        assert_ne!(assert_cached_matches_fresh(&doc), before, "the edit is visible");
+
+        add(&mut doc, tri(0.0, 0.0, 0.1, 0.5));
+        assert_cached_matches_fresh(&doc);
+        let (ob, ib) = doc.remove(b).unwrap();
+        assert_cached_matches_fresh(&doc);
+        doc.restore(ob, ib);
+        assert_cached_matches_fresh(&doc);
+        let removed = doc.remove_many(&[a, c]);
+        assert_cached_matches_fresh(&doc);
+        doc.restore_many(&removed);
+        assert_cached_matches_fresh(&doc);
+        for o in doc.objects_mut() {
+            if o.id == b {
+                o.visible = false;
+            }
+        }
+        assert_cached_matches_fresh(&doc);
+
+        // Layer visibility is read per click, even when set without a bump.
+        doc.get_mut(c).unwrap().layer = "hidden".into();
+        assert_cached_matches_fresh(&doc);
+        doc.layers.insert("hidden".into(), crate::LayerStyle { visible: false, ..Default::default() });
+        assert_cached_matches_fresh(&doc);
+        doc.layers.get_mut("hidden").unwrap().visible = true;
+        assert_cached_matches_fresh(&doc);
+    }
+
+    #[test]
+    fn an_instance_box_follows_its_block_without_invalidation() {
+        let mut doc = Document::default();
+        let tri_block = |z: f64| match tri(0.0, 0.0, z, 0.5).geometry {
+            Geometry::Mesh(m) => vec![crate::BlockGeometry::Mesh(m)],
+            _ => unreachable!(),
+        };
+        doc.blocks.insert("b".into(), tri_block(0.0));
+        add(&mut doc, tri(-0.3, -0.3, 0.1, 0.8));
+        let mut inst = poly(&[], false);
+        inst.geometry = Geometry::Instance {
+            block: "b".into(),
+            position: DVec3::new(-0.2, -0.2, 0.0),
+            rotation_deg: 0.0,
+            scale: 1.0,
+            source: None,
+            params: Default::default(),
+            clip: None,
+        };
+        let inst = add(&mut doc, inst);
+        let low = assert_cached_matches_fresh(&doc);
+        // A direct `blocks` edit touches no object, so the cache stays warm.
+        doc.blocks.insert("b".into(), tri_block(0.3));
+        let high = assert_cached_matches_fresh(&doc);
+        assert!(high.contains(&Some(inst)) && low != high, "the raised block wins clicks");
     }
 }
