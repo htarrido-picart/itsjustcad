@@ -2117,6 +2117,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 day,
                 include_locked: true,
                 skip_analysis: true,
+                per_mesh: true,
             })
         }
         // radiation <selector> <path.epw>
@@ -2147,6 +2148,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 bins: None,
                 include_locked: true,
                 skip_analysis: true,
+                per_mesh: true,
             })
         }
         // sunpath [radius] [year]
