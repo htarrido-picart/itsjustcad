@@ -2084,6 +2084,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                     to_min,
                     step_min: step_min as u32,
                     skip_analysis: true,
+                    skip_shadows: true,
                 })
             }
             _ => wrong("shadowstudy", "YYYY-MM-DD from-HH:MM to-HH:MM step-min", &args),
@@ -2102,7 +2103,15 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 _ => return wrong("sunhours", "YYYY-MM-DD [grid-spacing]", &args),
             };
             let (year, month, day) = parse_date(date)?;
-            Ok(Command::SunHours { ids: None, year, month, day, spacing, skip_analysis: true })
+            Ok(Command::SunHours {
+                ids: None,
+                year,
+                month,
+                day,
+                spacing,
+                skip_analysis: true,
+                skip_shadows: true,
+            })
         }
         // facesunhours <selector> <YYYY-MM-DD>
         "facesunhours" => {
@@ -2117,6 +2126,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 day,
                 include_locked: true,
                 skip_analysis: true,
+                skip_shadows: true,
                 per_mesh: true,
             })
         }
@@ -2148,6 +2158,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 bins: None,
                 include_locked: true,
                 skip_analysis: true,
+                skip_shadows: true,
                 per_mesh: true,
             })
         }
@@ -2194,6 +2205,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 rules: None,
                 ids: None,
                 skip_analysis: true,
+                skip_shadows: true,
             }),
             [pack, story] => Ok(Command::CodeCheck {
                 pack: (*pack).to_string(),
@@ -2201,6 +2213,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 rules: None,
                 ids: None,
                 skip_analysis: true,
+                skip_shadows: true,
             }),
             _ => wrong("codecheck", "a pack name and optionally a story name", &args),
         },

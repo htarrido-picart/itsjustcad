@@ -1289,6 +1289,12 @@ pub enum Command {
         /// keeps reading overlays so their results don't change.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         skip_analysis: bool,
+        /// Leave shadowstudy output layers (`shadows-HH:MM`, #331) out as
+        /// targets and occluders, like `skip_analysis`. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay keeps
+        /// reading those layers so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_shadows: bool,
     },
     /// Sunlight-hours heatmap: sample a ground grid over the scene bbox, ray-cast
     /// toward the sun every 30 min of the day, and emit a colored mesh overlay on
@@ -1309,6 +1315,12 @@ pub enum Command {
         /// keeps reading overlays so their results don't change.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         skip_analysis: bool,
+        /// Leave shadowstudy output layers (`shadows-HH:MM`, #331) out as
+        /// targets and occluders, like `skip_analysis`. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay keeps
+        /// reading those layers so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_shadows: bool,
     },
     /// Annual radiation (insolation) study: for the selected meshes, weight
     /// each face's beam exposure by the EPW file's hourly Direct-Normal
@@ -1342,6 +1354,12 @@ pub enum Command {
         /// keeps reading overlays so their results don't change.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         skip_analysis: bool,
+        /// Leave shadowstudy output layers (`shadows-HH:MM`, #331) out as
+        /// targets and occluders, like `skip_analysis`. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay keeps
+        /// reading those layers so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_shadows: bool,
         /// Emit one result object per analysed source mesh, its faces carrying
         /// the values as `face_values` (#328), and record one id per result.
         /// Always `true` in ops logged since; absent (`false`) in older
@@ -1394,6 +1412,12 @@ pub enum Command {
         /// keeps reading overlays so their results don't change.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         skip_analysis: bool,
+        /// Leave shadowstudy output layers (`shadows-HH:MM`, #331) out as
+        /// targets and occluders, like `skip_analysis`. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay keeps
+        /// reading those layers so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_shadows: bool,
         /// Emit one result object per analysed source mesh, its faces carrying
         /// the values as `face_values` (#328), and record one id per result.
         /// Always `true` in ops logged since; absent (`false`) in older
@@ -1751,6 +1775,12 @@ pub enum Command {
         /// keeps reading overlays so their results don't change.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         skip_analysis: bool,
+        /// Leave shadowstudy output layers (`shadows-HH:MM`, #331) out as
+        /// targets and occluders, like `skip_analysis`. Always `true` in ops
+        /// logged since; absent (`false`) in older documents, whose replay keeps
+        /// reading those layers so their results don't change.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skip_shadows: bool,
     },
     /// Fabrication preflight over the cut-profile contour set (see
     /// [`crate::cutcheck`]). `thickness` is in `units`. `limits` is `None`
