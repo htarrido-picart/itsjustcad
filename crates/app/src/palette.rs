@@ -66,6 +66,7 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     // Camera / lens.
     ("camera", "Camera", "camera 2point|persp|pano|fisheye [fov]|<n>mm|phone <lens>"),
     ("basemap", "View", "basemap [osm|sat] [span_m] [opacity] | off"),
+    ("geocode", "View", "geocode \"<address>\""),
     // App / session.
     ("help", "Help", "help [verb]"),
     ("save", "File", "save [path]"),

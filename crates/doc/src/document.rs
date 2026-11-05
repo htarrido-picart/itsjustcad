@@ -250,6 +250,11 @@ pub struct Document {
     /// environmental analyses (`shadowstudy`, `sunhours`). Logged via a
     /// `location` op so saved files replay it.
     pub location: Option<GeoLocation>,
+    /// Display-only name of the place the location was geocoded from
+    /// (`geocode`, #215), shown in the Daylight panel. Set and cleared with
+    /// `location`; analyses never read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_name: Option<String>,
     /// Site climate from an EPW file (`climate`, #170): facade daylight uses
     /// its sunshine and hottest month instead of clear-sky sun hours.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -390,6 +395,7 @@ impl Default for Document {
             basemap: None,
             sun: None,
             location: None,
+            place_name: None,
             climate: None,
             sections: BTreeMap::new(),
             materials: BTreeMap::new(),

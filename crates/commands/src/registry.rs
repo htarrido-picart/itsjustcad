@@ -799,8 +799,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "location",
-            usage: "location <lat> <lon> [tz-hours]",
-            summary: "Set the observer location (used by shadowstudy/sunhours). tz is UTC offset in hours (default 0). Example: location 40.71 -74.01 -5",
+            usage: "location <lat> <lon> [tz-hours [place]]",
+            summary: "Set the observer location (used by shadowstudy/sunhours). tz is UTC offset in hours (default 0). Words after tz are a display-only place name (what `geocode` logs). Example: location 40.71 -74.01 -5",
             category: Category::Analyze,
         },
         CommandSpec {

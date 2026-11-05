@@ -224,6 +224,7 @@ enum Inverse {
     Location {
         prev_loc: Option<itsjustcad_doc::GeoLocation>,
         prev_sun: Option<itsjustcad_doc::SunPosition>,
+        prev_place: Option<String>,
     },
     /// `climate`: restore the previous climate and location.
     Climate {
@@ -1256,9 +1257,10 @@ impl Session {
                 self.doc.sun = *prev;
                 self.doc.generation += 1;
             }
-            Inverse::Location { prev_loc, prev_sun } => {
+            Inverse::Location { prev_loc, prev_sun, prev_place } => {
                 self.doc.location = *prev_loc;
                 self.doc.sun = *prev_sun;
+                self.doc.place_name = prev_place.clone();
                 self.doc.generation += 1;
             }
             Inverse::Climate { prev, prev_loc } => {
@@ -2192,6 +2194,7 @@ impl Session {
             lat_deg: s.lat_deg,
             lon_deg: s.lon_deg,
             tz_hours: s.tz_hours,
+            place: None,
         })?;
         let temp = match (s.mean_dry_bulb_c, s.min_dry_bulb_c, s.max_dry_bulb_c) {
             (Some(m), Some(lo), Some(hi)) => {
@@ -14805,10 +14808,12 @@ fn apply_forward(
             // Record the observer location so environmental analyses can reuse
             // it. tz is UTC (0) because `sun` takes UTC clock times.
             doc.location = Some(itsjustcad_doc::GeoLocation { lat_deg, lon_deg, tz_hours: 0.0 });
+            // A new observer point: the geocoded place name no longer applies.
+            let prev_place = doc.place_name.take();
             doc.generation += 1;
             Ok((
                 Command::Sun { azimuth_deg, altitude_deg, lat_deg, lon_deg },
-                Inverse::Location { prev_loc, prev_sun },
+                Inverse::Location { prev_loc, prev_sun, prev_place },
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!(
@@ -14817,18 +14822,21 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Location { lat_deg, lon_deg, tz_hours } => {
+        Command::Location { lat_deg, lon_deg, tz_hours, place } => {
             let prev_loc = doc.location;
             let prev_sun = doc.sun;
+            // A numeric `location` (no place) clears a stale geocoded name.
+            let prev_place = std::mem::replace(&mut doc.place_name, place.clone());
             doc.location = Some(itsjustcad_doc::GeoLocation { lat_deg, lon_deg, tz_hours });
             doc.generation += 1;
+            let at = place.as_deref().map(|p| format!(" — {p}")).unwrap_or_default();
             Ok((
-                Command::Location { lat_deg, lon_deg, tz_hours },
-                Inverse::Location { prev_loc, prev_sun },
+                Command::Location { lat_deg, lon_deg, tz_hours, place },
+                Inverse::Location { prev_loc, prev_sun, prev_place },
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!(
-                        "location set to ({lat_deg:.4}, {lon_deg:.4}) tz {tz_hours:+.1}h"
+                        "location set to ({lat_deg:.4}, {lon_deg:.4}) tz {tz_hours:+.1}h{at}"
                     ),
                 },
             ))
@@ -25042,6 +25050,48 @@ mod tests {
         };
         let old: Document = serde_json::from_str(&stripped).unwrap();
         assert!(old.analysis_reports.is_empty(), "pre-report snapshots load empty");
+    }
+
+    #[test]
+    fn location_place_is_display_only_and_undoable() {
+        // #215: `geocode` logs `location <lat> <lon> <tz> <place…>`.
+        let mut s = Session::default();
+        run(&mut s, "location 40.71 -74.01 -5");
+        assert_eq!(s.doc.place_name, None);
+        let out = run(&mut s, "location 37.422 -122.0841 -7 \"Mountain View, CA\"");
+        assert!(out.message.contains("Mountain View, CA"), "{}", out.message);
+        let loc = s.doc.location.unwrap();
+        assert!((loc.lat_deg - 37.422).abs() < 1e-9 && (loc.tz_hours + 7.0).abs() < 1e-9);
+        assert_eq!(s.doc.place_name.as_deref(), Some("Mountain View, CA"));
+        // Saved files replay the numbers and the name, never a lookup.
+        let json = crate::io::to_json(&s);
+        let back = crate::io::from_json(&json).unwrap();
+        assert_eq!(back.doc.place_name.as_deref(), Some("Mountain View, CA"));
+        assert_eq!(back.doc.location, s.doc.location);
+        // Undo restores the previous location and drops the name.
+        s.undo().unwrap();
+        assert!((s.doc.location.unwrap().lat_deg - 40.71).abs() < 1e-9);
+        assert_eq!(s.doc.place_name, None);
+        s.redo().unwrap();
+        assert_eq!(s.doc.place_name.as_deref(), Some("Mountain View, CA"));
+        // A numeric location or a `sun` moves the observer: the name goes.
+        run(&mut s, "location 1 2 3");
+        assert_eq!(s.doc.place_name, None);
+        run(&mut s, "location 37.4 -122.1 -7 Mountain View");
+        run(&mut s, "sun 40.71 -74.01 2024-06-21 14:00");
+        assert_eq!(s.doc.place_name, None);
+        s.undo().unwrap();
+        assert_eq!(s.doc.place_name.as_deref(), Some("Mountain View"));
+    }
+
+    #[test]
+    fn location_without_place_serializes_unchanged() {
+        // Old files have no `place`; a numeric location still writes none.
+        let cmd = parse("location 40.71 -74.01 -5").unwrap();
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(!json.contains("place"), "{json}");
+        let old: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(old, cmd);
     }
 
     #[test]

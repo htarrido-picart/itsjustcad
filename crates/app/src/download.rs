@@ -279,11 +279,27 @@ pub fn start(handle: &tokio::runtime::Handle, spec: DownloadSpec) -> Download {
     dl
 }
 
-/// GET a small file into memory (the SendCutSend feeds). An HTTP error status
-/// is an error. Shares the app's reqwest client stack with [`start`].
+/// The User-Agent [`fetch_bytes`] sends. Services such as OpenStreetMap's
+/// Nominatim (#215) refuse stock library agents and ask apps to identify.
+#[allow(dead_code)] // used by itsjustcad (app crate); invisible to download_model example
+pub const USER_AGENT: &str = concat!(
+    "ItsJustCAD/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/htarrido-picart/itsjustcad)"
+);
+
+/// GET a small file into memory (the SendCutSend feeds, `geocode` lookups).
+/// An HTTP error status is an error. Shares the app's reqwest client stack
+/// with [`start`] and identifies itself with [`USER_AGENT`].
 #[allow(dead_code)] // used by itsjustcad (app crate); invisible to download_model example
 pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let resp = reqwest::get(url)
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|e| format!("request failed: {e}"))?;
+    let resp = client
+        .get(url)
+        .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     let status = resp.status();

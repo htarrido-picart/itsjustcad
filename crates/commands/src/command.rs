@@ -1244,6 +1244,11 @@ pub enum Command {
         /// Time-zone offset from UTC in hours (east positive).
         #[serde(default)]
         tz_hours: f64,
+        /// Display-only place name (#215): the address match `geocode` set the
+        /// location from. Never read back by analyses. Omitted when unset, so
+        /// older files (which lack it) load and re-save unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        place: Option<String>,
     },
     /// Set (or clear) the site climate from an EPW weather file (#170): facade
     /// daylight and overheating (`siteoptimize`, the Yield economics) then use

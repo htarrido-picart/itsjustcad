@@ -4,6 +4,7 @@
 mod focus_inspector;
 mod cut_export;
 mod optimize_panel;
+mod geocode_ui;
 
 use itsjustcad_commands::Session;
 use itsjustcad_commands::lot::hierarchy::LevelKind;
@@ -893,6 +894,8 @@ pub struct App {
     drill: itsjustcad_commands::lot::hierarchy::Drill,
     /// Site plan optimizer form / running search / results (#145).
     optimize: optimize_panel::OptimizePanel,
+    /// Address lookup for the site location (`geocode`, #215).
+    geocode: crate::geocode::Geocoder,
     /// Background undo-history rebuild after a fast open (#224).
     history_rebuild: crate::history_rebuild::HistoryRebuild,
     /// Auto-recompute: per-source signature of the last-observed source block
@@ -1615,6 +1618,7 @@ impl App {
             focus_site_override: None,
             drill: Default::default(),
             optimize: Default::default(),
+            geocode: Default::default(),
             history_rebuild: Default::default(),
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
@@ -2527,6 +2531,13 @@ impl App {
             Some("basemap") => {
                 let args = crate::app_verbs::parse_basemap_args(words);
                 self.set_basemap(args);
+            }
+            // Address → site location (#215). Opt-in network at the user's
+            // request: one lookup, after the first-use privacy notice. The
+            // result is logged as a numeric `location` op.
+            Some("geocode") => {
+                let rest = line.trim_start().split_once(char::is_whitespace).map_or("", |(_, r)| r);
+                self.geocode_request(rest, false);
             }
             // AI diffusion render of the current view. Opt-in network: only the
             // user-configured backend in render_decks.json is ever reached, and
@@ -11453,6 +11464,7 @@ impl eframe::App for App {
         // The document's optimizer search (#201) finishes wherever the user is.
         self.optimize.poll(&mut self.session);
         self.optimize_notice(ui.ctx());
+        self.geocode_frame(ui.ctx());
         // A refused undo past a fast-open boundary rebuilds its history off
         // the UI thread (#224); install it when done.
         let (line, running) = self.history_rebuild.poll(&mut self.session);
@@ -12807,6 +12819,63 @@ mod tests {
         }
     }
 
+    /// The Daylight section's address field (#215): a matched place, a
+    /// failed lookup, the pick list and the first-use privacy notice.
+    ///
+    ///   IJC_SHOT_DIR=/tmp/shots cargo test -p itsjustcad app_preview_geocode -- --ignored
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly to render the address field"]
+    fn app_preview_geocode() {
+        use crate::geocode::Place;
+        let dir = std::path::PathBuf::from(
+            std::env::var("IJC_SHOT_DIR").unwrap_or_else(|_| "tests/snapshots".into()),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let place = |name: &str, lat, lon| Place { name: name.into(), lat, lon };
+        for name in ["placed", "failed", "choose", "privacy"] {
+            for dark in [false, true] {
+                let img = render_app(
+                    egui::vec2(1440.0, 2300.0),
+                    dark,
+                    |app| {
+                        for line in ["lotsettings preset=walkable", "rect 0,0,0 300 200", "siteplan last"] {
+                            app.execute_line(line.to_string());
+                        }
+                        let source = *app.session.doc.subdivision_links.keys().next().unwrap();
+                        app.session.doc.selection = [source].into();
+                        app.panel_tabs.show(crate::tabstrip::PanelTab::Parameters);
+                        app.subdiv_segment = optimize_panel::SEG_OPTIMIZE;
+                        app.optimize.form.constraints[12] = (true, 95.0);
+                        app.geocode.address = "1600 Amphitheatre Pkwy, Mountain View".into();
+                        app.geocode.from_field = true;
+                        match name {
+                            "placed" => app.geocode_apply(&place(
+                                "Google Building 41, 1600, Amphitheatre Parkway, Mountain View, Santa Clara County, California, 94043, United States",
+                                37.4224858,
+                                -122.0855846,
+                            )),
+                            "failed" => {
+                                app.geocode.error = Some(
+                                    crate::geocode::GeocodeError::Network("request failed".into()).to_string(),
+                                );
+                            }
+                            "choose" => {
+                                app.geocode.matches = vec![
+                                    place("Google Building 41, 1600, Amphitheatre Parkway, Mountain View, Santa Clara County, California, 94043, United States", 37.4224858, -122.0855846),
+                                    place("Googleplex, 1600, Amphitheatre Parkway, Mountain View, Santa Clara County, California, 94043, United States", 37.4217636, -122.084614),
+                                ];
+                            }
+                            _ => app.geocode.privacy_pending = Some(app.geocode.address.clone()),
+                        }
+                    },
+                    6,
+                );
+                let theme = if dark { "dark" } else { "light" };
+                img.save(dir.join(format!("geocode_{name}_{theme}_full.png"))).unwrap();
+            }
+        }
+    }
+
     #[test]
     #[ignore = "needs a GPU adapter; run explicitly to (re)generate app-window previews"]
     fn app_preview_window() {
@@ -13045,6 +13114,129 @@ mod tests {
             })
             .collect();
         harness.run_steps(2);
+    }
+
+    /// Run frames until the app's address lookup has finished.
+    fn settle_geocode(h: &mut egui_kittest::Harness<'_, App>) {
+        for _ in 0..200 {
+            h.run_steps(1);
+            if !h.state().geocode.busy() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("geocode lookup never finished");
+    }
+
+    const GEO_STUB: &str = "https://geo.test/search";
+
+    #[test]
+    fn journey_geocode_sets_location_and_undo_restores() {
+        run_app_journey(|h| {
+            let app = h.state_mut();
+            app.execute_line("location 40.71 -74.01 -5".into());
+            // First use: the privacy notice, and nothing is sent yet.
+            app.geocode_request_with("\"1600 Amphitheatre Pkwy, Mountain View\"", false, false, GEO_STUB, |_: &str| {
+                panic!("sent before the privacy notice was accepted")
+            });
+            assert_eq!(app.geocode.privacy_pending.as_deref(), Some("1600 Amphitheatre Pkwy, Mountain View"));
+            h.run_steps(2);
+            let app = h.state_mut();
+            app.geocode.privacy_pending = None;
+            app.geocode_request_with("1600 Amphitheatre Pkwy, Mountain View", false, true, GEO_STUB, |url: &str| {
+                assert!(url.contains("q=1600+Amphitheatre+Pkwy"), "{url}");
+                Ok(br#"[{"lat":"37.4224857","lon":"-122.0855846","display_name":"Google Building 41, 1600, Amphitheatre Parkway, Mountain View, California, United States"}]"#.to_vec())
+            });
+            settle_geocode(h);
+            let app = h.state_mut();
+            let loc = app.session.doc.location.expect("geocoded location");
+            assert!((loc.lat_deg - 37.42).abs() < 0.01 && (loc.lon_deg + 122.08).abs() < 0.01);
+            assert!(loc.tz_hours == -7.0 || loc.tz_hours == -8.0, "{}", loc.tz_hours);
+            assert!(app.session.doc.place_name.as_deref().unwrap().contains("Mountain View"));
+            let lines = app.command_line.scrollback();
+            assert!(lines.iter().any(|l| l.starts_with("> location 37.4224857 -122.0855846 ")), "{lines:?}");
+            assert!(lines.iter().any(|l| l.contains("America/Los_Angeles")), "{lines:?}");
+            app.execute_line("undo".into());
+            let loc = app.session.doc.location.unwrap();
+            assert!((loc.lat_deg - 40.71).abs() < 1e-9, "undo restores the previous location");
+            assert_eq!(app.session.doc.place_name, None);
+        });
+    }
+
+    /// Owner decision (#215): the Daylight field's lookup never shows in the
+    /// command line: no echo, no recall entry, no recorded input. It still
+    /// sets the location through the logged op, so undo works.
+    #[test]
+    fn journey_geocode_from_field_leaves_command_history_unchanged() {
+        run_app_journey(|h| {
+            let app = h.state_mut();
+            app.execute_line("location 40.71 -74.01 -5".into());
+            let (shown, recall) = (app.command_line.scrollback().to_vec(), app.command_line.recall_len());
+            app.geocode_request_with("1600 Amphitheatre Pkwy, Mountain View", true, true, GEO_STUB, |_: &str| {
+                Ok(br#"[{"lat":"37.4224857","lon":"-122.0855846","display_name":"Google Building 41, Mountain View, California, United States"}]"#.to_vec())
+            });
+            settle_geocode(h);
+            let app = h.state_mut();
+            assert!(app.session.doc.place_name.as_deref().unwrap().contains("Mountain View"));
+            assert_eq!(app.command_line.scrollback(), &shown[..], "no transcript lines");
+            assert_eq!(app.command_line.recall_len(), recall, "no recall entry");
+            assert!(app.geocode.notice.as_deref().unwrap().contains("America/Los_Angeles"));
+            // A failure also stays under the field.
+            app.geocode_request_with("Quito", true, true, GEO_STUB, |_: &str| Err("offline".into()));
+            settle_geocode(h);
+            let app = h.state_mut();
+            assert!(app.geocode.error.is_some());
+            assert_eq!(app.command_line.scrollback(), &shown[..]);
+            app.execute_line("undo".into());
+            assert!((app.session.doc.location.unwrap().lat_deg - 40.71).abs() < 1e-9, "one undo step");
+        });
+    }
+
+    #[test]
+    fn journey_geocode_failures_leave_location_unchanged() {
+        run_app_journey(|h| {
+            let app = h.state_mut();
+            app.execute_line("location 40.71 -74.01 -5".into());
+            let before = app.session.doc.location;
+            app.geocode_request_with("Quito", false, true, GEO_STUB, |_: &str| {
+                Err("request failed: error sending request".to_string())
+            });
+            settle_geocode(h);
+            let app = h.state_mut();
+            assert_eq!(app.session.doc.location, before);
+            let last = app.command_line.scrollback().last().cloned().unwrap_or_default();
+            assert!(last.contains("cannot reach the geocoder") && last.contains("location unchanged"), "{last}");
+            assert!(app.geocode.error.is_some(), "shown under the address field too");
+
+            app.geocode_request_with("zzqx nowhere", false, true, GEO_STUB, |_: &str| Ok(b"[]".to_vec()));
+            settle_geocode(h);
+            let app = h.state_mut();
+            assert_eq!(app.session.doc.location, before);
+            assert_eq!(
+                app.command_line.scrollback().last().map(String::as_str),
+                Some("no place found for 'zzqx nowhere'")
+            );
+        });
+    }
+
+    #[test]
+    fn journey_geocode_several_matches_are_picked() {
+        run_app_journey(|h| {
+            h.state_mut().geocode_request_with("San Jose", false, true, GEO_STUB, |_: &str| {
+                Ok(br#"[{"lat":"37.3362","lon":"-121.8906","display_name":"San Jose, California, United States"},{"lat":"9.9325","lon":"-84.0796","display_name":"San Jose, Costa Rica"}]"#.to_vec())
+            });
+            settle_geocode(h);
+            // The pick list is up; nothing is set until the user picks.
+            h.run_steps(2);
+            let app = h.state_mut();
+            assert_eq!(app.geocode.matches.len(), 2);
+            assert!(app.session.doc.location.is_none());
+            let costa_rica = app.geocode.matches[1].clone();
+            app.geocode_apply(&costa_rica);
+            let loc = app.session.doc.location.unwrap();
+            assert!((loc.lat_deg - 9.9325).abs() < 1e-9 && loc.tz_hours == -6.0);
+            assert!(app.geocode.matches.is_empty());
+        });
     }
 
     #[test]

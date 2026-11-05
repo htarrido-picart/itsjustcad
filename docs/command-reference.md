@@ -226,7 +226,8 @@ Solar and radiation studies. `curvature` (a NURBS analysis) also lives on the `a
 |---|---|
 | `sun` | `sun <lat> <lon> <YYYY-MM-DD> <HH:MM>` — solar lighting direction (NOAA SPA) |
 | `sunoff` | revert to headlight shading |
-| `location` | `location <lat> <lon> [tz-hours]` — observer location for the studies below |
+| `location` | `location <lat> <lon> [tz-hours [place]]` — observer location for the studies below; trailing words are a display-only place name |
+| `geocode` | `geocode "<address>"` — look the address up on OpenStreetMap Nominatim and set `location` from the match (UTC offset from the coordinates, offline). GUI only; the first use asks before sending. Logged as the numeric `location`, so files reopen offline. Endpoint: `geocoder_url` in `~/.config/itsjustcad/ui.json` |
 | `shadowstudy` | `shadowstudy <date> <from> <to> <step-min>` — ground shadows per time step, one filled mesh per stamp on `shadows-HH:MM` |
 | `sunhours` | `sunhours <date> [grid-spacing]` — ground sun-hours heatmap (occlusion ray-cast) |
 | `facesunhours` | `facesunhours <selector> <date>` — per-face insolation on the selected mesh |
@@ -379,6 +380,7 @@ gumball on|off|toggle                                transform gizmo
 camera 2point|persp|pano|fisheye [fov]|<n>mm         projection / lens
 camera phone <lens>                                  phone-camera sim (phone-main, phone-ultrawide, phone-tele, phone-periscope)
 basemap [osm|sat] [span_m] [opacity] | basemap off   georeferenced site underlay
+geocode "<address>"                site location from an address (OpenStreetMap Nominatim; GUI only)
 reducemotion on|off                                  accessibility: stop animated progress
 chatencryption on|off                                encrypt chat sessions at rest (default OFF, opt-in)
 save [path] · help [verb]                            save document / inline help

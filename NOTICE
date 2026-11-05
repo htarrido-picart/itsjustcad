@@ -21,3 +21,14 @@ Contributions
 Contributions are welcome under a Contributor License Agreement that assigns
 the author the rights needed to keep offering the commercial/mobile editions
 (see CONTRIBUTING.md). Contributors are credited in AUTHORS.
+
+Third-party data
+---
+The desktop build embeds time-zone boundary data from tzf-dist
+(https://github.com/ringsaturn/tzf-dist), derived from
+timezone-boundary-builder and OpenStreetMap: © OpenStreetMap contributors,
+available under the Open Database License (ODbL 1.0,
+https://opendatacommons.org/licenses/odbl/). It is used to find a site's
+UTC offset offline (`geocode`). Address search results come from
+OpenStreetMap Nominatim, © OpenStreetMap contributors, ODbL 1.0. The iOS /
+Mac FFI build does not include this data.
