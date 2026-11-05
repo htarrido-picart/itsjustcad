@@ -193,14 +193,230 @@ fn gather_occluders(doc: &Document, dir: ViewDirection) -> Vec<OccTri> {
 /// geometry behind a wall) without splitting partially-occluded edges. Edges
 /// that are only partly hidden are kept whole, so the result under-removes
 /// rather than over-removes — honest and safe, never deleting a visible edge.
-fn edge_occluded(occ: &[OccTri], dir: ViewDirection, wa: DVec3, wb: DVec3) -> bool {
+fn edge_occluded(occ: &OccIndex, dir: ViewDirection, wa: DVec3, wb: DVec3) -> bool {
+    let mid3 = (wa + wb) * 0.5;
+    occ.occluded(project(dir, mid3), view_depth(dir, mid3) - OCC_EPS)
+}
+
+/// Bias so an edge lying ON its own triangle (coplanar) is not self-hidden.
+const OCC_EPS: f64 = 1e-4;
+
+/// The brute-force reference for [`edge_occluded`]: every triangle, no index.
+#[cfg(test)]
+fn edge_occluded_brute(occ: &[OccTri], dir: ViewDirection, wa: DVec3, wb: DVec3) -> bool {
     let mid3 = (wa + wb) * 0.5;
     let mid = project(dir, mid3);
     let mid_depth = view_depth(dir, mid3);
-    // Bias so an edge lying ON its own triangle (coplanar) is not self-hidden.
-    const EPS: f64 = 1e-4;
     occ.iter()
-        .any(|t| tri_depth_at(t, mid).is_some_and(|d| d < mid_depth - EPS))
+        .any(|t| tri_depth_at(t, mid).is_some_and(|d| d < mid_depth - OCC_EPS))
+}
+
+/// Axis-aligned 2D box, inclusive on every side.
+#[derive(Clone, Copy)]
+struct Box2 {
+    min: DVec2,
+    max: DVec2,
+}
+
+impl Box2 {
+    fn contains(&self, p: DVec2) -> bool {
+        p.x >= self.min.x && p.x <= self.max.x && p.y >= self.min.y && p.y <= self.max.y
+    }
+}
+
+/// Multi-level uniform 2D grid over the projected occluder triangles, so each
+/// edge sample tests only the triangles whose (inflated) 2D box can contain it
+/// instead of every triangle in the view. The answer is the brute-force one
+/// exactly: the test is an order-independent `any` over [`tri_depth_at`], and a
+/// triangle is only skipped where it provably cannot contain the sample.
+///
+/// * Degenerate triangles (|area| < 1e-12, finite) never contain anything and
+///   are dropped.
+/// * Each kept box is inflated to cover the barycentric tolerance in
+///   [`tri_depth_at`] (the tolerant region is the triangle scaled by
+///   `1 + 3e-6` about its centroid) with a wide margin for rounding.
+/// * Triangles with a non-finite corner, or slivers thin enough that rounding
+///   could leak their barycentric test outside any reasonable box, are tested
+///   for every sample (`always`).
+/// * Level 0 has about one cell per triangle; each further level is 8× coarser
+///   per axis, down to a single cell. A triangle goes in the finest level where
+///   its box spans at most [`OCC_MAX_CELLS`] cells, so big faces (ground
+///   planes, roofs) are not copied into thousands of fine cells.
+/// * A sample whose 2D position is not finite falls back to every triangle.
+struct OccIndex {
+    tris: Vec<OccTri>,
+    boxes: Vec<Box2>,
+    always: Vec<u32>,
+    /// Union of the gridded boxes; samples outside it hit no gridded triangle.
+    bounds: Box2,
+    levels: Vec<OccGrid>,
+}
+
+/// One grid level of [`OccIndex`]: triangles of cell `i` are
+/// `items[start[i]..start[i + 1]]` (CSR).
+struct OccGrid {
+    nx: usize,
+    ny: usize,
+    cell: DVec2,
+    start: Vec<u32>,
+    items: Vec<u32>,
+}
+
+/// Inclusive cell range `(x0, x1, y0, y1)` of a box in one [`OccGrid`].
+type CellRange = (usize, usize, usize, usize);
+
+/// Most cells a triangle's box may span in the level that stores it.
+const OCC_MAX_CELLS: usize = 64;
+
+impl OccGrid {
+    /// Column/row of a coordinate. Monotone in the input, so a point inside a
+    /// box always maps to a cell inside the box's cell range.
+    fn col(&self, x: f64, origin: f64) -> usize {
+        (((x - origin) / self.cell.x).floor().max(0.0) as usize).min(self.nx - 1)
+    }
+
+    fn row(&self, y: f64, origin: f64) -> usize {
+        (((y - origin) / self.cell.y).floor().max(0.0) as usize).min(self.ny - 1)
+    }
+
+    /// Inclusive cell range `(x0, x1, y0, y1)` covered by a box.
+    fn cell_range(&self, b: Box2, origin: DVec2) -> CellRange {
+        (
+            self.col(b.min.x, origin.x),
+            self.col(b.max.x, origin.x),
+            self.row(b.min.y, origin.y),
+            self.row(b.max.y, origin.y),
+        )
+    }
+
+    /// Fill the CSR from `(triangle, cell range)` pairs: count, prefix-sum, place.
+    fn fill(&mut self, tris: &[(u32, CellRange)]) {
+        self.start = vec![0; self.nx * self.ny + 1];
+        for &(_, r) in tris {
+            for y in r.2..=r.3 {
+                for x in r.0..=r.1 {
+                    self.start[y * self.nx + x + 1] += 1;
+                }
+            }
+        }
+        for k in 1..self.start.len() {
+            self.start[k] += self.start[k - 1];
+        }
+        let mut next = self.start.clone();
+        self.items = vec![0; self.start[self.nx * self.ny] as usize];
+        for &(i, r) in tris {
+            for y in r.2..=r.3 {
+                for x in r.0..=r.1 {
+                    let c = y * self.nx + x;
+                    self.items[next[c] as usize] = i;
+                    next[c] += 1;
+                }
+            }
+        }
+    }
+}
+
+impl OccIndex {
+    fn new(tris: Vec<OccTri>) -> Self {
+        let mut boxes = Vec::with_capacity(tris.len());
+        let (mut always, mut gridded) = (Vec::new(), Vec::new());
+        let mut bounds = Box2 { min: DVec2::MAX, max: DVec2::MIN };
+        for (i, t) in tris.iter().enumerate() {
+            let min = t.a.min(t.b).min(t.c);
+            let max = t.a.max(t.b).max(t.c);
+            boxes.push(Box2 { min, max });
+            if !(min.is_finite() && max.is_finite()) {
+                always.push(i as u32);
+                continue;
+            }
+            let area = (t.b - t.a).perp_dot(t.c - t.a).abs();
+            if area < 1e-12 {
+                continue;
+            }
+            let diam = (max - min).max_element();
+            if area < 1e-4 * diam * diam {
+                always.push(i as u32);
+                continue;
+            }
+            let mag = min.abs().max(max.abs()).max_element();
+            let pad = DVec2::splat(1e-4 * diam + 1e-8 * mag);
+            let b = Box2 { min: min - pad, max: max + pad };
+            boxes[i] = b;
+            bounds.min = bounds.min.min(b.min);
+            bounds.max = bounds.max.max(b.max);
+            gridded.push(i as u32);
+        }
+
+        let mut levels = Vec::new();
+        if !gridded.is_empty() {
+            let ext = (bounds.max - bounds.min).max(DVec2::splat(1e-9));
+            let n = gridded.len() as f64;
+            let mut nx = ((n * ext.x / ext.y).sqrt().ceil() as usize).clamp(1, 2048);
+            let mut ny = ((n / nx as f64).ceil() as usize).clamp(1, 2048);
+            let mut rest = gridded;
+            loop {
+                let mut grid = OccGrid {
+                    nx,
+                    ny,
+                    cell: DVec2::new(ext.x / nx as f64, ext.y / ny as f64),
+                    start: Vec::new(),
+                    items: Vec::new(),
+                };
+                let last = nx == 1 && ny == 1;
+                let (mut here, mut up) = (Vec::new(), Vec::new());
+                for i in rest {
+                    let r = grid.cell_range(boxes[i as usize], bounds.min);
+                    if last || (r.1 - r.0 + 1) * (r.3 - r.2 + 1) <= OCC_MAX_CELLS {
+                        here.push((i, r));
+                    } else {
+                        up.push(i);
+                    }
+                }
+                grid.fill(&here);
+                levels.push(grid);
+                if up.is_empty() {
+                    break;
+                }
+                rest = up;
+                nx = nx.div_ceil(8);
+                ny = ny.div_ceil(8);
+            }
+        }
+        OccIndex { tris, boxes, always, bounds, levels }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tris.is_empty()
+    }
+
+    /// True when some occluder's surface at `pt` is nearer than `depth_limit`
+    /// (the sample's depth minus the coplanar bias).
+    fn occluded(&self, pt: DVec2, depth_limit: f64) -> bool {
+        let hit = |i: &u32| {
+            self.boxes[*i as usize].contains(pt)
+                && tri_depth_at(&self.tris[*i as usize], pt).is_some_and(|d| d < depth_limit)
+        };
+        if !pt.is_finite() {
+            return self
+                .tris
+                .iter()
+                .any(|t| tri_depth_at(t, pt).is_some_and(|d| d < depth_limit));
+        }
+        if self
+            .always
+            .iter()
+            .any(|i| tri_depth_at(&self.tris[*i as usize], pt).is_some_and(|d| d < depth_limit))
+        {
+            return true;
+        }
+        if !self.bounds.contains(pt) {
+            return false;
+        }
+        self.levels.iter().any(|g| {
+            let c = g.row(pt.y, self.bounds.min.y) * g.nx + g.col(pt.x, self.bounds.min.x);
+            g.items[g.start[c] as usize..g.start[c + 1] as usize].iter().any(hit)
+        })
+    }
 }
 
 /// World-space line segments worth drawing for one object.
@@ -543,8 +759,8 @@ struct ViewFit {
     /// Visible objects' projected+scaled world segments, carrying their plot pen
     /// weight (mm) and color. NOT yet offset/clipped.
     weighted: Vec<(f64, [f32; 3], DVec3, DVec3)>,
-    /// Hidden-line occluder triangles (empty unless `HiddenLine` mode).
-    occ: Vec<OccTri>,
+    /// Hidden-line occluder index (empty unless `HiddenLine` mode).
+    occ: OccIndex,
 }
 
 /// Collect the visible geometry for a viewport and compute its centering fit.
@@ -558,11 +774,13 @@ fn collect_view_fit(doc: &Document, view: &SheetView, rect: (DVec2, DVec2)) -> O
     // per-edge midpoint test can cull edges buried behind solid faces. Wireframe
     // (and shaded-without-raster) leaves `occ` empty so no edges are removed —
     // byte-identical to the historical output.
-    let occ: Vec<OccTri> = if view.display_mode == itsjustcad_doc::SheetDisplayMode::HiddenLine {
-        gather_occluders(doc, view.direction)
-    } else {
-        Vec::new()
-    };
+    let occ = OccIndex::new(
+        if view.display_mode == itsjustcad_doc::SheetDisplayMode::HiddenLine {
+            gather_occluders(doc, view.direction)
+        } else {
+            Vec::new()
+        },
+    );
 
     // Collect (lineweight_mm, plot_color, world-segment) tuples.
     // Per-object lineweight beats layer lineweight (mirror the color override
@@ -641,29 +859,29 @@ fn view_weighted_segments(
     let Some(fit) = collect_view_fit(doc, view, rect) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for (w, color, wa, wb) in fit.weighted {
-        // Hidden-line cull: drop edges whose midpoint is behind a solid face.
-        // `occ` is empty in wireframe mode, so this is a no-op there.
+    cull_and_clip(&fit, view)
+}
+
+/// Hidden-line cull, projection, centering and clip of a fit's segments, in
+/// parallel with an ordered collect so the output order (pen-sorted) and every
+/// coordinate match the sequential pass exactly. Drops edges that are occluded,
+/// fully outside the clip box, or shorter than 1e-6 mm after clipping.
+fn cull_and_clip(fit: &ViewFit, view: &SheetView) -> Vec<(f64, [f32; 3], DVec2, DVec2)> {
+    let paper = |w: DVec3| {
+        let p = project(view.direction, w);
+        DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+    };
+    crate::segments::par_filter_map(&fit.weighted, |&(w, color, wa, wb)| {
         if !fit.occ.is_empty() && edge_occluded(&fit.occ, view.direction, wa, wb) {
-            continue;
+            return None;
         }
-        let pa = {
-            let p = project(view.direction, wa);
-            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
-        };
-        let pb = {
-            let p = project(view.direction, wb);
-            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
-        };
-        if let Some((a, b)) = clip(pa + fit.offset, pb + fit.offset, fit.cmin, fit.cmax) {
-            if (b - a).length() < 1e-6 {
-                continue;
-            }
-            out.push((w, color, a, b));
+        let (a, b) = clip(paper(wa) + fit.offset, paper(wb) + fit.offset, fit.cmin, fit.cmax)?;
+        if (b - a).length() < 1e-6 {
+            None
+        } else {
+            Some((w, color, a, b))
         }
-    }
-    out
+    })
 }
 
 /// The viewport's projected line art as plain 2D segments in PAPER-MM space,
@@ -793,26 +1011,7 @@ fn render_view(
     // Use sentinels that guarantee the first segment always emits `w`/`RG` ops.
     let mut cur_w = -1.0_f64;
     let mut cur_c = [-1.0_f32; 3];
-    for (w, color, wa, wb) in fit.weighted {
-        // Hidden-line cull: drop edges whose midpoint is behind a solid face.
-        // `occ` is empty in wireframe mode, so this is a no-op there.
-        if !fit.occ.is_empty() && edge_occluded(&fit.occ, view.direction, wa, wb) {
-            continue;
-        }
-        let pa = {
-            let p = project(view.direction, wa);
-            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
-        };
-        let pb = {
-            let p = project(view.direction, wb);
-            DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
-        };
-        let Some((a, b)) = clip(pa + offset, pb + offset, cmin, cmax) else {
-            continue;
-        };
-        if (b - a).length() < 1e-6 {
-            continue;
-        }
+    for (w, color, a, b) in cull_and_clip(&fit, view) {
         // Emit a `w` (line width) operator only on weight change.
         // PDF line width is in points; 1 mm = PT_PER_MM pt.
         if (w - cur_w).abs() > 1e-6 {
@@ -2200,5 +2399,165 @@ mod tests {
         assert!(par_n > 1_000, "fixture too small: {par_n} lines");
         assert_eq!(par_n, seq_n);
         assert!(par == seq, "PDF bytes differ");
+    }
+
+    /// Deterministic LCG for the occlusion-index tests (no `rand` dependency).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// Uniform in [-r, r], snapped to quarters half the time so corners,
+        /// edges and cell boundaries coincide exactly.
+        fn coord(&mut self, r: f64) -> f64 {
+            let v = (self.next() * 2.0 - 1.0) * r;
+            if self.next() < 0.5 { (v * 4.0).round() / 4.0 } else { v }
+        }
+        fn point(&mut self, r: f64) -> DVec3 {
+            DVec3::new(self.coord(r), self.coord(r), self.coord(r))
+        }
+    }
+
+    /// A random occluder scene: free triangles, a coplanar shared-edge grid, big
+    /// covering faces, slivers, degenerate (collinear / repeated-corner)
+    /// triangles and one with a non-finite corner. Edges: random, every triangle
+    /// side (midpoint ON a triangle boundary) and coplanar diagonals.
+    fn random_scene(rng: &mut Lcg, origin: DVec3) -> (Vec<[DVec3; 3]>, Vec<(DVec3, DVec3)>) {
+        let mut tris = Vec::new();
+        for _ in 0..300 {
+            let c = rng.point(10.0);
+            let s = 0.2 + rng.next() * 3.0;
+            tris.push([c + rng.point(s), c + rng.point(s), c + rng.point(s)]);
+        }
+        for i in 0..8 {
+            for j in 0..8 {
+                let p = |x: i32, y: i32| DVec3::new(x as f64, y as f64, 2.0);
+                let (x, y) = (i - 4, j - 4);
+                tris.push([p(x, y), p(x + 1, y), p(x + 1, y + 1)]);
+                tris.push([p(x, y), p(x + 1, y + 1), p(x, y + 1)]);
+            }
+        }
+        for _ in 0..3 {
+            tris.push([rng.point(40.0), rng.point(40.0), rng.point(40.0)]);
+        }
+        for _ in 0..20 {
+            let a = rng.point(8.0);
+            let d = rng.point(5.0);
+            tris.push([a, a + d, a + d * 0.5 + DVec3::splat(1e-7)]);
+            tris.push([a, a + d, a + d * 0.37]);
+            tris.push([a, a, a + d]);
+        }
+        tris.push([DVec3::new(f64::INFINITY, 0.0, 0.0), DVec3::ZERO, DVec3::ONE]);
+        tris.push([DVec3::new(f64::NAN, 0.0, 0.0), DVec3::X, DVec3::Y]);
+
+        let mut edges = Vec::new();
+        for t in &tris {
+            edges.extend([(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]);
+        }
+        for _ in 0..2000 {
+            edges.push((rng.point(12.0), rng.point(12.0)));
+        }
+        for _ in 0..300 {
+            let z = 2.0;
+            let a = DVec3::new(rng.coord(4.0), rng.coord(4.0), z);
+            edges.push((a, DVec3::new(rng.coord(4.0), rng.coord(4.0), z)));
+        }
+        edges.push((DVec3::new(f64::NAN, 0.0, 0.0), DVec3::ZERO));
+        let shift = |p: DVec3| p + origin;
+        (
+            tris.into_iter().map(|t| t.map(shift)).collect(),
+            edges.into_iter().map(|(a, b)| (shift(a), shift(b))).collect(),
+        )
+    }
+
+    /// #332: the gridded occluder index answers exactly like the brute-force
+    /// scan over every triangle, on random scenes in every view direction,
+    /// including far-from-origin (site-coordinate) scenes.
+    #[test]
+    fn occ_index_matches_brute_force_on_random_scenes() {
+        let mut rng = Lcg(0x332);
+        let (mut hidden, mut total) = (0usize, 0usize);
+        for origin in [DVec3::ZERO, DVec3::new(512_345.0, 4_123_456.0, 37.0)] {
+            for _ in 0..4 {
+                let (tris, edges) = random_scene(&mut rng, origin);
+                for dir in [ViewDirection::Top, ViewDirection::Front, ViewDirection::Right, ViewDirection::Iso] {
+                    let occ: Vec<OccTri> = tris
+                        .iter()
+                        .map(|t| OccTri {
+                            a: project(dir, t[0]),
+                            b: project(dir, t[1]),
+                            c: project(dir, t[2]),
+                            da: view_depth(dir, t[0]),
+                            db: view_depth(dir, t[1]),
+                            dc: view_depth(dir, t[2]),
+                        })
+                        .collect();
+                    let brute: Vec<bool> =
+                        edges.iter().map(|&(a, b)| edge_occluded_brute(&occ, dir, a, b)).collect();
+                    let index = OccIndex::new(occ);
+                    for (k, &(a, b)) in edges.iter().enumerate() {
+                        assert_eq!(
+                            edge_occluded(&index, dir, a, b),
+                            brute[k],
+                            "{dir:?} origin {origin} edge {a} -> {b}"
+                        );
+                    }
+                    hidden += brute.iter().filter(|h| **h).count();
+                    total += brute.len();
+                }
+            }
+        }
+        assert!(hidden > total / 20 && hidden < total * 19 / 20, "{hidden}/{total} hidden");
+    }
+
+    /// #332: the parallel, indexed hidden-line pass gives exactly the segments of
+    /// the old sequential brute-force loop, and the hidden-line PDF bytes match
+    /// the sequential pass, in every view direction.
+    #[test]
+    fn hidden_line_indexed_parallel_matches_brute_sequential() {
+        let mut s = crate::segments::mixed_session();
+        for c in [
+            "sheet h a1",
+            "sheetview h top 200",
+            "sheetview h front 200",
+            "sheetview h right 200",
+            "sheetview h persp 200",
+        ] {
+            s.run(crate::parse(c).unwrap()).unwrap();
+        }
+        for i in 1..=4 {
+            s.run(crate::parse(&format!("sheetviewset h {i} mode hiddenline")).unwrap()).unwrap();
+        }
+        let sheet = s.doc.sheet("h").unwrap().clone();
+        let rects = sheet.view_layout_rects();
+        let mut culled = 0;
+        for (view, r) in sheet.views.iter().zip(&rects) {
+            let rect = (DVec2::new(r.x, r.y), DVec2::new(r.x + r.w, r.y + r.h));
+            let fit = collect_view_fit(&s.doc, view, rect).unwrap();
+            assert!(!fit.occ.is_empty());
+            let mut want = Vec::new();
+            for &(w, color, wa, wb) in &fit.weighted {
+                if edge_occluded_brute(&fit.occ.tris, view.direction, wa, wb) {
+                    culled += 1;
+                    continue;
+                }
+                let paper = |p: DVec3| {
+                    let p = project(view.direction, p);
+                    DVec2::new(world_to_paper_mm(p.x, view.scale), world_to_paper_mm(p.y, view.scale))
+                };
+                if let Some((a, b)) = clip(paper(wa) + fit.offset, paper(wb) + fit.offset, fit.cmin, fit.cmax)
+                    && (b - a).length() >= 1e-6
+                {
+                    want.push((w, color, a, b));
+                }
+            }
+            assert_eq!(view_weighted_segments(&s.doc, view, rect), want, "{:?}", view.direction);
+        }
+        assert!(culled > 100, "too few hidden edges: {culled}");
+        let (par, par_n) = sheet_pdf(&s.doc, &sheet);
+        let (seq, seq_n) = crate::segments::sequential(|| sheet_pdf(&s.doc, &sheet));
+        assert_eq!(par_n, seq_n);
+        assert!(par == seq, "hidden-line PDF bytes differ");
     }
 }
