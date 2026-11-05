@@ -152,7 +152,7 @@ fn open_file(
             // A tail that fails on the snapshot: fall back to the full replay.
             Err(_) => return open_file(file, None, ctl),
         },
-        None => Session::replay_with(file.ops, ctl)?,
+        None => Session::replay_deferred(file.ops, ctl)?,
     };
     session.set_branches(
         file.branches,

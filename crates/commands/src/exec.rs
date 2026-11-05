@@ -24,6 +24,7 @@ use crate::{
 
 mod replay;
 mod session_meta;
+pub(crate) mod site_defer;
 
 pub use replay::{HistoryJob, RebuiltHistory, ReplayControl};
 #[cfg(test)]
@@ -950,7 +951,17 @@ impl Session {
                     {
                         // Fast-open tail replay (#217): keep the history
                         // deferred; `ensure_history` rebuilds it from the
-                        // whole forward log when it is first needed.
+                        // whole forward log when it is first needed. Merge a
+                        // same-source `lotrefresh` like the history does
+                        // (`coalesce_lot_refresh`), so the saved log matches.
+                        let merge = matches!(
+                            (pending.last(), &op),
+                            (Some(Command::LotRefresh { source: a, .. }), Command::LotRefresh { source: b, .. })
+                                if a == b
+                        );
+                        if merge {
+                            pending.pop();
+                        }
                         pending.push(op);
                     } else {
                         self.log.truncate(self.cursor);
@@ -6486,7 +6497,17 @@ fn rederive_link(
 
     // Snapshot + remove the OLD produced children (for undo) up front; the
     // generators below mint fresh ids regardless of kind.
-    let restored = doc.remove_many(&link.produced);
+    let generation = doc.generation;
+    let mut restored = doc.remove_many(&link.produced);
+    if site_defer::take_stub_of(source) {
+        // Deferred replay (#218): the children were stubs. Count the removal
+        // of the real ones; no inverse is kept.
+        doc.generation = generation + u64::from(!link.produced.is_empty());
+        restored.clear();
+    }
+    if let Some(new_ids) = site_defer::stub(doc, source, &link, &poly, z, ids.as_deref(), verb) {
+        return Ok((new_ids, restored, Dropped::default()));
+    }
 
     // Re-derive by kind: Lots → derive_subdivision/insert_lots (produced = lots),
     // Site → generate_site/insert_site (produced = roads ++ blocks).
@@ -6538,6 +6559,8 @@ fn regenerate_by_kind(
     lot_overrides: &mut Vec<itsjustcad_doc::LotOverride>,
     ids: Option<Vec<ObjectId>>,
 ) -> Result<Vec<ObjectId>, String> {
+    #[cfg(test)]
+    site_defer::REGENERATIONS.with(|n| n.set(n.get() + 1));
     match kind {
         itsjustcad_doc::SubdivKind::Lots => {
             let mut bake = crate::lot::derive_subdivision(poly, z, settings)?;
