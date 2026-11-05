@@ -1314,7 +1314,8 @@ pub enum Command {
     /// each face's beam exposure by the EPW file's hourly Direct-Normal
     /// irradiance (occlusion-tested) and add isotropic-sky diffuse, giving
     /// kWh/m²·yr per face. Emits a colored overlay on the `analysis` layer
-    /// (blue = least → red = most). Requires a location.
+    /// (blue = least → red = most), one object per analysed mesh carrying the
+    /// values per face. Requires a location.
     Radiation {
         /// Objects whose faces are analysed.
         targets: Selector,
@@ -1341,6 +1342,13 @@ pub enum Command {
         /// keeps reading overlays so their results don't change.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         skip_analysis: bool,
+        /// Emit one result object per analysed source mesh, its faces carrying
+        /// the values as `face_values` (#328), and record one id per result.
+        /// Always `true` in ops logged since; absent (`false`) in older
+        /// documents, whose replay emits one overlay object per face with the
+        /// recorded ids.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        per_mesh: bool,
     },
     /// Sun-path diagram: draw the yearly sun-path dome for the document's
     /// location as polylines on the `sunpath` layer — seven date arcs (Dec 21 →
@@ -1361,7 +1369,8 @@ pub enum Command {
     /// toward the sun every 30 min of the day (occlusion-tested against the whole
     /// scene) and count the daylight hours of direct sun each face receives.
     /// Emits a colored overlay copy of the selected faces on the `analysis` layer
-    /// (blue = few hours → red = most) and reports min/avg/max hours. Requires a
+    /// (blue = few hours → red = most), one object per analysed mesh carrying
+    /// the hours as per-face values, and reports min/avg/max hours. Requires a
     /// document location (set via `sun`/`location`/EPW import).
     FaceSunHours {
         /// Objects whose faces are analysed.
@@ -1385,6 +1394,13 @@ pub enum Command {
         /// keeps reading overlays so their results don't change.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         skip_analysis: bool,
+        /// Emit one result object per analysed source mesh, its faces carrying
+        /// the values as `face_values` (#328), and record one id per result.
+        /// Always `true` in ops logged since; absent (`false`) in older
+        /// documents, whose replay emits one overlay object per face with the
+        /// recorded ids.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        per_mesh: bool,
     },
     // -- underlay (raster reference image on the ground plane) --
     /// Place a raster image (PNG) on the ground plane. `height` is `None` when

@@ -4933,6 +4933,103 @@ fn analysis_targets(
     Ok(kept)
 }
 
+/// World-space triangles of the analysed meshes, in target order, and the
+/// face count of each mesh that has faces (the runs `faces` splits into).
+fn analysed_faces(doc: &Document, target_ids: &[ObjectId]) -> (Vec<[DVec3; 3]>, Vec<usize>) {
+    let mut faces: Vec<[DVec3; 3]> = Vec::new();
+    let mut runs = Vec::new();
+    for id in target_ids {
+        if let Some(obj) = doc.get(*id)
+            && let Geometry::Mesh(m) = &obj.geometry
+            && !m.faces().is_empty()
+        {
+            let pos = m.positions();
+            for f in m.faces() {
+                faces.push([pos[f[0] as usize], pos[f[1] as usize], pos[f[2] as usize]]);
+            }
+            runs.push(m.faces().len());
+        }
+    }
+    (faces, runs)
+}
+
+/// A face copy nudged 5 mm along its normal, so the overlay renders just above
+/// the source surface instead of z-fighting with it.
+fn lifted_face(tri: &[DVec3; 3]) -> [DVec3; 3] {
+    let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+    let nlen = normal.length();
+    if nlen > 1e-12 {
+        normal /= nlen;
+    }
+    let lift = normal * 5e-3;
+    [tri[0] + lift, tri[1] + lift, tri[2] + lift]
+}
+
+/// Insert the `analysis` overlay of a per-face study (`values[i]` scores
+/// `faces[i]`, coloured blue→red over `[0, max]`). `per_mesh` (#328): one
+/// mesh per run of `faces` with the values as `face_values`; otherwise the
+/// legacy one-triangle object per face with its ramp colour. Reuses `ids` when
+/// their count matches. Returns the created ids and layers.
+fn insert_analysis_overlays(
+    doc: &mut Document,
+    faces: &[[DVec3; 3]],
+    runs: &[usize],
+    values: &[f64],
+    max: f64,
+    ids: Option<Vec<ObjectId>>,
+    per_mesh: bool,
+) -> (Vec<ObjectId>, Vec<String>) {
+    let count = if per_mesh { runs.len() } else { faces.len() };
+    let new_ids: Vec<ObjectId> = match ids {
+        Some(ids) if ids.len() == count => ids,
+        _ => (0..count).map(|_| ObjectId::new()).collect(),
+    };
+
+    let mut layers_created = Vec::new();
+    if !doc.layers.contains_key(ANALYSIS_LAYER) {
+        doc.layers.insert(ANALYSIS_LAYER.to_string(), LayerStyle::default());
+        layers_created.push(ANALYSIS_LAYER.to_string());
+    }
+
+    let overlay = |id: ObjectId, color, face_values, mesh| SceneObject {
+        visible: true,
+        id,
+        name: None,
+        layer: ANALYSIS_LAYER.to_string(),
+        color,
+        material: None,
+        lineweight_mm: None,
+        edge_tags: None,
+        street: None,
+        face_values,
+        geometry: Geometry::Mesh(mesh),
+    };
+    if per_mesh {
+        let mut start = 0;
+        for (&n, id) in runs.iter().zip(&new_ids) {
+            let run = start..start + n;
+            start += n;
+            let positions = faces[run.clone()].iter().flat_map(lifted_face).collect();
+            let tris = (0..n as u32).map(|i| [3 * i, 3 * i + 1, 3 * i + 2]).collect();
+            let fv = itsjustcad_doc::FaceValues {
+                values: values[run].iter().map(|&v| v as f32).collect(),
+                min: 0.0,
+                max: max as f32,
+                ramp: itsjustcad_doc::Ramp::BlueRed,
+            };
+            doc.insert(overlay(*id, None, Some(fv), kernel_mesh::Mesh::new(positions, tris)));
+        }
+    } else {
+        for ((tri, &v), id) in faces.iter().zip(values).zip(&new_ids) {
+            let frac = if max > 0.0 { v / max } else { 0.0 };
+            let color = itsjustcad_doc::Ramp::BlueRed.color(frac);
+            let mesh = kernel_mesh::Mesh::new(lifted_face(tri).to_vec(), vec![[0, 1, 2]]);
+            doc.insert(overlay(*id, Some(color), None, mesh));
+        }
+    }
+    (new_ids, layers_created)
+}
+
 /// Scene bounds without skipped overlays; [`Document::scene_aabb`] when none.
 fn analysis_scene_aabb(doc: &Document, skip_analysis: bool) -> Option<kernel_mesh::Aabb> {
     doc.objects()
@@ -5889,6 +5986,7 @@ fn exec_climate(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_radiation(
     doc: &mut Document,
     targets: Selector,
@@ -5897,6 +5995,7 @@ fn exec_radiation(
     bins: Option<Vec<[f64; 2]>>,
     include_locked: bool,
     skip_analysis: bool,
+    per_mesh: bool,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
     let loc = doc.location.ok_or_else(|| {
         ExecError::Invalid(
@@ -5925,19 +6024,10 @@ fn exec_radiation(
     // logged ops replay as they ran, reading them.
     let skip_analysis = skip_analysis || ids.is_none();
     let target_ids = analysis_targets(doc, target_ids, skip_analysis, "radiation")?;
+    let per_mesh = per_mesh || ids.is_none();
 
     // World-space triangles of the selected faces (what we score + color).
-    let mut faces: Vec<[DVec3; 3]> = Vec::new();
-    for id in &target_ids {
-        if let Some(obj) = doc.get(*id)
-            && let Geometry::Mesh(m) = &obj.geometry
-        {
-            let pos = m.positions();
-            for f in m.faces() {
-                faces.push([pos[f[0] as usize], pos[f[1] as usize], pos[f[2] as usize]]);
-            }
-        }
-    }
+    let (faces, runs) = analysed_faces(doc, &target_ids);
     if faces.is_empty() {
         return Err(ExecError::Invalid(
             "radiation needs a selected mesh (extrude or box first, then select)".into(),
@@ -5973,45 +6063,9 @@ fn exec_radiation(
         kwh.push(k);
     }
 
-    let new_ids: Vec<ObjectId> = match ids {
-        Some(ids) if ids.len() == faces.len() => ids,
-        _ => (0..faces.len()).map(|_| ObjectId::new()).collect(),
-    };
+    let (new_ids, layers_created) =
+        insert_analysis_overlays(doc, &faces, &runs, &kwh, max_k, ids, per_mesh);
 
-    let mut layers_created = Vec::new();
-    if !doc.layers.contains_key(ANALYSIS_LAYER) {
-        doc.layers
-            .insert(ANALYSIS_LAYER.to_string(), LayerStyle::default());
-        layers_created.push(ANALYSIS_LAYER.to_string());
-    }
-
-    for ((tri, &k), id) in faces.iter().zip(&kwh).zip(&new_ids) {
-        let frac = if max_k > 0.0 { k / max_k } else { 0.0 };
-        let color = itsjustcad_doc::Ramp::BlueRed.color(frac);
-        let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
-        let nlen = normal.length();
-        if nlen > 1e-12 {
-            normal /= nlen;
-        }
-        let lift = normal * 5e-3;
-        let mesh = kernel_mesh::Mesh::new(
-            vec![tri[0] + lift, tri[1] + lift, tri[2] + lift],
-            vec![[0, 1, 2]],
-        );
-        doc.insert(SceneObject {
-            visible: true,
-            id: *id,
-            name: None,
-            layer: ANALYSIS_LAYER.to_string(),
-            color: Some(color),
-            material: None,
-            lineweight_mm: None,
-            edge_tags: None,
-            street: None,
-            face_values: None,
-            geometry: Geometry::Mesh(mesh),
-        });
-    }
     // Structured summary for the deck's `report` command (per-face insolation
     // with facings, so the LLM can point at hot/cold faces).
     doc.analysis_reports.insert(
@@ -6032,13 +6086,14 @@ fn exec_radiation(
             bins: Some(bins),
             include_locked,
             skip_analysis,
+            per_mesh,
         },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
             message: format!(
                 "radiation: {} face(s), annual insolation min {min_k:.0} / avg {avg:.0} / \
                  max {max_k:.0} kWh/m2-yr on '{ANALYSIS_LAYER}'",
-                new_ids.len()
+                faces.len()
             ),
             created: new_ids,
         },
@@ -9477,6 +9532,7 @@ fn exec_face_sun_hours(
     day: u32,
     include_locked: bool,
     skip_analysis: bool,
+    per_mesh: bool,
 ) -> Result<(Command, Inverse, ApplyOutcome), ExecError> {
     let loc = doc.location.ok_or_else(|| {
         ExecError::Invalid(
@@ -9494,19 +9550,10 @@ fn exec_face_sun_hours(
     // logged ops replay as they ran, reading them.
     let skip_analysis = skip_analysis || ids.is_none();
     let target_ids = analysis_targets(doc, target_ids, skip_analysis, "facesunhours")?;
+    let per_mesh = per_mesh || ids.is_none();
 
     // World-space triangles of the *selected* faces only (what we score + color).
-    let mut faces: Vec<[DVec3; 3]> = Vec::new();
-    for id in &target_ids {
-        if let Some(obj) = doc.get(*id)
-            && let Geometry::Mesh(m) = &obj.geometry
-        {
-            let pos = m.positions();
-            for f in m.faces() {
-                faces.push([pos[f[0] as usize], pos[f[1] as usize], pos[f[2] as usize]]);
-            }
-        }
-    }
+    let (faces, runs) = analysed_faces(doc, &target_ids);
     if faces.is_empty() {
         return Err(ExecError::Invalid(
             "facesunhours needs a selected mesh (extrude or box first, then select)".into(),
@@ -9568,47 +9615,9 @@ fn exec_face_sun_hours(
         hours.push(h);
     }
 
-    let new_ids: Vec<ObjectId> = match ids {
-        Some(ids) if ids.len() == faces.len() => ids,
-        _ => (0..faces.len()).map(|_| ObjectId::new()).collect(),
-    };
+    let (new_ids, layers_created) =
+        insert_analysis_overlays(doc, &faces, &runs, &hours, max_h, ids, per_mesh);
 
-    let mut layers_created = Vec::new();
-    if !doc.layers.contains_key(ANALYSIS_LAYER) {
-        doc.layers
-            .insert(ANALYSIS_LAYER.to_string(), LayerStyle::default());
-        layers_created.push(ANALYSIS_LAYER.to_string());
-    }
-
-    for ((tri, &h), id) in faces.iter().zip(&hours).zip(&new_ids) {
-        let frac = if max_h > 0.0 { h / max_h } else { 0.0 };
-        let color = itsjustcad_doc::Ramp::BlueRed.color(frac);
-        // Overlay copy of the face, nudged toward the sky along its normal so it
-        // renders just above the source surface instead of z-fighting with it.
-        let mut normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
-        let nlen = normal.length();
-        if nlen > 1e-12 {
-            normal /= nlen;
-        }
-        let lift = normal * 5e-3;
-        let mesh = kernel_mesh::Mesh::new(
-            vec![tri[0] + lift, tri[1] + lift, tri[2] + lift],
-            vec![[0, 1, 2]],
-        );
-        doc.insert(SceneObject {
-            visible: true,
-            id: *id,
-            name: None,
-            layer: ANALYSIS_LAYER.to_string(),
-            color: Some(color),
-            material: None,
-            lineweight_mm: None,
-            edge_tags: None,
-            street: None,
-            face_values: None,
-            geometry: Geometry::Mesh(mesh),
-        });
-    }
     // Structured summary for the deck's `report` command (per-face sun-hours
     // with facings, so the LLM can critique glazing/amenity placement).
     doc.analysis_reports.insert(
@@ -9637,6 +9646,7 @@ fn exec_face_sun_hours(
             day,
             include_locked,
             skip_analysis,
+            per_mesh,
         },
         Inverse::CreatedOnLayer { created: new_ids.clone(), layers_created },
         ApplyOutcome {
@@ -9644,7 +9654,7 @@ fn exec_face_sun_hours(
                 "facesunhours {year}-{month:02}-{day:02}: {} face(s), sun-hours \
                  min {min_h:.1} / avg {avg:.1} / max {max_h:.1} \
                  (astronomical daylight {daylight:.1} h) on '{ANALYSIS_LAYER}'",
-                new_ids.len()
+                faces.len()
             ),
             created: new_ids,
         },
@@ -14744,12 +14754,35 @@ fn apply_forward(
             exec_sun_hours(doc, ids, year, month, day, spacing, skip_analysis)
         }
         Command::SunPath { ids, year, radius } => exec_sun_path(doc, ids, year, radius),
-        Command::Radiation { targets, ids, path, bins, include_locked, skip_analysis } => {
-            exec_radiation(doc, targets, ids, path, bins, include_locked, skip_analysis)
-        }
-        Command::FaceSunHours { targets, ids, year, month, day, include_locked, skip_analysis } => {
-            exec_face_sun_hours(doc, targets, ids, year, month, day, include_locked, skip_analysis)
-        }
+        Command::Radiation {
+            targets,
+            ids,
+            path,
+            bins,
+            include_locked,
+            skip_analysis,
+            per_mesh,
+        } => exec_radiation(doc, targets, ids, path, bins, include_locked, skip_analysis, per_mesh),
+        Command::FaceSunHours {
+            targets,
+            ids,
+            year,
+            month,
+            day,
+            include_locked,
+            skip_analysis,
+            per_mesh,
+        } => exec_face_sun_hours(
+            doc,
+            targets,
+            ids,
+            year,
+            month,
+            day,
+            include_locked,
+            skip_analysis,
+            per_mesh,
+        ),
         Command::Contours { interval, major_every, ids } => {
             exec_contours(doc, interval, major_every, ids)
         }
@@ -23905,13 +23938,13 @@ mod tests {
         // Overlay faces live on 'analysis' and are colored; the roof (top)
         // faces must be redder (higher insolation) than the bottom faces.
         let (mut top_red, mut bottom_red) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for id in &out.created {
-            let obj = s.doc.get(*id).unwrap();
-            assert_eq!(obj.layer, "analysis");
-            let red = obj.color.unwrap()[0];
-            let Geometry::Mesh(m) = &obj.geometry else { panic!("mesh expected") };
-            let z_avg: f64 =
-                m.positions().iter().map(|p| p.z).sum::<f64>() / m.positions().len() as f64;
+        assert_eq!(out.created.len(), 1, "one result for the box");
+        let obj = s.doc.get(out.created[0]).unwrap();
+        assert_eq!(obj.layer, "analysis");
+        let m = obj.geometry.mesh().expect("mesh expected");
+        for (f, rgb) in m.faces().iter().zip(obj.face_colors().expect("per-face values")) {
+            let red = rgb[0];
+            let z_avg = f.iter().map(|&i| m.positions()[i as usize].z).sum::<f64>() / 3.0;
             if z_avg > 3.9 {
                 top_red = top_red.max(red);
             } else if z_avg < 0.1 {
@@ -24136,7 +24169,8 @@ mod tests {
         let mut s = locked_and_free_boxes();
         run(&mut s, "location 40.0 0.0 0");
         let out = run(&mut s, "facesunhours all 2024-06-21");
-        assert_eq!(out.created.len(), 24, "both boxes' 12 faces each: {}", out.message);
+        assert_eq!(out.created.len(), 2, "one result per box: {}", out.message);
+        assert!(out.message.contains("24 face(s)"), "both boxes' 12 faces each: {}", out.message);
         assert_replay_stable(&s);
     }
 
@@ -24146,7 +24180,8 @@ mod tests {
         let mut s = locked_and_free_boxes();
         run(&mut s, &format!("import {}", path.display()));
         let out = run(&mut s, &format!("radiation all {}", path.display()));
-        assert_eq!(out.created.len(), 24, "both boxes' 12 faces each: {}", out.message);
+        assert_eq!(out.created.len(), 2, "one result per box: {}", out.message);
+        assert!(out.message.contains("24 face(s)"), "both boxes' 12 faces each: {}", out.message);
         assert_replay_stable(&s);
     }
 
@@ -24196,8 +24231,8 @@ mod tests {
         let first = run(&mut s, "facesunhours all 2024-06-21");
         let r1 = report_json(&s, "facesunhours");
         let second = run(&mut s, "facesunhours all 2024-06-21");
-        assert_eq!(first.created.len(), 24);
-        assert_eq!(second.created.len(), 24, "{}", second.message);
+        assert_eq!(first.created.len(), 2);
+        assert_eq!(second.created.len(), 2, "{}", second.message);
         assert_eq!(report_json(&s, "facesunhours"), r1);
         assert_eq!(first.message, second.message);
         assert_replay_stable(&s);
@@ -24214,6 +24249,118 @@ mod tests {
         assert_eq!(second.created.len(), first.created.len(), "{}", second.message);
         assert_eq!(report_json(&s, "radiation"), r1);
         assert_replay_stable(&s);
+    }
+
+    /// `cmd` as logged before #328: no `per_mesh`, ids to be minted.
+    fn legacy_per_face(mut cmd: Command) -> Command {
+        match &mut cmd {
+            Command::FaceSunHours { ids, per_mesh, .. }
+            | Command::Radiation { ids, per_mesh, .. } => {
+                *ids = Some(Vec::new());
+                *per_mesh = false;
+            }
+            other => panic!("not a per-face analysis: {other:?}"),
+        }
+        cmd
+    }
+
+    /// Sun scene with an EPW imported, plus the two per-face verbs' commands.
+    fn per_face_studies(epw: &str) -> (Session, [(String, &'static str); 2]) {
+        let path = write_synth_epw(epw);
+        let mut s = sun_scene();
+        run(&mut s, &format!("import {}", path.display()));
+        let verbs = [
+            ("facesunhours all 2024-06-21".to_string(), "facesunhours"),
+            (format!("radiation all {}", path.display()), "radiation"),
+        ];
+        (s, verbs)
+    }
+
+    /// #328: one result object per analysed mesh carrying per-face values. Same
+    /// report, message, lifted triangles and per-face colours as the legacy
+    /// one-object-per-face overlay.
+    #[test]
+    fn analysis_result_per_mesh_matches_legacy_per_face_overlay() {
+        let (_, verbs) = per_face_studies("permesh.epw");
+        let scene = || per_face_studies("permesh.epw").0;
+        for (cmd, key) in verbs {
+            let mut legacy = scene();
+            let old = legacy.run(legacy_per_face(parse(&cmd).unwrap())).unwrap();
+            let mut s = scene();
+            let new = run(&mut s, &cmd);
+            assert_eq!(report_json(&s, key), report_json(&legacy, key), "{key}");
+            assert_eq!(new.message, old.message);
+            assert_eq!((new.created.len(), old.created.len()), (2, 24), "{key}");
+
+            let max = s.doc.analysis_reports[key].max as f32;
+            let (mut tris, mut colours) = (Vec::new(), Vec::new());
+            for id in &new.created {
+                let obj = s.doc.get(*id).unwrap();
+                assert_eq!((obj.layer.as_str(), obj.color), ("analysis", None));
+                let fv = obj.face_values.as_ref().unwrap();
+                assert_eq!((fv.min, fv.max), (0.0, max), "{key}");
+                let m = obj.geometry.mesh().unwrap();
+                tris.extend(m.faces().iter().map(|f| f.map(|i| m.positions()[i as usize])));
+                colours.extend(obj.face_colors().unwrap());
+            }
+            let mut legacy_tris = Vec::new();
+            for (id, rgb) in old.created.iter().zip(&colours) {
+                let obj = legacy.doc.get(*id).unwrap();
+                let p = obj.geometry.mesh().unwrap().positions();
+                legacy_tris.push([p[0], p[1], p[2]]);
+                let want = obj.color.unwrap();
+                let close = rgb.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-6);
+                assert!(close, "{rgb:?} vs {want:?}");
+            }
+            assert_eq!(tris, legacy_tris, "{key}: same lifted faces in the same order");
+            assert_replay_stable(&s);
+        }
+    }
+
+    /// Ops logged before #328 carry no `per_mesh`: replay emits one overlay
+    /// object per face under the recorded ids, and the log re-saves unchanged.
+    #[test]
+    fn analysis_ops_logged_before_328_replay_per_face_with_recorded_ids() {
+        let legacy: Command = serde_json::from_str(
+            r#"{"cmd":"face_sun_hours","targets":{"sel":"all"},"ids":[],"year":2024,"month":6,"day":21,"include_locked":true,"skip_analysis":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(legacy, Command::FaceSunHours { per_mesh: false, .. }));
+        let (_, verbs) = per_face_studies("legacy328.epw");
+        let scene = || per_face_studies("legacy328.epw").0;
+        for (cmd, key) in verbs {
+            let mut s = scene();
+            let out = s.run(legacy_per_face(parse(&cmd).unwrap())).unwrap();
+            assert_eq!(out.created.len(), 24, "{key}: one overlay per face");
+            let log = s.save_log();
+            let saved = serde_json::to_string(log.last().unwrap()).unwrap();
+            assert!(!saved.contains("per_mesh"), "{saved}");
+            let replayed = Session::replay(log.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_string(&replayed.save_log()).unwrap(),
+                serde_json::to_string(&log).unwrap(),
+                "{key}: legacy log re-saves byte-identically"
+            );
+            assert_eq!(replayed.doc, s.doc, "{key}: same overlays under the recorded ids");
+        }
+    }
+
+    #[test]
+    fn analysis_result_per_mesh_undo_redo_round_trip() {
+        let (_, verbs) = per_face_studies("undo328.epw");
+        let scene = || per_face_studies("undo328.epw").0;
+        for (cmd, key) in verbs {
+            let mut s = scene();
+            let out = run(&mut s, &cmd);
+            let results: Vec<_> = out.created.iter().map(|id| s.doc.get(*id).cloned()).collect();
+            run(&mut s, "undo");
+            assert_eq!(s.doc.len(), scene().doc.len(), "{key}: results removed");
+            assert!(!s.doc.layers.contains_key("analysis"), "{key}");
+            run(&mut s, "redo");
+            let redone: Vec<_> = out.created.iter().map(|id| s.doc.get(*id).cloned()).collect();
+            assert_eq!(redone, results, "{key}: results back with their values");
+            assert_eq!(s.doc.len(), scene().doc.len() + 2);
+        }
     }
 
     /// Overlays from an earlier analysis change neither the sunhours grid
@@ -24250,6 +24397,7 @@ mod tests {
                 day: 21,
                 include_locked: true,
                 skip_analysis: true,
+                per_mesh: true,
             })
             .unwrap_err();
         assert!(err.to_string().contains("'analysis' layer"), "{err}");
