@@ -84,6 +84,16 @@ impl ShadowCaster {
     ) -> Vec<T> {
         match self.never {}
     }
+
+    pub fn map_fans<I: Sync, T: Send>(
+        &self,
+        _bvh: &TriBvh,
+        _items: &[I],
+        _plan: impl Fn(&I, &mut Vec<u32>) -> DVec3 + Sync,
+        _f: impl Fn(&I, &mut Occluded<'_>) -> T + Sync,
+    ) -> Vec<T> {
+        match self.never {}
+    }
 }
 
 /// Work in flight on [`Tracer`]; never built on this target.

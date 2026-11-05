@@ -5165,6 +5165,14 @@ fn face_lit_one(
     (lit, centroid, normal)
 }
 
+/// The queries [`face_lit_one`] makes, for [`itsjustcad_hwrt::ShadowCaster::map_fans`]:
+/// pushes the index of each sun direction it tests and returns the origin.
+fn face_lit_plan(tri: &[DVec3; 3], sun_dirs: &[DVec3], fan: &mut Vec<u32>) -> DVec3 {
+    let (centroid, normal) = tri_centroid_normal(tri);
+    fan.extend((0..sun_dirs.len() as u32).filter(|&k| normal.dot(sun_dirs[k as usize]) > 0.0));
+    centroid + normal * 1e-3
+}
+
 /// [`face_lit_one`] over all faces, parallel.
 fn face_lit_slots(
     faces: &[[DVec3; 3]],
@@ -5172,7 +5180,9 @@ fn face_lit_slots(
     bvh: &kernel_mesh::TriBvh,
 ) -> Vec<(usize, DVec3, DVec3)> {
     if let Some(hw) = itsjustcad_hwrt::ShadowCaster::new(bvh, Some(sun_dirs)) {
-        return hw.map(bvh, faces, |tri, occ| face_lit_one(tri, sun_dirs, occ));
+        return hw.map_fans(bvh, faces, |tri, fan| face_lit_plan(tri, sun_dirs, fan), |tri, occ| {
+            face_lit_one(tri, sun_dirs, occ)
+        });
     }
     faces
         .par_iter()
@@ -5207,6 +5217,19 @@ fn face_radiation_one(
         occluded(origin, DVec3::new(s[0], s[1], s[2]))
     });
     (k, centroid, normal)
+}
+
+/// The queries [`face_radiation_one`] makes, for [`itsjustcad_hwrt::ShadowCaster::map_fans`]:
+/// pushes the index into `sky.sun_directions()` of each sun it tests and
+/// returns the origin.
+fn face_radiation_plan(
+    tri: &[DVec3; 3],
+    sky: &itsjustcad_solar::AnnualSky,
+    fan: &mut Vec<u32>,
+) -> DVec3 {
+    let (centroid, normal) = tri_centroid_normal(tri);
+    sky.beam_suns(normal.to_array(), |k| fan.push(k as u32));
+    centroid + normal * 1e-3
 }
 
 /// Pre-#296 per-face path: recomputes the sun positions for every face.
@@ -5245,7 +5268,9 @@ fn face_radiation_scores(
         itsjustcad_solar::AnnualSky::new(bins, year, loc.lat_deg, loc.lon_deg, loc.tz_hours);
     let suns: Vec<DVec3> = sky.sun_directions().map(DVec3::from_array).collect();
     if let Some(hw) = itsjustcad_hwrt::ShadowCaster::new(bvh, Some(&suns)) {
-        return hw.map(bvh, faces, |tri, occ| face_radiation_one(tri, &sky, occ));
+        return hw.map_fans(bvh, faces, |tri, fan| face_radiation_plan(tri, &sky, fan), |tri, occ| {
+            face_radiation_one(tri, &sky, occ)
+        });
     }
     faces
         .par_iter()
@@ -18570,6 +18595,34 @@ mod tests {
             "radiation kernel must be bit-identical to sequential"
         );
         assert_eq!(par, face_radiation_scores(&tris, &bins, 2026, loc, &bvh), "radiation repeat");
+
+        // #323: each face's plan is exactly the queries its scorer makes,
+        // whatever the answers, so `map_fans` never falls back to the CPU.
+        let sky = itsjustcad_solar::AnnualSky::new(&bins, 2026, loc.lat_deg, loc.lon_deg, loc.tz_hours);
+        let suns: Vec<DVec3> = sky.sun_directions().map(DVec3::from_array).collect();
+        let bits = |v: DVec3| v.to_array().map(f64::to_bits);
+        for t in &tris {
+            for answer in [false, true] {
+                let mut fan = Vec::new();
+                let o = face_lit_plan(t, &sun_dirs, &mut fan);
+                let planned: Vec<_> = fan.iter().map(|&k| (bits(o), bits(sun_dirs[k as usize]))).collect();
+                let mut asked = Vec::new();
+                face_lit_one(t, &sun_dirs, |o, d| {
+                    asked.push((bits(o), bits(d)));
+                    answer
+                });
+                assert_eq!(asked, planned, "facesunhours plan");
+                fan.clear();
+                let o = face_radiation_plan(t, &sky, &mut fan);
+                let planned: Vec<_> = fan.iter().map(|&k| (bits(o), bits(suns[k as usize]))).collect();
+                asked.clear();
+                face_radiation_one(t, &sky, |o, d| {
+                    asked.push((bits(o), bits(d)));
+                    answer
+                });
+                assert_eq!(asked, planned, "radiation plan");
+            }
+        }
 
         // shadowstudy: per-stamp ground hulls.
         let object_pts: Vec<Vec<[f64; 3]>> = s
@@ -32665,13 +32718,17 @@ mod tests {
             eprintln!("no hardware ray tracing: skipped");
             return;
         };
-        let gpu = hw.map(&bvh, &tris, |t, occ| face_lit_one(t, &sun_dirs, occ));
+        let gpu = hw.map_fans(&bvh, &tris, |t, fan| face_lit_plan(t, &sun_dirs, fan), |t, occ| {
+            face_lit_one(t, &sun_dirs, occ)
+        });
         let cpu: Vec<_> = tris.par_iter().map(|t| face_lit_one(t, &sun_dirs, cpu_occ)).collect();
         assert!(gpu == cpu, "facesunhours differs");
         gpu.iter().for_each(|r| mix(r.0 as u64));
         let suns: Vec<DVec3> = sky.sun_directions().map(DVec3::from_array).collect();
         let hw = itsjustcad_hwrt::ShadowCaster::new(&bvh, Some(&suns)).expect("caster");
-        let gpu = hw.map(&bvh, &tris, |t, occ| face_radiation_one(t, &sky, occ));
+        let gpu = hw.map_fans(&bvh, &tris, |t, fan| face_radiation_plan(t, &sky, fan), |t, occ| {
+            face_radiation_one(t, &sky, occ)
+        });
         let cpu: Vec<_> = tris.par_iter().map(|t| face_radiation_one(t, &sky, cpu_occ)).collect();
         assert!(
             gpu.iter().zip(&cpu).all(|(a, b)| a.0.to_bits() == b.0.to_bits() && a.1 == b.1 && a.2 == b.2),

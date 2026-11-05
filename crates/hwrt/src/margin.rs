@@ -180,13 +180,23 @@ impl Frame {
     /// (origin outside Ω, `|d|∞ > 1`, `|d|∞ < 2⁻¹⁰`, non-finite): the CPU
     /// answers those.
     pub fn ray(&self, o: DVec3, d: DVec3) -> Option<RayF> {
+        let ([o, o_lo], d) = (self.origin(o)?, Self::dir(d)?);
+        Some(RayF { o, o_lo, d })
+    }
+
+    /// The origin half of [`Frame::ray`]: `[hi, lo]`, or `None` outside Ω.
+    pub fn origin(&self, o: DVec3) -> Option<[[f32; 3]; 2]> {
         let inside = o.cmpge(self.omega.min).all() && o.cmple(self.omega.max).all();
+        inside.then(|| {
+            let (hi, lo) = split(o - self.center);
+            [hi, lo]
+        })
+    }
+
+    /// The direction half of [`Frame::ray`].
+    pub fn dir(d: DVec3) -> Option<[f32; 3]> {
         let m = d.abs().max_element();
-        if !inside || !(1.0 / 1024.0..=1.0).contains(&m) {
-            return None;
-        }
-        let (o, o_lo) = split(o - self.center);
-        Some(RayF { o, o_lo, d: f32s(d) })
+        (1.0 / 1024.0..=1.0).contains(&m).then(|| f32s(d))
     }
 }
 
