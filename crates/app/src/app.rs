@@ -12764,6 +12764,7 @@ mod tests {
             ("optimize", optimize_panel::SEG_OPTIMIZE),
             (running, optimize_panel::SEG_OPTIMIZE),
             ("cancelled", optimize_panel::SEG_OPTIMIZE),
+            ("stopped", optimize_panel::SEG_OPTIMIZE),
             ("climate", optimize_panel::SEG_OPTIMIZE),
             ("climate_yield", optimize_panel::SEG_YIELD),
             ("noclimate", optimize_panel::SEG_OPTIMIZE),
@@ -12801,6 +12802,19 @@ mod tests {
                             if name == "cancelled" {
                                 app.optimize.cancel();
                             }
+                        } else if name == "stopped" {
+                            // A run stopped early (#226): Continue and New Run.
+                            use itsjustcad_commands::optimize_runs::SavedRun;
+                            use itsjustcad_commands::site_optimize::{self, Control};
+                            use std::sync::atomic::{AtomicBool, Ordering};
+                            app.optimize.form.budget = 400;
+                            let req = app.optimize.form.to_request();
+                            let p = site_optimize::prepare_doc(&app.session.doc, &[source], &req).unwrap();
+                            let stop = AtomicBool::new(false);
+                            let watch = |_: &site_optimize::Progress| stop.store(true, Ordering::Relaxed);
+                            let ctl = Control { stop: Some(&stop), progress: Some(&watch), ..Control::default() };
+                            let r = p.run(ctl).unwrap();
+                            app.session.set_optimize_run(source, SavedRun::new(&p, r, 2.4));
                         } else if seg == optimize_panel::SEG_OPTIMIZE {
                             app.optimize.form.budget = 40;
                             app.optimize.run_now(&mut app.session, source);

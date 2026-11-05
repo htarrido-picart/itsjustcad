@@ -558,4 +558,44 @@ mod tests {
         assert_eq!(clamp_segment(0, 2), 0);
         assert_eq!(clamp_segment(5, 0), 0);
     }
+
+    /// #226: Continue picks a run stopped early up with its own request and
+    /// ends with the full budget, saved over it; a changed plan shows why it
+    /// cannot be continued.
+    #[test]
+    fn continue_a_stopped_run() {
+        let mut s = itsjustcad_commands::Session::default();
+        for line in ["rect 0,0,0 200 150", "siteplan last"] {
+            s.run(itsjustcad_commands::parse(line).unwrap()).unwrap();
+        }
+        let source = *s.doc.subdivision_links.keys().next().unwrap();
+        let req = site_optimize::OptimizeRequest { budget: 48, ..Default::default() };
+        let p = site_optimize::prepare_doc(&s.doc, &[source], &req).unwrap();
+        let stop = AtomicBool::new(false);
+        let watch = |_: &site_optimize::Progress| stop.store(true, Ordering::Relaxed);
+        let ctl = site_optimize::Control { stop: Some(&stop), progress: Some(&watch), ..Default::default() };
+        s.set_optimize_run(source, SavedRun::new(&p, p.run(ctl).unwrap(), 1.0));
+        assert!(s.optimize_run(source).unwrap().resumable());
+
+        let mut panel = OptimizePanel::default();
+        panel.open_for(source, &s.doc.subdivision_links[&source].settings, None);
+        panel.form.budget = 7;
+        panel.resume(&s, source, &egui::Context::default());
+        assert_eq!(panel.form.budget, 48, "the run's own request");
+        let t = Instant::now();
+        while panel.job.is_some() {
+            assert!(t.elapsed() < Duration::from_secs(120));
+            panel.poll(&mut s);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let run = s.optimize_run(source).unwrap();
+        assert!(panel.error.is_none(), "{:?}", panel.error);
+        assert!(!run.result.stopped_early && !run.resumable());
+        assert_eq!(run.result.evaluated, 48);
+        assert!(run.elapsed_s > 1.0, "adds the stopped run's time");
+
+        panel.resume(&s, source, &egui::Context::default());
+        assert!(panel.job.is_none());
+        assert_eq!(panel.error.as_ref().map(|e| e.1.as_str()), Some(site_optimize::RESUME_NONE));
+    }
 }
