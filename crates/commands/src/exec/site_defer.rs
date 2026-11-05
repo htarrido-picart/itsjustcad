@@ -495,6 +495,45 @@ mod tests {
         assert_eq!(fast.doc, eager.doc);
     }
 
+    /// A no-checkpoint open (#341) leaves the history pending like a fast
+    /// open (#224): an edit does not replay, undo within new edits needs no
+    /// rebuild, and undo past the open waits for the background rebuild,
+    /// then walks the pre-open states.
+    #[test]
+    fn edit_after_deferred_open_does_not_replay() {
+        let rebuilds = || crate::exec::HISTORY_REBUILDS.with(std::cell::Cell::get);
+        let (s, _, _) = site_session(400.0, 6);
+        let log = s.save_log();
+        let json = crate::io::to_json(&s);
+        let mut fast = crate::io::open_json(&json, None, ReplayControl::default()).unwrap().session;
+        fast.set_background_history(true);
+        let mut eager = Session::replay(log.clone()).unwrap();
+        let n0 = rebuilds();
+        for line in ["location 40.7 -74.0 10", "undo"] {
+            run(&mut fast, line);
+            run(&mut eager, line);
+        }
+        assert_eq!(rebuilds(), n0, "no history replay on the edit or its undo");
+        assert!(fast.history_pending());
+        assert_eq!(fast.doc, eager.doc, "undo within new edits");
+        assert_eq!(fast.run(Command::Undo).unwrap_err(), crate::ExecError::HistoryPending);
+        assert!(fast.history_requested());
+        let job = fast.history_job().unwrap();
+        for line in ["redo", "box 900,0,0 1,1,1"] {
+            run(&mut fast, line);
+            run(&mut eager, line);
+        }
+        assert!(fast.install_history(job.run(ReplayControl::default()).unwrap()));
+        assert_eq!(rebuilds(), n0 + 1);
+        assert_eq!(fast.save_log().len(), log.len() + 2);
+        assert_eq!(&fast.save_log()[..log.len()], &log[..]);
+        for _ in 0..6 {
+            run(&mut fast, "undo");
+            run(&mut eager, "undo");
+            assert_eq!(fast.doc, eager.doc);
+        }
+    }
+
     /// Live edits never stub: every produced child exists after each edit,
     /// and each edit regenerates once, as before.
     #[test]
@@ -556,5 +595,20 @@ mod tests {
         let json = crate::io::to_json(&s);
         let (t, r) = best(&|| crate::io::open_json(&json, None, ReplayControl::default()).unwrap().session);
         println!("open (no checkpoint, deferred): {:.3} s, {r} regenerations", t);
+        // First edit after the open (#224): a pending history is not rebuilt.
+        // The rebuild is what a first edit used to cost before #225.
+        let (mut edit, mut rebuild) = (f64::MAX, f64::MAX);
+        for _ in 0..5 {
+            let mut fast = crate::io::open_json(&json, None, ReplayControl::default()).unwrap().session;
+            let t = std::time::Instant::now();
+            run(&mut fast, "location 40.7 -74.0 10");
+            edit = edit.min(t.elapsed().as_secs_f64());
+            assert!(fast.history_pending());
+            let job = fast.history_job().unwrap();
+            let t = std::time::Instant::now();
+            assert!(fast.install_history(job.run(ReplayControl::default()).unwrap()));
+            rebuild = rebuild.min(t.elapsed().as_secs_f64());
+        }
+        println!("first edit: {:.6} s; history rebuild it no longer waits for: {:.3} s", edit, rebuild);
     }
 }
