@@ -6,6 +6,8 @@
 //!   (curve tessellation, mesh feature edges, Hershey text, hatch fill) runs on
 //!   the rayon pool; the ordered `collect` keeps results in document order, so
 //!   the output is byte-identical to a sequential pass.
+//! - [`par_filter_map`]: ordered parallel `filter_map` over a slice (the PDF
+//!   per-segment hidden-line cull + clip, #332).
 //! - [`push_trimmed`]: writes a fixed-precision number straight into the output
 //!   buffer with trailing zeros trimmed, without a per-number `String`.
 
@@ -28,12 +30,27 @@ where
     objs.into_par_iter().map(f).collect()
 }
 
+/// Ordered parallel `filter_map` over a slice on the rayon pool: same items, same
+/// order as the sequential `iter().filter_map(f)` (which [`sequential`] forces).
+pub(crate) fn par_filter_map<T, U, F>(items: &[T], f: F) -> Vec<U>
+where
+    T: Sync,
+    U: Send,
+    F: Fn(&T) -> Option<U> + Sync + Send,
+{
+    #[cfg(test)]
+    if FORCE_SEQ.with(|s| s.get()) {
+        return items.iter().filter_map(f).collect();
+    }
+    items.par_iter().filter_map(f).collect()
+}
+
 #[cfg(test)]
 thread_local! {
     static FORCE_SEQ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Run `f` with [`par_objects`] forced onto the calling thread, in order. Test
+/// Run `f` with [`par_objects`] and [`par_filter_map`] forced onto the calling thread, in order. Test
 /// reference for the parallel path.
 #[cfg(test)]
 pub(crate) fn sequential<R>(f: impl FnOnce() -> R) -> R {
