@@ -19,6 +19,8 @@
 //! [`ShadowCaster::new`] and [`Tracer::new`] return `None` and callers keep
 //! the CPU path.
 //! `ITSJUSTCAD_HWRT_STATS=1` prints per-batch counts and timings to stderr.
+//! `ITSJUSTCAD_HWRT_FANS=cpu` makes `ShadowCaster::map_fans` write one ray
+//! record per query on the CPU instead of expanding fans on the GPU (#337).
 
 use glam::DVec3;
 #[cfg(not(any(target_os = "macos", all(target_os = "ios", target_abi = "macabi"))))]

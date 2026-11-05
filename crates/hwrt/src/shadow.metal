@@ -137,19 +137,9 @@ constant int CODE_TRUE = -2147483647;      // i32::MIN + 1: certainly occluded
 //         -1         every candidate rejected: the ray is not occluded;
 //         CODE_CPU   the ray was not for the GPU (non-finite marker);
 //         else (<= -2) no accept, candidate -(out+2) was uncertain.
-kernel void shadow_any_hit(primitive_acceleration_structure accel [[buffer(0)]],
-                           device const Tri* tris [[buffer(1)]],
-                           device const Ray* rays [[buffer(2)]],
-                           device int* out [[buffer(3)]],
-                           device const Box* leaves [[buffer(4)]],
-                           constant uint& n [[buffer(5)]],
-                           uint gid [[thread_position_in_grid]]) {
-    if (gid >= n) return;
-    float3 o = float3(rays[gid].o), o_lo = float3(rays[gid].o_lo), d = float3(rays[gid].d);
-    if (!all(isfinite(d))) {
-        out[gid] = CODE_CPU;
-        return;
-    }
+static int any_hit(primitive_acceleration_structure accel, device const Tri* tris,
+                   device const Box* leaves, float3 o, float3 o_lo, float3 d) {
+    if (!all(isfinite(d))) return CODE_CPU;
     ray r(o, d, 0.0f, INFINITY);
     intersection_params params;
     intersection_query<> q;
@@ -166,5 +156,42 @@ kernel void shadow_any_hit(primitive_acceleration_structure accel [[buffer(0)]],
         }
         if (c == UNCERTAIN && maybe < 0) maybe = int(i);
     }
-    out[gid] = hit != -1 ? hit : (maybe >= 0 ? -2 - maybe : -1);
+    return hit != -1 ? hit : (maybe >= 0 ? -2 - maybe : -1);
+}
+
+kernel void shadow_any_hit(primitive_acceleration_structure accel [[buffer(0)]],
+                           device const Tri* tris [[buffer(1)]],
+                           device const Ray* rays [[buffer(2)]],
+                           device int* out [[buffer(3)]],
+                           device const Box* leaves [[buffer(4)]],
+                           constant uint& n [[buffer(5)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    out[gid] = any_hit(accel, tris, leaves, float3(rays[gid].o), float3(rays[gid].o_lo), float3(rays[gid].d));
+}
+
+// Fans (#337): `rays[gid]` packs the ray's item in the batch (high bits) and
+// its direction's index (low FAN_DIR_BITS). The item's origin is `origins[i]`
+// and the direction `dirs[k]`, both written by the CPU with the same `Frame`
+// halves as a `Ray` record, so the kernel sees the same bits. A NaN origin or
+// direction marks a ray the CPU answers.
+constant uint FAN_DIR_BITS = 19;  // `FAN_DIR_BITS` in caster.rs
+
+struct Origin { packed_float3 o; packed_float3 o_lo; };
+
+kernel void shadow_fans(primitive_acceleration_structure accel [[buffer(0)]],
+                        device const Tri* tris [[buffer(1)]],
+                        device const Origin* origins [[buffer(2)]],
+                        device const uint* rays [[buffer(3)]],
+                        device const packed_float3* dirs [[buffer(4)]],
+                        device int* out [[buffer(5)]],
+                        device const Box* leaves [[buffer(6)]],
+                        constant uint& n [[buffer(7)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    uint p = rays[gid];
+    uint i = p >> FAN_DIR_BITS;
+    float3 o = float3(origins[i].o);
+    float3 d = all(isfinite(o)) ? float3(dirs[p & ((1u << FAN_DIR_BITS) - 1)]) : float3(NAN);
+    out[gid] = any_hit(accel, tris, leaves, o, float3(origins[i].o_lo), d);
 }
