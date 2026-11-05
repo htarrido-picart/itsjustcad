@@ -1250,6 +1250,15 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         place: Option<String>,
     },
+    /// Look an address up with the host's geocoder (#215) and set the
+    /// location from the match through a logged [`Command::Location`]. Never
+    /// logged itself: replay applies the numbers, never the lookup.
+    Geocode {
+        /// The address, quotes dropped.
+        query: String,
+        /// Which match to use (`#n`, 1-based); `None` = the best (first).
+        pick: Option<usize>,
+    },
     /// Set (or clear) the site climate from an EPW weather file (#170): facade
     /// daylight and overheating (`siteoptimize`, the Yield economics) then use
     /// its sunshine hours (direct normal ≥ 120 W/m²) and its hottest month
@@ -2856,6 +2865,8 @@ impl Command {
                 | Command::Export { .. }
                 | Command::ControlImages { .. }
                 | Command::Import { .. }
+                // The lookup is not logged; the `location` op it applies is.
+                | Command::Geocode { .. }
                 // trace expands into logged Layer/Polyline ops; it is not
                 // itself logged (the Import/Terrain precedent).
                 | Command::Trace { .. }

@@ -37,6 +37,7 @@
 
 mod boxsel;
 pub mod cameras;
+pub mod geocoder;
 pub mod guided;
 pub mod history_job;
 mod job;
@@ -320,6 +321,9 @@ pub struct AppHandle {
     deck_context: Option<HereContext>,
     pending: Arc<Mutex<Vec<PendingOp>>>,
     history: Arc<Mutex<Vec<ChatMessage>>>,
+    /// The host geocoder for `geocode` ([`geocoder::ijc_set_geocoder`],
+    /// #215), re-installed on every new session.
+    geocoder: Option<Arc<geocoder::HostGeocoder>>,
 }
 
 /// The wgpu device, the `CAMetalLayer` surface and its swapchain config, and the
@@ -843,6 +847,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         deck_context: None,
         pending: Arc::new(Mutex::new(Vec::new())),
         history: Arc::new(Mutex::new(Vec::new())),
+        geocoder: None,
     };
     Box::into_raw(Box::new(handle))
 }
@@ -1078,6 +1083,7 @@ fn install_session(app: &mut AppHandle, mut session: Session) {
     history_job::jobs(app).cancel_all();
     optimize_job::cancel_all(app);
     app.session = session;
+    geocoder::install(app);
     app.guided = Default::default();
     if let Ok(mut hist) = app.history.lock() {
         hist.clear();
@@ -1125,6 +1131,7 @@ pub unsafe extern "C" fn ijc_new_document(h: *mut AppHandle) {
         history_job::jobs(&app).cancel_all();
         optimize_job::cancel_all(&mut app);
         app.session = Session::default();
+        geocoder::install(&mut app);
         app.guided = Default::default();
         if let Ok(mut hist) = app.history.lock() {
             hist.clear();

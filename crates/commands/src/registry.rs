@@ -804,6 +804,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Analyze,
         },
         CommandSpec {
+            name: "geocode",
+            usage: "geocode \"<address>\" [#n]",
+            summary: "Look a street address up and set the site location from the best match via `location <lat> <lon> <tz> <place>` (the UTC offset comes from the match). Needs network: sends the address to the configured geocoder (OpenStreetMap Nominatim by default on desktop, MapKit on iOS); one request per command; fails and changes nothing with no geocoder or no match. Lists the other matches; #n picks the n-th instead. Only the `location` op is logged, so files replay offline; one undo step. Example: geocode \"1600 Amphitheatre Pkwy, Mountain View\" #2",
+            category: Category::Analyze,
+        },
+        CommandSpec {
             name: "climate",
             usage: "climate <path.epw> | climate off",
             summary: "Set the site climate from an EPW (EnergyPlus weather) file you supply — no download. Facade daylight and overheating (siteoptimize min_daylight / max_overheat, the Yield economics) then count sunshine hours (hours with direct-normal irradiance ≥ 120 W/m², per month and hour, from the file's hourly DNI; diffuse horizontal is stored too) and use the file's hottest month (mean dry-bulb) instead of clear-sky sun hours and the longest day; reports name which source they used. Sets the location from the EPW when the document has none. Logged with the parsed climate embedded, so files replay without the EPW; one undo step. off clears it (clear-sky again). Example: climate /data/guayaquil.epw",

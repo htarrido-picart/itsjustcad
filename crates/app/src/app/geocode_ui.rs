@@ -1,65 +1,103 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-//! The `geocode "<address>"` verb and the Daylight section's address field
-//! (#215): the first-use privacy notice, the lookup, the pick list, and
-//! setting the location through the logged `location` op.
+//! The `geocode` command's desktop side and the Daylight section's address
+//! field (#215): the host geocoder on the session, the first-use privacy
+//! notice, the lookups off the UI thread, and the field's pick list.
+//!
+//! A typed `geocode` (and a Deck one) is the core command: it looks the
+//! address up through the session's hook and applies the logged `location`
+//! op. A typed line is looked up on a worker thread first, so the UI never
+//! waits on the network; the command then runs with the answer in hand (one
+//! request). The field's lookup runs the `location` op on the session
+//! directly, so it never shows in the command line.
 
 use super::App;
-use crate::geocode::{location_line, tz_offset, Outcome, Place, NOMINATIM_URL};
+use crate::geocode::{Outcome, PRIVACY_ACK};
 use crate::i18n::t;
-
-/// `ui.json` key: the first-use privacy notice was accepted.
-const PRIVACY_ACK: &str = "geocode_privacy_ack";
-/// `ui.json` key: a Nominatim-compatible search endpoint replacing the public
-/// one (the usage policy asks that apps can switch without an update).
-const ENDPOINT_KEY: &str = "geocoder_url";
+use itsjustcad_commands::geocode::{location_op, GeoPlace};
 
 impl App {
-    /// `geocode <address>` (`from_field` false) or the Daylight field's Find
-    /// (`from_field` true): one lookup per call. The first time, the privacy
-    /// notice asks before anything is sent. A field lookup never touches the
-    /// command line: no echo, no recall entry, its messages under the field.
-    pub(in crate::app) fn geocode_request(&mut self, address: &str, from_field: bool) {
-        let prefs = super::load_ui_json();
-        let acked = prefs[PRIVACY_ACK].as_bool() == Some(true);
-        let endpoint = prefs[ENDPOINT_KEY].as_str().unwrap_or(NOMINATIM_URL).to_string();
-        let handle = self.tokio.clone();
-        let fetch = move |url: &str| handle.block_on(crate::download::fetch_bytes(url));
-        self.geocode_request_with(address, from_field, acked, &endpoint, fetch);
+    /// Install `hook` as the session's geocoder (and the one the field uses).
+    #[cfg(test)]
+    pub(in crate::app) fn set_geocoder(&mut self, hook: std::sync::Arc<crate::geocode::Nominatim>) {
+        self.geo_hook = hook;
+        self.session.set_geocoder(Some(self.geo_hook.clone()));
     }
 
-    /// [`Self::geocode_request`] with the notice state, endpoint and network
-    /// injected (tests stub the geocoder; CI never reaches the network).
-    pub(in crate::app) fn geocode_request_with(
-        &mut self,
-        address: &str,
-        from_field: bool,
-        acked: bool,
-        endpoint: &str,
-        fetch: impl FnOnce(&str) -> Result<Vec<u8>, String> + Send + 'static,
-    ) {
-        self.geocode.from_field = from_field;
+    /// Put the geocoder on a session that lacks it (a new or opened one).
+    fn ensure_geocoder(&mut self) {
+        if !self.session.has_geocoder() {
+            self.session.set_geocoder(Some(self.geo_hook.clone()));
+        }
+    }
+
+    /// The Daylight field's Find: one lookup. The first time, the privacy
+    /// notice asks before anything is sent. A field lookup never touches the
+    /// command line: no echo, no recall entry, its messages under the field.
+    pub(in crate::app) fn geocode_request(&mut self, address: &str) {
+        self.ensure_geocoder();
+        self.geocode.from_field = true;
         let address = crate::geocode::address_arg(address);
         if address.is_empty() {
-            self.geocode_say("usage: geocode \"<address>\"".into());
+            self.geocode.notice = Some("usage: geocode \"<address>\" [#n]".into());
             return;
         }
         self.geocode.address.clone_from(&address);
-        if !acked {
+        if !self.geo_hook.acked() {
+            self.geocode.privacy_resend = true;
             self.geocode.privacy_pending = Some(address);
             return;
         }
-        if let Some(outcome) = self.geocode.start(&address, endpoint, fetch) {
+        if let Some(outcome) = self.geocode.start_field(&address, self.geo_hook.clone()) {
             self.geocode_finish(outcome);
         }
     }
 
-    /// Per frame: fold a finished lookup in, and show the privacy notice or
-    /// the pick list when one is waiting.
+    /// A typed `geocode` line: looked up on a worker thread, then run as the
+    /// core command ([`Outcome::Run`]). Without the notice accepted (or with
+    /// a line that does not parse) it runs at once: the hook sends nothing,
+    /// asks for the notice, and the command reports why; accepting the
+    /// notice then runs the line again.
+    pub(in crate::app) fn geocode_typed(&mut self, line: &str) {
+        self.ensure_geocoder();
+        self.geocode.from_field = false;
+        match itsjustcad_commands::parse(line) {
+            Ok(itsjustcad_commands::Command::Geocode { query, .. }) if self.geo_hook.acked() => {
+                if let Some(outcome) = self.geocode.start_typed(line, &query, self.geo_hook.clone()) {
+                    self.geocode_finish(outcome);
+                }
+            }
+            Ok(itsjustcad_commands::Command::Geocode { .. }) => {
+                self.command_line.execute(&mut self.session, line);
+                if self.geo_hook_requested_notice() {
+                    self.geocode.privacy_rerun = Some(line.to_string());
+                }
+            }
+            _ => {
+                self.command_line.execute(&mut self.session, line);
+            }
+        }
+    }
+
+    /// Per frame: keep the geocoder on the session with the Daylight date,
+    /// fold a finished lookup in, and show the privacy notice or the pick
+    /// list when one is waiting.
     pub(in crate::app) fn geocode_frame(&mut self, ctx: &egui::Context) {
+        self.ensure_geocoder();
+        self.geo_hook.set_custom_day(match self.optimize.form.daylight_period {
+            itsjustcad_commands::site_metrics::DaylightPeriod::Custom { month, day } => {
+                Some((month as u8, day as u8))
+            }
+            _ => None,
+        });
         if let Some(outcome) = self.geocode.poll() {
             self.geocode_finish(outcome);
+        }
+        // A Deck command the gate refused: show the notice; accepting it
+        // sends nothing for that command.
+        if let Some(address) = self.geo_hook.take_notice_request() {
+            self.geocode_command_notice(address);
         }
         if self.geocode.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -71,8 +109,30 @@ impl App {
         }
     }
 
-    /// A message for the user: under the field for a field lookup (as the
-    /// error when it is one), else on the command line.
+    /// Whether the last command's lookup was refused for want of the notice;
+    /// if so, the notice is now showing for it.
+    fn geo_hook_requested_notice(&mut self) -> bool {
+        match self.geo_hook.take_notice_request() {
+            Some(address) => {
+                self.geocode_command_notice(address);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Show the privacy notice for a command's (not the field's) address.
+    fn geocode_command_notice(&mut self, address: String) {
+        if self.geocode.privacy_pending.is_none() {
+            self.geocode.from_field = false;
+            self.geocode.privacy_resend = false;
+            self.geocode.privacy_rerun = None;
+            self.geocode.privacy_pending = Some(address);
+        }
+    }
+
+    /// A message for the user: under the field for a field lookup, else on
+    /// the command line.
     fn geocode_say(&mut self, line: String) {
         if self.geocode.from_field {
             self.geocode.notice = Some(line);
@@ -84,77 +144,27 @@ impl App {
     fn geocode_finish(&mut self, outcome: Outcome) {
         match outcome {
             Outcome::Apply(place) => self.geocode_apply(&place),
-            // The pick list shows the matches; the field needs no transcript.
-            Outcome::Choose(_) if self.geocode.from_field => {}
-            Outcome::Choose(places) => {
-                self.command_line.push_line(format!(
-                    "geocode: {} places match; pick one in the list",
-                    places.len()
-                ));
-                for (i, p) in places.iter().enumerate() {
-                    self.command_line
-                        .push_line(format!("  {}. {} ({:.4}, {:.4})", i + 1, p.name, p.lat, p.lon));
-                }
-            }
-            // `Geocoder` already holds a failure as `error` for the field.
+            // The pick list shows the matches.
+            Outcome::Choose(_) => {}
+            // `GeocodeUi` already holds a field failure as `error`.
             Outcome::Failed(_) if self.geocode.from_field => {}
             Outcome::Failed(msg) => self.command_line.push_line(msg),
+            Outcome::Run(line) => {
+                self.command_line.execute(&mut self.session, &line);
+            }
         }
     }
 
-    /// Set the location to `place` through the logged `location` op (one undo
-    /// step), with the offset for the Daylight date in use. A field lookup
-    /// runs the op on the session directly (op log and undo only); a typed
-    /// one goes through the command line like any command.
-    pub(in crate::app) fn geocode_apply(&mut self, place: &Place) {
+    /// Set the location to the field's `place` through the logged `location`
+    /// op (one undo step), run on the session directly: op log and undo
+    /// only, never the command line.
+    pub(in crate::app) fn geocode_apply(&mut self, place: &GeoPlace) {
         self.geocode.matches.clear();
-        let tz = tz_offset(place.lat, place.lon, self.geocode_date());
-        let line = location_line(place, tz.hours);
-        let cmd = match itsjustcad_commands::parse(&line) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                self.geocode_say(format!("geocode: {e}"));
-                return;
-            }
-        };
-        let applied = if self.geocode.from_field {
-            match self.session.run(cmd) {
-                Ok(_) => true,
-                Err(e) => {
-                    self.geocode.error = Some(format!("geocode: {e}"));
-                    false
-                }
-            }
-        } else {
-            self.command_line.execute_command(&mut self.session, &line, cmd)
-        };
-        if applied {
-            let zone = match &tz.zone {
-                Some(z) => format!("time zone {z} (UTC{:+})", tz.hours),
-                None => format!(
-                    "no time zone known here; UTC{:+} guessed from longitude (lon / 15)",
-                    tz.hours
-                ),
-            };
-            if self.geocode.from_field {
-                // The field already shows the attribution line.
-                self.geocode.notice = Some(zone);
-            } else {
-                self.command_line
-                    .push_line(format!("geocode: {zone} · {}", crate::geocode::ATTRIBUTION));
-            }
-        }
-    }
-
-    /// The date whose UTC offset (DST) the location gets: the Daylight
-    /// section's custom date this year, else today.
-    fn geocode_date(&self) -> jiff::civil::Date {
-        let today = jiff::Zoned::now().date();
-        match self.optimize.form.daylight_period {
-            itsjustcad_commands::site_metrics::DaylightPeriod::Custom { month, day } => {
-                jiff::civil::Date::new(today.year(), month as i8, day as i8).unwrap_or(today)
-            }
-            _ => today,
+        let (cmd, tz_note) = location_op(place);
+        match self.session.run(cmd) {
+            // The field already shows the attribution line.
+            Ok(_) => self.geocode.notice = Some(tz_note),
+            Err(e) => self.geocode.error = Some(format!("geocode: {e}")),
         }
     }
 
@@ -163,6 +173,9 @@ impl App {
         let dark = ctx.theme() == egui::Theme::Dark;
         let roles = self.live_roles(dark);
         let (mut send, mut cancel) = (false, false);
+        // A Deck command's notice only records the acceptance.
+        let sends = self.geocode.privacy_resend || self.geocode.privacy_rerun.is_some();
+        let accept_label = if sends { t("geocode.privacy.send") } else { t("geocode.privacy.accept") };
         egui::Modal::new(egui::Id::new("itsjustcad_geocode_privacy"))
             .frame(crate::widgets::dialog_modal_frame(&roles))
             .show(ctx, |ui| {
@@ -178,7 +191,7 @@ impl App {
                             &roles,
                             dark,
                             crate::widgets::ButtonRole::Prominent,
-                            t("geocode.privacy.send"),
+                            accept_label,
                         )
                         .clicked();
                         cancel = crate::widgets::role_button(
@@ -197,10 +210,19 @@ impl App {
             v[PRIVACY_ACK] = serde_json::json!(true);
             super::save_ui_json(&v);
             if let Some(address) = self.geocode.privacy_pending.take() {
-                self.geocode_request(&address, self.geocode.from_field);
+                if self.geocode.privacy_resend {
+                    self.geocode_request(&address);
+                } else if let Some(line) = self.geocode.privacy_rerun.take() {
+                    self.geocode_typed(&line);
+                } else {
+                    self.command_line.push_line(
+                        "geocode: privacy notice accepted; nothing was sent: run the command again",
+                    );
+                }
             }
         } else if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.geocode.privacy_pending = None;
+            self.geocode.privacy_rerun = None;
             self.geocode_say("geocode: cancelled; nothing was sent".into());
         }
     }
@@ -221,7 +243,7 @@ impl App {
                     ui.add_space(crate::theme::Spacing::SM);
                     ui.spacing_mut().item_spacing.y = crate::theme::Spacing::XS;
                     for (i, p) in matches.iter().enumerate() {
-                        let label = format!("{}\n{:.4}, {:.4}", p.name, p.lat, p.lon);
+                        let label = format!("{}\n{:.4}, {:.4}", p.name, p.lat_deg, p.lon_deg);
                         let row = egui::Button::selectable(false, label)
                             .wrap()
                             .min_size(egui::vec2(ui.available_width(), 0.0));

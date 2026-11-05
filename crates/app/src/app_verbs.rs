@@ -275,9 +275,6 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         "template" => AppVerb::GuiOnly("template"),
         "cutexport" => AppVerb::GuiOnly("cutexport"),
         "critique" => AppVerb::GuiOnly("critique"),
-        // Network lookup at the user's request (#215): never from the deck
-        // or a headless script.
-        "geocode" => AppVerb::GuiOnly("geocode"),
         "feedback" => AppVerb::Feedback(itsjustcad_deck::parse_feedback_line(line)?),
         "basemap" => AppVerb::Basemap(parse_basemap_args(words)),
         other => AppVerb::View(standard_view(other)?),
@@ -534,7 +531,6 @@ mod tests {
     /// i.e. no verb is silently dropped from consideration.
     const DECK_APP_VERB_DENYLIST: &[&str] = &[
         "critique",
-        "geocode",      // GUI-only: sends the address to OpenStreetMap
         "cutexport",     // GUI-only
         "template",     // GUI-only
         "save",         // fs write — refused on deck plane
@@ -596,7 +592,6 @@ mod tests {
             "template",
             "cutexport",
             "critique",
-            "geocode",
             "basemap",
             "render",
             "feedback",

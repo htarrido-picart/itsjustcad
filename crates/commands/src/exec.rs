@@ -449,6 +449,10 @@ pub struct Session {
     /// Bumped when the metadata above changes, so a host can tell the
     /// document needs saving although the op-log did not move.
     meta_rev: u64,
+    /// The host's address lookup for `geocode` (#215). Host state like
+    /// `plugins`: never part of the op-log or file format (the command logs
+    /// the `location` it applies). `None` until a host installs one.
+    geocoder: Option<std::sync::Arc<dyn crate::geocode::Geocoder>>,
 }
 
 /// Structured result of an import, beyond the human message. Drives the app's
@@ -788,6 +792,7 @@ impl Default for Session {
             optimize_runs: BTreeMap::new(),
             cut_preset: None,
             meta_rev: 0,
+            geocoder: None,
         }
     }
 }
@@ -800,6 +805,71 @@ impl Session {
         self.last_import.take()
     }
 
+    /// Install (or remove, with `None`) the host's geocoder for `geocode`.
+    /// A host re-installs it on every session it creates (open, new).
+    pub fn set_geocoder(&mut self, geocoder: Option<std::sync::Arc<dyn crate::geocode::Geocoder>>) {
+        self.geocoder = geocoder;
+    }
+
+    /// Whether a host geocoder is installed.
+    pub fn has_geocoder(&self) -> bool {
+        self.geocoder.is_some()
+    }
+
+    /// `geocode "<address>" [#n]`: one host lookup, then the logged
+    /// `location` op for the chosen match. Any failure changes nothing.
+    fn geocode(&mut self, query: &str, pick: Option<usize>) -> Result<ApplyOutcome, ExecError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(ExecError::Invalid("usage: geocode \"<address>\" [#n]".into()));
+        }
+        let Some(geocoder) = self.geocoder.clone() else {
+            return Err(ExecError::Invalid(
+                "geocode: no geocoder on this host; location unchanged (set it with `location <lat> <lon> <tz>`)".into(),
+            ));
+        };
+        let places = geocoder.search(query).map_err(|e| ExecError::Invalid(e.to_string()))?;
+        if places.is_empty() {
+            return Err(ExecError::Invalid(format!("no place found for '{query}'; location unchanged")));
+        }
+        let n = pick.unwrap_or(1);
+        let Some(place) = n.checked_sub(1).and_then(|i| places.get(i)) else {
+            return Err(ExecError::Invalid(format!(
+                "geocode: no match #{n} for '{query}' ({} found); location unchanged",
+                places.len()
+            )));
+        };
+        if !(-90.0..=90.0).contains(&place.lat_deg) || !(-180.0..=180.0).contains(&place.lon_deg) {
+            return Err(ExecError::Invalid(format!(
+                "geocode: the geocoder returned an invalid position ({}, {}); location unchanged",
+                place.lat_deg, place.lon_deg
+            )));
+        }
+        let (cmd, tz_note) = crate::geocode::location_op(place);
+        self.run(cmd)?;
+        let name = if place.name.trim().is_empty() { "the match" } else { place.name.trim() };
+        let mut message = format!(
+            "geocode: location set to {name} ({:.5}, {:.5}), {tz_note}",
+            place.lat_deg, place.lon_deg
+        );
+        if let Some(a) = geocoder.attribution() {
+            message.push_str(&format!(" · {a}"));
+        }
+        if places.len() > 1 {
+            message.push_str(&format!("\nother matches (pick with `geocode \"{query}\" #n`):"));
+            for (i, p) in places.iter().enumerate().filter(|(i, _)| *i + 1 != n) {
+                message.push_str(&format!(
+                    "\n  #{} {} ({:.4}, {:.4})",
+                    i + 1,
+                    p.name.split_whitespace().collect::<Vec<_>>().join(" "),
+                    p.lat_deg,
+                    p.lon_deg
+                ));
+            }
+        }
+        Ok(ApplyOutcome { message, created: Vec::new() })
+    }
+
     pub fn run(&mut self, cmd: Command) -> Result<ApplyOutcome, ExecError> {
         match cmd {
             Command::Undo => self.undo(),
@@ -807,6 +877,7 @@ impl Session {
             Command::Amend { step, with } => self.amend(step, *with),
             Command::Option(op) => self.option(op),
             Command::Import { path } => self.import(path),
+            Command::Geocode { query, pick } => self.geocode(&query, pick),
             Command::Trace { target, tol, layer } => self.trace(target, tol, layer),
             Command::Terrain { path } => self.terrain(path),
             Command::OsmFile { path } => self.osmfile(path),
@@ -17613,6 +17684,7 @@ fn apply_forward(
         | Command::Amend { .. }
         | Command::Option(..)
         | Command::Import { .. }
+        | Command::Geocode { .. }
         | Command::Terrain { .. }
         | Command::OsmFile { .. }
         | Command::Plant { .. }
@@ -17787,6 +17859,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Sun { .. } => "sun",
         Command::SunOff => "sunoff",
         Command::Location { .. } => "location",
+        Command::Geocode { .. } => "geocode",
         Command::Climate { .. } => "climate",
         Command::ShadowStudy { .. } => "shadowstudy",
         Command::SunHours { .. } => "sunhours",

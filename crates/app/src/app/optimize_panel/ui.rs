@@ -709,7 +709,7 @@ impl App {
             self.set_climate_file(path.as_deref());
         }
         if let Some(address) = geocode_find {
-            self.geocode_request(&address, true);
+            self.geocode_request(&address);
         }
     }
 

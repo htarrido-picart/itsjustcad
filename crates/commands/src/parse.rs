@@ -2062,6 +2062,22 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
             }),
             _ => wrong("location", "lat lon [tz-hours [place]]", &args),
         },
+        "geocode" => {
+            let usage = "an address (quotes optional) and an optional #n match number (n ≥ 1)";
+            let (pick, words) = match args.split_last() {
+                Some((last, rest)) if last.starts_with('#') => {
+                    match last[1..].parse::<usize>().ok().filter(|n| *n >= 1) {
+                        Some(n) => (Some(n), rest),
+                        None => return wrong("geocode", usage, &args),
+                    }
+                }
+                _ => (None, &args[..]),
+            };
+            match location_place(words) {
+                Some(query) => Ok(Command::Geocode { query, pick }),
+                None => wrong("geocode", usage, &args),
+            }
+        }
         // shadowstudy <YYYY-MM-DD> <from-HH:MM> <to-HH:MM> <step-min>
         "shadowstudy" => match args.as_slice() {
             [date, from, to, step] => {

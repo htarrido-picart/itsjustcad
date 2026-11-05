@@ -895,7 +895,10 @@ pub struct App {
     /// Site plan optimizer form / running search / results (#145).
     optimize: optimize_panel::OptimizePanel,
     /// Address lookup for the site location (`geocode`, #215).
-    geocode: crate::geocode::Geocoder,
+    geocode: crate::geocode::GeocodeUi,
+    /// The session's host geocoder (Nominatim) for `geocode`, typed, Deck or
+    /// field (#215); re-installed on every new or opened session.
+    geo_hook: std::sync::Arc<crate::geocode::Nominatim>,
     /// Background undo-history rebuild after a fast open (#224).
     history_rebuild: crate::history_rebuild::HistoryRebuild,
     /// Auto-recompute: per-source signature of the last-observed source block
@@ -1619,6 +1622,7 @@ impl App {
             drill: Default::default(),
             optimize: Default::default(),
             geocode: Default::default(),
+            geo_hook: std::sync::Arc::new(crate::geocode::Nominatim::desktop()),
             history_rebuild: Default::default(),
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
@@ -2532,13 +2536,11 @@ impl App {
                 let args = crate::app_verbs::parse_basemap_args(words);
                 self.set_basemap(args);
             }
-            // Address → site location (#215). Opt-in network at the user's
+            // Address → site location (#215): the core `geocode` command,
+            // looked up off the UI thread first. Opt-in network at the user's
             // request: one lookup, after the first-use privacy notice. The
             // result is logged as a numeric `location` op.
-            Some("geocode") => {
-                let rest = line.trim_start().split_once(char::is_whitespace).map_or("", |(_, r)| r);
-                self.geocode_request(rest, false);
-            }
+            Some("geocode") => self.geocode_typed(line),
             // AI diffusion render of the current view. Opt-in network: only the
             // user-configured backend in render_decks.json is ever reached, and
             // only at this explicit request. Ships with NO backend active.
@@ -10615,7 +10617,11 @@ fn ui_config_path() -> Option<std::path::PathBuf> {
     Some(crate::config_dir()?.join("ui.json"))
 }
 
-fn load_ui_json() -> serde_json::Value {
+/// The status line shown once when a chat save fell back to plaintext.
+const PLAINTEXT_CHAT_WARNING: &str =
+    "WARNING: chat encryption unavailable — the last chat save was written in PLAINTEXT";
+
+pub(crate) fn load_ui_json() -> serde_json::Value {
     ui_config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -11386,9 +11392,7 @@ impl eframe::App for App {
         // on`, surface it once here (consume-once flag) so "encrypted" chat can
         // never silently mean plaintext.
         if crate::chat_crypto::take_plaintext_fallback_notice() {
-            self.command_line.push_line(
-                "WARNING: chat encryption unavailable — the last chat save was written in PLAINTEXT",
-            );
+            self.command_line.push_line(PLAINTEXT_CHAT_WARNING);
         }
         // Apply a `skin` verb requested last frame (needs a Context to re-stamp
         // the design tokens; `execute_line` had none). Live skin switch.
@@ -12826,12 +12830,18 @@ mod tests {
     #[test]
     #[ignore = "needs a GPU adapter; run explicitly to render the address field"]
     fn app_preview_geocode() {
-        use crate::geocode::Place;
+        use itsjustcad_commands::geocode::GeoPlace;
         let dir = std::path::PathBuf::from(
             std::env::var("IJC_SHOT_DIR").unwrap_or_else(|_| "tests/snapshots".into()),
         );
         std::fs::create_dir_all(&dir).unwrap();
-        let place = |name: &str, lat, lon| Place { name: name.into(), lat, lon };
+        let place = |name: &str, lat_deg, lon_deg| GeoPlace {
+            name: name.into(),
+            lat_deg,
+            lon_deg,
+            tz_hours: Some(-7.0),
+            zone: Some("America/Los_Angeles".into()),
+        };
         for name in ["placed", "failed", "choose", "privacy"] {
             for dark in [false, true] {
                 let img = render_app(
@@ -12856,7 +12866,7 @@ mod tests {
                             )),
                             "failed" => {
                                 app.geocode.error = Some(
-                                    crate::geocode::GeocodeError::Network("request failed".into()).to_string(),
+                                    itsjustcad_commands::geocode::GeoError::Unreachable("request failed".into()).to_string(),
                                 );
                             }
                             "choose" => {
@@ -13128,34 +13138,89 @@ mod tests {
         panic!("geocode lookup never finished");
     }
 
-    const GEO_STUB: &str = "https://geo.test/search";
+    /// Install a stub Nominatim geocoder (no network) answering with `fetch`;
+    /// returns its request count.
+    fn stub_geocoder(
+        app: &mut App,
+        acked: bool,
+        fetch: impl Fn(&str) -> Result<Vec<u8>, String> + Send + Sync + 'static,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        app.set_geocoder(std::sync::Arc::new(crate::geocode::Nominatim::new(
+            move || crate::geocode::Settings { acked, endpoint: "https://geo.test/search".into() },
+            move |url: &str| {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                fetch(url)
+            },
+        )));
+        calls
+    }
 
+    fn geo_calls(calls: &std::sync::atomic::AtomicUsize) -> usize {
+        calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The scrollback without [`PLAINTEXT_CHAT_WARNING`]: a process-wide
+    /// notice another test's chat save can raise on a runner with no keychain
+    /// (Linux CI), unrelated to what a journey checks.
+    fn transcript(app: &App) -> Vec<String> {
+        app.command_line
+            .scrollback()
+            .iter()
+            .filter(|l| l.as_str() != PLAINTEXT_CHAT_WARNING)
+            .cloned()
+            .collect()
+    }
+
+    const MOUNTAIN_VIEW: &[u8] = br#"[{"lat":"37.4224857","lon":"-122.0855846","display_name":"Google Building 41, 1600, Amphitheatre Parkway, Mountain View, California, United States"}]"#;
+    const SAN_JOSE: &[u8] = br#"[{"lat":"37.3362","lon":"-121.8906","display_name":"San Jose, California, United States"},{"lat":"9.9325","lon":"-84.0796","display_name":"San Jose, Costa Rica"}]"#;
+
+    /// A typed `geocode` is the core command: the privacy gate first, then
+    /// one request off the UI thread, the logged `location`, one undo step.
     #[test]
     fn journey_geocode_sets_location_and_undo_restores() {
         run_app_journey(|h| {
             let app = h.state_mut();
             app.execute_line("location 40.71 -74.01 -5".into());
-            // First use: the privacy notice, and nothing is sent yet.
-            app.geocode_request_with("\"1600 Amphitheatre Pkwy, Mountain View\"", false, false, GEO_STUB, |_: &str| {
-                panic!("sent before the privacy notice was accepted")
-            });
-            assert_eq!(app.geocode.privacy_pending.as_deref(), Some("1600 Amphitheatre Pkwy, Mountain View"));
+            // First use: the privacy notice, and nothing is sent.
+            stub_geocoder(app, false, |_: &str| panic!("sent before the privacy notice was accepted"));
+            app.execute_line("geocode \"1600 Amphitheatre Pkwy, Mountain View\"".into());
+            let last = transcript(app).last().cloned().unwrap_or_default();
+            assert_eq!(last, format!("error: {}", crate::geocode::NOT_SENT));
             h.run_steps(2);
             let app = h.state_mut();
+            assert_eq!(app.geocode.privacy_pending.as_deref(), Some("1600 Amphitheatre Pkwy, Mountain View"));
+            assert!(!app.geocode.privacy_resend);
+            assert_eq!(
+                app.geocode.privacy_rerun.as_deref(),
+                Some("geocode \"1600 Amphitheatre Pkwy, Mountain View\""),
+                "accepting runs the typed line again"
+            );
+            assert!((app.session.doc.location.unwrap().lat_deg - 40.71).abs() < 1e-9);
             app.geocode.privacy_pending = None;
-            app.geocode_request_with("1600 Amphitheatre Pkwy, Mountain View", false, true, GEO_STUB, |url: &str| {
+            app.geocode.privacy_rerun = None;
+
+            let calls = stub_geocoder(app, true, |url: &str| {
                 assert!(url.contains("q=1600+Amphitheatre+Pkwy"), "{url}");
-                Ok(br#"[{"lat":"37.4224857","lon":"-122.0855846","display_name":"Google Building 41, 1600, Amphitheatre Parkway, Mountain View, California, United States"}]"#.to_vec())
+                Ok(MOUNTAIN_VIEW.to_vec())
             });
+            app.execute_line("geocode \"1600 Amphitheatre Pkwy, Mountain View\"".into());
+            assert!(app.geocode.busy(), "looked up off the UI thread");
             settle_geocode(h);
             let app = h.state_mut();
+            assert_eq!(geo_calls(&calls), 1, "one request per command");
             let loc = app.session.doc.location.expect("geocoded location");
             assert!((loc.lat_deg - 37.42).abs() < 0.01 && (loc.lon_deg + 122.08).abs() < 0.01);
             assert!(loc.tz_hours == -7.0 || loc.tz_hours == -8.0, "{}", loc.tz_hours);
             assert!(app.session.doc.place_name.as_deref().unwrap().contains("Mountain View"));
-            let lines = app.command_line.scrollback();
-            assert!(lines.iter().any(|l| l.starts_with("> location 37.4224857 -122.0855846 ")), "{lines:?}");
-            assert!(lines.iter().any(|l| l.contains("America/Los_Angeles")), "{lines:?}");
+            let lines = transcript(app);
+            assert!(lines.iter().any(|l| l == "> geocode \"1600 Amphitheatre Pkwy, Mountain View\""), "{lines:?}");
+            let out = lines.last().unwrap();
+            assert!(out.contains("America/Los_Angeles") && out.contains(crate::geocode::ATTRIBUTION), "{out}");
+            // The op log holds the numbers, never the lookup.
+            let log = app.session.save_log();
+            assert!(matches!(log.last(), Some(itsjustcad_commands::Command::Location { .. })), "{log:?}");
             app.execute_line("undo".into());
             let loc = app.session.doc.location.unwrap();
             assert!((loc.lat_deg - 40.71).abs() < 1e-9, "undo restores the previous location");
@@ -13171,22 +13236,23 @@ mod tests {
         run_app_journey(|h| {
             let app = h.state_mut();
             app.execute_line("location 40.71 -74.01 -5".into());
-            let (shown, recall) = (app.command_line.scrollback().to_vec(), app.command_line.recall_len());
-            app.geocode_request_with("1600 Amphitheatre Pkwy, Mountain View", true, true, GEO_STUB, |_: &str| {
-                Ok(br#"[{"lat":"37.4224857","lon":"-122.0855846","display_name":"Google Building 41, Mountain View, California, United States"}]"#.to_vec())
-            });
+            let (shown, recall) = (transcript(app), app.command_line.recall_len());
+            stub_geocoder(app, true, |_: &str| Ok(MOUNTAIN_VIEW.to_vec()));
+            app.geocode_request("1600 Amphitheatre Pkwy, Mountain View");
             settle_geocode(h);
             let app = h.state_mut();
             assert!(app.session.doc.place_name.as_deref().unwrap().contains("Mountain View"));
-            assert_eq!(app.command_line.scrollback(), &shown[..], "no transcript lines");
+            assert_eq!(transcript(app), shown, "no transcript lines");
             assert_eq!(app.command_line.recall_len(), recall, "no recall entry");
             assert!(app.geocode.notice.as_deref().unwrap().contains("America/Los_Angeles"));
-            // A failure also stays under the field.
-            app.geocode_request_with("Quito", true, true, GEO_STUB, |_: &str| Err("offline".into()));
+
+            stub_geocoder(app, true, |_: &str| Err("offline".into()));
+            app.geocode_request("Quito");
             settle_geocode(h);
             let app = h.state_mut();
             assert!(app.geocode.error.is_some());
-            assert_eq!(app.command_line.scrollback(), &shown[..]);
+            assert_eq!(transcript(app), shown, "a failure stays under the field");
+            assert_eq!(app.command_line.recall_len(), recall);
             app.execute_line("undo".into());
             assert!((app.session.doc.location.unwrap().lat_deg - 40.71).abs() < 1e-9, "one undo step");
         });
@@ -13198,35 +13264,69 @@ mod tests {
             let app = h.state_mut();
             app.execute_line("location 40.71 -74.01 -5".into());
             let before = app.session.doc.location;
-            app.geocode_request_with("Quito", false, true, GEO_STUB, |_: &str| {
-                Err("request failed: error sending request".to_string())
-            });
+            let calls = stub_geocoder(app, true, |_: &str| Err("request failed: error sending request".to_string()));
+            app.execute_line("geocode Quito".into());
             settle_geocode(h);
             let app = h.state_mut();
             assert_eq!(app.session.doc.location, before);
-            let last = app.command_line.scrollback().last().cloned().unwrap_or_default();
+            assert_eq!(geo_calls(&calls), 1, "the command reuses the lookup's failure");
+            let last = transcript(app).last().cloned().unwrap_or_default();
             assert!(last.contains("cannot reach the geocoder") && last.contains("location unchanged"), "{last}");
-            assert!(app.geocode.error.is_some(), "shown under the address field too");
 
-            app.geocode_request_with("zzqx nowhere", false, true, GEO_STUB, |_: &str| Ok(b"[]".to_vec()));
+            stub_geocoder(app, true, |_: &str| Ok(b"[]".to_vec()));
+            app.execute_line("geocode \"zzqx nowhere\"".into());
             settle_geocode(h);
             let app = h.state_mut();
             assert_eq!(app.session.doc.location, before);
             assert_eq!(
-                app.command_line.scrollback().last().map(String::as_str),
-                Some("no place found for 'zzqx nowhere'")
+                transcript(app).last().map(String::as_str),
+                Some("error: no place found for 'zzqx nowhere'; location unchanged")
             );
+
+            // A Deck command (run on the session, not typed) before the
+            // notice: nothing sent, the notice shows, accepting re-runs nothing.
+            stub_geocoder(app, false, |_: &str| panic!("sent before the privacy notice was accepted"));
+            app.command_line.execute(&mut app.session, "geocode Quito");
+            assert!(transcript(app).last().unwrap().contains("not sent"));
+            h.run_steps(2);
+            let app = h.state_mut();
+            assert_eq!(app.geocode.privacy_pending.as_deref(), Some("Quito"));
+            assert!(!app.geocode.privacy_resend && app.geocode.privacy_rerun.is_none());
+            app.geocode.privacy_pending = None;
+
+            // No geocoder at all: a clear error, nothing sent or changed.
+            app.session.set_geocoder(None);
+            app.command_line.execute(&mut app.session, "geocode Quito");
+            assert!(transcript(app).last().unwrap().contains("no geocoder"));
+            assert_eq!(app.session.doc.location, before);
         });
     }
 
     #[test]
     fn journey_geocode_several_matches_are_picked() {
         run_app_journey(|h| {
-            h.state_mut().geocode_request_with("San Jose", false, true, GEO_STUB, |_: &str| {
-                Ok(br#"[{"lat":"37.3362","lon":"-121.8906","display_name":"San Jose, California, United States"},{"lat":"9.9325","lon":"-84.0796","display_name":"San Jose, Costa Rica"}]"#.to_vec())
-            });
+            // Typed: the best match, the others listed with their #n.
+            let calls = stub_geocoder(h.state_mut(), true, |_: &str| Ok(SAN_JOSE.to_vec()));
+            h.state_mut().execute_line("geocode \"San Jose\"".into());
             settle_geocode(h);
-            // The pick list is up; nothing is set until the user picks.
+            let app = h.state_mut();
+            assert!((app.session.doc.location.unwrap().lat_deg - 37.3362).abs() < 1e-9);
+            let out = transcript(app).last().cloned().unwrap();
+            assert!(out.contains("#2 San Jose, Costa Rica"), "{out}");
+            app.execute_line("geocode \"San Jose\" #2".into());
+            settle_geocode(h);
+            let app = h.state_mut();
+            let loc = app.session.doc.location.unwrap();
+            assert!((loc.lat_deg - 9.9325).abs() < 1e-9 && loc.tz_hours == -6.0);
+            assert_eq!(geo_calls(&calls), 1, "#2 comes from the cache");
+            assert!(app.geocode.matches.is_empty(), "no pick list for a command");
+
+            // The field: a pick list.
+            app.execute_line("undo".into());
+            app.execute_line("undo".into());
+            stub_geocoder(app, true, |_: &str| Ok(SAN_JOSE.to_vec()));
+            app.geocode_request("San Jose");
+            settle_geocode(h);
             h.run_steps(2);
             let app = h.state_mut();
             assert_eq!(app.geocode.matches.len(), 2);

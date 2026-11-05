@@ -172,15 +172,19 @@ fn parse_cli_args_from(args: &[String]) -> CliArgs {
 /// [`itsjustcad_commands::io::load_file`] (checkpoint fast-path or full replay).
 /// On a missing / unreadable / malformed / wrong-version file it prints a clear
 /// stderr message and returns `Err(2)` so the caller exits with the IO code.
+/// The session gets the headless Nominatim geocoder, so a `geocode` script
+/// line works (#215).
 fn load_open_session(open_path: Option<&str>) -> Result<itsjustcad_commands::Session, i32> {
-    match open_path {
-        None => Ok(itsjustcad_commands::Session::default()),
+    let mut session = match open_path {
+        None => itsjustcad_commands::Session::default(),
         Some(path) => itsjustcad_commands::io::load_file(std::path::Path::new(path))
             .map_err(|e| {
                 eprintln!("error: could not open '{}': {e}", path);
                 2
-            }),
-    }
+            })?,
+    };
+    session.set_geocoder(Some(std::sync::Arc::new(geocode::Nominatim::headless())));
+    Ok(session)
 }
 
 /// Entry point for `--run` (headless or not). Returns an OS exit code.
