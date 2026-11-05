@@ -140,9 +140,23 @@ impl Session {
         Ok(session)
     }
 
+    /// [`Session::replay_with`] for an open (#218): the same document and
+    /// saved log, but the history stays deferred as after
+    /// [`Session::from_snapshot`] (rebuilt to undo past it), so the replay
+    /// can skip the intermediate regenerations of runs of site edits.
+    pub fn replay_deferred(log: Vec<Command>, ctl: ReplayControl<'_>) -> Result<Self, ExecError> {
+        if log.is_empty() {
+            return Self::replay_with(log, ctl);
+        }
+        Self::from_snapshot_tail(Session::default().doc, log, 0, ctl)
+    }
+
     /// Run the logged ops of a saved log in order (see [`Session::replay`]).
     fn run_all(&mut self, log: Vec<Command>, ctl: ReplayControl<'_>) -> Result<(), ExecError> {
         let total = log.len();
+        // Without a history to keep, regenerate each run of edits to one site
+        // once (#218).
+        let _deferring = self.defer_history.then(super::site_defer::begin);
         for (done, cmd) in log.into_iter().enumerate() {
             ctl.step(done, total)?;
             // Security: the app only ever appends *logged* ops to the saved log
@@ -155,8 +169,10 @@ impl Session {
             if !cmd.is_logged() {
                 continue;
             }
+            super::site_defer::before(&mut self.doc, &cmd)?;
             self.run(cmd)?;
         }
+        super::site_defer::flush(&mut self.doc)?;
         ctl.report(total, total);
         Ok(())
     }

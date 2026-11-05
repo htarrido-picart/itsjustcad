@@ -738,7 +738,20 @@ pub fn generate_site(
     if blocks.is_empty() {
         return Err("lotgeneratesite produced no blocks".into());
     }
+    let street_edges = blocks.iter().map(|b| b.street_edge_count()).sum();
+    let alley_edges = blocks.iter().map(|b| b.alley_edge_count()).sum();
+    Ok(SiteBake {
+        blocks,
+        street_edges,
+        alley_edges,
+        ..road_bake(&graph, z, edits)
+    })
+}
 
+/// The roads [`generate_site`] bakes for `graph` (its [`streets::edited_graph`]
+/// with `edits`), without the blocks: a deferred replay (#218) stands these in
+/// for a plan until it regenerates.
+pub fn road_bake(graph: &subdivision::StreetGraph, z: f64, edits: &BTreeMap<u32, StreetEdit>) -> SiteBake {
     let mut roads = Vec::new();
     let mut road_closed = Vec::new();
     let mut streets = Vec::new();
@@ -756,18 +769,15 @@ pub fn generate_site(
         roads.push(s.centerline.clone());
         road_closed.push(closed);
     }
-    let street_edges = blocks.iter().map(|b| b.street_edge_count()).sum();
-    let alley_edges = blocks.iter().map(|b| b.alley_edge_count()).sum();
-
-    Ok(SiteBake {
+    SiteBake {
         roads,
         road_closed,
         streets,
-        blocks,
-        street_edges,
-        alley_edges,
+        blocks: Vec::new(),
+        street_edges: 0,
+        alley_edges: 0,
         z,
-    })
+    }
 }
 
 /// The class a generated street starts with: the spine is a collector, the rear

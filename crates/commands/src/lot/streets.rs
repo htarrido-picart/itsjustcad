@@ -416,11 +416,13 @@ pub fn min_block_depth(settings: &SubdivisionSettings) -> f64 {
 }
 
 fn thin_blocks(site: &Polygon2d, graph: &StreetGraph, settings: &SubdivisionSettings) -> usize {
-    let inset = min_block_depth(settings) * 0.5 - 1e-3;
-    subdivision::extract_blocks(site, graph, settings)
-        .iter()
-        .filter(|b| subdivision::clip_bridge::offset(&b.polygon, -inset).is_empty())
-        .count()
+    crate::exec::site_defer::memo_thin_blocks(site, graph, settings, || {
+        let inset = min_block_depth(settings) * 0.5 - 1e-3;
+        subdivision::extract_blocks(site, graph, settings)
+            .iter()
+            .filter(|b| subdivision::clip_bridge::offset(&b.polygon, -inset).is_empty())
+            .count()
+    })
 }
 
 /// Reject an edit that turns `before` into `after` (streets `changed`) when a
