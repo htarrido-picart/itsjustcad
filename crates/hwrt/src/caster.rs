@@ -62,6 +62,35 @@ struct Tally {
     recheck_ns: AtomicU64,
 }
 
+/// One item's [`Tally`], summed without atomics (one shared counter per
+/// ray made the score phase contend on a cache line).
+#[derive(Default)]
+struct Counts {
+    cpu_only: u64,
+    certain: u64,
+    confirmed: u64,
+    uncertain_confirmed: u64,
+    rechecked: u64,
+    recheck_ns: u64,
+}
+
+impl Tally {
+    fn add(&self, c: &Counts) {
+        for (a, v) in [
+            (&self.cpu_only, c.cpu_only),
+            (&self.certain, c.certain),
+            (&self.confirmed, c.confirmed),
+            (&self.uncertain_confirmed, c.uncertain_confirmed),
+            (&self.rechecked, c.rechecked),
+            (&self.recheck_ns, c.recheck_ns),
+        ] {
+            if v != 0 {
+                a.fetch_add(v, Relaxed);
+            }
+        }
+    }
+}
+
 /// Any-hit shadow rays on the GPU for one `TriBvh`.
 pub struct ShadowCaster {
     gpu: &'static Gpu,
@@ -135,6 +164,8 @@ impl ShadowCaster {
     /// one (bitwise) is answered by the CPU, so `f` need not be oblivious to
     /// the answers for the output to be exact. The GPU runs batch `k` while
     /// the CPU records batch `k + 1` and replays batch `k − 1`.
+    /// [`ShadowCaster::map_fans`] runs `f` once when the queries are known
+    /// up front.
     pub fn map<I: Sync, T: Send>(
         &self,
         bvh: &TriBvh,
@@ -142,34 +173,83 @@ impl ShadowCaster {
         f: impl Fn(&I, &mut Occluded<'_>) -> T + Sync,
     ) -> Vec<T> {
         assert_eq!(bvh.triangle_count(), self.tri_count, "ShadowCaster used with another TriBvh");
+        self.pipeline(items, |chunk| self.record(chunk, &f), |b, tally, clock| self.finish(bvh, b, &f, tally, clock))
+    }
+
+    /// [`ShadowCaster::map`] for items whose queries are a fan: one origin
+    /// and directions from the set given to [`ShadowCaster::new`].
+    /// `plan(item, fan)` returns the origin and pushes, in query order, the
+    /// index into that set of each direction `f` will query. The plan goes
+    /// straight to the GPU, and `f` runs once, with the answers (#323).
+    ///
+    /// The same exactness guard as `map`: a query of `f` that differs
+    /// (bitwise) from the planned one, and every later query of that item,
+    /// is answered by the CPU, so a wrong plan costs time, never bits.
+    /// Without a direction set this is `map`.
+    pub fn map_fans<I: Sync, T: Send>(
+        &self,
+        bvh: &TriBvh,
+        items: &[I],
+        plan: impl Fn(&I, &mut Vec<u32>) -> DVec3 + Sync,
+        f: impl Fn(&I, &mut Occluded<'_>) -> T + Sync,
+    ) -> Vec<T> {
+        let Some(ds) = &self.dirs else {
+            return self.map(bvh, items, f);
+        };
+        assert_eq!(bvh.triangle_count(), self.tri_count, "ShadowCaster used with another TriBvh");
+        self.pipeline(
+            items,
+            |chunk| self.record_fans(chunk, ds, &plan),
+            |b, tally, clock| self.finish_fans(bvh, b, ds, &f, tally, clock),
+        )
+    }
+
+    /// Record batch `k + 1`, then finish batch `k` while the GPU traces
+    /// `k + 1`; print the tallies when asked.
+    fn pipeline<'a, I, B, T>(
+        &self,
+        items: &'a [I],
+        record: impl Fn(&'a [I]) -> B,
+        finish: impl Fn(B, &Tally, &mut Clock) -> Vec<T>,
+    ) -> Vec<T> {
         let tally = Tally::default();
+        let mut clock = Clock::default();
         let t0 = Instant::now();
-        let (mut gpu_s, mut wait_s) = (0.0, 0.0);
         let mut out = Vec::with_capacity(items.len());
-        let mut pending: Option<Batch<'_, I>> = None;
+        let mut pending: Option<B> = None;
+        let finish = |b: B, clock: &mut Clock, out: &mut Vec<T>| {
+            let t = Instant::now();
+            out.extend(finish(b, &tally, clock));
+            clock.score += t.elapsed().as_secs_f64();
+        };
         for chunk in items.chunks(ITEMS_PER_BATCH) {
-            let next = self.record(chunk, &f);
+            let t = Instant::now();
+            let next = record(chunk);
+            clock.record += t.elapsed().as_secs_f64();
             if let Some(p) = pending.take() {
-                out.extend(self.finish(bvh, p, &f, &tally, &mut gpu_s, &mut wait_s));
+                finish(p, &mut clock, &mut out);
             }
             pending = Some(next);
         }
         if let Some(p) = pending.take() {
-            out.extend(self.finish(bvh, p, &f, &tally, &mut gpu_s, &mut wait_s));
+            finish(p, &mut clock, &mut out);
         }
         if crate::stats_enabled() {
             let g = |a: &AtomicU64| a.load(Relaxed);
             let rays = g(&tally.rays).max(1) as f64;
             let rerun = g(&tally.rechecked) + g(&tally.cpu_only);
             eprintln!(
-                "hwrt: {} rays in {:.1} ms; GPU {:.1} ms (CPU waited {:.1} ms); \
+                "hwrt: {} rays in {:.1} ms (record {:.1} ms, score {:.1} ms); \
+                 GPU {:.1} ms (CPU waited {:.1} ms); \
                  {} certain on GPU, {} leaf-confirmed, {} uncertain-confirmed; \
                  CPU re-run {} ({:.4}%: {} uncertain, {} not on GPU), \
                  re-run CPU time {:.1} ms",
                 g(&tally.rays),
                 t0.elapsed().as_secs_f64() * 1e3,
-                gpu_s * 1e3,
-                wait_s * 1e3,
+                clock.record * 1e3,
+                (clock.score - clock.wait) * 1e3,
+                clock.gpu * 1e3,
+                clock.wait * 1e3,
                 g(&tally.certain),
                 g(&tally.confirmed),
                 g(&tally.uncertain_confirmed),
@@ -212,11 +292,7 @@ impl ShadowCaster {
                 c
             })
             .collect();
-        let mut offs = Vec::with_capacity(chunk.len() + 1);
-        offs.push(0);
-        for c in &counts {
-            offs.push(offs.last().unwrap() + c);
-        }
+        let offs = prefix(counts.iter().copied());
         let n = *offs.last().unwrap();
         let mut rays = vec![[DVec3::ZERO; 2]; n];
         let gpu = match self.alloc(n) {
@@ -225,15 +301,7 @@ impl ShadowCaster {
                 // visible to the GPU.
                 let dst = unsafe { metal::contents::<RayF>(&ray_buf, n) };
                 self.fill(chunk, f, &counts, &mut rays, Some(dst));
-                let n32 = u32::try_from(n).unwrap_or(u32::MAX);
-                match self.gpu.dispatch(&self.pipe.0, &self.accel.0, &[&self.tris.0, &ray_buf, &out_buf, &self.leaves.0], n32) {
-                    Ok(job) if n32 as usize == n => Some(GpuBatch { job, _rays: Shared(ray_buf), out: Shared(out_buf) }),
-                    Ok(_) => None,
-                    Err(e) => {
-                        eprintln!("hwrt: dispatch failed, batch on CPU: {e}");
-                        None
-                    }
-                }
+                self.launch(ray_buf, out_buf, n)
             }
             Err(e) => {
                 eprintln!("hwrt: allocation failed, batch on CPU: {e}");
@@ -244,10 +312,86 @@ impl ShadowCaster {
         Batch { items: chunk, rays, offs, gpu }
     }
 
+    /// Plan `chunk`'s fans and write their GPU rays straight into the GPU
+    /// buffer; then dispatch.
+    fn record_fans<'a, I: Sync>(
+        &self,
+        chunk: &'a [I],
+        ds: &DirSet,
+        plan: &(impl Fn(&I, &mut Vec<u32>) -> DVec3 + Sync),
+    ) -> FanBatch<'a, I> {
+        let groups: Vec<FanGroup> = chunk
+            .par_chunks(FAN_GROUP)
+            .map(|items| {
+                let mut g = FanGroup {
+                    origins: Vec::with_capacity(items.len()),
+                    ends: Vec::with_capacity(items.len()),
+                    dirs: Vec::new(),
+                };
+                let mut fan = Vec::new();
+                for it in items {
+                    fan.clear();
+                    g.origins.push(plan(it, &mut fan));
+                    g.dirs.extend_from_slice(&fan);
+                    g.ends.push(g.dirs.len());
+                }
+                g
+            })
+            .collect();
+        let offs = prefix(groups.iter().map(|g| g.dirs.len()));
+        let n = *offs.last().unwrap();
+        let gpu = match self.alloc(n) {
+            Ok((ray_buf, out_buf)) => {
+                // SAFETY: a fresh shared buffer of `n` records, not yet
+                // visible to the GPU.
+                let mut rest = unsafe { metal::contents::<RayF>(&ray_buf, n) };
+                let mut parts = Vec::with_capacity(groups.len());
+                for g in &groups {
+                    let (a, r) = std::mem::take(&mut rest).split_at_mut(g.dirs.len());
+                    rest = r;
+                    parts.push(a);
+                }
+                groups.par_iter().zip(parts).for_each(|(g, gs)| {
+                    let mut start = 0;
+                    for (o, &end) in g.origins.iter().zip(&g.ends) {
+                        // `Frame::ray` in halves: the same bits as `gpu_ray`.
+                        let og = self.frame.origin(*o);
+                        for (r, &k) in gs[start..end].iter_mut().zip(&g.dirs[start..end]) {
+                            *r = match (og, ds.gpu.get(k as usize)) {
+                                (Some([o, o_lo]), Some(&Some(d))) => RayF { o, o_lo, d },
+                                _ => NOT_GPU,
+                            };
+                        }
+                        start = end;
+                    }
+                });
+                self.launch(ray_buf, out_buf, n)
+            }
+            Err(e) => {
+                eprintln!("hwrt: allocation failed, batch on CPU: {e}");
+                None
+            }
+        };
+        FanBatch { items: chunk, groups, offs, gpu }
+    }
+
     fn alloc(&self, n: usize) -> Result<(Buffer, Buffer), String> {
         let rays = self.gpu.buffer_len(n * std::mem::size_of::<RayF>()).ok_or("ray buffer")?;
         let out = self.gpu.buffer_len(n * 4).ok_or("result buffer")?;
         Ok((rays, out))
+    }
+
+    /// Dispatch `n` recorded rays, or `None` (batch on the CPU).
+    fn launch(&self, ray_buf: Buffer, out_buf: Buffer, n: usize) -> Option<GpuBatch> {
+        let n32 = u32::try_from(n).unwrap_or(u32::MAX);
+        match self.gpu.dispatch(&self.pipe.0, &self.accel.0, &[&self.tris.0, &ray_buf, &out_buf, &self.leaves.0], n32) {
+            Ok(job) if n32 as usize == n => Some(GpuBatch { job, _rays: Shared(ray_buf), out: Shared(out_buf) }),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("hwrt: dispatch failed, batch on CPU: {e}");
+                None
+            }
+        }
     }
 
     /// The recording pass: item `k`'s queries go to its slice of `rays` (and
@@ -293,96 +437,169 @@ impl ShadowCaster {
         });
     }
 
-    /// Wait for the batch, then replay `f` with each query resolved:
-    /// GPU miss → `false`; GPU candidate → one exact CPU test, else the full
-    /// CPU query. A query that differs (bitwise) from the recorded one, or
-    /// that the GPU must not answer, goes to the CPU.
+    /// Wait for the batch, then replay `f` with each query resolved by
+    /// [`resolve`]. A query that differs (bitwise) from the recorded one
+    /// goes to the CPU.
     fn finish<I: Sync, T: Send>(
         &self,
         bvh: &TriBvh,
         batch: Batch<'_, I>,
         f: &(impl Fn(&I, &mut Occluded<'_>) -> T + Sync),
         tally: &Tally,
-        gpu_s: &mut f64,
-        wait_s: &mut f64,
+        clock: &mut Clock,
     ) -> Vec<T> {
         let n = batch.rays.len();
-        let codes: Option<&[i32]> = batch.gpu.as_ref().and_then(|g| {
-            let t = Instant::now();
-            let r = g.job.wait();
-            *wait_s += t.elapsed().as_secs_f64();
-            match r {
-                Ok(s) => {
-                    *gpu_s += s;
-                    // SAFETY: the GPU finished writing `n` results.
-                    Some(&*unsafe { metal::contents::<i32>(&g.out.0, n) })
-                }
-                Err(e) => {
-                    eprintln!("hwrt: GPU batch failed, batch on CPU: {e}");
-                    None
-                }
-            }
-        });
+        let codes = codes(&batch.gpu, n, clock);
         tally.rays.fetch_add(n as u64, Relaxed);
-        let cpu = |o: DVec3, d: DVec3| {
-            tally.cpu_only.fetch_add(1, Relaxed);
-            bvh.ray_occluded(o, d)
-        };
-        let rerun = |o: DVec3, d: DVec3| {
-            tally.rechecked.fetch_add(1, Relaxed);
-            let t = Instant::now();
-            let r = bvh.ray_occluded(o, d);
-            tally.recheck_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-            r
-        };
-        let resolve = |o: DVec3, d: DVec3, code: i32| match code {
-            -1 => false,
-            CODE_TRUE => {
-                tally.certain.fetch_add(1, Relaxed);
-                true
-            }
-            CODE_CPU => cpu(o, d),
-            // `classify` certified the f64 triangle test; the leaf test
-            // decides whether the traversal reaches it.
-            c if c >= 0 && bvh.ray_reaches_prim(o, d, c as u32) => {
-                tally.confirmed.fetch_add(1, Relaxed);
-                true
-            }
-            c if c <= -2 && bvh.ray_hits_prim(o, d, (-2 - c) as u32) => {
-                tally.uncertain_confirmed.fetch_add(1, Relaxed);
-                true
-            }
-            _ => rerun(o, d),
-        };
         let (rays, offs) = (&batch.rays, &batch.offs);
-        let out = batch
+        batch
             .items
             .par_iter()
             .enumerate()
             .map(|(k, it)| {
+                let mut c = Counts::default();
                 let Some(codes) = codes else {
-                    return f(it, &mut |o, d| cpu(o, d));
+                    let r = f(it, &mut |o, d| cpu(bvh, &mut c, o, d));
+                    tally.add(&c);
+                    return r;
                 };
                 let (rs, cs) = (&rays[offs[k]..offs[k + 1]], &codes[offs[k]..offs[k + 1]]);
                 let mut j = 0;
-                f(it, &mut |o, d| match rs.get(j) {
+                let r = f(it, &mut |o, d| match rs.get(j) {
                     Some(r) if same(r[0], o) && same(r[1], d) => {
                         // Same f64 ray ⇒ same GPU ray (`gpu_ray` is a
                         // function of the ray), so the code is for it.
                         j += 1;
-                        resolve(o, d, cs[j - 1])
+                        resolve(bvh, &mut c, o, d, cs[j - 1])
                     }
                     _ => {
                         // Diverged from the recording: CPU from here on.
                         j = usize::MAX;
-                        cpu(o, d)
+                        cpu(bvh, &mut c, o, d)
                     }
-                })
+                });
+                tally.add(&c);
+                r
+            })
+            .collect()
+    }
+
+    /// Wait for the batch, then run `f` once per item with each query
+    /// resolved by [`resolve`]. A query that is not the planned one goes to
+    /// the CPU, as do all later queries of that item.
+    fn finish_fans<I: Sync, T: Send>(
+        &self,
+        bvh: &TriBvh,
+        batch: FanBatch<'_, I>,
+        ds: &DirSet,
+        f: &(impl Fn(&I, &mut Occluded<'_>) -> T + Sync),
+        tally: &Tally,
+        clock: &mut Clock,
+    ) -> Vec<T> {
+        let n = *batch.offs.last().unwrap();
+        let codes = codes(&batch.gpu, n, clock);
+        tally.rays.fetch_add(n as u64, Relaxed);
+        let groups = batch.items.par_chunks(FAN_GROUP).zip(&batch.groups).enumerate();
+        let out: Vec<Vec<T>> = groups
+            .map(|(k, (items, g))| {
+                let mut c = Counts::default();
+                let mut start = 0;
+                let out = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, it)| {
+                        let Some(codes) = codes else {
+                            return f(it, &mut |o, d| cpu(bvh, &mut c, o, d));
+                        };
+                        let (origin, end) = (g.origins[i], g.ends[i]);
+                        let (fan, cs) = (&g.dirs[start..end], &codes[batch.offs[k] + start..batch.offs[k] + end]);
+                        start = end;
+                        let mut j = 0;
+                        f(it, &mut |o, d| match fan.get(j).and_then(|&x| ds.list.get(x as usize)) {
+                            Some(&pd) if same(origin, o) && same(pd, d) => {
+                                // The planned ray, so the code is for it.
+                                j += 1;
+                                resolve(bvh, &mut c, o, d, cs[j - 1])
+                            }
+                            _ => {
+                                j = usize::MAX;
+                                cpu(bvh, &mut c, o, d)
+                            }
+                        })
+                    })
+                    .collect();
+                tally.add(&c);
+                out
             })
             .collect();
-        drop(batch.gpu);
-        out
+        out.into_iter().flatten().collect()
     }
+}
+
+/// Wait for `gpu` and return its `n` result codes, or `None` (no GPU batch,
+/// or it failed): the CPU answers every query.
+fn codes<'b>(gpu: &'b Option<GpuBatch>, n: usize, clock: &mut Clock) -> Option<&'b [i32]> {
+    let g = gpu.as_ref()?;
+    let t = Instant::now();
+    let r = g.job.wait();
+    clock.wait += t.elapsed().as_secs_f64();
+    match r {
+        Ok(s) => {
+            clock.gpu += s;
+            // SAFETY: the GPU finished writing `n` results.
+            Some(&*unsafe { metal::contents::<i32>(&g.out.0, n) })
+        }
+        Err(e) => {
+            eprintln!("hwrt: GPU batch failed, batch on CPU: {e}");
+            None
+        }
+    }
+}
+
+/// A query the GPU did not answer.
+fn cpu(bvh: &TriBvh, c: &mut Counts, o: DVec3, d: DVec3) -> bool {
+    c.cpu_only += 1;
+    bvh.ray_occluded(o, d)
+}
+
+/// The exact answer from a GPU code: miss → `false`; certain → `true`;
+/// candidate → one exact CPU test, else the full CPU query.
+fn resolve(bvh: &TriBvh, c: &mut Counts, o: DVec3, d: DVec3, code: i32) -> bool {
+    match code {
+        -1 => false,
+        CODE_TRUE => {
+            c.certain += 1;
+            true
+        }
+        CODE_CPU => cpu(bvh, c, o, d),
+        // `classify` certified the f64 triangle test; the leaf test
+        // decides whether the traversal reaches it.
+        k if k >= 0 && bvh.ray_reaches_prim(o, d, k as u32) => {
+            c.confirmed += 1;
+            true
+        }
+        k if k <= -2 && bvh.ray_hits_prim(o, d, (-2 - k) as u32) => {
+            c.uncertain_confirmed += 1;
+            true
+        }
+        _ => {
+            c.rechecked += 1;
+            let t = Instant::now();
+            let r = bvh.ray_occluded(o, d);
+            c.recheck_ns += t.elapsed().as_nanos() as u64;
+            r
+        }
+    }
+}
+
+/// Offsets `[0, c₀, c₀ + c₁, …]`.
+fn prefix(counts: impl ExactSizeIterator<Item = usize>) -> Vec<usize> {
+    let mut offs = Vec::with_capacity(counts.len() + 1);
+    offs.push(0);
+    for c in counts {
+        offs.push(offs.last().unwrap() + c);
+    }
+    offs
 }
 
 /// Marker GPU ray (non-finite direction) for queries the CPU answers; the
@@ -405,12 +622,21 @@ fn same(a: DVec3, b: DVec3) -> bool {
 struct DirSet {
     slots: Vec<Option<[u64; 3]>>,
     shift: u32,
+    /// The directions in the caller's order, and their `f32` halves
+    /// ([`Frame::dir`]) for [`ShadowCaster::map_fans`].
+    list: Vec<DVec3>,
+    gpu: Vec<Option<[f32; 3]>>,
 }
 
 impl DirSet {
     fn new(dirs: &[DVec3]) -> Self {
         let size = (dirs.len() * 4).next_power_of_two().max(8);
-        let mut s = Self { slots: vec![None; size], shift: 64 - size.trailing_zeros() };
+        let mut s = Self {
+            slots: vec![None; size],
+            shift: 64 - size.trailing_zeros(),
+            list: dirs.to_vec(),
+            gpu: dirs.iter().map(|&d| Frame::dir(d)).collect(),
+        };
         for d in dirs {
             let b = bits(*d);
             let mut i = s.slot(b);
@@ -448,6 +674,35 @@ struct Batch<'a, I> {
     rays: Vec<[DVec3; 2]>,
     offs: Vec<usize>,
     gpu: Option<GpuBatch>,
+}
+
+/// Items planned per task in [`ShadowCaster::map_fans`]: one flat plan
+/// per group, not one allocation per item.
+const FAN_GROUP: usize = 256;
+
+struct FanBatch<'a, I> {
+    items: &'a [I],
+    groups: Vec<FanGroup>,
+    /// Each group's first ray in the batch.
+    offs: Vec<usize>,
+    gpu: Option<GpuBatch>,
+}
+
+/// The fans of [`FAN_GROUP`] consecutive items: item `i` has origin
+/// `origins[i]` and directions `dirs[ends[i - 1]..ends[i]]`.
+struct FanGroup {
+    origins: Vec<DVec3>,
+    ends: Vec<usize>,
+    dirs: Vec<u32>,
+}
+
+/// Main-thread seconds per [`ShadowCaster::map`] phase.
+#[derive(Default)]
+struct Clock {
+    record: f64,
+    score: f64,
+    gpu: f64,
+    wait: f64,
 }
 
 struct GpuBatch {
@@ -601,5 +856,62 @@ mod tests {
         let dirs: Vec<DVec3> = rs.iter().step_by(2).map(|r| r[1]).collect();
         let hw = ShadowCaster::new(&bvh, Some(&dirs)).expect("caster");
         assert_eq!(hw.map(&bvh, &items, f), cpu);
+    }
+
+    /// `map_fans` equals the CPU path bit for bit: right plans, plans that
+    /// miss, reorder or add queries, answer-dependent queries, directions
+    /// outside the GPU's range, and no direction set.
+    #[test]
+    fn map_fans_matches_cpu() {
+        let mut rng = Rng(0x323_0001);
+        let tris = scene(&mut rng);
+        let bvh = TriBvh::build(tris.clone());
+        let mut dirs: Vec<DVec3> = (0..40).map(|_| rng.dir()).collect();
+        dirs.extend([DVec3::Z, DVec3::new(0.3, 1.0, 0.0), DVec3::new(1e-4, 0.0, 1e-4), DVec3::splat(2.0)]);
+        let Some(hw) = ShadowCaster::new(&bvh, Some(&dirs)) else {
+            assert!(Gpu::get().is_none() || crate::forced_cpu(), "GPU present but caster failed");
+            eprintln!("no hardware ray tracing here: skipped");
+            return;
+        };
+        // Item: origin, the planned fan, and how `f` departs from it.
+        let items: Vec<(DVec3, Vec<u32>, u32)> = (0..30_000)
+            .map(|k| {
+                let o = match k % 50 {
+                    0 => DVec3::splat(1e6), // outside the frame
+                    _ => rng.v(0.0, 20.0) + DVec3::Z * rng.f(-0.5, 5.0),
+                };
+                let fan = (0..dirs.len() as u32).filter(|_| !rng.next().is_multiple_of(3)).collect();
+                (o, fan, k % 7)
+            })
+            .collect();
+        let plan = |it: &(DVec3, Vec<u32>, u32), fan: &mut Vec<u32>| {
+            fan.extend(&it.1);
+            match it.2 {
+                1 => fan.truncate(fan.len() / 2),
+                2 => fan.reverse(),
+                3 => fan.push(u32::MAX),
+                _ => {}
+            }
+            it.0
+        };
+        let f = |it: &(DVec3, Vec<u32>, u32), occ: &mut Occluded<'_>| -> Vec<bool> {
+            let mut out = Vec::new();
+            for &k in &it.1 {
+                let hit = occ(it.0, dirs[k as usize]);
+                out.push(hit);
+                if hit && it.2 == 4 {
+                    out.push(occ(it.0 + DVec3::Z, -dirs[k as usize]));
+                }
+            }
+            if it.2 == 5 {
+                out.push(occ(it.0, DVec3::X));
+            }
+            out
+        };
+        let cpu: Vec<Vec<bool>> = items.iter().map(|it| f(it, &mut |o, d| bvh.ray_occluded(o, d))).collect();
+        assert!(cpu.iter().flatten().filter(|&&b| b).count() > 1000);
+        assert_eq!(hw.map_fans(&bvh, &items, plan, f), cpu);
+        let hw = ShadowCaster::new(&bvh, None).expect("caster");
+        assert_eq!(hw.map_fans(&bvh, &items, plan, f), cpu);
     }
 }

@@ -524,6 +524,19 @@ impl AnnualSky {
         Self { bins: out }
     }
 
+    /// The occlusion queries [`AnnualSky::face_irradiation`] makes for
+    /// `normal`, in call order: `push(k)` for each index `k` into
+    /// [`AnnualSky::sun_directions`]. Same test, same bits: the answers never
+    /// change which suns are queried (#323).
+    pub fn beam_suns(&self, normal: [f64; 3], mut push: impl FnMut(usize)) {
+        for (k, s) in self.sun_directions().enumerate() {
+            let cos_inc = normal[0] * s[0] + normal[1] * s[1] + normal[2] * s[2];
+            if cos_inc > 0.0 || cos_inc.is_nan() {
+                push(k);
+            }
+        }
+    }
+
     /// Annual insolation on a face, kWh/m²·yr; see [`annual_face_irradiation`].
     pub fn face_irradiation(
         &self,
@@ -1299,6 +1312,30 @@ DATA PERIODS,1,1,Data,Sunday,1/1,12/31
                 ] {
                     assert_eq!(o.to_bits(), a.to_bits(), "lat {lat} n {n:?}: {o} vs {a}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn beam_suns_lists_face_irradiation_queries() {
+        // #323: the query plan equals the suns `face_irradiation` asks
+        // about, in order, whatever the answers.
+        let bins = parse_epw_radiation(&synth_epw()).unwrap();
+        let sky = AnnualSky::new(&bins, 2026, 40.71, -74.01, -5.0);
+        let suns: Vec<[f64; 3]> = sky.sun_directions().collect();
+        let normals =
+            [[0.0, 0.0, 1.0], [0.0, 0.0, -1.0], [0.6, 0.0, 0.8], [0.0, 0.0, 0.0], [f64::NAN, 0.0, 1.0]];
+        for n in normals {
+            let mut plan = Vec::new();
+            sky.beam_suns(n, |k| plan.push(suns[k]));
+            for answer in [false, true] {
+                let mut asked = Vec::new();
+                sky.face_irradiation(n, |s| {
+                    asked.push(s);
+                    answer
+                });
+                assert_eq!(asked.len(), plan.len(), "n {n:?}");
+                assert!(asked.iter().zip(&plan).all(|(a, b)| a.map(f64::to_bits) == b.map(f64::to_bits)));
             }
         }
     }
