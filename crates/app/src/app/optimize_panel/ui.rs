@@ -576,6 +576,12 @@ impl App {
         // Set (`Some(Some(path))`) or remove (`Some(None)`) the climate file,
         // once the form's borrow ends.
         let mut climate_change: Option<Option<std::path::PathBuf>> = None;
+        // The site's address (#215): looked up once the form's borrow ends.
+        let place = self.session.doc.place_name.clone();
+        let (geo_busy, geo_error) = (self.geocode.busy(), self.geocode.error.clone());
+        let geo_notice = self.geocode.notice.clone().filter(|_| self.geocode.from_field);
+        let mut geocode_find: Option<String> = None;
+        let address = &mut self.geocode.address;
         let form = &mut self.optimize.form;
         let on = form.constraints[11].0 || form.constraints[12].0;
         egui::CollapsingHeader::new(t("optimize.daylight"))
@@ -623,6 +629,42 @@ impl App {
                         }
                     });
                     ui.add_space(crate::theme::Spacing::XS);
+                    // Or the site's street address: one lookup per Find/Enter
+                    // (never per keystroke — Nominatim's usage policy).
+                    let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                    let rtl = egui::Layout::right_to_left(egui::Align::Center);
+                    ui.allocate_ui_with_layout(row, rtl, |ui| {
+                        ui.spacing_mut().button_padding.x =
+                            crate::theme::Spacing::S + crate::theme::Spacing::XS;
+                        let ready = !geo_busy && !address.trim().is_empty();
+                        let find = ui
+                            .add_enabled(ready, egui::Button::new(t("optimize.daylight.find")))
+                            .on_hover_text(t("optimize.daylight.find_hint"));
+                        if geo_busy {
+                            ui.spinner();
+                        }
+                        let field = ui.add(
+                            egui::TextEdit::singleline(address)
+                                .hint_text(t("optimize.daylight.address_hint"))
+                                .desired_width(ui.available_width())
+                                .min_size(egui::vec2(0.0, find.rect.height())),
+                        );
+                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if find.clicked() || (enter && ready) {
+                            geocode_find = Some(address.clone());
+                        }
+                    });
+                    if let Some(name) = &place {
+                        ui.add(egui::Label::new(format!("{} {name}", t("optimize.daylight.place"))).wrap());
+                    }
+                    if let Some(n) = &geo_notice {
+                        ui.add(egui::Label::new(egui::RichText::new(n).weak()).wrap());
+                    }
+                    if let Some(e) = &geo_error {
+                        ui.add(egui::Label::new(egui::RichText::new(e).color(ui.visuals().error_fg_color)).wrap());
+                    }
+                    ui.weak(egui::RichText::new(t("optimize.daylight.osm")).small());
+                    ui.add_space(crate::theme::Spacing::XS);
                     egui::Grid::new(("optimize_daylight_grid", source))
                         .num_columns(2)
                         .spacing(GRID_SPACING)
@@ -665,6 +707,9 @@ impl App {
             });
         if let Some(path) = climate_change {
             self.set_climate_file(path.as_deref());
+        }
+        if let Some(address) = geocode_find {
+            self.geocode_request(&address);
         }
     }
 

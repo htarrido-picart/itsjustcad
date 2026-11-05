@@ -37,6 +37,7 @@
 
 mod boxsel;
 pub mod cameras;
+pub mod geocoder;
 pub mod guided;
 pub mod history_job;
 mod job;
@@ -320,6 +321,9 @@ pub struct AppHandle {
     deck_context: Option<HereContext>,
     pending: Arc<Mutex<Vec<PendingOp>>>,
     history: Arc<Mutex<Vec<ChatMessage>>>,
+    /// The host geocoder for `geocode` ([`geocoder::ijc_set_geocoder`],
+    /// #215), re-installed on every new session.
+    geocoder: Option<Arc<geocoder::HostGeocoder>>,
 }
 
 /// The wgpu device, the `CAMetalLayer` surface and its swapchain config, and the
@@ -843,6 +847,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         deck_context: None,
         pending: Arc::new(Mutex::new(Vec::new())),
         history: Arc::new(Mutex::new(Vec::new())),
+        geocoder: None,
     };
     Box::into_raw(Box::new(handle))
 }
@@ -1078,6 +1083,7 @@ fn install_session(app: &mut AppHandle, mut session: Session) {
     history_job::jobs(app).cancel_all();
     optimize_job::cancel_all(app);
     app.session = session;
+    geocoder::install(app);
     app.guided = Default::default();
     if let Ok(mut hist) = app.history.lock() {
         hist.clear();
@@ -1125,6 +1131,7 @@ pub unsafe extern "C" fn ijc_new_document(h: *mut AppHandle) {
         history_job::jobs(&app).cancel_all();
         optimize_job::cancel_all(&mut app);
         app.session = Session::default();
+        geocoder::install(&mut app);
         app.guided = Default::default();
         if let Ok(mut hist) = app.history.lock() {
             hist.clear();
@@ -4916,7 +4923,8 @@ fn object_points_json(doc: &itsjustcad_doc::Document, id: itsjustcad_doc::Object
 }
 
 /// The document's site location (set by `location <lat> <lon> [tz]` or an EPW
-/// import) as `{"lat":deg,"lon":deg,"tzHours":h}`, or `null` when unset or for
+/// import) as `{"lat":deg,"lon":deg,"tzHours":h,"place":name|null}` (`place`
+/// is the display-only geocoded name, #215), or `null` when unset or for
 /// a null/invalid handle. Reflects queued commands only after the next
 /// [`ijc_render_frame`] / [`ijc_flush`]. Free with [`ijc_string_free`].
 ///
@@ -4925,10 +4933,16 @@ fn object_points_json(doc: &itsjustcad_doc::Document, id: itsjustcad_doc::Object
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ijc_location_json(h: *mut AppHandle) -> *mut c_char {
     guard_ffi(std::ptr::null_mut(), || {
-        let v = (unsafe { handle_ref(h) }).and_then(|app| app.session.doc.location).map_or(
-            serde_json::Value::Null,
-            |l| serde_json::json!({ "lat": l.lat_deg, "lon": l.lon_deg, "tzHours": l.tz_hours }),
-        );
+        let v = (unsafe { handle_ref(h) }).and_then(|app| {
+            let doc = &app.session.doc;
+            doc.location.map(|l| {
+                serde_json::json!({
+                    "lat": l.lat_deg, "lon": l.lon_deg, "tzHours": l.tz_hours,
+                    "place": doc.place_name,
+                })
+            })
+        });
+        let v = v.unwrap_or(serde_json::Value::Null);
         into_c_string(v.to_string())
     })
 }
@@ -9126,7 +9140,14 @@ mod headless_tests {
             assert_eq!(r(ijc_location_json(std::ptr::null_mut())), serde_json::Value::Null);
             let out = r(ijc_run_command_result(h, c("location 40.4168 -3.7038 1").as_ptr()));
             assert_eq!(out["ok"], true, "{out}");
-            assert_eq!(r(ijc_location_json(h)), serde_json::json!({"lat": 40.4168, "lon": -3.7038, "tzHours": 1.0}));
+            assert_eq!(
+                r(ijc_location_json(h)),
+                serde_json::json!({"lat": 40.4168, "lon": -3.7038, "tzHours": 1.0, "place": null})
+            );
+            // iOS logs the MapKit match as the display-only place (#215).
+            ijc_run_command_result(h, c("location 37.42 -122.08 -7 Mountain View, CA").as_ptr())
+                .pipe_free();
+            assert_eq!(r(ijc_location_json(h))["place"], "Mountain View, CA");
             ijc_free(h);
         }
     }

@@ -799,8 +799,14 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "location",
-            usage: "location <lat> <lon> [tz-hours]",
-            summary: "Set the observer location (used by shadowstudy/sunhours). tz is UTC offset in hours (default 0). Example: location 40.71 -74.01 -5",
+            usage: "location <lat> <lon> [tz-hours [place]]",
+            summary: "Set the observer location (used by shadowstudy/sunhours). tz is UTC offset in hours (default 0). Words after tz are a display-only place name (what `geocode` logs). Example: location 40.71 -74.01 -5",
+            category: Category::Analyze,
+        },
+        CommandSpec {
+            name: "geocode",
+            usage: "geocode \"<address>\" [#n]",
+            summary: "Look a street address up and set the site location from the best match via `location <lat> <lon> <tz> <place>` (the UTC offset comes from the match). Needs network: sends the address to the configured geocoder (OpenStreetMap Nominatim by default on desktop, MapKit on iOS); one request per command; fails and changes nothing with no geocoder or no match. Lists the other matches; #n picks the n-th instead. Only the `location` op is logged, so files replay offline; one undo step. Example: geocode \"1600 Amphitheatre Pkwy, Mountain View\" #2",
             category: Category::Analyze,
         },
         CommandSpec {

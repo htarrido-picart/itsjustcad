@@ -19,6 +19,7 @@ mod error;
 mod exec;
 pub mod gbnf;
 pub mod geo;
+pub mod geocode;
 pub mod ifc;
 pub mod io;
 pub mod landscape;

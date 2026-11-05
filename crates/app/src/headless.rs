@@ -1184,6 +1184,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #215: a `geocode` script line is the core command, through the
+    /// session's geocoder (stubbed here: no network).
+    #[test]
+    fn run_script_lines_geocode_sets_location() {
+        let mut session = Session::default();
+        session.set_geocoder(Some(std::sync::Arc::new(crate::geocode::Nominatim::new(
+            || crate::geocode::Settings { acked: true, endpoint: "https://geo.test/search".into() },
+            |_: &str| Ok(br#"[{"lat":"-0.2201","lon":"-78.5123","display_name":"Quito, Ecuador"}]"#.to_vec()),
+        ))));
+        let (out, _) = run_script_lines(session, &["geocode \"Quito\"".to_owned()]).unwrap();
+        let loc = out.doc.location.unwrap();
+        assert_eq!((loc.lat_deg, loc.tz_hours), (-0.2201, -5.0));
+        assert_eq!(out.doc.place_name.as_deref(), Some("Quito, Ecuador"));
+        // Without a geocoder the line fails the script.
+        assert!(run_script_lines(Session::default(), &["geocode Quito".to_owned()]).is_err());
+    }
+
     #[test]
     fn run_script_lines_bad_command_returns_err() {
         let session = Session::default();

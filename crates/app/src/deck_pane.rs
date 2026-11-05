@@ -7018,6 +7018,42 @@ mod side_effect_gate_tests {
         assert_eq!(session.doc.len(), 1, "box must be in the document");
     }
 
+    /// #215: a Deck-emitted `geocode` runs as the core command through the
+    /// host geocoder: one request, the logged `location` only.
+    #[test]
+    fn deck_geocode_runs_through_the_session_geocoder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let hook = crate::geocode::Nominatim::new(
+            || crate::geocode::Settings { acked: true, endpoint: "https://geo.test/search".into() },
+            move |_: &str| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(br#"[{"lat":"-0.2201","lon":"-78.5123","display_name":"Quito, Ecuador"}]"#.to_vec())
+            },
+        );
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        session.set_geocoder(Some(std::sync::Arc::new(hook)));
+        pane.handle_extract_events(vec![ExtractEvent::Command("geocode \"Quito\"".into())], &mut session);
+        assert!(pane.pending_side_effects.is_empty());
+        assert_eq!(pane.current_commands.len(), 1);
+        let msg = pane.current_commands[0].result.as_ref().unwrap();
+        assert!(msg.contains("Quito, Ecuador") && msg.contains("America/Guayaquil"), "{msg}");
+        assert_eq!(session.doc.location.unwrap().tz_hours, -5.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one request per command");
+        let log = session.save_log();
+        assert!(matches!(log.as_slice(), [itsjustcad_commands::Command::Location { .. }]), "{log:?}");
+
+        // No geocoder installed: a clear error, nothing changed.
+        let mut pane = blank_pane();
+        let mut session = Session::default();
+        pane.handle_extract_events(vec![ExtractEvent::Command("geocode Quito".into())], &mut session);
+        let err = pane.current_commands[0].result.as_ref().unwrap_err();
+        assert!(err.contains("no geocoder"), "{err}");
+        assert!(session.doc.location.is_none());
+    }
+
     #[test]
     fn allow_toggle_auto_runs_in_sandbox_but_still_gates_outside() {
         // With the opt-in on, an in-sandbox export runs; an outside one is still

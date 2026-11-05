@@ -2045,20 +2045,39 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
             expect_empty("sunoff", &args, &args)?;
             Ok(Command::SunOff)
         }
-        // location <lat> <lon> [tz-hours]
+        // location <lat> <lon> [tz-hours [place…]] — the trailing words are
+        // the display-only place name `geocode` logs (#215).
         "location" => match args.as_slice() {
             [lat, lon] => Ok(Command::Location {
                 lat_deg: number(lat)?,
                 lon_deg: number(lon)?,
                 tz_hours: 0.0,
+                place: None,
             }),
-            [lat, lon, tz] => Ok(Command::Location {
+            [lat, lon, tz, place @ ..] => Ok(Command::Location {
                 lat_deg: number(lat)?,
                 lon_deg: number(lon)?,
                 tz_hours: number(tz)?,
+                place: location_place(place),
             }),
-            _ => wrong("location", "lat lon [tz-hours]", &args),
+            _ => wrong("location", "lat lon [tz-hours [place]]", &args),
         },
+        "geocode" => {
+            let usage = "an address (quotes optional) and an optional #n match number (n ≥ 1)";
+            let (pick, words) = match args.split_last() {
+                Some((last, rest)) if last.starts_with('#') => {
+                    match last[1..].parse::<usize>().ok().filter(|n| *n >= 1) {
+                        Some(n) => (Some(n), rest),
+                        None => return wrong("geocode", usage, &args),
+                    }
+                }
+                _ => (None, &args[..]),
+            };
+            match location_place(words) {
+                Some(query) => Ok(Command::Geocode { query, pick }),
+                None => wrong("geocode", usage, &args),
+            }
+        }
         // shadowstudy <YYYY-MM-DD> <from-HH:MM> <to-HH:MM> <step-min>
         "shadowstudy" => match args.as_slice() {
             [date, from, to, step] => {
@@ -4359,6 +4378,18 @@ fn parse_cplane(args: &[&str]) -> Result<Command, ParseError> {
         }
     };
     Ok(Command::CPlane { op })
+}
+
+/// The place-name words after `location <lat> <lon> <tz>`, joined, with one
+/// pair of surrounding quotes dropped; `None` when there are none.
+fn location_place(words: &[&str]) -> Option<String> {
+    let joined = words.join(" ");
+    let name = joined
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(&joined)
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Parse the `plotstyle` verb (plot styles / CTB-STB pen tables). Forms:

@@ -64,6 +64,11 @@ raw-window-handle = "0.6"
 # OS clipboard read for the text-input right-click Paste (egui exposes write via
 # ctx.copy_text but not read). Already in the tree via eframe.
 arboard = "3"
+# Site time zone from lat/lon, offline (#215 `geocode`): tzf-rs maps a point to
+# an IANA zone name (bundled boundary data, no clap CLI), jiff gives its UTC
+# offset with DST on a date. App crate only, so the iOS FFI never links them.
+tzf-rs = { version = "2.1.3", default-features = false, features = ["bundled"] }
+jiff = "0.2.38"
 
 # True native OS menus (macOS global NSMenu bar / Windows HMENU).
 # Linux uses the in-window egui bar instead — muda pulls gtk/glib on Linux

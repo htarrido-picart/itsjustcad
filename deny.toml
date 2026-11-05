@@ -36,5 +36,12 @@ allow = [
     "AGPL-3.0-only",
 ]
 
+# tzf-dist ships OpenStreetMap-derived time-zone boundaries (ODbL data, MIT
+# code) for `geocode`'s offline UTC offset (#215). Desktop app crate only;
+# attribution in NOTICE. Scoped to that crate so ODbL is not allowed elsewhere.
+[[licenses.exceptions]]
+crate = "tzf-dist"
+allow = ["ODbL-1.0"]
+
 [licenses.private]
 ignore = true
