@@ -20,20 +20,28 @@ const SHADER: &str = include_str!("shadow.metal");
 
 /// Items recorded per GPU batch. Big enough to amortise a dispatch, small
 /// enough that one batch's rays (`f64` + `f32` + result, 88 bytes each) stay
-/// around 50 MB for `radiation`.
+/// around 50 MB for `radiation` (fans: 8 bytes each).
 const ITEMS_PER_BATCH: usize = 8192;
 
-/// The shadow pipeline, compiled once per process.
-fn pipeline(gpu: &Gpu) -> Option<&'static Shared<Pipeline>> {
-    static PIPE: OnceLock<Option<Shared<Pipeline>>> = OnceLock::new();
+/// The shadow pipelines: one ray record per query (`shadow_any_hit`), or
+/// fans expanded on the GPU (`shadow_fans`, #337).
+struct Pipes {
+    rays: Pipeline,
+    fans: Pipeline,
+}
+
+/// The shadow pipelines, compiled once per process.
+fn pipeline(gpu: &Gpu) -> Option<&'static Shared<Pipes>> {
+    static PIPE: OnceLock<Option<Shared<Pipes>>> = OnceLock::new();
     PIPE.get_or_init(|| {
         let t = Instant::now();
-        match gpu.pipeline(SHADER, "shadow_any_hit") {
-            Ok(p) => {
+        match gpu.pipelines(SHADER, &["shadow_any_hit", "shadow_fans"]) {
+            Ok(mut p) => {
                 if crate::stats_enabled() {
                     eprintln!("hwrt: shader compile {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
                 }
-                Some(Shared(p))
+                let fans = p.pop()?;
+                Some(Shared(Pipes { rays: p.pop()?, fans }))
             }
             Err(e) => {
                 eprintln!("hwrt: shader compile failed, using CPU: {e}");
@@ -94,7 +102,7 @@ impl Tally {
 /// Any-hit shadow rays on the GPU for one `TriBvh`.
 pub struct ShadowCaster {
     gpu: &'static Gpu,
-    pipe: &'static Shared<Pipeline>,
+    pipe: &'static Shared<Pipes>,
     accel: Shared<Accel>,
     tris: Shared<Buffer>,
     leaves: Shared<Buffer>,
@@ -102,6 +110,10 @@ pub struct ShadowCaster {
     tri_count: usize,
     /// The allowed ray directions, when restricted.
     dirs: Option<DirSet>,
+    /// [`ShadowCaster::map_fans`] writes one ray record per query on the
+    /// CPU instead of expanding fans on the GPU (`ITSJUSTCAD_HWRT_FANS=cpu`):
+    /// the pre-#337 path, kept as the oracle.
+    record_rays: bool,
 }
 
 impl ShadowCaster {
@@ -141,7 +153,13 @@ impl ShadowCaster {
                 t1.elapsed().as_secs_f64() * 1e3
             );
         }
-        let dirs = dirs.map(DirSet::new);
+        let dirs = match dirs.map(DirSet::new) {
+            Some(mut ds) => {
+                ds.table = Some(Shared(gpu.buffer(&ds.gpu_table())?));
+                Some(ds)
+            }
+            None => None,
+        };
         Some(Self {
             gpu,
             pipe,
@@ -151,6 +169,7 @@ impl ShadowCaster {
             frame,
             tri_count: tris.len(),
             dirs,
+            record_rays: std::env::var("ITSJUSTCAD_HWRT_FANS").is_ok_and(|v| crate::is_off(&v)),
         })
     }
 
@@ -180,7 +199,8 @@ impl ShadowCaster {
     /// and directions from the set given to [`ShadowCaster::new`].
     /// `plan(item, fan)` returns the origin and pushes, in query order, the
     /// index into that set of each direction `f` will query. The plan goes
-    /// straight to the GPU, and `f` runs once, with the answers (#323).
+    /// straight to the GPU, which builds the rays (#337), and `f` runs
+    /// once, with the answers (#323).
     ///
     /// The same exactness guard as `map`: a query of `f` that differs
     /// (bitwise) from the planned one, and every later query of that item,
@@ -301,7 +321,7 @@ impl ShadowCaster {
                 // visible to the GPU.
                 let dst = unsafe { metal::contents::<RayF>(&ray_buf, n) };
                 self.fill(chunk, f, &counts, &mut rays, Some(dst));
-                self.launch(ray_buf, out_buf, n)
+                self.launch(&self.pipe.0.rays, vec![ray_buf], out_buf, n)
             }
             Err(e) => {
                 eprintln!("hwrt: allocation failed, batch on CPU: {e}");
@@ -340,39 +360,82 @@ impl ShadowCaster {
             .collect();
         let offs = prefix(groups.iter().map(|g| g.dirs.len()));
         let n = *offs.last().unwrap();
-        let gpu = match self.alloc(n) {
-            Ok((ray_buf, out_buf)) => {
-                // SAFETY: a fresh shared buffer of `n` records, not yet
-                // visible to the GPU.
-                let mut rest = unsafe { metal::contents::<RayF>(&ray_buf, n) };
-                let mut parts = Vec::with_capacity(groups.len());
-                for g in &groups {
-                    let (a, r) = std::mem::take(&mut rest).split_at_mut(g.dirs.len());
-                    rest = r;
-                    parts.push(a);
-                }
-                groups.par_iter().zip(parts).for_each(|(g, gs)| {
-                    let mut start = 0;
-                    for (o, &end) in g.origins.iter().zip(&g.ends) {
-                        // `Frame::ray` in halves: the same bits as `gpu_ray`.
-                        let og = self.frame.origin(*o);
-                        for (r, &k) in gs[start..end].iter_mut().zip(&g.dirs[start..end]) {
-                            *r = match (og, ds.gpu.get(k as usize)) {
-                                (Some([o, o_lo]), Some(&Some(d))) => RayF { o, o_lo, d },
-                                _ => NOT_GPU,
-                            };
-                        }
-                        start = end;
-                    }
-                });
-                self.launch(ray_buf, out_buf, n)
-            }
-            Err(e) => {
-                eprintln!("hwrt: allocation failed, batch on CPU: {e}");
-                None
-            }
+        let gpu = if self.record_rays || !ds.packs() {
+            self.write_rays(&groups, ds, n)
+        } else {
+            self.write_fans(&groups, ds, chunk.len(), n)
         };
+        let gpu = gpu.unwrap_or_else(|e| {
+            eprintln!("hwrt: allocation failed, batch on CPU: {e}");
+            None
+        });
         FanBatch { items: chunk, groups, offs, gpu }
+    }
+
+    /// One GPU ray record per planned query (the oracle for
+    /// [`ShadowCaster::write_fans`]); then dispatch.
+    fn write_rays(&self, groups: &[FanGroup], ds: &DirSet, n: usize) -> Result<Option<GpuBatch>, String> {
+        let (ray_buf, out_buf) = self.alloc(n)?;
+        // SAFETY: a fresh shared buffer of `n` records, not yet visible to
+        // the GPU.
+        let mut rest = unsafe { metal::contents::<RayF>(&ray_buf, n) };
+        let mut parts = Vec::with_capacity(groups.len());
+        for g in groups {
+            let (a, r) = std::mem::take(&mut rest).split_at_mut(g.dirs.len());
+            rest = r;
+            parts.push(a);
+        }
+        groups.par_iter().zip(parts).for_each(|(g, gs)| {
+            let mut start = 0;
+            for (o, &end) in g.origins.iter().zip(&g.ends) {
+                // `Frame::ray` in halves: the same bits as `gpu_ray`.
+                let og = self.frame.origin(*o);
+                for (r, &k) in gs[start..end].iter_mut().zip(&g.dirs[start..end]) {
+                    *r = match (og, ds.gpu.get(k as usize)) {
+                        (Some([o, o_lo]), Some(&Some(d))) => RayF { o, o_lo, d },
+                        _ => NOT_GPU,
+                    };
+                }
+                start = end;
+            }
+        });
+        Ok(self.launch(&self.pipe.0.rays, vec![ray_buf], out_buf, n))
+    }
+
+    /// The fans as they are (#337): per item its [`Frame::origin`] halves,
+    /// per ray one `u32` packing its item in the batch and its direction's
+    /// index into the table of [`Frame::dir`] halves uploaded once.
+    /// `shadow_fans` reads the same `f32` bits [`ShadowCaster::write_rays`]
+    /// would write, so the codes are the same. Then dispatch.
+    fn write_fans(&self, groups: &[FanGroup], ds: &DirSet, items: usize, n: usize) -> Result<Option<GpuBatch>, String> {
+        let buf = |bytes: usize| self.gpu.buffer_len(bytes).ok_or("fan buffer");
+        let (origins_buf, rays_buf, out_buf) = (buf(items * 24)?, buf(n * 4)?, buf(n * 4)?);
+        // SAFETY: fresh shared buffers of these lengths, not yet visible to
+        // the GPU.
+        let (mut origins, mut rays) = unsafe {
+            (metal::contents::<[[f32; 3]; 2]>(&origins_buf, items), metal::contents::<u32>(&rays_buf, n))
+        };
+        let mut parts = Vec::with_capacity(groups.len());
+        for g in groups {
+            let (o, ro) = std::mem::take(&mut origins).split_at_mut(g.origins.len());
+            let (r, rr) = std::mem::take(&mut rays).split_at_mut(g.dirs.len());
+            (origins, rays) = (ro, rr);
+            parts.push((o, r));
+        }
+        let out_of_set = ds.list.len() as u32; // the table's NaN entry
+        groups.par_iter().zip(parts).enumerate().for_each(|(gi, (g, (os, rs)))| {
+            let mut start = 0;
+            for (i, ((o, &p), &end)) in os.iter_mut().zip(&g.origins).zip(&g.ends).enumerate() {
+                *o = self.frame.origin(p).unwrap_or([[f32::NAN; 3]; 2]);
+                let item = ((gi * FAN_GROUP + i) as u32) << FAN_DIR_BITS;
+                for (r, &k) in rs[start..end].iter_mut().zip(&g.dirs[start..end]) {
+                    *r = item | k.min(out_of_set);
+                }
+                start = end;
+            }
+        });
+        let table = ds.table.as_ref().expect("direction table").0.clone();
+        Ok(self.launch(&self.pipe.0.fans, vec![origins_buf, rays_buf, table], out_buf, n))
     }
 
     fn alloc(&self, n: usize) -> Result<(Buffer, Buffer), String> {
@@ -381,11 +444,15 @@ impl ShadowCaster {
         Ok((rays, out))
     }
 
-    /// Dispatch `n` recorded rays, or `None` (batch on the CPU).
-    fn launch(&self, ray_buf: Buffer, out_buf: Buffer, n: usize) -> Option<GpuBatch> {
+    /// Dispatch `n` rays to `pipe`, bound as (scene triangles, `inputs`,
+    /// `out_buf`, leaves), or `None` (batch on the CPU).
+    fn launch(&self, pipe: &Pipeline, inputs: Vec<Buffer>, out_buf: Buffer, n: usize) -> Option<GpuBatch> {
         let n32 = u32::try_from(n).unwrap_or(u32::MAX);
-        match self.gpu.dispatch(&self.pipe.0, &self.accel.0, &[&self.tris.0, &ray_buf, &out_buf, &self.leaves.0], n32) {
-            Ok(job) if n32 as usize == n => Some(GpuBatch { job, _rays: Shared(ray_buf), out: Shared(out_buf) }),
+        let mut bind = vec![&self.tris.0];
+        bind.extend(&inputs);
+        bind.extend([&out_buf, &self.leaves.0]);
+        match self.gpu.dispatch(pipe, &self.accel.0, &bind, n32) {
+            Ok(job) if n32 as usize == n => Some(GpuBatch { job, _inputs: Shared(inputs), out: Shared(out_buf) }),
             Ok(_) => None,
             Err(e) => {
                 eprintln!("hwrt: dispatch failed, batch on CPU: {e}");
@@ -626,6 +693,8 @@ struct DirSet {
     /// ([`Frame::dir`]) for [`ShadowCaster::map_fans`].
     list: Vec<DVec3>,
     gpu: Vec<Option<[f32; 3]>>,
+    /// [`DirSet::gpu_table`] on the GPU, for `shadow_fans`.
+    table: Option<Shared<Buffer>>,
 }
 
 impl DirSet {
@@ -636,6 +705,7 @@ impl DirSet {
             shift: 64 - size.trailing_zeros(),
             list: dirs.to_vec(),
             gpu: dirs.iter().map(|&d| Frame::dir(d)).collect(),
+            table: None,
         };
         for d in dirs {
             let b = bits(*d);
@@ -649,6 +719,18 @@ impl DirSet {
             s.slots[i] = Some(b);
         }
         s
+    }
+
+    /// The `f32` direction halves, NaN where the GPU must not answer, and
+    /// one NaN entry after them for indices outside the set.
+    fn gpu_table(&self) -> Vec<[f32; 3]> {
+        self.gpu.iter().map(|d| d.unwrap_or([f32::NAN; 3])).chain([[f32::NAN; 3]]).collect()
+    }
+
+    /// Can a fan ray pack its item and direction (or the out-of-set
+    /// entry) into one `u32`?
+    fn packs(&self) -> bool {
+        self.list.len() < 1 << FAN_DIR_BITS
     }
 
     fn slot(&self, b: [u64; 3]) -> usize {
@@ -675,6 +757,11 @@ struct Batch<'a, I> {
     offs: Vec<usize>,
     gpu: Option<GpuBatch>,
 }
+
+/// Direction-index bits of a packed fan ray (`shadow_fans`); the item in
+/// the batch takes the other 13.
+const FAN_DIR_BITS: u32 = 19;
+const _: () = assert!(ITEMS_PER_BATCH <= 1 << (32 - FAN_DIR_BITS));
 
 /// Items planned per task in [`ShadowCaster::map_fans`]: one flat plan
 /// per group, not one allocation per item.
@@ -707,7 +794,7 @@ struct Clock {
 
 struct GpuBatch {
     job: Job,
-    _rays: Shared<Buffer>,
+    _inputs: Shared<Vec<Buffer>>,
     out: Shared<Buffer>,
 }
 
@@ -726,8 +813,8 @@ mod tests {
             for (g, r) in dst.iter_mut().zip(rays) {
                 *g = self.gpu_ray(r[0], r[1]).unwrap_or(NOT_GPU);
             }
-            let job = self.gpu.dispatch(&self.pipe.0, &self.accel.0, &[&self.tris.0, &rb, &ob, &self.leaves.0], n as u32).expect("dispatch");
-            let g = GpuBatch { job, _rays: Shared(rb), out: Shared(ob) };
+            let job = self.gpu.dispatch(&self.pipe.0.rays, &self.accel.0, &[&self.tris.0, &rb, &ob, &self.leaves.0], n as u32).expect("dispatch");
+            let g = GpuBatch { job, _inputs: Shared(vec![rb]), out: Shared(ob) };
             g.job.wait().expect("gpu");
             // SAFETY: the GPU finished writing `rays.len()` results.
             unsafe { metal::contents::<i32>(&g.out.0, rays.len()) }.to_vec()
@@ -911,7 +998,74 @@ mod tests {
         let cpu: Vec<Vec<bool>> = items.iter().map(|it| f(it, &mut |o, d| bvh.ray_occluded(o, d))).collect();
         assert!(cpu.iter().flatten().filter(|&&b| b).count() > 1000);
         assert_eq!(hw.map_fans(&bvh, &items, plan, f), cpu);
+        // Fans expanded on the GPU and one ray record per query: both exact.
+        let mut rec = ShadowCaster::new(&bvh, Some(&dirs)).expect("caster");
+        rec.record_rays = !hw.record_rays;
+        assert_eq!(rec.map_fans(&bvh, &items, plan, f), cpu);
         let hw = ShadowCaster::new(&bvh, None).expect("caster");
         assert_eq!(hw.map_fans(&bvh, &items, plan, f), cpu);
+    }
+
+    /// `shadow_fans` sees the bits `write_rays` writes: the same code for
+    /// every planned ray, in every batch (#337). Covers out-of-frame
+    /// origins, directions outside the GPU's range and indices outside the
+    /// set, empty fans, and a short last batch.
+    #[test]
+    fn fan_codes_match_ray_codes() {
+        let mut rng = Rng(0x337_0001);
+        let tris = scene(&mut rng);
+        let bvh = TriBvh::build(tris.clone());
+        // Origins on and near triangles (where `o_lo` decides the code).
+        let rs = rays(&mut rng, &tris, 2 * ITEMS_PER_BATCH + 777);
+        let mut dirs: Vec<DVec3> = rs.iter().take(60).map(|r| r[1]).collect();
+        dirs.extend([DVec3::Z, DVec3::new(1e-4, 0.0, 1e-4), DVec3::splat(2.0), DVec3::NAN]);
+        let caster = |record_rays| {
+            let mut c = ShadowCaster::new(&bvh, Some(&dirs))?;
+            c.record_rays = record_rays;
+            Some(c)
+        };
+        let (Some(fans), Some(rays)) = (caster(false), caster(true)) else {
+            assert!(Gpu::get().is_none() || crate::forced_cpu(), "GPU present but caster failed");
+            eprintln!("no hardware ray tracing here: skipped");
+            return;
+        };
+        let items: Vec<(DVec3, Vec<u32>)> = (0..2 * ITEMS_PER_BATCH + 777)
+            .map(|k| {
+                let o = match k % 40 {
+                    0 => DVec3::splat(-1e6),
+                    _ => rs[k][0],
+                };
+                let mut fan: Vec<u32> = match k % 13 {
+                    0 => Vec::new(),
+                    _ => (0..dirs.len() as u32).filter(|_| rng.next().is_multiple_of(2)).collect(),
+                };
+                if k % 17 == 0 {
+                    fan.extend([dirs.len() as u32, u32::MAX]);
+                }
+                (o, fan)
+            })
+            .collect();
+        let plan = |it: &(DVec3, Vec<u32>), fan: &mut Vec<u32>| {
+            fan.extend(&it.1);
+            it.0
+        };
+        let (ds_f, ds_r) = (fans.dirs.as_ref().unwrap(), rays.dirs.as_ref().unwrap());
+        let (mut seen, mut clock) = ([0usize; 3], Clock::default());
+        for chunk in items.chunks(ITEMS_PER_BATCH) {
+            let (a, b) = (fans.record_fans(chunk, ds_f, &plan), rays.record_fans(chunk, ds_r, &plan));
+            let n = *a.offs.last().unwrap();
+            let ca = codes(&a.gpu, n, &mut clock).expect("fan batch");
+            let cb = codes(&b.gpu, n, &mut clock).expect("ray batch");
+            assert_eq!(ca, cb);
+            for &c in ca {
+                seen[match c {
+                    CODE_CPU => 0,
+                    -1 => 1,
+                    _ => 2,
+                }] += 1;
+            }
+        }
+        eprintln!("fan codes: {seen:?} (CPU, miss, other)");
+        assert!(seen.iter().all(|&k| k > 1000));
     }
 }

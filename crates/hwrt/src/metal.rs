@@ -78,18 +78,28 @@ impl Gpu {
     /// Compile `src` and make a compute pipeline for `function`, fast math
     /// off (IEEE `f32` rounding the margins rely on).
     pub fn pipeline(&self, src: &str, function: &str) -> Result<Pipeline, String> {
+        Ok(self.pipelines(src, &[function])?.remove(0))
+    }
+
+    /// [`Gpu::pipeline`] for several functions of one source, compiled once.
+    pub fn pipelines(&self, src: &str, functions: &[&str]) -> Result<Vec<Pipeline>, String> {
         let opts = MTLCompileOptions::new();
         opts.setMathMode(MTLMathMode::Safe);
         let lib = self
             .device
             .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
             .map_err(|e| e.localizedDescription().to_string())?;
-        let f = lib
-            .newFunctionWithName(&NSString::from_str(function))
-            .ok_or_else(|| format!("no function {function}"))?;
-        self.device
-            .newComputePipelineStateWithFunction_error(&f)
-            .map_err(|e| e.localizedDescription().to_string())
+        functions
+            .iter()
+            .map(|function| {
+                let f = lib
+                    .newFunctionWithName(&NSString::from_str(function))
+                    .ok_or_else(|| format!("no function {function}"))?;
+                self.device
+                    .newComputePipelineStateWithFunction_error(&f)
+                    .map_err(|e| e.localizedDescription().to_string())
+            })
+            .collect()
     }
 
     /// A shared-storage buffer holding a copy of `data` (at least 16 bytes).
