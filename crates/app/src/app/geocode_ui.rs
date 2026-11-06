@@ -9,7 +9,8 @@
 //! address up through the session's hook and applies the logged `location`
 //! op. A typed line is looked up on a worker thread first, so the UI never
 //! waits on the network; the command then runs with the answer in hand (one
-//! request). The field's lookup runs the `location` op on the session
+//! request); a Deck one is prefetched the same way ([`crate::deck_net`],
+//! #346). The field's lookup runs the `location` op on the session
 //! directly, so it never shows in the command line.
 
 use super::App;
