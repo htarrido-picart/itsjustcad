@@ -26,6 +26,7 @@ pub mod landscape;
 pub mod las;
 pub mod lot;
 pub mod optimize_runs;
+pub mod osmfetch;
 pub mod osnap;
 pub mod mesh_export;
 pub mod mesh_import;

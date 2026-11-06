@@ -287,6 +287,7 @@ Occupancies for `room`: assembly, business, residential, mercantile, educational
 | `underlayopacity` | `underlayopacity <0..1>` |
 | `underlayoff` | remove underlay |
 | `osmfile` | `osmfile <path.json>` — OpenStreetMap building context |
+| `osmfetch` | `osmfetch [radius_m]` — OpenStreetMap context around the site location from the Overpass API: buildings extruded on `context` (height, else `building:levels` × 3 m, else 9 m), road centrelines on `context-roads` (clipped to the radius), water on `context-water`, parks and green areas on `context-green`, trees as points on `context-trees`; draped onto the terrain when there is one. Default radius 400 m (about four city blocks), 10–1000 m. **Needs network: sends the site coordinates** (never the address or the document) to the Overpass endpoint, one request per command (typed or Deck; the Deck asks first). Desktop and headless: endpoint `overpass_url` in `~/.config/itsjustcad/ui.json` (default `https://overpass-api.de/api/interpreter`); a typed line is fetched off the UI thread. iOS: `URLSession` through `ijc_set_osm_fetcher` / `ijc_osm_answer`. Needs a location (`geocode "<address>"` or `location <lat> <lon>`). Clear errors for no network, timeout, a busy server and a too-large area; nothing changes on failure. Only the generated geometry is logged (`osm_context`), never the request, so files reopen offline and identically; one undo step. Data © OpenStreetMap contributors, ODbL 1.0 |
 
 ---
 

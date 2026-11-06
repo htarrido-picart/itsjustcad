@@ -998,12 +998,13 @@ mod tests {
         // The command CATALOG itself is the compact-by-design part: ~10–15 KB for
         // ~190 verbs vs the full prompt's ~45 KB command table. The cap tracks the
         // growing verb count (CAD-parity batch added ~28 verbs; ramp/stair added 2;
-        // lotset/lotreset added 2; insertpoint/deletepoint added 2); it stays
+        // lotset/lotreset added 2; insertpoint/deletepoint added 2; osmfetch
+        // added 1); it stays
         // well under the full table so the compact prompt keeps its size
         // advantage.
         let catalog = compact_command_catalog();
         assert!(
-            catalog.len() < 16_500,
+            catalog.len() < 16_600,
             "compact catalog bloated to {} bytes",
             catalog.len()
         );

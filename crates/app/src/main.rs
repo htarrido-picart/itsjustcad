@@ -19,6 +19,7 @@ mod draw_tool;
 mod dyntabs;
 mod filewatch;
 mod geocode;
+mod osmfetch;
 mod gumball;
 mod hardware;
 mod headless;
@@ -172,8 +173,8 @@ fn parse_cli_args_from(args: &[String]) -> CliArgs {
 /// [`itsjustcad_commands::io::load_file`] (checkpoint fast-path or full replay).
 /// On a missing / unreadable / malformed / wrong-version file it prints a clear
 /// stderr message and returns `Err(2)` so the caller exits with the IO code.
-/// The session gets the headless Nominatim geocoder, so a `geocode` script
-/// line works (#215).
+/// The session gets the headless Nominatim geocoder and Overpass fetcher, so
+/// `geocode` (#215) and `osmfetch` (#343) script lines work.
 fn load_open_session(open_path: Option<&str>) -> Result<itsjustcad_commands::Session, i32> {
     let mut session = match open_path {
         None => itsjustcad_commands::Session::default(),
@@ -184,6 +185,7 @@ fn load_open_session(open_path: Option<&str>) -> Result<itsjustcad_commands::Ses
             })?,
     };
     session.set_geocoder(Some(std::sync::Arc::new(geocode::Nominatim::headless())));
+    session.set_osm_fetcher(Some(std::sync::Arc::new(osmfetch::Overpass::headless())));
     Ok(session)
 }
 

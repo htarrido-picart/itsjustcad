@@ -1566,6 +1566,28 @@ pub enum Command {
     OsmFile {
         path: String,
     },
+    /// Fetch OpenStreetMap context around `doc.location` (#343) through the
+    /// host's Overpass fetcher and add it as one logged
+    /// [`Command::OsmContext`] op. Never logged itself: replay applies the
+    /// stored geometry, never the network request.
+    OsmFetch {
+        /// Radius in metres; `None` = [`crate::osmfetch::DEFAULT_RADIUS_M`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        radius_m: Option<f64>,
+    },
+    /// The geometry one `osmfetch` generated, carried verbatim in the op log
+    /// so a file replays offline and identically (#343). Not in the registry
+    /// (internal). One op = one undo step.
+    OsmContext {
+        /// The site centre and radius the context was fetched for (record).
+        lat_deg: f64,
+        lon_deg: f64,
+        radius_m: f64,
+        items: Vec<crate::osmfetch::ContextItem>,
+        /// Ids of the created objects, written back on first exec.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<ObjectId>>,
+    },
     /// Extract contour polylines FROM the terrain mesh (marching triangles at
     /// every multiple of `interval`, chained into polylines). Minor contours
     /// land on layer "contours", every `major_every`-th level on
@@ -2872,6 +2894,7 @@ impl Command {
                 | Command::Trace { .. }
                 | Command::Terrain { .. }
                 | Command::OsmFile { .. }
+                | Command::OsmFetch { .. }
                 | Command::Plant { .. }
                 | Command::PlantRow { .. }
                 | Command::PlantSchedule { .. }
@@ -2940,6 +2963,7 @@ impl Command {
                 | Command::XrefReload { .. }
                 | Command::Terrain { .. }
                 | Command::OsmFile { .. }
+                | Command::OsmFetch { .. }
                 | Command::PlantSchedule { .. }
                 // dataextract only touches the fs when writing a .csv
                 | Command::DataExtract { path: Some(_), .. }
@@ -3015,6 +3039,10 @@ impl Command {
             Command::XrefReload { name, .. } => Some(format!("xref reload ← {name}")),
             Command::Terrain { path } => Some(format!("terrain ← {path}")),
             Command::OsmFile { path } => Some(format!("osm ← {path}")),
+            Command::OsmFetch { radius_m } => Some(format!(
+                "osmfetch ← Overpass API (sends the site coordinates, {} m radius)",
+                radius_m.unwrap_or(crate::osmfetch::DEFAULT_RADIUS_M)
+            )),
             Command::PlantSchedule { path } => Some(format!("plantschedule → {path}")),
             Command::DataExtract { path: Some(p), .. } => Some(format!("dataextract → {p}")),
             Command::Underlay { path, .. } => Some(format!("underlay ← {path}")),

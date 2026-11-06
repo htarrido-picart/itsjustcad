@@ -453,6 +453,9 @@ pub struct Session {
     /// `plugins`: never part of the op-log or file format (the command logs
     /// the `location` it applies). `None` until a host installs one.
     geocoder: Option<std::sync::Arc<dyn crate::geocode::Geocoder>>,
+    /// The host's Overpass access for `osmfetch` (#343). Host state like
+    /// `geocoder`: never logged or saved (the command logs the geometry).
+    osm_fetcher: Option<std::sync::Arc<dyn crate::osmfetch::OsmFetcher>>,
 }
 
 /// Structured result of an import, beyond the human message. Drives the app's
@@ -793,6 +796,7 @@ impl Default for Session {
             cut_preset: None,
             meta_rev: 0,
             geocoder: None,
+            osm_fetcher: None,
         }
     }
 }
@@ -814,6 +818,64 @@ impl Session {
     /// Whether a host geocoder is installed.
     pub fn has_geocoder(&self) -> bool {
         self.geocoder.is_some()
+    }
+
+    /// Install (or remove, with `None`) the host's Overpass fetcher for
+    /// `osmfetch`. A host re-installs it on every session it creates.
+    pub fn set_osm_fetcher(&mut self, fetcher: Option<std::sync::Arc<dyn crate::osmfetch::OsmFetcher>>) {
+        self.osm_fetcher = fetcher;
+    }
+
+    /// Whether a host Overpass fetcher is installed.
+    pub fn has_osm_fetcher(&self) -> bool {
+        self.osm_fetcher.is_some()
+    }
+
+    /// `osmfetch [radius_m]`: one host request around the site, then one
+    /// logged `osm_context` op with the generated geometry. Any failure
+    /// changes nothing.
+    fn osmfetch(&mut self, radius_m: Option<f64>) -> Result<ApplyOutcome, ExecError> {
+        use crate::osmfetch::{DEFAULT_RADIUS_M, MAX_RADIUS_M, MIN_RADIUS_M};
+        let radius_m = radius_m.unwrap_or(DEFAULT_RADIUS_M);
+        if !(MIN_RADIUS_M..=MAX_RADIUS_M).contains(&radius_m) {
+            return Err(ExecError::Invalid(format!(
+                "osmfetch: radius must be {MIN_RADIUS_M}-{MAX_RADIUS_M} m (got {radius_m}); a larger area is too large for one request; nothing added"
+            )));
+        }
+        let Some(loc) = self.doc.location else {
+            return Err(ExecError::Invalid(
+                "osmfetch: no site location; set it with `geocode \"<address>\"` or `location <lat> <lon>`; nothing added".into(),
+            ));
+        };
+        let Some(fetcher) = self.osm_fetcher.clone() else {
+            return Err(ExecError::Invalid(
+                "osmfetch: no OpenStreetMap fetcher on this host; nothing added (import a saved Overpass export with `osmfile`)".into(),
+            ));
+        };
+        let req = crate::osmfetch::OsmRequest::new(loc.lat_deg, loc.lon_deg, radius_m);
+        let bytes = fetcher.fetch(&req).map_err(|e| ExecError::Invalid(e.to_string()))?;
+        let origin = crate::geo::GeoOrigin { lat_deg: loc.lat_deg, lon_deg: loc.lon_deg };
+        let terrain = terrain_index(&self.doc);
+        let ground = |x: f64, y: f64| terrain.as_ref().and_then(|t| t.z_at(x, y));
+        let items = crate::osmfetch::context_items(&bytes, origin, radius_m, &ground)
+            .map_err(|e| ExecError::Invalid(e.to_string()))?;
+        drop(terrain);
+        if items.is_empty() {
+            return Err(ExecError::Invalid(format!(
+                "osmfetch: no OpenStreetMap context found within {radius_m} m of the site; nothing added"
+            )));
+        }
+        let out = self.run(Command::OsmContext {
+            lat_deg: loc.lat_deg,
+            lon_deg: loc.lon_deg,
+            radius_m,
+            items,
+            ids: None,
+        })?;
+        Ok(ApplyOutcome {
+            message: format!("{} · {}", out.message, fetcher.attribution()),
+            created: out.created,
+        })
     }
 
     /// `geocode "<address>" [#n]`: one host lookup, then the logged
@@ -881,6 +943,7 @@ impl Session {
             Command::Trace { target, tol, layer } => self.trace(target, tol, layer),
             Command::Terrain { path } => self.terrain(path),
             Command::OsmFile { path } => self.osmfile(path),
+            Command::OsmFetch { radius_m } => self.osmfetch(radius_m),
             Command::Plant { species, at, age_years } => self.plant(species, at, age_years),
             Command::PlantRow { species, a, b, spacing } => {
                 self.plantrow(species, a, b, spacing)
@@ -16019,6 +16082,20 @@ fn apply_forward(
                 },
             ))
         }
+        Command::OsmContext { lat_deg, lon_deg, radius_m, items, ids } => {
+            crate::osmfetch::validate(&items).map_err(ExecError::Invalid)?;
+            let ids = ensure_ids(ids.unwrap_or_default(), items.len());
+            let layers_created = crate::osmfetch::insert(doc, &items, &ids);
+            let message = format!(
+                "osmfetch: OpenStreetMap context within {radius_m} m: {}",
+                crate::osmfetch::summary(&items)
+            );
+            Ok((
+                Command::OsmContext { lat_deg, lon_deg, radius_m, items, ids: Some(ids.clone()) },
+                Inverse::CreatedOnLayer { created: ids.clone(), layers_created },
+                ApplyOutcome { created: ids, message },
+            ))
+        }
         Command::PointLiteral { id, positions } => {
             if positions.is_empty() {
                 return Err(ExecError::Invalid(
@@ -17687,6 +17764,7 @@ fn apply_forward(
         | Command::Geocode { .. }
         | Command::Terrain { .. }
         | Command::OsmFile { .. }
+        | Command::OsmFetch { .. }
         | Command::Plant { .. }
         | Command::PlantRow { .. }
         | Command::PlantSchedule { .. }
@@ -17878,6 +17956,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Import { .. } => "import",
         Command::Terrain { .. } => "terrain",
         Command::OsmFile { .. } => "osmfile",
+        Command::OsmFetch { .. } => "osmfetch",
+        Command::OsmContext { .. } => "osm_context",
         Command::Contours { .. } => "contours",
         Command::Pad { .. } => "pad",
         Command::CutFill { .. } => "cutfill",
