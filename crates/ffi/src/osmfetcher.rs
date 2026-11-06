@@ -23,6 +23,22 @@
 //!   then runs the same command line again. That run uses the answer once:
 //!   it logs the generated geometry, never the request.
 //! - The callback is never called after [`super::ijc_free`].
+//!
+//! Privacy and approval (#348): the callback is the only point where
+//! anything can leave the device, and the core sends nothing itself. The
+//! app MUST NOT send `query` until the user approves it, as on desktop:
+//! - First use: a privacy notice saying what is sent (the site's latitude
+//!   and longitude and the radius, never the address or the document), to
+//!   whom (the configured Overpass endpoint; OpenStreetMap community servers
+//!   by default), and that the result is OpenStreetMap data (© OpenStreetMap
+//!   contributors, ODbL 1.0, attribution kept). Remember its acceptance.
+//! - Every fetch: an approval step showing the centre, the radius and the
+//!   endpoint, with Send / Cancel. The centre and radius are the document's
+//!   location and the command's radius (both also in `query`, `(around:…)`).
+//! - Send: start the request; answer with [`ijc_osm_answer`] as above.
+//! - Cancel: send nothing and call [`ijc_osm_cancel`] with the same `query`.
+//!   Nothing was added or logged (the command already failed without
+//!   changing the document); the next `osmfetch` asks again.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -155,6 +171,35 @@ pub unsafe extern "C" fn ijc_osm_answer(
     })
 }
 
+/// The user cancelled the approval step for `query` (the string the
+/// callback got): nothing was sent. Forget the request, so the next
+/// `osmfetch` calls the callback (and so the approval) again. Returns false
+/// for a null/invalid/busy handle, no fetcher, or bad input.
+///
+/// # Safety
+/// `h` must be null or a live handle; `query` null or a valid
+/// NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_osm_cancel(h: *mut AppHandle, query: *const c_char) -> bool {
+    guard_ffi(false, || {
+        if query.is_null() {
+            return false;
+        }
+        let Ok(query) = unsafe { CStr::from_ptr(query) }.to_str() else {
+            return false;
+        };
+        let Some(app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let Some(f) = app.osm_fetcher.as_ref() else {
+            return false;
+        };
+        lock(&f.asked).remove(query);
+        lock(&f.answers).remove(query);
+        true
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +252,17 @@ mod tests {
             assert!(matches!(log.last(), Some(itsjustcad_commands::Command::OsmContext { .. })), "{log:?}");
             assert_eq!(run(h, "undo")["ok"], true);
             assert_eq!(crate::handle_ref(h).unwrap().session.doc.len(), 0);
+
+            // Cancel (#348): nothing added or logged; the next run asks again.
+            let n_log = crate::handle_ref(h).unwrap().session.save_log().len();
+            run(h, "osmfetch");
+            assert_eq!(ASKED.lock().unwrap().len(), 2, "asked again after the answer was used");
+            assert!(!ijc_osm_cancel(h, std::ptr::null()));
+            assert!(ijc_osm_cancel(h, q.as_ptr()));
+            assert_eq!(crate::handle_ref(h).unwrap().session.save_log().len(), n_log, "cancel logs nothing");
+            run(h, "osmfetch");
+            assert_eq!(ASKED.lock().unwrap().len(), 3, "the next osmfetch asks again");
+            assert!(ijc_osm_cancel(h, q.as_ptr()));
 
             // An error answer is used once and classified.
             run(h, "osmfetch");

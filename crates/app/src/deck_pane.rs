@@ -1116,6 +1116,11 @@ struct PendingSideEffect {
     /// (Decline + "Open file picker…"); they are NEVER auto-run and NEVER
     /// eligible for "approve for session". Writers get approve-once/for-session.
     reader: bool,
+    /// True when this command SENDS to the network (`osmfetch`, #348): its
+    /// card is the privacy approval (centre, radius, endpoint; the first-use
+    /// notice too), Send / Cancel, one ask. Never auto-run, never
+    /// session-approvable.
+    network: bool,
 }
 
 /// Deck pane navigation: chat, or a full-pane command detail with a back button.
@@ -3024,11 +3029,13 @@ impl DeckPane {
                         // opt-in on. The user must pick the file via the OS
                         // dialog; the LLM's proposed path is never auto-used.
                         let reader = cmd.reads_external_file();
+                        // A network send (#348) is always approved by hand.
+                        let network = matches!(cmd, Command::OsmFetch { .. });
                         // Opt-in fast path (WRITERS only): user allowed deck
                         // side-effects AND the path stays inside the sandbox →
-                        // run without a prompt. Escaping paths and readers are
-                        // always queued.
-                        if !reader && self.allow_deck_side_effects && !outside {
+                        // run without a prompt. Escaping paths, readers and
+                        // network sends are always queued.
+                        if !reader && !network && self.allow_deck_side_effects && !outside {
                             self.run_deck_command(&line, cmd, session);
                         } else {
                             let summary = cmd
@@ -3040,6 +3047,7 @@ impl DeckPane {
                                 summary,
                                 outside_sandbox: outside,
                                 reader,
+                                network,
                             });
                         }
                         return;
@@ -3783,10 +3791,12 @@ use QUESTION:)."
             ApproveSession,
             Decline,
             Pick,
+            Send,
         }
         let mut decision: Option<Decision> = None;
         let pending = &self.pending_side_effects[0];
         let reader = pending.reader;
+        let network = pending.network.then(|| self.network_approval(&pending.cmd, session));
         let outside = pending.outside_sandbox;
         let summary = pending.summary.clone();
         let remaining = self.pending_side_effects.len();
@@ -3796,6 +3806,39 @@ use QUESTION:)."
         let picker_applies =
             reader_with_user_path(&self.pending_side_effects[0].cmd, "x").is_some();
         let dismissed = self.approval_overlay(ui, "deck_side_effect_modal", |ui| {
+            if let Some((first_use, details)) = &network {
+                use crate::i18n::t;
+                ui.heading(t("osmfetch.approve.title"));
+                ui.add_space(crate::theme::Spacing::XS);
+                if *first_use {
+                    ui.label(t("osmfetch.privacy.body"));
+                    ui.add_space(crate::theme::Spacing::S);
+                }
+                ui.label(t("osmfetch.approve.body"));
+                ui.add_space(crate::theme::Spacing::S);
+                egui::Frame::group(ui.style())
+                    .fill(ui.visuals().extreme_bg_color)
+                    .inner_margin(egui::Margin::same(crate::theme::Spacing::S as i8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.monospace(details);
+                    });
+                if remaining > 1 {
+                    ui.label(egui::RichText::new(format!("{} more queued", remaining - 1)).weak().small());
+                }
+                ui.add_space(crate::theme::Spacing::M);
+                ui.horizontal_wrapped(|ui| {
+                    let dark = ui.visuals().dark_mode;
+                    use crate::widgets::{role_button, ButtonRole};
+                    if role_button(ui, roles, dark, ButtonRole::Prominent, t("osmfetch.send")).clicked() {
+                        decision = Some(Decision::Send);
+                    }
+                    if role_button(ui, roles, dark, ButtonRole::Normal, t("geocode.cancel")).clicked() {
+                        decision = Some(Decision::Decline);
+                    }
+                });
+                return;
+            }
             ui.heading(if reader {
                 "Open a file?"
             } else {
@@ -3905,6 +3948,8 @@ use QUESTION:)."
                 let p = self.pending_side_effects.remove(0);
                 self.run_confirmed_side_effect(session, p.cmd, p.line);
             }
+            Some(Decision::Send) => self.network_send(session),
+            Some(Decision::Decline) if network.is_some() => self.network_cancel(),
             Some(Decision::Decline) => {
                 let p = self.pending_side_effects.remove(0);
                 self.transcript.push(Entry::Status(format!(
@@ -3958,6 +4003,46 @@ use QUESTION:)."
         }
     }
 
+    /// The network card's content for `cmd` (#348): whether the first-use
+    /// notice shows, and the centre, radius and endpoint it would send to.
+    fn network_approval(&self, cmd: &Command, session: &Session) -> (bool, String) {
+        let (acked, endpoint) = match &self.net_hooks {
+            Some(h) => (h.osm.acked(), h.osm.endpoint()),
+            None => (false, crate::osmfetch::Overpass::configured_endpoint()),
+        };
+        let details = match crate::osmfetch::request_for(cmd, session) {
+            Some(req) => crate::osmfetch::approval_details(&req, &endpoint),
+            // Fails before sending (no location, radius out of range).
+            None => cmd.side_effect_summary().unwrap_or_default(),
+        };
+        (!acked, details)
+    }
+
+    /// Send on the network card (#348): accept the notice on first use,
+    /// approve exactly the request shown, then run it as any confirmed
+    /// side effect (fetched off the UI thread). The one ask.
+    fn network_send(&mut self, session: &mut Session) {
+        let p = self.pending_side_effects.remove(0);
+        if let Some(h) = &self.net_hooks {
+            if !h.osm.acked() {
+                h.osm.set_acked();
+                crate::osmfetch::persist_ack();
+            }
+            if let Some(req) = crate::osmfetch::request_for(&p.cmd, session) {
+                h.osm.approve(&req);
+            }
+        }
+        self.run_confirmed_side_effect(session, p.cmd, p.line);
+    }
+
+    /// Cancel on the network card: nothing sent, run or logged.
+    fn network_cancel(&mut self) {
+        self.pending_side_effects.remove(0);
+        self.transcript
+            .push(Entry::Status("osmfetch: cancelled; nothing was sent".into()));
+        self.persist_chat();
+    }
+
     /// Run a human-confirmed side-effecting command and record it as its own
     /// transcript entry. Goes through `session.run` — logged/replayed like any
     /// command — so replay reproduces the confirmed side-effect.
@@ -4006,6 +4091,7 @@ use QUESTION:)."
             summary,
             outside_sandbox,
             reader,
+            network: false,
         });
     }
 
@@ -7793,10 +7879,11 @@ mod deck_net_tests {
         assert!(pane.pending_side_effects.is_empty());
         settle(&mut pane, &mut session, &rt);
         assert!(session.doc.location.is_some());
-        // Side-effect prompt unchanged: proposed, approved once here.
+        // One card: the privacy approval merged into the side-effect prompt.
         assert_eq!(pane.pending_side_effects.len(), 1);
-        let p = pane.pending_side_effects.remove(0);
-        pane.run_confirmed_side_effect(&mut session, p.cmd, p.line);
+        assert!(pane.pending_side_effects[0].network);
+        assert!(pane.net_inflight.is_none(), "nothing sent before Send");
+        pane.network_send(&mut session);
         assert!(pane.net_inflight.as_ref().is_some_and(|f| f.confirmed));
         let before = pane.transcript.len();
         release.send(()).unwrap();
@@ -7841,6 +7928,48 @@ mod deck_net_tests {
             assert!(session.doc.location.is_none() && session.doc.is_empty());
             assert!(pane.current_commands.is_empty());
         }
+    }
+
+    /// #348: a Deck `osmfetch` asks once (the network card, even with deck
+    /// side effects allowed for the session), shows the notice on first use
+    /// only, sends nothing before Send, and Cancel changes nothing.
+    #[test]
+    fn deck_osmfetch_asks_once_and_cancel_sends_nothing() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (g, _) = geo(true, None);
+        let (o, calls) = osm(None);
+        let (mut pane, mut session) = setup(&g, &o, true);
+        pane.allow_deck_side_effects = true;
+        session.run(parse("location -0.2201 -78.5123 -5").unwrap()).unwrap();
+        let log_len = session.save_log().len();
+
+        pane.handle_extract_events(vec![ExtractEvent::Command("osmfetch 200".into())], &mut session);
+        assert_eq!(pane.pending_side_effects.len(), 1, "never auto-run, even with the opt-in");
+        let (first_use, details) = pane.network_approval(&pane.pending_side_effects[0].cmd, &session);
+        assert!(first_use, "first use shows the notice");
+        assert!(details.contains("-0.22010, -78.51230") && details.contains("200 m"), "{details}");
+        assert!(details.contains("https://overpass.test/api/interpreter"), "{details}");
+        pane.network_cancel();
+        assert!(pane.pending_side_effects.is_empty() && pane.net_inflight.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "Cancel sends nothing");
+        assert_eq!(session.save_log().len(), log_len, "Cancel logs nothing");
+        assert!(session.doc.is_empty());
+        assert!(!o.acked(), "Cancel does not accept the notice");
+
+        pane.handle_extract_events(vec![ExtractEvent::Command("osmfetch 200".into())], &mut session);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing sent before Send");
+        pane.network_send(&mut session);
+        assert!(pane.pending_side_effects.is_empty(), "asked once: no second prompt");
+        settle(&mut pane, &mut session, &rt);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(o.acked());
+        assert!(matches!(session.save_log().last(), Some(Command::OsmContext { .. })));
+
+        // Later uses: the approval only, still asked every time.
+        pane.handle_extract_events(vec![ExtractEvent::Command("osmfetch 200".into())], &mut session);
+        assert_eq!(pane.pending_side_effects.len(), 1);
+        assert!(!pane.network_approval(&pane.pending_side_effects[0].cmd, &session).0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
