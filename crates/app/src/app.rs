@@ -905,6 +905,9 @@ pub struct App {
     osm_hook: std::sync::Arc<crate::osmfetch::Overpass>,
     /// A typed `osmfetch` whose request is in flight off the UI thread.
     osm_pending: Option<(String, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// A typed `osmfetch` waiting for the user's Send / Cancel (#348):
+    /// nothing is sent before Send.
+    osm_approval: Option<(String, itsjustcad_commands::osmfetch::OsmRequest)>,
     /// Background undo-history rebuild after a fast open (#224).
     history_rebuild: crate::history_rebuild::HistoryRebuild,
     /// Auto-recompute: per-source signature of the last-observed source block
@@ -1631,6 +1634,7 @@ impl App {
             geo_hook: std::sync::Arc::new(crate::geocode::Nominatim::desktop()),
             osm_hook: std::sync::Arc::new(crate::osmfetch::Overpass::desktop()),
             osm_pending: None,
+            osm_approval: None,
             history_rebuild: Default::default(),
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
@@ -10645,7 +10649,7 @@ pub(crate) fn load_ui_json() -> serde_json::Value {
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()))
 }
 
-fn save_ui_json(value: &serde_json::Value) {
+pub(crate) fn save_ui_json(value: &serde_json::Value) {
     if let Some(path) = ui_config_path() {
         let _ = std::fs::create_dir_all(path.parent().expect("has parent"));
         let _ = std::fs::write(
@@ -13236,7 +13240,27 @@ mod tests {
             assert_eq!(geo_calls(&calls), 0, "nothing sent without a location");
 
             app.execute_line("location 37.4224857 -122.0855846 -7".into());
+            let log_len = app.session.save_log().len();
+            // #348: the approval step first; Cancel sends and changes nothing.
             app.execute_line("osmfetch 200".into());
+            assert!(app.osmfetch_awaiting_approval() && !app.osmfetch_busy());
+            assert_eq!(geo_calls(&calls), 0, "nothing sent before approval");
+            h.run_steps(2);
+            let app = h.state_mut();
+            assert!(app.osmfetch_awaiting_approval(), "waits for the user");
+            assert_eq!(geo_calls(&calls), 0);
+            app.osmfetch_decide(false);
+            assert!(!app.osmfetch_awaiting_approval() && !app.osmfetch_busy());
+            assert_eq!(transcript(app).last().unwrap(), "osmfetch: cancelled; nothing was sent");
+            assert_eq!(geo_calls(&calls), 0, "Cancel sends nothing");
+            assert_eq!(app.session.save_log().len(), log_len, "Cancel logs nothing");
+            assert_eq!(app.session.doc.len(), 0);
+            assert!(!app.osm_hook.acked());
+
+            app.execute_line("osmfetch 200".into());
+            assert_eq!(geo_calls(&calls), 0);
+            app.osmfetch_decide(true);
+            assert!(app.osm_hook.acked(), "Send accepts the first-use notice");
             assert!(app.osmfetch_busy(), "fetched off the UI thread");
             for _ in 0..200 {
                 h.run_steps(1);

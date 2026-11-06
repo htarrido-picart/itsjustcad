@@ -13,16 +13,18 @@
 //! one Deck command or one script line), never retried automatically; a
 //! busy server (HTTP 429, or 502 "at capacity") is reported, not hammered.
 //!
-//! Privacy: the request carries only the site's coordinates and the
-//! radius, never the address or the document. Typing `osmfetch` is the
-//! explicit request (its usage text says it sends the coordinates), and a
-//! Deck-proposed `osmfetch` is side-effecting, so the Deck asks before it
-//! runs; there is no separate first-use notice (unlike `geocode`, which
-//! sends the address the user typed).
+//! Privacy (#348): the request carries only the site's coordinates and the
+//! radius, never the address or the document. The desktop hook is gated:
+//! it sends nothing unless the user approved that exact request
+//! ([`Overpass::approve`]) in the approval step (typed and Deck alike),
+//! which also shows the first-use privacy notice until it is accepted
+//! ([`PRIVACY_ACK`] in `ui.json`). Headless, the explicit script line is the
+//! approval, and the hook says on stderr what it sends.
 //!
 //! App crate only: the iOS FFI links none of this (`URLSession` fetches there
 //! through `ijc_set_osm_fetcher`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use itsjustcad_commands::osmfetch::{
@@ -35,6 +37,9 @@ pub const OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
 
 /// `ui.json` key: an Overpass-compatible endpoint replacing the public one.
 pub const ENDPOINT_KEY: &str = "overpass_url";
+
+/// `ui.json` key: the first-use privacy notice was accepted.
+pub const PRIVACY_ACK: &str = "osmfetch_privacy_ack";
 
 /// How long one request may take: the server-side query limit plus margin.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
@@ -67,6 +72,31 @@ pub fn request_for(cmd: &Command, session: &Session) -> Option<OsmRequest> {
     (MIN_RADIUS_M..=MAX_RADIUS_M).contains(&r).then(|| OsmRequest::new(loc.lat_deg, loc.lon_deg, r))
 }
 
+/// Save the notice's acceptance in `ui.json` (never from tests: that is the
+/// user's real config).
+pub fn persist_ack() {
+    #[cfg(not(test))]
+    {
+        let mut v = crate::app::load_ui_json();
+        v[PRIVACY_ACK] = serde_json::json!(true);
+        crate::app::save_ui_json(&v);
+    }
+}
+
+/// The approval step's details: centre, radius and where it goes (#348).
+pub fn approval_details(req: &OsmRequest, endpoint: &str) -> String {
+    use crate::i18n::t;
+    format!(
+        "{}: {:.5}, {:.5}\n{}: {} m\n{}: {endpoint}",
+        t("osmfetch.centre"),
+        req.lat_deg,
+        req.lon_deg,
+        t("osmfetch.radius"),
+        req.radius_m,
+        t("osmfetch.endpoint"),
+    )
+}
+
 /// The Overpass host hook: one `fetch` per request, plus a prefetched
 /// answer handed once to the command that asked for it.
 pub struct Overpass {
@@ -75,6 +105,13 @@ pub struct Overpass {
     /// A [`Self::prefetch`]ed answer, keyed by the request's QL, used once
     /// by the command's own fetch so it does not send a second request.
     stashed: Mutex<Option<(String, Answer)>>,
+    /// Every request counts as approved (headless: the script line is the
+    /// explicit request).
+    auto_approve: bool,
+    /// The one request the user approved, by key, used by the next send.
+    approved: Mutex<Option<String>>,
+    /// The first-use privacy notice was accepted.
+    acked: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -82,21 +119,62 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Overpass {
-    /// A hook with injected endpoint and network (tests stub both).
+    /// A gated hook with injected endpoint and network (tests stub both):
+    /// it sends only a request [`Self::approve`]d first, notice not accepted.
     pub fn new(
         endpoint: impl Fn() -> String + Send + Sync + 'static,
         fetch: impl Fn(&str) -> Result<Vec<u8>, String> + Send + Sync + 'static,
     ) -> Self {
-        Self { endpoint: Box::new(endpoint), fetch: Box::new(fetch), stashed: Mutex::default() }
+        Self {
+            endpoint: Box::new(endpoint),
+            fetch: Box::new(fetch),
+            stashed: Mutex::default(),
+            auto_approve: false,
+            approved: Mutex::default(),
+            acked: AtomicBool::new(false),
+        }
     }
 
-    fn configured_endpoint() -> String {
+    /// The same hook with every request approved (headless).
+    fn auto_approved(mut self) -> Self {
+        self.auto_approve = true;
+        self.acked = AtomicBool::new(true);
+        self
+    }
+
+    /// The endpoint a request goes to now (shown in the approval step).
+    pub fn endpoint(&self) -> String {
+        (self.endpoint)()
+    }
+
+    /// Whether the first-use privacy notice was accepted.
+    pub fn acked(&self) -> bool {
+        self.acked.load(Ordering::Acquire)
+    }
+
+    /// Record that the privacy notice was accepted (the caller persists it).
+    pub fn set_acked(&self) {
+        self.acked.store(true, Ordering::Release);
+    }
+
+    /// The user approved `req`: the next send of exactly this request may
+    /// go out, once.
+    pub fn approve(&self, req: &OsmRequest) {
+        *lock(&self.approved) = Some(req.key().to_string());
+    }
+
+    /// The endpoint `ui.json` configures (the public one by default).
+    pub fn configured_endpoint() -> String {
         crate::app::load_ui_json()[ENDPOINT_KEY].as_str().unwrap_or(OVERPASS_URL).to_string()
     }
 
     /// The desktop app's hook: endpoint from `ui.json`.
     pub fn desktop() -> Self {
-        Self::new(Self::configured_endpoint, http_fetch)
+        let hook = Self::new(Self::configured_endpoint, http_fetch);
+        if crate::app::load_ui_json()[PRIVACY_ACK].as_bool() == Some(true) {
+            hook.set_acked();
+        }
+        hook
     }
 
     /// The headless CLI's hook: says on stderr what it sends.
@@ -104,11 +182,12 @@ impl Overpass {
         Self::new(Self::configured_endpoint, |url: &str| {
             let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string));
             eprintln!(
-                "osmfetch: sending the site coordinates to {} (OpenStreetMap Overpass API)",
+                "osmfetch: sending the site coordinates and radius to {} (OpenStreetMap Overpass API; data © OpenStreetMap contributors, ODbL 1.0)",
                 host.unwrap_or_default()
             );
             http_fetch(url)
         })
+        .auto_approved()
     }
 
     /// Fetch `req` ahead of the command (on a worker thread, so the UI never
@@ -118,7 +197,12 @@ impl Overpass {
         *lock(&self.stashed) = Some((req.key().to_string(), answer));
     }
 
+    /// The only place a request leaves: refused unless approved.
     fn request(&self, req: &OsmRequest) -> Answer {
+        let approved = lock(&self.approved).take().is_some_and(|k| k == req.key());
+        if !(self.auto_approve || approved) {
+            return Err(OsmError::NotApproved);
+        }
         let url = request_url(&(self.endpoint)(), req).map_err(OsmError::Unreachable)?;
         let body = (self.fetch)(&url).map_err(|e| OsmError::classify(&e))?;
         if body.len() > MAX_BYTES {
@@ -192,13 +276,39 @@ mod tests {
         let mut s = itsjustcad_commands::Session::default();
         s.run(itsjustcad_commands::parse("location 40 0 0").unwrap()).unwrap();
         s.set_osm_fetcher(Some(hook.clone()));
-        hook.prefetch(&OsmRequest::new(40.0, 0.0, 400.0));
+        let req = OsmRequest::new(40.0, 0.0, 400.0);
+        hook.approve(&req);
+        hook.prefetch(&req);
         let out = s.run(itsjustcad_commands::parse("osmfetch").unwrap()).unwrap();
         assert!(out.message.contains("1 tree(s) on 'context-trees'"), "{}", out.message);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // No stash left: the next command sends its own request.
+        // No stash and no approval left: the next command sends nothing.
+        let err = s.run(itsjustcad_commands::parse("osmfetch").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("needs your approval"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        hook.approve(&req);
         s.run(itsjustcad_commands::parse("osmfetch").unwrap()).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// #348: nothing is sent unless that exact request was approved, and an
+    /// approval is used once.
+    #[test]
+    fn gate_sends_only_the_approved_request_once() {
+        let (hook, calls) = counting(Ok(BODY));
+        let req = OsmRequest::new(40.0, 0.0, 400.0);
+        assert_eq!(hook.fetch(&req), Err(OsmError::NotApproved));
+        hook.prefetch(&req);
+        assert_eq!(hook.fetch(&req), Err(OsmError::NotApproved));
+        hook.approve(&OsmRequest::new(40.0, 0.0, 200.0));
+        assert_eq!(hook.fetch(&req), Err(OsmError::NotApproved), "another request's approval");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        hook.approve(&req);
+        assert!(hook.fetch(&req).is_ok());
+        assert_eq!(hook.fetch(&req), Err(OsmError::NotApproved), "used once");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!hook.acked());
+        assert!(Overpass::headless().acked(), "headless: the script line is the approval");
     }
 
     #[test]
@@ -211,6 +321,7 @@ mod tests {
             ("request failed: error sending request", "cannot reach"),
         ] {
             let hook = Overpass::new(|| OVERPASS_URL.into(), move |_: &str| Err(msg.to_string()));
+            hook.approve(&req);
             let err = hook.fetch(&req).unwrap_err().to_string();
             assert!(err.contains(want), "{msg}: {err}");
         }
