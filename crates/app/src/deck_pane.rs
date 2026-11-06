@@ -1483,6 +1483,16 @@ pub struct DeckPane {
     /// explicit human [run]/[skip]. They never touch the filesystem until the
     /// user confirms (security C-2 / H-7).
     pending_side_effects: Vec<PendingSideEffect>,
+    /// Desktop network hooks (#346); `None` (tests, headless) runs `geocode`
+    /// and `osmfetch` synchronously, as before.
+    net_hooks: Option<crate::deck_net::NetHooks>,
+    /// The network command whose request is in flight; the draft pauses at it.
+    net_inflight: Option<crate::deck_net::InFlight>,
+    /// Draft lines emitted while paused, run in order once the answer is in.
+    net_held: std::collections::VecDeque<String>,
+    /// The turn ended while paused: its elapsed seconds, to finish it once
+    /// the held lines ran.
+    net_finish: Option<f32>,
     /// Opt-in: auto-run deck side-effecting commands whose path stays inside the
     /// sandbox root, without a per-command prompt. Defaults OFF. Paths that
     /// escape the sandbox are still queued even when this is on.
@@ -1677,6 +1687,10 @@ impl Default for DeckPane {
             attached_image: None,
             image_cache: std::collections::HashMap::new(),
             pending_side_effects: Vec::new(),
+            net_hooks: None,
+            net_inflight: None,
+            net_held: std::collections::VecDeque::new(),
+            net_finish: None,
             allow_deck_side_effects: false,
             deck_run_approved: false,
             pending_firstrun: Vec::new(),
@@ -1709,7 +1723,81 @@ impl Default for DeckPane {
 
 impl DeckPane {
     pub fn busy(&self) -> bool {
-        self.rx.is_some()
+        self.rx.is_some() || self.net_inflight.is_some()
+    }
+
+    /// Install the desktop network hooks the Deck prefetches through (#346).
+    pub fn set_net_hooks(&mut self, hooks: crate::deck_net::NetHooks) {
+        self.net_hooks = Some(hooks);
+    }
+
+    /// The app replaced the document: a request in flight must not apply its
+    /// answer to the new one.
+    pub fn close_document(&mut self) {
+        self.cancel_net("the document changed");
+    }
+
+    /// Drop the network command in flight (and the draft lines held behind
+    /// it). The worker still finishes; its answer only lands in the hook's
+    /// cache, never in a document. Returns whether one was in flight.
+    fn cancel_net(&mut self, why: &str) -> bool {
+        let Some(f) = self.net_inflight.take() else { return false };
+        let held = std::mem::take(&mut self.net_held).len();
+        let verb = f.line.split_whitespace().next().unwrap_or("request");
+        let rest = if held > 0 { format!("; {held} later command(s) not run") } else { String::new() };
+        self.transcript
+            .push(Entry::Status(format!("{verb}: {why}; the answer was not applied{rest}")));
+        // A turn that ended while paused: record what did run.
+        if self.net_finish.take().is_some() && !self.current_commands.is_empty() {
+            self.transcript
+                .push(Entry::Commands(std::mem::take(&mut self.current_commands)));
+        }
+        self.persist_chat();
+        true
+    }
+
+    /// Start `cmd`'s request off the UI thread when it is a network command
+    /// and the desktop hooks are installed; else hand it back to run now.
+    fn start_net(&mut self, line: &str, cmd: Command, session: &Session, confirmed: bool) -> Option<Command> {
+        let Some(hooks) = &self.net_hooks else { return Some(cmd) };
+        match hooks.start(line, cmd, session, confirmed) {
+            Ok(f) => {
+                self.net_inflight = Some(f);
+                None
+            }
+            Err(cmd) => Some(*cmd),
+        }
+    }
+
+    /// Once the request in flight is answered: run its command (from the
+    /// prefetched answer), then the draft lines held behind it, then finish a
+    /// turn that ended meanwhile.
+    fn poll_net(&mut self, session: &mut Session, handle: &tokio::runtime::Handle) {
+        if !self.net_inflight.as_ref().is_some_and(crate::deck_net::InFlight::done) {
+            return;
+        }
+        let f = self.net_inflight.take().expect("in flight");
+        if f.confirmed {
+            self.run_confirmed_side_effect_now(session, f.cmd, f.line);
+        } else {
+            self.run_deck_command_now(&f.line, f.cmd, session);
+        }
+        while self.net_inflight.is_none()
+            && let Some(line) = self.net_held.pop_front()
+        {
+            self.route_command_line(line, session);
+        }
+        if self.net_inflight.is_some() {
+            return;
+        }
+        if let Some(elapsed) = self.net_finish.take() {
+            self.end_turn(elapsed, session, handle);
+        } else if self.rx.is_none() && !self.current_commands.is_empty() {
+            // A first-run replay after the turn ended (see `firstrun_approve`).
+            self.transcript
+                .push(Entry::Commands(std::mem::take(&mut self.current_commands)));
+            self.persist_chat();
+        }
     }
 
     /// True when the ACTIVE deck is a healthy LOCAL endpoint (probe Ready) — e.g.
@@ -1998,6 +2086,7 @@ impl DeckPane {
     /// in-flight turn. A loaded draft is a fresh continuation, not a stored
     /// session, so `loaded_session_id`/`dirty_since_load` are cleared.
     fn load_draft(&mut self, draft: SavedChat) {
+        self.cancel_net("the chat changed");
         self.session_id = draft.session_id;
         self.messages = draft.messages;
         self.transcript = draft.transcript;
@@ -2667,6 +2756,7 @@ impl DeckPane {
     }
 
     fn stop_turn(&mut self) {
+        self.cancel_net("cancelled");
         if let Some(task) = self.turn_task.take() {
             task.abort();
         }
@@ -2767,6 +2857,17 @@ impl DeckPane {
     /// while replaying an approved-once batch). Writers still hit the write-modal
     /// via `pending_side_effects`; readers still take the manual picker carve-out.
     fn process_command_line(&mut self, line: String, session: &mut Session) {
+        // #346: the draft pauses at a network command in flight; later lines
+        // wait for its answer (one may need the location it sets) and run in
+        // order once it is in.
+        if self.net_inflight.is_some() {
+            self.net_held.push_back(line);
+            return;
+        }
+        self.route_command_line(line, session);
+    }
+
+    fn route_command_line(&mut self, line: String, session: &mut Session) {
         {
             {
                 {
@@ -2952,6 +3053,12 @@ impl DeckPane {
     /// Execute a (parsed) deck command through the same session path the human
     /// command line uses, recording the outcome in this turn's command list.
     fn run_deck_command(&mut self, line: &str, cmd: Command, session: &mut Session) {
+        if let Some(cmd) = self.start_net(line, cmd, session, false) {
+            self.run_deck_command_now(line, cmd, session);
+        }
+    }
+
+    fn run_deck_command_now(&mut self, line: &str, cmd: Command, session: &mut Session) {
         let result = session.run(cmd).map_err(|e| e.to_string());
         if let Err(e) = &result {
             self.errors_this_turn.push(format!("`{line}` failed: {e}"));
@@ -3334,10 +3441,19 @@ use QUESTION:)."
                 .take()
                 .map(|t| t.elapsed().as_secs_f32())
                 .unwrap_or(0.0);
-            self.transcript
-                .push(Entry::Status(format!("turn done in {elapsed:.1}s")));
-            self.finish_turn(session, handle);
+            // Paused at a network command: finish once its answer is in.
+            if self.net_inflight.is_some() {
+                self.net_finish = Some(elapsed);
+                return;
+            }
+            self.end_turn(elapsed, session, handle);
         }
+    }
+
+    fn end_turn(&mut self, elapsed: f32, session: &Session, handle: &tokio::runtime::Handle) {
+        self.transcript
+            .push(Entry::Status(format!("turn done in {elapsed:.1}s")));
+        self.finish_turn(session, handle);
     }
 
     /// Drive background work (drain + probe + warm) without rendering anything.
@@ -3351,6 +3467,7 @@ use QUESTION:)."
         ctx: &egui::Context,
     ) {
         self.drain(session, handle);
+        self.poll_net(session, handle);
         if self.busy()
             && let Some(started) = self.turn_started
             && started.elapsed().as_secs() > TURN_TIMEOUT_SECS
@@ -3656,7 +3773,8 @@ use QUESTION:)."
         _icons: &crate::icons::Icons,
         roles: &crate::theme::ColorRoles,
     ) {
-        if self.pending_side_effects.is_empty() {
+        // One network request at a time (#346): the next prompt waits.
+        if self.pending_side_effects.is_empty() || self.net_inflight.is_some() {
             return;
         }
         // One decision per frame. Index 0 is the head of the queue.
@@ -3844,6 +3962,12 @@ use QUESTION:)."
     /// transcript entry. Goes through `session.run` — logged/replayed like any
     /// command — so replay reproduces the confirmed side-effect.
     fn run_confirmed_side_effect(&mut self, session: &mut Session, cmd: Command, line: String) {
+        if let Some(cmd) = self.start_net(&line, cmd, session, true) {
+            self.run_confirmed_side_effect_now(session, cmd, line);
+        }
+    }
+
+    fn run_confirmed_side_effect_now(&mut self, session: &mut Session, cmd: Command, line: String) {
         let result = session.run(cmd).map_err(|e| e.to_string());
         // Mirror the confirmed command into the Commands-history scrollback
         // (issue #59), the same as auto-run deck commands.
@@ -4026,6 +4150,7 @@ use QUESTION:)."
     /// The loaded session is TRACKED (`loaded_session_id`) so continuing it and
     /// then leaving offers update-in-place rather than a fork.
     fn replace_live_with_stored(&mut self, id: &str) {
+        self.cancel_net("the chat changed");
         let Some(store) = self.store.as_ref() else { return };
         let Some(session) = store.get(id) else { return };
         self.messages = session
@@ -4319,6 +4444,7 @@ use QUESTION:)."
         self.handle_image_drop(ui, roles);
         self.handle_image_paste(ui);
         self.drain(session, handle);
+        self.poll_net(session, handle);
         if self.busy()
             && let Some(started) = self.turn_started
             && started.elapsed().as_secs() > TURN_TIMEOUT_SECS
@@ -5324,7 +5450,9 @@ use QUESTION:)."
                             let received = self.current_response.len();
                             ui.horizontal(|ui| {
                                 busy_indicator(ui, reduce_motion);
-                                let status = if received == 0 {
+                                let status = if let Some(f) = &self.net_inflight {
+                                    f.status.clone()
+                                } else if received == 0 {
                                     format!("waiting for model… {elapsed}s")
                                 } else {
                                     format!("streaming… {received} chars, {elapsed}s")
@@ -5802,6 +5930,10 @@ mod side_effect_gate_tests {
             attached_image: None,
             image_cache: std::collections::HashMap::new(),
             pending_side_effects: Vec::new(),
+            net_hooks: None,
+            net_inflight: None,
+            net_held: std::collections::VecDeque::new(),
+            net_finish: None,
             allow_deck_side_effects: false,
             // Test helper = an already-running session: the OUTER first-run gate
             // is already open, so existing #56 behavior tests drive commands past
@@ -7487,5 +7619,241 @@ mod input_panel_sizing_tests {
             assert!(cap >= prev, "cap should be non-decreasing: {cap} < {prev}");
             prev = cap;
         }
+    }
+}
+
+/// #346: a Deck `geocode`/`osmfetch` is fetched on a worker thread, the draft
+/// pausing at it. Stub hooks only (no network); a gated stub holds the
+/// request until the test releases it, so "the UI thread is free" is checked
+/// by the call returning while the request is still blocked.
+#[cfg(test)]
+mod deck_net_tests {
+    use super::side_effect_gate_tests::blank_pane;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+
+    const QUITO: &[u8] = br#"[{"lat":"-0.2201","lon":"-78.5123","display_name":"Quito, Ecuador"}]"#;
+    const TREE: &[u8] = br#"{"elements":[{"type":"node","id":1,"lat":-0.2200,"lon":-78.5123,"tags":{"natural":"tree"}}]}"#;
+
+    /// A stub fetch answering `body`; with a gate it first waits for the
+    /// test's release (bounded, so a synchronous regression fails, not hangs).
+    fn stub(
+        body: &'static [u8],
+        gate: Option<mpsc::Receiver<()>>,
+        check: fn(&str),
+    ) -> (impl Fn(&str) -> Result<Vec<u8>, String> + Send + Sync + 'static, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let gate = Mutex::new(gate);
+        let f = move |url: &str| {
+            check(url);
+            if let Some(rx) = gate.lock().unwrap().as_ref() {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+            }
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(body.to_vec())
+        };
+        (f, calls)
+    }
+
+    fn geo(acked: bool, gate: Option<mpsc::Receiver<()>>) -> (Arc<crate::geocode::Nominatim>, Arc<AtomicUsize>) {
+        let (f, calls) = stub(QUITO, gate, |_| {});
+        let hook = crate::geocode::Nominatim::new(
+            move || crate::geocode::Settings { acked, endpoint: "https://geo.test/search".into() },
+            f,
+        );
+        (Arc::new(hook), calls)
+    }
+
+    fn osm(gate: Option<mpsc::Receiver<()>>) -> (Arc<crate::osmfetch::Overpass>, Arc<AtomicUsize>) {
+        // The request must carry the location the earlier `geocode` set.
+        let (f, calls) = stub(TREE, gate, |url| assert!(url.contains("-0.2201"), "{url}"));
+        (Arc::new(crate::osmfetch::Overpass::new(|| "https://overpass.test/api/interpreter".into(), f)), calls)
+    }
+
+    /// A pane (async when `hooks`) and a session with both hooks installed.
+    fn setup(
+        geo: &Arc<crate::geocode::Nominatim>,
+        osm: &Arc<crate::osmfetch::Overpass>,
+        hooks: bool,
+    ) -> (DeckPane, Session) {
+        let mut pane = blank_pane();
+        if hooks {
+            pane.set_net_hooks(crate::deck_net::NetHooks { geo: geo.clone(), osm: osm.clone() });
+        }
+        let mut session = Session::default();
+        session.set_geocoder(Some(geo.clone()));
+        session.set_osm_fetcher(Some(osm.clone()));
+        (pane, session)
+    }
+
+    /// Poll as the frame loop does until the request in flight is done.
+    fn settle(pane: &mut DeckPane, session: &mut Session, rt: &tokio::runtime::Runtime) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pane.net_inflight.is_some() {
+            assert!(std::time::Instant::now() < deadline, "request never finished");
+            std::thread::yield_now();
+            pane.poll_net(session, rt.handle());
+        }
+    }
+
+    const DRAFT: &str = "Setting the site.\n```draft\ngeocode \"Quito\"\nbox 0,0,0 1,1,1\n```\n";
+
+    /// One whole turn through `drain`: the reply, then done.
+    fn stream_turn(pane: &mut DeckPane, session: &mut Session, rt: &tokio::runtime::Runtime) {
+        let (tx, rx) = unbounded_channel();
+        tx.send(DeckDelta::Text(DRAFT.into())).unwrap();
+        tx.send(DeckDelta::Done).unwrap();
+        pane.rx = Some(rx);
+        pane.turn_started = Some(std::time::Instant::now());
+        pane.drain(session, rt.handle());
+    }
+
+    /// The transcript as JSON, the turn's elapsed time blanked.
+    fn transcript_json(pane: &DeckPane) -> String {
+        let entries: Vec<String> = pane
+            .transcript
+            .iter()
+            .map(|e| match e {
+                Entry::Status(s) if s.starts_with("turn done in") => "turn done".into(),
+                e => serde_json::to_string(e).unwrap(),
+            })
+            .collect();
+        mask_ids(&entries.join("\n"))
+    }
+
+    /// Fresh object ids (8 hex digits) blanked: they differ run to run.
+    fn mask_ids(s: &str) -> String {
+        s.split(' ')
+            .map(|w| if w.len() == 8 && w.bytes().all(|b| b.is_ascii_hexdigit()) { "<id>" } else { w })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn deck_geocode_leaves_the_ui_free_and_matches_the_sync_path() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Synchronous path (no hooks): the reference.
+        let (g, _) = geo(true, None);
+        let (o, _) = osm(None);
+        let (mut sync_pane, mut sync_session) = setup(&g, &o, false);
+        stream_turn(&mut sync_pane, &mut sync_session, &rt);
+        assert!(sync_pane.net_inflight.is_none());
+
+        // Async path: the request blocks until released.
+        let (release, gate) = mpsc::channel();
+        let (g, calls) = geo(true, Some(gate));
+        let (o, _) = osm(None);
+        let (mut pane, mut session) = setup(&g, &o, true);
+        stream_turn(&mut pane, &mut session, &rt);
+        // Back on the "UI thread" with the request still blocked: nothing ran,
+        // the box waits behind the lookup, the turn is not finished yet.
+        assert!(pane.busy() && pane.net_inflight.is_some());
+        assert_eq!(pane.net_held.len(), 1);
+        assert!(pane.net_finish.is_some());
+        assert!(pane.current_commands.is_empty());
+        assert!(session.doc.location.is_none() && session.doc.is_empty());
+        assert!(!pane.transcript.iter().any(|e| matches!(e, Entry::Status(s) if s.starts_with("turn done"))));
+        // Frames while pending do nothing.
+        pane.poll_net(&mut session, rt.handle());
+        assert!(pane.net_inflight.is_some());
+
+        release.send(()).unwrap();
+        settle(&mut pane, &mut session, &rt);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one request per command");
+        assert!(!pane.busy());
+        assert_eq!(transcript_json(&pane), transcript_json(&sync_pane));
+        assert_eq!(pane.take_command_echoes(), sync_pane.take_command_echoes());
+        // The op log, its fresh object ids blanked.
+        let log = |s: &Session| {
+            let d = format!("{:?}", s.save_log());
+            let mut parts = d.split("ObjectId(");
+            let head = parts.next().unwrap_or_default().to_string();
+            parts.fold(head, |acc, p| acc + "ObjectId(<id>)" + p.split_once(')').map_or(p, |(_, r)| r))
+        };
+        assert_eq!(log(&session), log(&sync_session));
+        assert_eq!(session.doc.location.unwrap().tz_hours, -5.0);
+        assert_eq!(session.doc.len(), 1);
+    }
+
+    #[test]
+    fn osmfetch_after_geocode_waits_then_fetches_off_thread() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (g, _) = geo(true, None);
+        let (release, gate) = mpsc::channel();
+        let (o, osm_calls) = osm(Some(gate));
+        let (mut pane, mut session) = setup(&g, &o, true);
+        pane.handle_extract_events(
+            vec![ExtractEvent::Command("geocode \"Quito\"".into()), ExtractEvent::Command("osmfetch".into())],
+            &mut session,
+        );
+        // The dependent osmfetch waits for the location, not yet proposed.
+        assert!(pane.net_inflight.is_some());
+        assert!(pane.pending_side_effects.is_empty());
+        settle(&mut pane, &mut session, &rt);
+        assert!(session.doc.location.is_some());
+        // Side-effect prompt unchanged: proposed, approved once here.
+        assert_eq!(pane.pending_side_effects.len(), 1);
+        let p = pane.pending_side_effects.remove(0);
+        pane.run_confirmed_side_effect(&mut session, p.cmd, p.line);
+        assert!(pane.net_inflight.as_ref().is_some_and(|f| f.confirmed));
+        let before = pane.transcript.len();
+        release.send(()).unwrap();
+        settle(&mut pane, &mut session, &rt);
+        assert_eq!(osm_calls.load(Ordering::SeqCst), 1, "one request per command");
+        assert_eq!(pane.transcript.len(), before + 1);
+        let Some(Entry::Commands(c)) = pane.transcript.last() else { panic!("no commands entry") };
+        let msg = c[0].result.as_ref().unwrap();
+        assert!(c[0].line == "osmfetch" && msg.contains("1 tree(s)"), "{msg}");
+    }
+
+    #[test]
+    fn cancel_while_pending_applies_nothing() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for close in [true, false] {
+            let (release, gate) = mpsc::channel();
+            let (g, calls) = geo(true, Some(gate));
+            let (o, _) = osm(None);
+            let (mut pane, mut session) = setup(&g, &o, true);
+            pane.handle_extract_events(
+                vec![ExtractEvent::Command("geocode \"Quito\"".into()), ExtractEvent::Command("box 0,0,0 1,1,1".into())],
+                &mut session,
+            );
+            assert!(pane.net_inflight.is_some());
+            if close {
+                pane.close_document();
+            } else {
+                pane.stop_turn();
+            }
+            assert!(pane.net_inflight.is_none() && pane.net_held.is_empty() && !pane.busy());
+            let why = if close { "the document changed" } else { "cancelled" };
+            assert!(pane.transcript.iter().any(
+                |e| matches!(e, Entry::Status(s) if s.contains(why) && s.contains("1 later command(s) not run"))
+            ));
+            release.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while calls.load(Ordering::SeqCst) == 0 {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            pane.poll_net(&mut session, rt.handle());
+            assert!(session.doc.location.is_none() && session.doc.is_empty());
+            assert!(pane.current_commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn privacy_gate_unchanged_nothing_prefetched_or_sent() {
+        let (g, calls) = geo(false, None);
+        let (o, _) = osm(None);
+        let (mut pane, mut session) = setup(&g, &o, true);
+        pane.handle_extract_events(vec![ExtractEvent::Command("geocode \"Quito\"".into())], &mut session);
+        assert!(pane.net_inflight.is_none(), "nothing prefetched before the notice is accepted");
+        let err = pane.current_commands[0].result.as_ref().unwrap_err();
+        assert!(err.contains("not sent"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(g.take_notice_request().as_deref(), Some("Quito"));
+        assert!(session.doc.location.is_none());
     }
 }

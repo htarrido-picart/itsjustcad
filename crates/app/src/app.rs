@@ -4422,6 +4422,7 @@ impl App {
             Ok(session) => {
                 self.session = session;
                 self.optimize.close_document();
+                self.deck_pane.close_document();
                 self.uploaded_generation = None;
                 // The recovered ops now live in THIS session's journal (next
                 // sync writes them); the crashed one has served its purpose.
@@ -4442,6 +4443,7 @@ impl App {
     fn new_document(&mut self) {
         self.session = Session::default();
         self.optimize.close_document();
+        self.deck_pane.close_document();
         self.uploaded_generation = None;
         self.journaled_generation = None;
         self.deck_pane.set_sandbox_root(None);
@@ -4479,6 +4481,7 @@ impl App {
             Ok(session) => {
                 self.session = session;
                 self.optimize.close_document();
+                self.deck_pane.close_document();
                 self.uploaded_generation = None;
                 // A freshly-opened document is clean at its loaded op-log cursor.
                 self.mark_saved();
@@ -4523,6 +4526,7 @@ impl App {
                 Ok(session) => {
                     self.session = session;
                     self.optimize.close_document();
+                    self.deck_pane.close_document();
                     self.uploaded_generation = None;
                     self.mark_saved();
                     self.deck_pane
@@ -12002,6 +12006,12 @@ impl eframe::App for App {
 
         // Deck pane tick: must run every frame regardless of visibility so
         // streaming turns and probes keep making progress while the pane is hidden.
+        // #346: the Deck prefetches `geocode`/`osmfetch` through the same
+        // hooks the session runs them with.
+        self.deck_pane.set_net_hooks(crate::deck_net::NetHooks {
+            geo: self.geo_hook.clone(),
+            osm: self.osm_hook.clone(),
+        });
         self.deck_pane.tick(&mut self.session, &self.tokio, ui.ctx());
 
         // Diffusion render: poll the in-flight job / connection test and draw

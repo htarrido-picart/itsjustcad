@@ -10,6 +10,7 @@ mod chat_crypto;
 mod chat_db;
 mod chat_store;
 mod command_line;
+mod deck_net;
 mod deck_pane;
 mod diffusion;
 mod doc_paths;

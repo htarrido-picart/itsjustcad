@@ -25,7 +25,10 @@
 
 use std::sync::Mutex;
 
-use itsjustcad_commands::osmfetch::{OsmError, OsmFetcher, OsmRequest};
+use itsjustcad_commands::osmfetch::{
+    OsmError, OsmFetcher, OsmRequest, DEFAULT_RADIUS_M, MAX_RADIUS_M, MIN_RADIUS_M,
+};
+use itsjustcad_commands::{Command, Session};
 
 /// The public Overpass API endpoint (the default).
 pub const OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
@@ -51,6 +54,17 @@ pub fn request_url(endpoint: &str, req: &OsmRequest) -> Result<String, String> {
     reqwest::Url::parse_with_params(endpoint, &[("data", req.query.as_str())])
         .map(String::from)
         .map_err(|e| format!("bad Overpass URL '{endpoint}': {e}"))
+}
+
+/// The request an `osmfetch` command would send on `session`, or `None`
+/// when it fails before sending (no location, a radius out of range) or is
+/// not an `osmfetch`: such a command runs at once and reports why.
+pub fn request_for(cmd: &Command, session: &Session) -> Option<OsmRequest> {
+    let (Command::OsmFetch { radius_m }, Some(loc)) = (cmd, session.doc.location) else {
+        return None;
+    };
+    let r = radius_m.unwrap_or(DEFAULT_RADIUS_M);
+    (MIN_RADIUS_M..=MAX_RADIUS_M).contains(&r).then(|| OsmRequest::new(loc.lat_deg, loc.lon_deg, r))
 }
 
 /// The Overpass host hook: one `fetch` per request, plus a prefetched

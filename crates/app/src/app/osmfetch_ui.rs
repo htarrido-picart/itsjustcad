@@ -6,14 +6,12 @@
 //!
 //! A typed `osmfetch` is fetched on a worker thread first, so the UI never
 //! waits on the network; the core command then runs with the answer in hand
-//! (one request) and logs the generated geometry. A Deck `osmfetch` goes
-//! through the normal Deck command path (side-effecting, so confirmed first).
+//! (one request) and logs the generated geometry. A Deck `osmfetch` is
+//! confirmed first (side-effecting), then fetched the same way
+//! ([`crate::deck_net`], #346).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
-use itsjustcad_commands::osmfetch::{OsmRequest, DEFAULT_RADIUS_M, MAX_RADIUS_M, MIN_RADIUS_M};
-use itsjustcad_commands::Command;
 
 use super::App;
 
@@ -37,15 +35,9 @@ impl App {
     /// radius out of range, a parse error) runs at once and reports why.
     pub(in crate::app) fn osmfetch_typed(&mut self, line: &str) {
         self.ensure_osm_fetcher();
-        let req = match (itsjustcad_commands::parse(line), self.session.doc.location) {
-            (Ok(Command::OsmFetch { radius_m }), Some(loc)) => {
-                let r = radius_m.unwrap_or(DEFAULT_RADIUS_M);
-                (MIN_RADIUS_M..=MAX_RADIUS_M)
-                    .contains(&r)
-                    .then(|| OsmRequest::new(loc.lat_deg, loc.lon_deg, r))
-            }
-            _ => None,
-        };
+        let req = itsjustcad_commands::parse(line)
+            .ok()
+            .and_then(|cmd| crate::osmfetch::request_for(&cmd, &self.session));
         let Some(req) = req else {
             self.command_line.execute(&mut self.session, line);
             return;
