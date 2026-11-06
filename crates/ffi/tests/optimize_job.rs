@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use itsjustcad_ffi::optimize_job::*;
 use itsjustcad_ffi::{
     AppHandle, ijc_free, ijc_init_headless, ijc_new_document, ijc_open_json,
-    ijc_run_command_result, ijc_save_json, ijc_string_free,
+    ijc_run_command_result, ijc_save_json, ijc_site_optimize_apply, ijc_string_free,
 };
 use serde_json::Value;
 
@@ -162,5 +162,68 @@ fn new_document_cancels_its_jobs() {
     let out = take_json(unsafe { ijc_site_optimize_result(h, id) });
     assert_eq!(out["error"], "siteoptimize: cancelled", "{out}");
     assert_eq!(saved(h, &site), before);
+    unsafe { ijc_free(h) };
+}
+
+/// #226: a run stopped early, reopened from the file (as after iOS killed
+/// the app), continues to its budget with the unbroken search's result; a
+/// changed plan refuses it.
+#[test]
+fn a_stopped_run_continues_after_a_reopen() {
+    let req = r#"{"objective":"lots","budget":120,"seed":3}"#;
+    let h = ijc_init_headless();
+    let site = site(h);
+    let id = start(h, &site, req);
+    let t0 = Instant::now();
+    while progress(h, id)["evaluated"].as_u64() == Some(0) {
+        assert!(t0.elapsed() < Duration::from_secs(120));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(unsafe { ijc_site_optimize_stop(h, id) });
+    assert_eq!(wait(h, id)["state"], "done");
+    let stopped = take_json(unsafe { ijc_site_optimize_result(h, id) });
+    assert_eq!(stopped["stopped_early"], true, "{stopped}");
+    assert_eq!(saved(h, &site)["resumable"], true);
+    let file = text(unsafe { ijc_save_json(h) });
+    unsafe { ijc_free(h) };
+
+    let h = ijc_init_headless();
+    assert!(unsafe { ijc_open_json(h, file.as_ptr(), file.len()) });
+    let before = saved(h, &site);
+    assert_eq!(before["resumable"], true, "{before}");
+    let id = unsafe { ijc_site_optimize_resume(h, site.as_ptr()) };
+    assert!(id > 0);
+    assert_eq!(wait(h, id)["state"], "done");
+    let done = take_json(unsafe { ijc_site_optimize_result(h, id) });
+    assert_eq!(done["saved"], true, "{done}");
+    assert_eq!(done["stopped_early"], false);
+    assert_eq!(done["evaluated"], 120, "only the rest of the budget");
+    let after = saved(h, &site);
+    assert_eq!(after["resumable"], false);
+    assert!(after["elapsed_s"].as_f64() >= before["elapsed_s"].as_f64());
+
+    // The unbroken search with the same seed ranks the same.
+    let id = start(h, &site, req);
+    assert_eq!(wait(h, id)["state"], "done");
+    let full = take_json(unsafe { ijc_site_optimize_result(h, id) });
+    assert_eq!(done["candidates"], full["candidates"]);
+    assert_eq!(done["pareto"], full["pareto"]);
+    assert_eq!(done["feasible"], full["feasible"]);
+
+    // A finished run, then a changed plan: refused with the reason.
+    let refused = |h| {
+        let id = unsafe { ijc_site_optimize_resume(h, site.as_ptr()) };
+        assert_eq!(wait(h, id)["state"], "failed");
+        take_json(unsafe { ijc_site_optimize_result(h, id) })["error"].clone()
+    };
+    assert!(refused(h).as_str().unwrap().contains("cannot be continued"));
+    unsafe { ijc_free(h) };
+    let h = ijc_init_headless();
+    assert!(unsafe { ijc_open_json(h, file.as_ptr(), file.len()) });
+    let params = CString::new(r#"{"road_width":14}"#).unwrap();
+    let out = take_json(unsafe { ijc_site_optimize_apply(h, site.as_ptr(), params.as_ptr()) });
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(saved(h, &site)["resumable"], false, "stale");
+    assert!(refused(h).as_str().unwrap().contains("plan changed"));
     unsafe { ijc_free(h) };
 }

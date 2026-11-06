@@ -48,6 +48,14 @@ preset saved by a newer build is lost when an older build saves over it.
 Both are omitted while unset, so files without them stay byte-identical, and
 older builds ignore them.
 
+A saved run stopped early may also carry `search` (#226): the stopped search,
+so it can be continued with only the rest of its budget. It has its own
+`version` (currently **1**) and is opaque to other readers. It is optional and
+omitted once a run finishes, so runs without it load unchanged. A `search` this
+build cannot continue (another `version`) still loads with its run, which then
+only offers a new run; an unreadable `search` loads as unset (the run loads).
+Continuing is refused when the plan changed since the run (its `fingerprint`).
+
 A reader **must** reject files where the version > the version it knows. A
 reader **must** accept files where the version == 1 forever — regardless of
 whether the field is spelled `mydrafter` or `itsjustcad` — that is the

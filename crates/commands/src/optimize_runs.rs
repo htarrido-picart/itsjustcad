@@ -19,6 +19,11 @@
 //! plan (or its boundary) drops it at that edit. A new run replaces it.
 //! Older builds ignore the header field; entries this build cannot read
 //! (a newer `version`, a bad shape) load as no run.
+//!
+//! A run stopped early also keeps its search (#226, `search`), so it can be
+//! continued with only the rest of its budget ([`prepare_resume`]). A search
+//! state this build cannot continue (another build's) loads the run anyway,
+//! just not resumable; files without one load unchanged.
 
 use std::collections::BTreeMap;
 
@@ -26,7 +31,10 @@ use itsjustcad_doc::{Document, ObjectId, SubdivKind};
 use serde::{Deserialize, Serialize};
 use subdivision::{Polygon2d, SubdivisionSettings};
 
-use crate::site_optimize::{self, OptimizeRequest, OptimizeResult, PlanEdits, Prepared};
+use crate::site_optimize::{
+    self, OptimizeRequest, OptimizeResult, PlanEdits, Prepared, RESUME_NONE, RESUME_OLD,
+    RESUME_STALE, SearchState,
+};
 
 /// The saved run format this build writes and reads.
 pub const SAVED_RUN_VERSION: u32 = 1;
@@ -45,13 +53,23 @@ pub struct SavedRun {
     pub finished_at: u64,
     /// How long it ran, seconds.
     pub elapsed_s: f64,
+    /// A stopped run's search, to continue it (#226). `None` for a finished
+    /// run, a file from an older build, or a state this build cannot read.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "site_optimize::de_lenient"
+    )]
+    pub search: Option<SearchState>,
 }
 
 impl SavedRun {
     /// The run of `prepared` that produced `result` in `elapsed_s`, finished
     /// now.
-    pub fn new(prepared: &Prepared, result: OptimizeResult, elapsed_s: f64) -> SavedRun {
+    pub fn new(prepared: &Prepared, mut result: OptimizeResult, elapsed_s: f64) -> SavedRun {
+        let search = result.search.take().filter(|_| result.stopped_early).map(|s| *s);
         SavedRun {
+            search,
             version: SAVED_RUN_VERSION,
             request: prepared.req.clone(),
             result,
@@ -63,9 +81,16 @@ impl SavedRun {
         }
     }
 
+    /// Whether this build can continue it: stopped early, with a search
+    /// state of this build's format (the plan may still have changed).
+    pub fn resumable(&self) -> bool {
+        self.result.stopped_early && self.search.as_ref().is_some_and(SearchState::is_current)
+    }
+
     /// `{"version","request","result","stopped_early","finished_at",
-    /// "elapsed_s","evaluated","feasible","budget","fingerprint","stale"}`;
-    /// `result` is the `ijc_site_optimize_json` result.
+    /// "elapsed_s","evaluated","feasible","budget","fingerprint","stale",
+    /// "resumable"}`; `result` is the `ijc_site_optimize_json` result, and
+    /// `resumable` is [`SavedRun::resumable`] on a plan not `stale`.
     pub fn to_json(&self, stale: bool) -> serde_json::Value {
         serde_json::json!({
             "version": self.version,
@@ -79,6 +104,7 @@ impl SavedRun {
             "budget": self.request.budget,
             "fingerprint": self.fingerprint,
             "stale": stale,
+            "resumable": self.resumable() && !stale,
         })
     }
 }
@@ -122,6 +148,30 @@ pub fn has_site_plan(doc: &Document, source: ObjectId) -> bool {
 /// Whether the plan changed since `run` (or is gone).
 pub fn is_stale(doc: &Document, source: ObjectId, run: &SavedRun) -> bool {
     plan_fingerprint(doc, source).as_deref() != Some(run.fingerprint.as_str())
+}
+
+/// The search to continue `run`, the saved run of `source` in `doc` (#226),
+/// and its state. Refused with [`RESUME_NONE`] when it finished or has no
+/// search, [`RESUME_OLD`] when its search is another build's, and
+/// [`RESUME_STALE`] when the plan changed since.
+pub fn prepare_resume(
+    doc: &Document,
+    source: ObjectId,
+    run: &SavedRun,
+) -> Result<(Prepared, SearchState), String> {
+    let state = match &run.search {
+        Some(s) if run.result.stopped_early => s,
+        _ => return Err(RESUME_NONE.into()),
+    };
+    if !state.is_current() {
+        return Err(RESUME_OLD.into());
+    }
+    let prepared =
+        site_optimize::prepare_doc(doc, &[source], &run.request).map_err(|_| RESUME_STALE)?;
+    if fingerprint(&prepared.site, &prepared.base, &prepared.edits) != run.fingerprint {
+        return Err(RESUME_STALE.into());
+    }
+    Ok((prepared, state.clone()))
 }
 
 /// The runs a file header holds, keyed by source id: unreadable entries (a
@@ -251,5 +301,85 @@ mod tests {
         bare.run(parse("rect 0,0,0 200 150").unwrap()).unwrap();
         let id = *bare.doc.all_ids().first().unwrap();
         assert!(!bare.set_optimize_run(id, run_of(&s, src)));
+    }
+
+    /// A run of `src` stopped after its first chunk of plans, with its search.
+    fn stopped_run(s: &Session, src: ObjectId) -> SavedRun {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let req = OptimizeRequest {
+            budget: 64,
+            objective: Objective::Lots,
+            ..OptimizeRequest::default()
+        };
+        let p = site_optimize::prepare_doc(&s.doc, &[src], &req).unwrap();
+        let stop = AtomicBool::new(false);
+        let watch = |_: &site_optimize::Progress| stop.store(true, Ordering::Relaxed);
+        let ctl = Control {
+            stop: Some(&stop),
+            progress: Some(&watch),
+            ..Control::default()
+        };
+        SavedRun::new(&p, p.run(ctl).unwrap(), 1.0)
+    }
+
+    /// #226: a stopped run keeps its search in the file, and continuing it
+    /// ends with the unbroken search's result.
+    #[test]
+    fn a_stopped_run_continues_from_the_file() {
+        let (mut s, src) = site();
+        let run = stopped_run(&s, src);
+        assert!(run.resumable());
+        s.set_optimize_run(src, run);
+        let back = io::from_json(&io::to_json(&s)).unwrap();
+        let b = back.optimize_run(src).unwrap();
+        assert_eq!(b.search, s.optimize_run(src).unwrap().search, "the search round-trips");
+        assert_eq!(b.to_json(false)["resumable"], true);
+        let (p, state) = prepare_resume(&back.doc, src, b).unwrap();
+        let done = p.resume(&state, Control::default()).unwrap();
+        assert_eq!(done.to_json(), p.run(Control::default()).unwrap().to_json());
+        let finished = SavedRun::new(&p, done, 2.0);
+        assert!(finished.search.is_none() && !finished.resumable());
+        assert_eq!(prepare_resume(&back.doc, src, &finished).unwrap_err(), RESUME_NONE);
+        let file = io::to_json(&s);
+        s.set_optimize_run(src, finished);
+        assert!(file.contains("\"search\""));
+        assert!(!io::to_json(&s).contains("\"search\""), "a finished run saves no search");
+    }
+
+    /// A search from another build loads the run but is refused, an
+    /// unreadable one loads the run without it, and a changed plan refuses.
+    #[test]
+    fn a_stale_or_old_search_is_refused() {
+        let (mut s, src) = site();
+        s.set_optimize_run(src, stopped_run(&s, src));
+        let mut v: serde_json::Value = serde_json::from_str(&io::to_json(&s)).unwrap();
+        let load = |v: &serde_json::Value| {
+            let back = io::from_json(&v.to_string()).unwrap();
+            let run = back.optimize_run(src).cloned().expect("the run still loads");
+            (prepare_resume(&back.doc, src, &run).map(|_| ()), run)
+        };
+        fn entry(v: &mut serde_json::Value) -> &mut serde_json::Value {
+            v["optimize_runs"].as_object_mut().unwrap().values_mut().next().unwrap()
+        }
+        entry(&mut v)["search"]["version"] = 0.into();
+        let (refused, run) = load(&v);
+        assert_eq!(refused.unwrap_err(), RESUME_OLD);
+        assert!(run.result.stopped_early && !run.resumable());
+        assert_eq!(run.to_json(false)["resumable"], false);
+        entry(&mut v)["search"] = serde_json::json!({"version": 9, "a": "newer shape"});
+        let (refused, run) = load(&v);
+        assert_eq!(refused.unwrap_err(), RESUME_NONE);
+        assert!(run.search.is_none() && run.result.stopped_early);
+
+        s.run(Command::LotSetParams {
+            source: src,
+            params: [("road_width".to_string(), "14".to_string())].into(),
+            ids: None,
+        })
+        .unwrap();
+        let run = s.optimize_run(src).unwrap();
+        assert!(run.resumable());
+        assert_eq!(run.to_json(true)["resumable"], false);
+        assert_eq!(prepare_resume(&s.doc, src, run).unwrap_err(), RESUME_STALE);
     }
 }

@@ -277,10 +277,37 @@ impl App {
                 let text = egui::RichText::new(t("optimize.run"))
                     .strong()
                     .color(ui.visuals().strong_text_color());
-                let run = egui::Button::new(text).fill(fill);
                 let other = self.optimize.running_source().is_some();
+                // A run stopped early that this build can continue (#226).
+                let resumable = !other
+                    && self.session.optimize_run(source).is_some_and(|r| {
+                        r.resumable() && !optimize_runs::is_stale(&self.session.doc, source, r)
+                    });
                 let mut start = false;
-                if crate::widgets::full_width_button(ui, crate::theme::Spacing::HIT_TARGET, run).clicked() {
+                let mut resume = false;
+                if resumable {
+                    ui.horizontal(|ui| {
+                        let gap = crate::theme::Spacing::S;
+                        ui.spacing_mut().item_spacing.x = gap;
+                        let size = egui::vec2(
+                            ((ui.available_width() - gap) / 2.0).max(0.0),
+                            crate::theme::Spacing::HIT_TARGET,
+                        );
+                        let text = egui::RichText::new(t("optimize.continue"))
+                            .strong()
+                            .color(ui.visuals().strong_text_color());
+                        let cont = egui::Button::new(text).fill(fill);
+                        resume = crate::widgets::sized_button(ui, size, cont).clicked();
+                        let new = egui::Button::new(t("optimize.new_run"));
+                        start = crate::widgets::sized_button(ui, size, new).clicked();
+                    });
+                } else if crate::widgets::full_width_button(
+                    ui,
+                    crate::theme::Spacing::HIT_TARGET,
+                    egui::Button::new(text).fill(fill),
+                )
+                .clicked()
+                {
                     // One search per document: another site's search runs,
                     // so ask before stopping it.
                     if other {
@@ -307,7 +334,10 @@ impl App {
                     ui.add_space(crate::theme::Spacing::XS);
                     ui.weak(t("optimize.other_running"));
                 }
-                if start {
+                if resume {
+                    let ctx = ui.ctx().clone();
+                    self.optimize.resume(&self.session, source, &ctx);
+                } else if start {
                     let ctx = ui.ctx().clone();
                     self.optimize.start(&self.session.doc, source, &ctx);
                 } else if self.optimize.cancelled == Some(source) {

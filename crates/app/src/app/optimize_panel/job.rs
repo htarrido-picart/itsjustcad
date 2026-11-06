@@ -10,6 +10,8 @@ pub(in crate::app) struct Job {
     /// The site plan searched.
     pub(super) source: ObjectId,
     pub(super) started: Instant,
+    /// The run time of the stopped run it continues (#226).
+    base_elapsed: f64,
     /// The form the search ran with (picks the shown columns).
     form: OptimizeForm,
     /// What the search plans, saved with its result.
@@ -115,11 +117,42 @@ impl OptimizePanel {
     /// Start a search of `source` off the UI thread (stopping any running
     /// one); repaints `ctx` when done.
     pub(super) fn start(&mut self, doc: &itsjustcad_doc::Document, source: ObjectId, ctx: &egui::Context) {
+        let prepared = site_optimize::prepare_doc(doc, &[source], &self.form.to_request());
+        self.launch(source, prepared.map(|p| (p, None, 0.0)), ctx);
+    }
+
+    /// Continue the saved run of `source` that stopped early (#226), with
+    /// its own request; a run that cannot be continued (the plan changed,
+    /// another build's search) shows why instead.
+    pub(super) fn resume(&mut self, session: &itsjustcad_commands::Session, source: ObjectId, ctx: &egui::Context) {
+        let prepared = session
+            .optimize_run(source)
+            .ok_or_else(|| site_optimize::RESUME_NONE.to_string())
+            .and_then(|run| {
+                let (p, state) = optimize_runs::prepare_resume(&session.doc, source, run)?;
+                Ok((p, Some(state), run.elapsed_s))
+            });
+        if let (Ok(_), Some(run)) = (&prepared, session.optimize_run(source))
+            && let Some(link) = session.doc.subdivision_links.get(&source)
+        {
+            self.form = OptimizeForm::from_request(&run.request, &link.settings);
+        }
+        self.launch(source, prepared, ctx);
+    }
+
+    /// Search `prepared` off the UI thread, or continue its stopped search
+    /// (stopping any running one); repaints `ctx` when done.
+    fn launch(
+        &mut self,
+        source: ObjectId,
+        prepared: Result<(site_optimize::Prepared, Option<site_optimize::SearchState>, f64), String>,
+        ctx: &egui::Context,
+    ) {
         self.cancel();
         self.confirm_stop = None;
         self.cancelled = None;
         self.error = None;
-        let prepared = match site_optimize::prepare_doc(doc, &[source], &self.form.to_request()) {
+        let (prepared, resume, base_elapsed) = match prepared {
             Ok(p) => p,
             Err(e) => {
                 self.error = Some((source, e));
@@ -130,6 +163,7 @@ impl OptimizePanel {
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(site_optimize::Progress {
             budget: prepared.req.budget,
+            evaluated: resume.as_ref().map_or(0, |s| s.evaluated()),
             ..Default::default()
         }));
         let ctx = ctx.clone();
@@ -147,12 +181,17 @@ impl OptimizePanel {
             };
             // A dropped job (cancelled) dropped `rx`; the send then fails
             // harmlessly.
-            let _ = tx.send(worker.run(ctl));
+            let out = match &resume {
+                Some(state) => worker.resume(state, ctl),
+                None => worker.run(ctl),
+            };
+            let _ = tx.send(out);
             ctx.request_repaint();
         });
         self.job = Some(Job {
             source,
             started: Instant::now(),
+            base_elapsed,
             form: self.form.clone(),
             prepared,
             rx,
@@ -203,7 +242,7 @@ impl OptimizePanel {
         let text = match got {
             Ok(r) => {
                 let n = r.candidates.len();
-                session.set_optimize_run(job.source, SavedRun::new(&job.prepared, r, elapsed));
+                session.set_optimize_run(job.source, SavedRun::new(&job.prepared, r, job.base_elapsed + elapsed));
                 format!("{} {n} {}", t("optimize.done"), t("optimize.plans"))
             }
             // A cancelled search shows nothing (the Run row says so).
@@ -272,6 +311,7 @@ impl OptimizePanel {
         self.job = Some(Job {
             source,
             started: Instant::now() - Duration::from_millis(3200),
+            base_elapsed: 0.0,
             form: self.form.clone(),
             prepared: site_optimize::prepare_doc(doc, &[source], &self.form.to_request()).unwrap(),
             rx,

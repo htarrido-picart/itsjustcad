@@ -34,6 +34,11 @@ use crate::lot::{self, SitePlanBake};
 pub use crate::site_metrics::{DaylightOpts, DaylightPeriod, DaylightSource, FacadeDaylight};
 use crate::site_metrics::facade_daylight;
 
+mod search;
+use search::{Batch, Outcome, SIGMA0, Summary, Tally, Trial};
+pub use search::{RESUME_NONE, RESUME_OLD, RESUME_STALE, SEARCH_STATE_VERSION, SearchState};
+pub(crate) use search::de_lenient;
+
 /// What to maximize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1016,6 +1021,10 @@ pub struct OptimizeResult {
     /// the best plans among those evaluated so far.
     #[serde(default)]
     pub stopped_early: bool,
+    /// A stopped search's state, to continue it (#226): saved with the run
+    /// ([`crate::optimize_runs::SavedRun::search`]), not with the result.
+    #[serde(skip)]
+    pub search: Option<Box<SearchState>>,
 }
 
 /// Which sun hours a search's daylight used: clear-sky geometry or the site's
@@ -1288,24 +1297,6 @@ fn latin_hypercube(n: usize, d: usize, rng: &mut Rng) -> Vec<Vec<f64>> {
     pts
 }
 
-#[derive(Clone)]
-struct Trial {
-    genome: Vec<f64>,
-    params: BTreeMap<String, String>,
-    eval: Result<Evaluation, String>,
-}
-
-impl Trial {
-    /// GA selection key, smaller = better: less infeasible first (0 =
-    /// feasible), then a higher score, then the [`TIE_BREAK`] metrics.
-    fn fitness(&self) -> (f64, [f64; 4]) {
-        match &self.eval {
-            Ok(e) => (e.infeasibility, sort_key(e)),
-            Err(_) => (f64::INFINITY, [0.0; 4]),
-        }
-    }
-}
-
 /// Metrics that order equal scores (higher first), so a lots objective prefers
 /// the layout with more net area, then more GFA, then more open space.
 const TIE_BREAK: [&str; 3] = ["net_area", "gfa", "open"];
@@ -1329,14 +1320,14 @@ fn cmp_keys(a: &[f64; 4], b: &[f64; 4]) -> std::cmp::Ordering {
 /// for every plan when nothing reserves it). Falls back to `open`.
 const PARETO_AXES: [&str; 4] = ["open", "net_area", "gfa", "lots"];
 
-fn pareto_axis(objective: Objective, evals: &[&Evaluation]) -> &'static str {
+fn pareto_axis(objective: Objective, sums: &[Summary]) -> &'static str {
     PARETO_AXES
         .into_iter()
         .filter(|k| *k != objective.token())
         .find(|k| {
-            let (lo, hi) = evals
+            let (lo, hi) = sums
                 .iter()
-                .map(|e| metric(&e.report, &e.ledger, &e.quantities, k))
+                .map(|s| s.metric(k))
                 .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
             hi - lo > 1e-6 * hi.abs().max(1.0)
         })
@@ -1471,11 +1462,38 @@ impl Control<'_> {
 }
 
 /// [`optimize_with`] under a [`Control`]: cancellable, reporting progress.
+/// A stopped result carries its [`OptimizeResult::search`] to continue it.
 pub fn optimize_ctl(
     site: &Polygon2d,
     base: &SubdivisionSettings,
     edits: &PlanEdits,
     req: &OptimizeRequest,
+    ctl: Control,
+) -> Result<OptimizeResult, String> {
+    run_search(site, base, edits, req, None, ctl)
+}
+
+/// Continue a stopped search (#226) of the same plan and request from its
+/// `state`: only the rest of the budget is spent, and the result is the one
+/// the search would have had unbroken. [`RESUME_OLD`] when `state` is from a
+/// build that searches differently, or does not match the plan and request.
+pub fn optimize_resume(
+    site: &Polygon2d,
+    base: &SubdivisionSettings,
+    edits: &PlanEdits,
+    req: &OptimizeRequest,
+    state: &SearchState,
+    ctl: Control,
+) -> Result<OptimizeResult, String> {
+    run_search(site, base, edits, req, Some(state), ctl)
+}
+
+fn run_search(
+    site: &Polygon2d,
+    base: &SubdivisionSettings,
+    edits: &PlanEdits,
+    req: &OptimizeRequest,
+    resume: Option<&SearchState>,
     ctl: Control,
 ) -> Result<OptimizeResult, String> {
     req.validate()?;
@@ -1508,8 +1526,15 @@ pub fn optimize_ctl(
     let d = dims.len();
     // Everything locked: one plan is all there is to evaluate.
     let budget = if d == 0 { 1 } else { req.budget };
-    let mut rng = Rng(req.seed);
+    let n_init = budget.div_ceil(2);
+    let lambda = ((budget - n_init) / 4).max(4);
     let daylight = req.location.filter(|_| req.wants_daylight());
+    // The most plans ranking lists, or measures daylight on.
+    let listed = req.top.max(1).max(match daylight {
+        None => 0,
+        Some(_) if req.min_daylight.is_some() || req.max_overheat.is_some() => DAYLIGHT_MAX_CHECKED,
+        Some(_) => DAYLIGHT_TOP_K,
+    });
     let opts = req.daylight_opts();
     let day = |p: &BTreeMap<String, String>| {
         let loc = daylight?;
@@ -1547,137 +1572,155 @@ pub fn optimize_ctl(
             .map(|_| &on_checkpoint as &(dyn Fn(OptimizeResult) + Sync)),
         ..ctl
     };
-    // A checkpoint during the search: rank the trials so far as a stop would
-    // (one daylight batch at most), quietly.
-    let snapshot = |trials: &[Trial]| {
+    // The params and evaluation of a genome's plan.
+    let plan_of = |genome: &[f64]| {
+        let mut params = decode(&dims, genome, base);
+        params.insert(
+            "floors_cap".into(),
+            req.max_stories.unwrap_or(0).to_string(),
+        );
+        params.extend(rule_params.clone());
+        let eval = settings_with(base, &params).and_then(|s| evaluate(site, &s, edits, req));
+        (params, eval)
+    };
+    // A listed plan's params and evaluation. A plan restored from a stopped
+    // search is planned again: evaluation is deterministic, so it is the
+    // same plan the search scored before the stop.
+    let realize = |t: Trial| match t.out {
+        Outcome::Eval(e) => Some((t.params, *e)),
+        Outcome::Saved { replay: true, .. } => {
+            let (params, eval) = plan_of(&t.genome);
+            eval.ok().map(|e| (params, e))
+        }
+        _ => None,
+    };
+    let realize = &realize as Realize;
+    let daylight_of = daylight.map(|_| &day as DaylightOf);
+    let capture = |tally: &Tally, batch: &Batch, todo: &[usize]| {
+        SearchState::capture(tally, &dims, budget, listed, batch, todo)
+    };
+    // A checkpoint during the search: rank the plans so far as a stop would
+    // (one daylight batch at most), quietly, with the search to continue.
+    let snapshot = |tally: &Tally, state: SearchState| {
         let stop = std::sync::atomic::AtomicBool::new(true);
         let quiet = Control {
             cancel: ctl.cancel,
             stop: Some(&stop),
             ..Control::default()
         };
-        let daylight = daylight.map(|_| &day as DaylightOf);
-        ctl.emit_checkpoint(rank(trials.to_vec(), req, daylight, quiet).ok());
+        let r = rank(tally.clone(), req, daylight_of, realize, quiet, Some(&state));
+        ctl.emit_checkpoint(r.ok().map(|r| r.with_search(Some(&state))));
     };
-    let eval_one =|genome: Vec<f64>| -> Trial {
-        let mut params = decode(&dims, &genome, base);
-                params.insert(
-                    "floors_cap".into(),
-                    req.max_stories.unwrap_or(0).to_string(),
-                );
-                params.extend(rule_params.clone());
-        // A cancelled or stopped search skips the rest of its chunk.
-        let eval = if ctl.halted() {
-            Err(CANCELLED.to_string())
-        } else {
-            settings_with(base, &params).and_then(|s| evaluate(site, &s, edits, req))
-        };
-        Trial {
-            genome,
-            params,
-            eval,
+    // A cancelled or stopped search skips the rest of its chunk (`None`).
+    let eval_one = |seq: usize, genome: &[f64]| -> Option<Trial> {
+        if ctl.halted() {
+            return None;
         }
+        let (params, eval) = plan_of(genome);
+        Some(Trial {
+            seq,
+            genome: genome.to_vec(),
+            params,
+            out: match eval {
+                Ok(e) => Outcome::Eval(Box::new(e)),
+                Err(e) => Outcome::Failed(e),
+            },
+        })
+    };
+    let (mut tally, mut batch, mut todo) = match resume {
+        Some(s) => s.restore(&dims, budget)?,
+        None => (
+            Tally::default(),
+            Batch {
+                start: 0,
+                len: n_init,
+                rng: req.seed,
+                sigma: SIGMA0,
+                parents: Vec::new(),
+            },
+            (0..n_init).collect(),
+        ),
     };
     let mut progress = Progress {
         budget,
+        evaluated: tally.evaluated,
+        feasible: tally.feasible,
+        best: tally.best,
         ..Progress::default()
     };
-    // Evaluate `genomes` in chunks onto `trials`, checking for a cancel and
-    // reporting progress after each. `Ok(true)` once stopped: the chunk's
-    // skipped plans are dropped, the evaluated ones kept.
-    let mut run = |trials: &mut Vec<Trial>, genomes: Vec<Vec<f64>>| -> Result<bool, String> {
-        let mut genomes = genomes.into_iter().peekable();
-        while genomes.peek().is_some() {
-            let chunk: Vec<Trial> = genomes
-                .by_ref()
-                .take(CHUNK)
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .map(&eval_one)
+    // Evaluate `todo` (offsets into `batch`, drawn as `genomes`) in chunks
+    // onto `tally`, checking for a cancel and reporting progress after each.
+    // `Some(left)` once stopped: the offsets left unevaluated.
+    let mut run = |tally: &mut Tally,
+                   batch: &Batch,
+                   genomes: &[Vec<f64>],
+                   todo: &[usize]|
+     -> Result<Option<Vec<usize>>, String> {
+        for (i, ids) in todo.chunks(CHUNK).enumerate() {
+            let chunk: Vec<(usize, Option<Trial>)> = ids
+                .par_iter()
+                .map(|&k| (k, eval_one(batch.start + k, &genomes[k])))
                 .collect();
             if ctl.cancelled() {
                 return Err(CANCELLED.into());
             }
-            let stopped = ctl.stopped();
-            let chunk: Vec<Trial> = if stopped {
-                chunk
-                    .into_iter()
-                    .filter(|t| !matches!(&t.eval, Err(e) if e == CANCELLED))
-                    .collect()
-            } else {
-                chunk
-            };
-            for t in &chunk {
-                if let Ok(e) = &t.eval
-                    && e.violations.is_empty()
-                {
-                    progress.feasible += 1;
-                    progress.best = Some(progress.best.map_or(e.score, |b| b.max(e.score)));
+            let mut left = Vec::new();
+            for (k, t) in chunk {
+                match t {
+                    Some(t) => tally.add(t),
+                    None => left.push(k),
                 }
             }
-            progress.evaluated += chunk.len();
-            trials.extend(chunk);
+            progress.evaluated = tally.evaluated;
+            progress.feasible = tally.feasible;
+            progress.best = tally.best;
             ctl.report(progress);
-            if stopped {
-                return Ok(true);
+            let rest = &todo[((i + 1) * CHUNK).min(todo.len())..];
+            if ctl.stopped() {
+                left.extend_from_slice(rest);
+                return Ok(Some(left));
             }
-            if progress.feasible > 0 && ctl.checkpoint_due() {
-                snapshot(trials);
+            if tally.feasible > 0 && ctl.checkpoint_due() {
+                snapshot(tally, capture(tally, batch, rest));
             }
         }
-        Ok(false)
+        Ok(None)
     };
 
-    let n_init = budget.div_ceil(2);
-    let mut trials = Vec::with_capacity(budget);
-    let mut stopped = run(&mut trials, latin_hypercube(n_init, d, &mut rng))?;
-    let (mu, lambda) = (8, ((budget - n_init) / 4).max(4));
-    let mut sigma = 0.2;
-    while !stopped && trials.len() < budget {
-        let mut order: Vec<usize> = (0..trials.len()).collect();
-        order.sort_by(|&a, &b| {
-            let (fa, fb) = (trials[a].fitness(), trials[b].fitness());
-            fa.0.total_cmp(&fb.0).then(cmp_keys(&fa.1, &fb.1)).then(a.cmp(&b))
-        });
-        let elite = &order[..mu.min(order.len())];
-        let children: Vec<Vec<f64>> = (0..lambda.min(budget - trials.len()))
-            .map(|_| {
-                let (a, b) = (
-                    &trials[elite[rng.below(elite.len())]].genome,
-                    &trials[elite[rng.below(elite.len())]].genome,
-                );
-                dims.iter()
-                    .enumerate()
-                    .map(|(i, dim)| {
-                        let g = if rng.unit() < 0.5 { a[i] } else { b[i] };
-                        if dim.is_discrete() {
-                            if rng.unit() < 0.2 { rng.unit() } else { g }
-                        } else {
-                            (g + sigma * rng.normal()).clamp(0.0, 0.999_999)
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-        stopped = run(&mut trials, children)?;
-        sigma *= 0.8;
-    }
-    if stopped && trials.is_empty() {
+    // The Latin hypercube, then (μ+λ) generations bred from the elite, until
+    // the budget is spent or a stop.
+    let stopped = loop {
+        let (genomes, rng) = batch.genomes(&dims);
+        if let Some(left) = run(&mut tally, &batch, &genomes, &todo)? {
+            break Some(capture(&tally, &batch, &left));
+        }
+        let drawn = batch.start + batch.len;
+        if drawn >= budget {
+            break None;
+        }
+        batch = batch.next(rng, lambda.min(budget - drawn), &tally.elite);
+        todo = (0..batch.len).collect();
+    };
+    let halted = stopped.is_some();
+    if halted && tally.evaluated == 0 {
         return Err(STOPPED_EMPTY.into());
     }
-
-    rank(trials, req, daylight.map(|_| &day as DaylightOf), ctl).map(|r| finish(r, stopped))
+    // A stop now, or in the daylight pass, keeps the search to continue it.
+    let state = stopped.or_else(|| daylight.map(|_| capture(&tally, &batch, &[])));
+    rank(tally, req, daylight_of, realize, ctl, state.as_ref()).map(|r| {
+        let r = if halted { r.with_search(state.as_ref()) } else { r };
+        finish(r, halted)
+    })
 }
 
 const NEEDS_LOCATION: &str = "siteoptimize: daylight needs a location — set one with \
                               `location <lat> <lon>` (or `sun …`) first";
 
-/// Rank the feasible trials (score, then [`TIE_BREAK`]), drop layouts whose
-/// yield duplicates a better one, and mark the (score, [`pareto_axis`]) Pareto
-/// front. With nothing feasible, name
-/// the constraint broken most often.
 /// Daylight of a candidate's params (re-plans it), for the top-K pass.
 type DaylightOf<'a> = &'a (dyn Fn(&BTreeMap<String, String>) -> Option<FacadeDaylight> + Sync);
+
+/// A listed plan's params and evaluation (`None`: it cannot be planned again).
+type Realize<'a> = &'a (dyn Fn(Trial) -> Option<(BTreeMap<String, String>, Evaluation)> + Sync);
 
 /// Store a facade daylight measure on `q`.
 pub fn set_daylight(q: &mut Quantities, d: Option<FacadeDaylight>) {
@@ -1687,39 +1730,30 @@ pub fn set_daylight(q: &mut Quantities, d: Option<FacadeDaylight>) {
     q.daylight_source = d.map(|d| d.source);
 }
 
+/// Rank the feasible plans (score, then [`TIE_BREAK`]), the best of each
+/// yield, and mark the (score, [`pareto_axis`]) Pareto front. With nothing
+/// feasible, name the constraint broken most often. A stop or a checkpoint
+/// in the daylight pass carries `state`, the search to continue (#226).
 fn rank(
-    trials: Vec<Trial>,
+    tally: Tally,
     req: &OptimizeRequest,
     daylight: Option<DaylightOf>,
+    realize: Realize,
     ctl: Control,
+    state: Option<&SearchState>,
 ) -> Result<OptimizeResult, String> {
-    let evaluated = trials.len();
-    let mut feasible: Vec<(usize, Trial)> = Vec::new();
-    let mut broken: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut first_err = None;
-    for (i, t) in trials.into_iter().enumerate() {
-        match &t.eval {
-            Ok(e) if e.violations.is_empty() => feasible.push((i, t)),
-            Ok(e) => e
-                .violations
-                .iter()
-                .for_each(|v| *broken.entry(v).or_default() += 1),
-            Err(err) => {
-                first_err.get_or_insert_with(|| err.clone());
-            }
-        }
-    }
-    let n_feasible = feasible.len();
+    let (evaluated, n_feasible) = (tally.evaluated, tally.feasible);
     let mut stopped_early = false;
-    if feasible.is_empty() {
-        let Some((name, n)) = broken
+    if n_feasible == 0 {
+        let Some((name, n)) = tally
+            .broken
             .iter()
             .max_by_key(|(_, n)| **n)
             .map(|(k, n)| (*k, *n))
         else {
             return Err(format!(
                 "siteoptimize: none of the {evaluated} candidates produced a site plan ({})",
-                first_err.unwrap_or_default()
+                tally.first_err.map(|(_, e)| e).unwrap_or_default()
             ));
         };
         let limit = match name {
@@ -1748,36 +1782,7 @@ fn rank(
         ));
     }
 
-    let eval = |t: &Trial| {
-        t.eval
-            .as_ref()
-            .ok()
-            .cloned()
-            .expect("feasible trials evaluated")
-    };
-    feasible.sort_by(|(ia, a), (ib, b)| {
-        cmp_keys(&sort_key(&eval(a)), &sort_key(&eval(b))).then(ia.cmp(ib))
-    });
-    let mut seen = std::collections::BTreeSet::new();
-    let mut unique: Vec<(BTreeMap<String, String>, Evaluation)> = feasible
-        .into_iter()
-        .filter_map(|(_, t)| {
-            let e = eval(&t);
-            let r = &e.report;
-            let key = (
-                r.lot_count,
-                r.total_lot_area.round() as i64,
-                r.total_gfa.round() as i64,
-                (r.open_space_ratio * 1e4).round() as i64,
-            );
-            seen.insert(key).then_some((t.params, e))
-        })
-        .collect();
-    // Daylight is costly (a re-plan and a ray-cast grid), so it is measured
-    // on the best candidates only, in batches of DAYLIGHT_TOP_K in rank order:
-    // as a weight, on one batch; as a constraint, until `top` layouts pass
-    // (it trades against profit, so the very best often fail) or
-    // DAYLIGHT_MAX_CHECKED were tried.
+    let mut unique = tally.ranked();
     if let Some(day) = daylight {
         let limit = if req.min_daylight.is_some() || req.max_overheat.is_some() {
             DAYLIGHT_MAX_CHECKED
@@ -1800,20 +1805,28 @@ fn rank(
                 stopped_early = true;
                 break;
             }
-            let batch: Vec<_> = rest.by_ref().take(DAYLIGHT_TOP_K).collect();
+            let batch: Vec<Trial> = rest.by_ref().take(DAYLIGHT_TOP_K).collect();
             if batch.is_empty() {
                 break;
             }
             ctl.report(progress);
             // A cancel skips the batch's not-yet-started ray casts.
-            let shares: Vec<Option<FacadeDaylight>> = batch
-                .par_iter()
-                .map(|(p, _)| if ctl.cancelled() { None } else { day(p) })
+            // A restored plan is planned again first ([`Realize`]).
+            let measured: Vec<_> = batch
+                .into_par_iter()
+                .map(|t| {
+                    if ctl.cancelled() {
+                        return None;
+                    }
+                    let (p, e) = realize(t)?;
+                    let d = day(&p);
+                    Some((p, e, d))
+                })
                 .collect();
             if ctl.cancelled() {
                 return Err(CANCELLED.into());
             }
-            for ((p, mut e), d) in batch.into_iter().zip(shares) {
+            for (p, mut e, d) in measured.into_iter().flatten() {
                 set_daylight(&mut e.quantities, d);
                 let d = e.quantities.daylight;
                 best = best.max(d.unwrap_or(0.0));
@@ -1844,7 +1857,9 @@ fn rank(
                     .collect();
                 if !ok.is_empty() {
                     ok.sort_by(|a, b| cmp_keys(&sort_key(&a.1), &sort_key(&b.1)));
-                    ctl.emit_checkpoint(Some(ranked(ok, req, evaluated, n_feasible, true)));
+                    let ok = ok.into_iter().map(|(p, e)| Trial::listed(p, e)).collect();
+                    let r = ranked(ok, req, evaluated, n_feasible, true, realize);
+                    ctl.emit_checkpoint(Some(r.with_search(state)));
                 }
             }
         }
@@ -1860,52 +1875,53 @@ fn rank(
             ));
         }
         checked.sort_by(|a, b| cmp_keys(&sort_key(&a.1), &sort_key(&b.1)));
-        unique = checked;
+        unique = checked.into_iter().map(|(p, e)| Trial::listed(p, e)).collect();
     }
-    Ok(ranked(unique, req, evaluated, n_feasible, stopped_early))
+    let r = ranked(unique, req, evaluated, n_feasible, stopped_early, realize);
+    Ok(if stopped_early { r.with_search(state) } else { r })
 }
 
 /// The result of the ranked, deduplicated layouts `unique`: their ranks, the
 /// Pareto front, and the top ones plus the front.
 fn ranked(
-    unique: Vec<(BTreeMap<String, String>, Evaluation)>,
+    unique: Vec<Trial>,
     req: &OptimizeRequest,
     evaluated: usize,
     n_feasible: usize,
     stopped_early: bool,
+    realize: Realize,
 ) -> OptimizeResult {
-    let unique: Vec<Candidate> = unique
-        .into_iter()
-        .enumerate()
-        .map(|(i, (params, eval))| Candidate {
-            rank: i + 1,
-            params,
-            eval,
-        })
+    let sums: Vec<Summary> = unique
+        .iter()
+        .map(|t| t.summary().expect("listed plans are evaluated"))
         .collect();
-    let axis = pareto_axis(
-        req.objective,
-        &unique.iter().map(|c| &c.eval).collect::<Vec<_>>(),
-    );
-    let dominated = |c: &Candidate| {
-        unique.iter().any(|o| {
-            let (s, os) = (c.eval.score, o.eval.score);
-            let (p, op) = (
-                metric(&c.eval.report, &c.eval.ledger, &c.eval.quantities, axis),
-                metric(&o.eval.report, &o.eval.ledger, &o.eval.quantities, axis),
-            );
-            // A better-ranked tie also dominates, so the front lists one per point.
-            os >= s && op >= p && (os > s || op > p || o.rank < c.rank)
+    let axis = pareto_axis(req.objective, &sums);
+    let dominated = |i: usize| {
+        let (s, p) = (sums[i].score(), sums[i].metric(axis));
+        sums.iter().enumerate().any(|(j, o)| {
+            let (os, op) = (o.score(), o.metric(axis));
+            // Equal on both: the better-ranked one stays on the front.
+            os >= s && op >= p && (os > s || op > p || j < i)
         })
     };
-    let pareto: Vec<usize> = unique
-        .iter()
-        .filter(|c| !dominated(c))
-        .map(|c| c.rank)
+    let pareto: Vec<usize> = (0..sums.len())
+        .filter(|&i| !dominated(i))
+        .map(|i| i + 1)
         .collect();
     let candidates = unique
         .into_iter()
-        .filter(|c| c.rank <= req.top.max(1) || pareto.contains(&c.rank))
+        .enumerate()
+        .filter(|(i, _)| *i < req.top.max(1) || pareto.contains(&(i + 1)))
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .filter_map(|(i, t)| {
+            let (params, eval) = realize(t)?;
+            Some(Candidate {
+                rank: i + 1,
+                params,
+                eval,
+            })
+        })
         .collect();
     OptimizeResult {
         objective: req.objective,
@@ -1917,10 +1933,18 @@ fn ranked(
         current: None,
         daylight: None,
         stopped_early,
+        search: None,
     }
 }
 
 impl OptimizeResult {
+    fn with_search(self, s: Option<&SearchState>) -> OptimizeResult {
+        OptimizeResult {
+            search: s.map(|s| Box::new(s.clone())),
+            ..self
+        }
+    }
+
     /// The candidate with `rank`, if listed.
     pub fn get(&self, rank: usize) -> Option<&Candidate> {
         self.candidates.iter().find(|c| c.rank == rank)
@@ -2101,6 +2125,11 @@ impl Prepared {
     /// Run the search under `ctl`.
     pub fn run(&self, ctl: Control) -> Result<OptimizeResult, String> {
         optimize_ctl(&self.site, &self.base, &self.edits, &self.req, ctl)
+    }
+
+    /// Continue the stopped search `state` under `ctl` ([`optimize_resume`]).
+    pub fn resume(&self, state: &SearchState, ctl: Control) -> Result<OptimizeResult, String> {
+        optimize_resume(&self.site, &self.base, &self.edits, &self.req, state, ctl)
     }
 }
 
@@ -2514,11 +2543,11 @@ mod tests {
             ledger: Ledger::default(),
         };
         let (a, b) = (y(10, 100.0, 0.0), y(12, 90.0, 0.0));
-        assert_eq!(pareto_axis(Objective::Lots, &[&a, &b]), "net_area");
-        assert_eq!(pareto_axis(Objective::NetArea, &[&a, &b]), "lots");
+        assert_eq!(pareto_axis(Objective::Lots, &[Summary::of(&a), Summary::of(&b)]), "net_area");
+        assert_eq!(pareto_axis(Objective::NetArea, &[Summary::of(&a), Summary::of(&b)]), "lots");
         let (c, d) = (y(10, 100.0, 0.1), y(12, 90.0, 0.2));
-        assert_eq!(pareto_axis(Objective::Lots, &[&c, &d]), "open");
-        assert_eq!(pareto_axis(Objective::Lots, &[&a]), "open", "nothing varies");
+        assert_eq!(pareto_axis(Objective::Lots, &[Summary::of(&c), Summary::of(&d)]), "open");
+        assert_eq!(pareto_axis(Objective::Lots, &[Summary::of(&a)]), "open", "nothing varies");
     }
 
     #[test]
@@ -3465,5 +3494,104 @@ mod tests {
             cp.current.as_ref().map(|c| c.score),
             full.current.as_ref().map(|c| c.score)
         );
+    }
+
+    /// Run `req` stopped once `at[0]` plans are evaluated, continue it from
+    /// its state (through JSON, as a saved run keeps it) stopping again at
+    /// each later `at`, then to the end. Returns the first stopped result and
+    /// the finished one.
+    fn stop_then_resume(
+        site: &Polygon2d,
+        base: &SubdivisionSettings,
+        req: &OptimizeRequest,
+        at: &[usize],
+    ) -> (OptimizeResult, OptimizeResult) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let saved = |r: &OptimizeResult| -> SearchState {
+            assert!(r.stopped_early);
+            let s = r.search.as_deref().expect("a stopped result carries its search");
+            serde_json::from_str(&serde_json::to_string(s).unwrap()).unwrap()
+        };
+        let edits = PlanEdits::default();
+        let mut runs: Vec<OptimizeResult> = Vec::new();
+        for (i, n) in at.iter().map(|&n| Some(n)).chain([None]).enumerate() {
+            let stop = AtomicBool::new(false);
+            let watch = |p: &Progress| {
+                if n.is_some_and(|n| p.evaluated >= n) {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            };
+            let ctl = Control {
+                stop: Some(&stop),
+                progress: Some(&watch),
+                ..Control::default()
+            };
+            let r = match runs.last() {
+                None => optimize_ctl(site, base, &edits, req, ctl),
+                Some(prev) => optimize_resume(site, base, &edits, req, &saved(prev), ctl),
+            };
+            let r = r.unwrap_or_else(|e| panic!("run {i}: {e}"));
+            runs.push(r);
+        }
+        let done = runs.pop().unwrap();
+        (runs.swap_remove(0), done)
+    }
+
+    /// #226 acceptance: a search stopped at N evaluations and continued to
+    /// its budget ranks exactly as the unbroken search with the same seed —
+    /// stopped in the Latin hypercube, in a generation, or several times.
+    #[test]
+    fn a_continued_search_ranks_as_the_unbroken_one() {
+        let site = rect(200.0, 150.0);
+        let base = SubdivisionSettings::default();
+        let req = req(120);
+        let full = optimize(&site, &base, &req).unwrap();
+        assert!(full.search.is_none(), "a finished search keeps no state");
+        for at in [&[2 * CHUNK][..], &[70], &[CHUNK, 64, 100]] {
+            let (stopped, done) = stop_then_resume(&site, &base, &req, at);
+            assert!(stopped.evaluated < req.budget, "{at:?}");
+            assert_eq!(done.to_json(), full.to_json(), "stopped at {at:?}");
+            assert!(!done.stopped_early && done.search.is_none());
+            assert_eq!(done.evaluated, req.budget, "only the rest of the budget");
+        }
+    }
+
+    /// The same with daylight measured on the best plans: the continued
+    /// search plans its restored best plans again to measure them.
+    #[test]
+    fn a_continued_daylight_search_ranks_as_the_unbroken_one() {
+        let site = rect(200.0, 150.0);
+        let base = SubdivisionSettings::walkable();
+        let req = OptimizeRequest {
+            location: Some(Location { lat_deg: 40.4, lon_deg: -3.7, tz_hours: 1.0 }),
+            min_daylight: Some(0.1),
+            ..req(40)
+        };
+        let full = optimize(&site, &base, &req).unwrap();
+        let (_, done) = stop_then_resume(&site, &base, &req, &[CHUNK]);
+        assert_eq!(done.to_json(), full.to_json());
+    }
+
+    /// A search state is a few KB, and one from another build, or for
+    /// another request, is refused.
+    #[test]
+    fn a_search_state_is_small_and_checked() {
+        let site = rect(200.0, 150.0);
+        let base = SubdivisionSettings::default();
+        let (stopped, _) = stop_then_resume(&site, &base, &req(120), &[70]);
+        let state = *stopped.search.clone().unwrap();
+        let text = serde_json::to_string(&state).unwrap();
+        eprintln!("search state: {} bytes", text.len());
+        assert!(text.len() < 32_000, "{} bytes", text.len());
+        let edits = PlanEdits::default();
+        let resume = |req: &OptimizeRequest, s: &SearchState| {
+            optimize_resume(&site, &base, &edits, req, s, Control::default())
+        };
+        let mut old = state.clone();
+        old.version = 0;
+        assert_eq!(resume(&req(120), &old).unwrap_err(), RESUME_OLD);
+        assert_eq!(resume(&req(200), &state).unwrap_err(), RESUME_OLD, "another budget");
+        let locked = OptimizeRequest { lock: vec!["seed".into()], ..req(120) };
+        assert_eq!(resume(&locked, &state).unwrap_err(), RESUME_OLD, "other dims");
     }
 }

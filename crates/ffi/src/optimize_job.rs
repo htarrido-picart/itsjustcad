@@ -20,6 +20,8 @@
 //! - [`ijc_site_optimize_checkpoint`] saves the best plans so far as the site
 //!   plan's latest run without stopping (#219: the app is going to the
 //!   background and may be killed there).
+//! - [`ijc_site_optimize_resume`] continues the site plan's saved run that
+//!   stopped early (#226) as a new job, spending only the rest of its budget.
 //! - [`ijc_site_optimize_result`] takes the finished result (the same JSON as
 //!   `ijc_site_optimize_json`, plus `"saved"`, or `{"error"}`; a cancelled
 //!   job's error is `"siteoptimize: cancelled"`) and forgets the job. A
@@ -38,7 +40,7 @@ use std::time::Instant;
 
 use itsjustcad_commands::optimize_runs::{self, SavedRun};
 use itsjustcad_commands::site_optimize::{
-    self, Control, OptimizeRequest, OptimizeResult, Prepared, Progress,
+    self, Control, OptimizeRequest, OptimizeResult, Prepared, Progress, SearchState,
 };
 use serde_json::{Value, json};
 
@@ -55,6 +57,9 @@ pub(crate) struct Job {
     /// Save the plans found so far and keep going (#219).
     checkpoint: AtomicBool,
     started: Instant,
+    /// The run time of the stopped run it continues (#226), added to what
+    /// its saved runs record.
+    base_elapsed: f64,
     /// What the search plans (saved with its result); `None` when it failed
     /// to start.
     prepared: Option<Prepared>,
@@ -123,7 +128,7 @@ impl Job {
             return;
         }
         let prior = app.session.optimize_run(p.source).cloned();
-        let run = SavedRun::new(p, r, elapsed);
+        let run = SavedRun::new(p, r, self.base_elapsed + elapsed);
         let at = run.finished_at;
         if app.session.set_optimize_run(p.source, run) {
             st.prior.get_or_insert(prior);
@@ -205,38 +210,90 @@ pub unsafe extern "C" fn ijc_site_optimize_start(
                 object_by_short_id(doc, source).ok_or_else(|| format!("no object '{source}'"))?;
             site_optimize::prepare_doc(doc, &[id], &request)
         })();
-        let job = Arc::new(Job {
-            cancel: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
-            checkpoint: AtomicBool::new(false),
-            started: Instant::now(),
-            prepared: prepared.as_ref().ok().cloned(),
-            state: Default::default(),
-        });
-        let id = jobs(app).insert(job.clone());
-        match prepared {
-            Err(e) => job.finish(Err(e)),
-            Ok(p) => {
-                itsjustcad_commands::qos::spawn_utility(move || {
-                    let report = |pr: &Progress| {
-                        job.state().progress = *pr;
-                    };
-                    let keep = |r: OptimizeResult| {
-                        job.state().checkpoint = Some((r, job.started.elapsed().as_secs_f64()));
-                    };
-                    let ctl = Control {
-                        cancel: Some(&job.cancel),
-                        stop: Some(&job.stop),
-                        progress: Some(&report),
-                        checkpoint: Some(&job.checkpoint),
-                        on_checkpoint: Some(&keep),
-                    };
-                    let out = run_guarded("siteoptimize: the search failed", || p.run(ctl));
-                    job.finish(out);
+        launch(app, prepared.map(|p| (p, None, 0.0)))
+    })
+}
+
+/// Start a job searching `prepared`, or continuing its stopped search;
+/// already failed with the message on `Err`.
+fn launch(app: &AppHandle, prepared: Result<(Prepared, Option<SearchState>, f64), String>) -> u64 {
+    let base_elapsed = prepared.as_ref().map_or(0.0, |(_, _, e)| *e);
+    let job = Arc::new(Job {
+        cancel: AtomicBool::new(false),
+        stop: AtomicBool::new(false),
+        checkpoint: AtomicBool::new(false),
+        started: Instant::now(),
+        base_elapsed,
+        prepared: prepared.as_ref().ok().map(|(p, _, _)| p.clone()),
+        state: Default::default(),
+    });
+    let id = jobs(app).insert(job.clone());
+    match prepared {
+        Err(e) => job.finish(Err(e)),
+        Ok((p, resume, _)) => {
+            itsjustcad_commands::qos::spawn_utility(move || {
+                let report = |pr: &Progress| {
+                    job.state().progress = *pr;
+                };
+                let keep = |r: OptimizeResult| {
+                    job.state().checkpoint = Some((r, job.started.elapsed().as_secs_f64()));
+                };
+                let ctl = Control {
+                    cancel: Some(&job.cancel),
+                    stop: Some(&job.stop),
+                    progress: Some(&report),
+                    checkpoint: Some(&job.checkpoint),
+                    on_checkpoint: Some(&keep),
+                };
+                let out = run_guarded("siteoptimize: the search failed", || match &resume {
+                    Some(state) => p.resume(state, ctl),
+                    None => p.run(ctl),
                 });
-            }
+                job.finish(out);
+            });
         }
-        id
+    }
+    id
+}
+
+/// Continue the saved run of the site plan on `source` (short id) that
+/// stopped early (#226: a checkpoint reopened after the app was killed, or a
+/// stop) as a new job, like [`ijc_site_optimize_start`] with the run's
+/// request: it picks the search up where it stopped and spends only the
+/// rest of the budget, and its result is the one the search would have had
+/// unbroken (`"stopped_early":false`), saved over the stopped run (whose
+/// `elapsed_s` it adds to). Show Continue when the saved run reads
+/// `"resumable":true` ([`ijc_site_optimize_saved_json`]).
+///
+/// A run that cannot be continued still returns a job, already failed with
+/// the reason: the plan changed since the run (`siteoptimize: the plan
+/// changed since this run…`), a run saved by another build, a finished run
+/// or none (`siteoptimize: this run cannot be continued…`); offer a new run.
+/// A cancel leaves the stopped run saved, still resumable. Returns 0 only for
+/// a null/invalid handle.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`super::ijc_init`]; `source` must
+/// be null or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_site_optimize_resume(h: *mut AppHandle, source: *const c_char) -> u64 {
+    guard_ffi(0, || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return 0;
+        };
+        let prepared = (|| {
+            let source = unsafe { c_arg(source, "source") }?;
+            let doc = &app.session.doc;
+            let id =
+                object_by_short_id(doc, source).ok_or_else(|| format!("no object '{source}'"))?;
+            let run = app
+                .session
+                .optimize_run(id)
+                .ok_or(site_optimize::RESUME_NONE)?;
+            let (p, state) = optimize_runs::prepare_resume(doc, id, run)?;
+            Ok((p, Some(state), run.elapsed_s))
+        })();
+        launch(app, prepared)
     })
 }
 
@@ -373,7 +430,7 @@ pub unsafe extern "C" fn ijc_site_optimize_result(h: *mut AppHandle, job_id: u64
                 let mut v = r.to_json();
                 let saved = app
                     .session
-                    .set_optimize_run(p.source, SavedRun::new(p, r, elapsed));
+                    .set_optimize_run(p.source, SavedRun::new(p, r, j.base_elapsed + elapsed));
                 v["saved"] = saved.into();
                 v
             }
@@ -395,12 +452,14 @@ pub unsafe extern "C" fn ijc_site_optimize_result(h: *mut AppHandle, job_id: u64
 /// "result":{the ijc_site_optimize_json result, with "stopped_early"},
 /// "stopped_early":bool,"finished_at":unix seconds,"elapsed_s":seconds,
 /// "evaluated":n,"feasible":n,"budget":n,"fingerprint":"16 hex digits",
-/// "stale":bool}`
+/// "stale":bool,"resumable":bool}`
 ///
 /// `stale` is true when the plan (boundary, settings or hand edits) changed
 /// since the run: show "Plan changed since this run"; Apply
 /// ([`super::ijc_site_optimize_apply`] with a row's `params`) still works.
-/// Free with [`super::ijc_string_free`].
+/// `resumable` is true for a run stopped early that
+/// [`ijc_site_optimize_resume`] can continue (its search saved by this
+/// build, the plan unchanged): show Continue and New Run. Free with [`super::ijc_string_free`].
 ///
 /// # Safety
 /// `h` must be null or a live handle from [`super::ijc_init`]; `source` must
