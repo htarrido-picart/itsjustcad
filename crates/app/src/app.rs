@@ -5,6 +5,7 @@ mod focus_inspector;
 mod cut_export;
 mod optimize_panel;
 mod geocode_ui;
+mod osmfetch_ui;
 
 use itsjustcad_commands::Session;
 use itsjustcad_commands::lot::hierarchy::LevelKind;
@@ -899,6 +900,11 @@ pub struct App {
     /// The session's host geocoder (Nominatim) for `geocode`, typed, Deck or
     /// field (#215); re-installed on every new or opened session.
     geo_hook: std::sync::Arc<crate::geocode::Nominatim>,
+    /// The session's Overpass fetcher for `osmfetch` (#343), typed or Deck;
+    /// re-installed on every new or opened session.
+    osm_hook: std::sync::Arc<crate::osmfetch::Overpass>,
+    /// A typed `osmfetch` whose request is in flight off the UI thread.
+    osm_pending: Option<(String, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     /// Background undo-history rebuild after a fast open (#224).
     history_rebuild: crate::history_rebuild::HistoryRebuild,
     /// Auto-recompute: per-source signature of the last-observed source block
@@ -1623,6 +1629,8 @@ impl App {
             optimize: Default::default(),
             geocode: Default::default(),
             geo_hook: std::sync::Arc::new(crate::geocode::Nominatim::desktop()),
+            osm_hook: std::sync::Arc::new(crate::osmfetch::Overpass::desktop()),
+            osm_pending: None,
             history_rebuild: Default::default(),
             subdiv_sig_cache: std::collections::HashMap::new(),
             subdiv_stale_roads: std::collections::HashSet::new(),
@@ -2541,6 +2549,11 @@ impl App {
             // request: one lookup, after the first-use privacy notice. The
             // result is logged as a numeric `location` op.
             Some("geocode") => self.geocode_typed(line),
+            // OpenStreetMap context around the site (#343): the core
+            // `osmfetch` command, fetched off the UI thread first. Opt-in
+            // network at the user's request: one Overpass request with the
+            // site coordinates; the generated geometry is logged.
+            Some("osmfetch") => self.osmfetch_typed(line),
             // AI diffusion render of the current view. Opt-in network: only the
             // user-configured backend in render_decks.json is ever reached, and
             // only at this explicit request. Ships with NO backend active.
@@ -11469,6 +11482,7 @@ impl eframe::App for App {
         self.optimize.poll(&mut self.session);
         self.optimize_notice(ui.ctx());
         self.geocode_frame(ui.ctx());
+        self.osmfetch_frame(ui.ctx());
         // A refused undo past a fast-open boundary rebuilds its history off
         // the UI thread (#224); install it when done.
         let (line, running) = self.history_rebuild.poll(&mut self.session);
@@ -13189,6 +13203,51 @@ mod tests {
 
     const MOUNTAIN_VIEW: &[u8] = br#"[{"lat":"37.4224857","lon":"-122.0855846","display_name":"Google Building 41, 1600, Amphitheatre Parkway, Mountain View, California, United States"}]"#;
     const SAN_JOSE: &[u8] = br#"[{"lat":"37.3362","lon":"-121.8906","display_name":"San Jose, California, United States"},{"lat":"9.9325","lon":"-84.0796","display_name":"San Jose, Costa Rica"}]"#;
+
+    /// A typed `osmfetch` (#343) is fetched off the UI thread, then runs as
+    /// the core command: one request, one logged op, one undo step.
+    #[test]
+    fn journey_osmfetch_adds_context_off_the_ui_thread_and_undo_removes_it() {
+        const TREE: &[u8] = br#"{"elements":[{"type":"node","id":1,"lat":37.4225,"lon":-122.0856,"tags":{"natural":"tree"}}]}"#;
+        run_app_journey(|h| {
+            let app = h.state_mut();
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let c = calls.clone();
+            app.set_osm_fetcher(std::sync::Arc::new(crate::osmfetch::Overpass::new(
+                || "https://overpass.test/api/interpreter".into(),
+                move |_: &str| {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(TREE.to_vec())
+                },
+            )));
+            app.execute_line("osmfetch".into());
+            let last = transcript(app).last().cloned().unwrap_or_default();
+            assert!(last.contains("geocode \"<address>\""), "no location: {last}");
+            assert_eq!(geo_calls(&calls), 0, "nothing sent without a location");
+
+            app.execute_line("location 37.4224857 -122.0855846 -7".into());
+            app.execute_line("osmfetch 200".into());
+            assert!(app.osmfetch_busy(), "fetched off the UI thread");
+            for _ in 0..200 {
+                h.run_steps(1);
+                if !h.state().osmfetch_busy() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let app = h.state_mut();
+            assert!(!app.osmfetch_busy());
+            assert_eq!(geo_calls(&calls), 1, "one request per command");
+            let out = transcript(app).last().cloned().unwrap();
+            assert!(out.contains("1 tree(s) on 'context-trees'") && out.contains("OpenStreetMap"), "{out}");
+            assert!(matches!(
+                app.session.save_log().last(),
+                Some(itsjustcad_commands::Command::OsmContext { .. })
+            ));
+            app.execute_line("undo".into());
+            assert_eq!(app.session.doc.len(), 0, "one undo step removes the context");
+        });
+    }
 
     /// A typed `geocode` is the core command: the privacy gate first, then
     /// one request off the UI thread, the logged `location`, one undo step.

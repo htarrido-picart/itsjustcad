@@ -1146,6 +1146,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Tools,
         },
         CommandSpec {
+            name: "osmfetch",
+            usage: "osmfetch [radius_m]",
+            summary: "Pull OpenStreetMap context around the site location (default radius 400 m, about four city blocks; max 1000 m) from the Overpass API into the scene: buildings extruded like osmfile (height, else building:levels x 3 m, else 9 m) on 'context', road centrelines on 'context-roads', water on 'context-water', parks and green areas on 'context-green', trees as points on 'context-trees'; draped onto the terrain when there is one. Needs network: sends the site coordinates to the configured Overpass endpoint, one request per command. Needs a location (`geocode \"<address>\"` or `location <lat> <lon>`). Only the generated geometry is logged, so files reopen offline; one undo step. Data © OpenStreetMap contributors, ODbL. Example: osmfetch 400",
+            category: Category::Tools,
+        },
+        CommandSpec {
             name: "distance",
             usage: "distance <a x,y,z> <b x,y,z>",
             summary: "Measure the distance between two points (query only, nothing is created). Example: distance 0,0,0 3,4,0",

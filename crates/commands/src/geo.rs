@@ -50,7 +50,7 @@ impl GeoOrigin {
 }
 
 /// Map one raw GeoJSON `[x, y]` coordinate to local meters using the heuristic.
-fn to_local(coord: [f64; 2], origin: Option<GeoOrigin>) -> DVec2 {
+pub(crate) fn to_local(coord: [f64; 2], origin: Option<GeoOrigin>) -> DVec2 {
     match origin {
         Some(o) if coord[0].abs() <= 180.0 && coord[1].abs() <= 90.0 => {
             o.project(coord[0], coord[1])
@@ -182,7 +182,7 @@ fn push_geometry(
 /// A ring from GeoJSON repeats its first vertex at the end; drop the duplicate
 /// so it matches our unrepeated-first-point convention. Returns `None` for
 /// rings with fewer than 3 distinct points.
-fn close_ring(mut ring: Vec<DVec2>) -> Option<Vec<DVec2>> {
+pub(crate) fn close_ring(mut ring: Vec<DVec2>) -> Option<Vec<DVec2>> {
     if ring.len() >= 2 && ring.first() == ring.last() {
         ring.pop();
     }
@@ -391,7 +391,7 @@ pub fn parse_overpass(bytes: &[u8], origin: Option<GeoOrigin>) -> Result<Vec<Bui
     Ok(out)
 }
 
-fn building_height(tags: Option<&serde_json::Value>) -> f64 {
+pub(crate) fn building_height(tags: Option<&serde_json::Value>) -> f64 {
     let Some(tags) = tags else {
         return DEFAULT_BUILDING_HEIGHT_M;
     };

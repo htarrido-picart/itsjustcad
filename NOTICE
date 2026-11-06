@@ -32,3 +32,10 @@ https://opendatacommons.org/licenses/odbl/). It is used to find a site's
 UTC offset offline (`geocode`). Address search results come from
 OpenStreetMap Nominatim, © OpenStreetMap contributors, ODbL 1.0. The iOS /
 Mac FFI build does not include this data.
+
+Site context from `osmfetch` (buildings, roads, water, green areas and trees
+on the `context*` layers) comes from OpenStreetMap through the Overpass API:
+© OpenStreetMap contributors, ODbL 1.0. A document holds the geometry derived
+from it (a Produced Work; the derived database is the `osm_context` op).
+Credit "© OpenStreetMap contributors" wherever drawings, renders or exports
+show these layers.

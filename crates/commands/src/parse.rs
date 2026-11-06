@@ -1647,6 +1647,11 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
             let [path] = take::<1>("osmfile", "an Overpass .json path", &args)?;
             Ok(Command::OsmFile { path: path.to_string() })
         }
+        "osmfetch" => match args.as_slice() {
+            [] => Ok(Command::OsmFetch { radius_m: None }),
+            [r] => Ok(Command::OsmFetch { radius_m: Some(number(r)?) }),
+            _ => wrong("osmfetch", "an optional radius in metres", &args),
+        },
         "contours" => match args.as_slice() {
             [interval] => Ok(Command::Contours {
                 interval: number(interval)?,

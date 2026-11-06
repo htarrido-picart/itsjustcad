@@ -38,6 +38,7 @@
 mod boxsel;
 pub mod cameras;
 pub mod geocoder;
+pub mod osmfetcher;
 pub mod guided;
 pub mod history_job;
 mod job;
@@ -324,6 +325,10 @@ pub struct AppHandle {
     /// The host geocoder for `geocode` ([`geocoder::ijc_set_geocoder`],
     /// #215), re-installed on every new session.
     geocoder: Option<Arc<geocoder::HostGeocoder>>,
+    /// The host Overpass fetcher for `osmfetch`
+    /// ([`osmfetcher::ijc_set_osm_fetcher`], #343), re-installed on every
+    /// new session.
+    osm_fetcher: Option<Arc<osmfetcher::HostOsmFetcher>>,
 }
 
 /// The wgpu device, the `CAMetalLayer` surface and its swapchain config, and the
@@ -497,13 +502,17 @@ fn side_effect_refusal(cmd: &Command) -> String {
 }
 
 /// The side-effect gate shared by every host/model command path: `Some(reason)`
-/// when `op` is a fs/net command that must be refused. The ONE exception is
+/// when `op` is a fs/net command that must be refused. The exceptions are
 /// `underlay`/`trace` of a file that resolves INSIDE the user-granted workdir
-/// (canonicalized, traversal- and symlink-guarded).
+/// (canonicalized, traversal- and symlink-guarded), and `osmfetch` (#343): the
+/// core sends nothing itself, only the host's own fetcher
+/// ([`osmfetcher::ijc_set_osm_fetcher`]) does, so the app decides (and may
+/// confirm) before any request leaves the device.
 fn gate_refusal(op: &PendingOp) -> Option<String> {
     match op {
         PendingOp::Cmd(cmd)
             if cmd.is_side_effecting()
+                && !matches!(cmd, Command::OsmFetch { .. })
                 && !itsjustcad_commands::workdir::allows_underlay(cmd)
                 && !itsjustcad_commands::workdir::allows_trace(cmd) =>
         {
@@ -848,6 +857,7 @@ fn new_handle(gpu: Option<Gpu>) -> *mut AppHandle {
         pending: Arc::new(Mutex::new(Vec::new())),
         history: Arc::new(Mutex::new(Vec::new())),
         geocoder: None,
+        osm_fetcher: None,
     };
     Box::into_raw(Box::new(handle))
 }
@@ -1084,6 +1094,7 @@ fn install_session(app: &mut AppHandle, mut session: Session) {
     optimize_job::cancel_all(app);
     app.session = session;
     geocoder::install(app);
+    osmfetcher::install(app);
     app.guided = Default::default();
     if let Ok(mut hist) = app.history.lock() {
         hist.clear();
@@ -1132,6 +1143,7 @@ pub unsafe extern "C" fn ijc_new_document(h: *mut AppHandle) {
         optimize_job::cancel_all(&mut app);
         app.session = Session::default();
         geocoder::install(&mut app);
+        osmfetcher::install(&mut app);
         app.guided = Default::default();
         if let Ok(mut hist) = app.history.lock() {
             hist.clear();
