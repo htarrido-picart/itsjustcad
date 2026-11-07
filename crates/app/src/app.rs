@@ -13283,6 +13283,40 @@ mod tests {
         });
     }
 
+    /// While a typed `osmfetch` is in flight the progress box stays up; its
+    /// Cancel drops the request and the late answer changes nothing.
+    #[test]
+    fn journey_osmfetch_progress_cancel_changes_nothing() {
+        const TREE: &[u8] = br#"{"elements":[{"type":"node","id":1,"lat":37.4225,"lon":-122.0856,"tags":{"natural":"tree"}}]}"#;
+        run_app_journey(|h| {
+            let app = h.state_mut();
+            let (release, gate) = std::sync::mpsc::channel::<()>();
+            let gate = std::sync::Mutex::new(gate);
+            app.set_osm_fetcher(std::sync::Arc::new(crate::osmfetch::Overpass::new(
+                || "https://overpass.test/api/interpreter".into(),
+                move |_: &str| {
+                    gate.lock().unwrap().recv().ok();
+                    Ok(TREE.to_vec())
+                },
+            )));
+            app.execute_line("location 37.4224857 -122.0855846 -7".into());
+            let log_len = app.session.save_log().len();
+            app.execute_line("osmfetch 200".into());
+            app.osmfetch_decide(true);
+            h.run_steps(3);
+            let app = h.state_mut();
+            assert!(app.osmfetch_busy(), "still fetching: the progress box is up");
+            app.osmfetch_cancel_pending();
+            assert!(!app.osmfetch_busy());
+            assert_eq!(transcript(app).last().unwrap(), "osmfetch: cancelled; nothing changed");
+            release.send(()).unwrap();
+            h.run_steps(3);
+            let app = h.state_mut();
+            assert_eq!(app.session.save_log().len(), log_len, "the late answer logs nothing");
+            assert_eq!(app.session.doc.len(), 0);
+        });
+    }
+
     /// A typed `geocode` is the core command: the privacy gate first, then
     /// one request off the UI thread, the logged `location`, one undo step.
     #[test]

@@ -100,10 +100,58 @@ impl App {
         let Some((_, done)) = &self.osm_pending else { return };
         if !done.load(Ordering::Acquire) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            self.osmfetch_progress_ui(ctx);
             return;
         }
         let (line, _) = self.osm_pending.take().expect("pending");
         self.command_line.execute(&mut self.session, &line);
+    }
+
+    /// Drop the in-flight typed request: its late answer only reaches the
+    /// hook's cache, never the document.
+    pub(in crate::app) fn osmfetch_cancel_pending(&mut self) {
+        if self.osm_pending.take().is_some() {
+            self.command_line.push_line("osmfetch: cancelled; nothing changed");
+        }
+    }
+
+    /// While the request is in flight: a busy indicator and Cancel, so the
+    /// box stays up until the context lands.
+    fn osmfetch_progress_ui(&mut self, ctx: &egui::Context) {
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let roles = self.live_roles(dark);
+        let reduce_motion = self.reduce_motion;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("itsjustcad_osmfetch_progress"))
+            .frame(crate::widgets::dialog_modal_frame(&roles))
+            .show(ctx, |ui| {
+                crate::widgets::dialog_body(ui, &roles, 420.0, |ui| {
+                    crate::widgets::dialog_title(ui, &roles, t("osmfetch.approve.title"));
+                    ui.add_space(crate::theme::Spacing::SM);
+                    ui.horizontal(|ui| {
+                        if reduce_motion {
+                            ui.label("●");
+                        } else {
+                            ui.spinner();
+                        }
+                        crate::widgets::dialog_text(ui, &roles, t("osmfetch.fetching"));
+                    });
+                    ui.add_space(crate::theme::Spacing::L);
+                    ui.horizontal(|ui| {
+                        cancel = crate::widgets::role_button(
+                            ui,
+                            &roles,
+                            dark,
+                            crate::widgets::ButtonRole::Normal,
+                            t("geocode.cancel"),
+                        )
+                        .clicked();
+                    });
+                });
+            });
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.osmfetch_cancel_pending();
+        }
     }
 
     /// The approval step: what is sent and where; the privacy notice too
