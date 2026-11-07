@@ -96,6 +96,9 @@ pub enum OsmError {
     /// The host started an asynchronous fetch (iOS): run the command again
     /// once it has answered. The message says so.
     Pending(String),
+    /// The host's approval gate held the request back (#348): the user has
+    /// not approved this request, so nothing was sent.
+    NotApproved,
 }
 
 impl std::fmt::Display for OsmError {
@@ -117,6 +120,9 @@ impl std::fmt::Display for OsmError {
                 "osmfetch: the Overpass API is busy ({e}); wait a minute and run the command again; nothing added"
             ),
             Self::Pending(m) => f.write_str(m),
+            Self::NotApproved => f.write_str(
+                "osmfetch: nothing was sent: the request needs your approval first; nothing added",
+            ),
         }
     }
 }
