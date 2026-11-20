@@ -6,7 +6,7 @@
 //! A [`ViewStyle`] carries the display mode, colour mode, lighting, profile
 //! and mesh edges, the sketchy character, the edge style (#361), the fog
 //! (#363), ambient occlusion (#358), sun shadows (#357), the section
-//! display (#359), the grid/axes
+//! display (#359), the material textures (#360), the grid/axes
 //! overlays and the background
 //! gradient. Missing keys
 //! take the defaults, which are today's look, so a style saved by an older
@@ -50,6 +50,9 @@ pub struct ViewStyle {
     pub sections: SectionStyle,
     pub grid: bool,
     pub axes: bool,
+    /// Material textures (#360, SketchUp's Shaded with Textures); on when a
+    /// style saved before them loads.
+    pub textures: bool,
     /// Sky/ground gradient behind the scene. `None` follows
     /// [`Self::profiles`], the coupling the `massing` preset has always had.
     pub gradient: Option<bool>,
@@ -73,6 +76,7 @@ impl Default for ViewStyle {
             sections: SectionStyle::default(),
             grid: true,
             axes: true,
+            textures: true,
             gradient: None,
         }
     }
@@ -210,6 +214,10 @@ mod tests {
         assert_eq!(partial.sections, SectionStyle::default());
         let with_sec: ViewStyle = serde_json::from_str(r#"{"sections":{"fill":false}}"#).unwrap();
         assert_eq!(with_sec.sections, SectionStyle { fill: false, ..SectionStyle::default() });
+        // Textures (#360): on by default and when missing.
+        assert!(d.textures && partial.textures);
+        let off: ViewStyle = serde_json::from_str(r#"{"textures":false}"#).unwrap();
+        assert_eq!(off, ViewStyle { textures: false, ..d });
     }
 
     #[test]

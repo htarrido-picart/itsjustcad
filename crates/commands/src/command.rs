@@ -1235,6 +1235,18 @@ pub enum Command {
     Material2 {
         targets: Selector,
         material: itsjustcad_doc::ObjectMaterial,
+        /// The texture image (#360), carried only by the op that first adds
+        /// it to the document's image store, so the file replays offline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<itsjustcad_doc::StoredImage>,
+    },
+    /// `material2 <sel> texture <file> [size <w> <h>]` (#360): read a PNG or
+    /// JPEG and run the logged [`Command::Material2`] that stores it and
+    /// textures the targets, one tile every `size` metres. Never logged.
+    Material2Texture {
+        targets: Selector,
+        path: String,
+        size: [f32; 2],
     },
     /// Clear a per-object appearance material (reverts to the flat color path).
     Material2Off {
@@ -2980,6 +2992,7 @@ impl Command {
                 | Command::Export { .. }
                 | Command::ControlImages { .. }
                 | Command::Import { .. }
+                | Command::Material2Texture { .. }
                 // The lookup is not logged; the `location` op it applies is.
                 | Command::Geocode { .. }
                 // trace expands into logged Layer/Polyline ops; it is not
@@ -3052,6 +3065,7 @@ impl Command {
                 | Command::BlockLibSave { .. }
                 // fs reads (can be probed to exfiltrate / DoS)
                 | Command::Import { .. }
+                | Command::Material2Texture { .. }
                 // xref attach/reload read an external drawing file
                 | Command::XrefAttach { .. }
                 | Command::XrefReload { .. }
@@ -3097,6 +3111,7 @@ impl Command {
             self,
             // Imports a drawing / mesh / data file into the document.
             Command::Import { .. }
+                | Command::Material2Texture { .. }
                 // Reads an external image off disk as a tracing underlay (images).
                 | Command::Underlay { .. }
                 // Trace READS the underlay image off disk to vectorize it.
@@ -3129,6 +3144,7 @@ impl Command {
                 path.as_deref().unwrap_or("<set>.pdf")
             )),
             Command::Import { path } => Some(format!("import ← {path}")),
+            Command::Material2Texture { path, .. } => Some(format!("material2 texture ← {path}")),
             Command::XrefAttach { path, .. } => Some(format!("xref attach ← {path}")),
             Command::XrefReload { name, .. } => Some(format!("xref reload ← {name}")),
             Command::Terrain { path } => Some(format!("terrain ← {path}")),
@@ -3207,6 +3223,7 @@ mod classify_tests {
     fn external_file_readers_are_classified_as_readers() {
         let readers: Vec<Command> = vec![
             Command::Import { path: "/etc/passwd".into() },
+            Command::Material2Texture { targets: sel(), path: "/tmp/t.png".into(), size: [1.0, 1.0] },
             Command::Underlay {
                 path: "/tmp/secret.png".into(),
                 corner: None,

@@ -10,6 +10,7 @@ mod cplane;
 mod document;
 pub mod hatch;
 pub mod hershey;
+mod image_store;
 pub mod loads;
 mod object;
 pub mod param_schema;
@@ -50,6 +51,7 @@ pub use sheet::{
     SHEET_MARGIN_MM, SHEET_TITLE_MM,
 };
 pub use structure::{Grid, Material, Room, Section, Story};
+pub use image_store::{ImageId, StoredImage, MAX_IMAGE_PX};
 pub use underlay::{Basemap, Underlay, default_underlay_layer};
 pub use units::{
     format_angle, format_area, format_length, format_volume, Units, METERS_PER_FOOT,

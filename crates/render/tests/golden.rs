@@ -220,6 +220,7 @@ fn make_renderer(
             underlay: None,
             basemap: None,
             show_lineweights: false,
+            textured: Vec::new(),
         };
         renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);
     }
@@ -333,6 +334,7 @@ fn golden_underlay_dark() {
         underlay: Some(underlay),
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
     renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);
@@ -373,6 +375,7 @@ fn batched_scene(boxes: usize, mesh: [f32; 4], ink: [f32; 4]) -> itsjustcad_rend
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     for i in 0..boxes {
         let b = kernel_mesh::make_box(
@@ -465,6 +468,7 @@ fn face_values_render_one_colour_per_face() {
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let mut renderer = SceneRenderer::new(&ctx.device, FORMAT);
     renderer.set_scene(&ctx.device, &ctx.queue, &data, 0);

@@ -432,6 +432,9 @@ pub struct ViewState {
     pub show_grid: bool,
     /// World axes shown — the check on View ▸ Show Axes (#364).
     pub show_axes: bool,
+    /// Material textures shown — the check on View ▸ Shaded with Textures
+    /// (#360).
+    pub show_textures: bool,
     /// Edge styles — the checks in View ▸ Edges (#361).
     pub edges: ViewEdges,
     /// Fog — the checks in View ▸ Fog (#363).
@@ -838,6 +841,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
 
             radio("grid", tr("menu.view.grid"), "grid", view.show_grid),
             radio("axes", tr("menu.view.axes"), "axes", view.show_axes),
+            radio("textures", tr("menu.view.textures"), "textures", view.show_textures),
             // Edge styles (#361): the bare verbs flip the toggles; the colour
             // modes are a radio group.
             NativeItem::Submenu {
@@ -1414,6 +1418,7 @@ pub fn demo_open(
         mouse_nav: MouseNav::Right,
         show_grid: true,
         show_axes: true,
+        show_textures: true,
         edges: ViewEdges::default(),
         fog: ViewFog::default(),
         ao: false,
@@ -2006,6 +2011,10 @@ mod tests {
         assert_eq!(view_check(on, "View/axes"), Some(false));
         assert_eq!(action(on, "View/grid"), Some(MenuAction::Execute("grid".into())));
         assert_eq!(action(on, "View/axes"), Some(MenuAction::Execute("axes".into())));
+        let tex = ViewState { show_textures: true, ..Default::default() };
+        assert_eq!(view_check(tex, "View/textures"), Some(true));
+        assert_eq!(view_check(ViewState::default(), "View/textures"), Some(false));
+        assert_eq!(action(tex, "View/textures"), Some(MenuAction::Execute("textures".into())));
         let par = ViewState { camera: Some(CameraTag::Parallel), ..Default::default() };
         assert_eq!(view_check(par, "View/cam_parallel"), Some(true));
         assert_eq!(view_check(par, "View/cam_persp"), Some(false));

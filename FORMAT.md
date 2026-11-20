@@ -306,6 +306,25 @@ import command itself is not.
 {"cmd": "show_obj", "targets": {"sel": "last", "n": 1}}
 ```
 
+### Appearance materials and textures
+
+**material2** — render-only appearance; `material` is a preset, custom
+scalars, or (#360) an image texture tiled every `size` metres (box-mapped
+UVs are computed at display time, never stored). The op that first uses an
+image carries its encoded PNG/JPEG bytes (base64) in `image`; later ops
+naming the same image id omit them. On replay the bytes land in the
+document's content-addressed image store (key = FNV-1a 64 of the bytes, 16
+hex digits), so a file opens with its textures offline. `material2 <sel>
+texture <file>` itself is not logged; images over 2048 px on the longest side
+are scaled down to 2048 px before they are stored. Files without textures
+carry no `image` field and are unchanged.
+```json
+{"cmd": "material2", "targets": {"sel": "last", "n": 1},
+ "material": {"kind": "texture", "image": "779e6f1956518c3c", "size": [2.0, 1.0],
+              "color": [0.5, 0.5, 0.5], "roughness": 0.6, "metallic": 0.0},
+ "image": {"width": 1024, "height": 512, "bytes": "<base64 PNG or JPEG>"}}
+```
+
 ### Sections
 
 **section** — writes closed polylines to layer "sections"

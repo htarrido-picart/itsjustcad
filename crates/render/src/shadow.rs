@@ -3,7 +3,7 @@
 //! Real-time sun shadows for the viewport (#357).
 //!
 //! One directional shadow map, shared by every pane: the opaque faces
-//! (`meshes` and `face_meshes`) drawn depth-only from the sun with an
+//! (`meshes`, `face_meshes` and `tex_meshes`) drawn depth-only from the sun with an
 //! orthographic projection fitted to the faces' bounds ([`fit_light`]). Any
 //! receiver outside that footprint has no caster between it and the sun, so
 //! the fit loses nothing; one map with 3x3 PCF reads well from a room to a
@@ -130,6 +130,7 @@ pub fn fit_light(dir: glam::Vec3, lo: glam::Vec3, hi: glam::Vec3) -> (glam::Mat4
 struct ShadowKey {
     meshes: u64,
     faces: u64,
+    textured: u64,
     dir: [u32; 3],
     bounds: Option<[u32; 6]>,
 }
@@ -197,7 +198,7 @@ pub(crate) struct ViewportShadow {
     empty: wgpu::TextureView,
     map: Option<wgpu::TextureView>,
     size: u32,
-    flat: [FlatIndices; 2],
+    flat: [FlatIndices; 3],
     /// Per pane: whether its last camera asked for shadows.
     wants: Vec<bool>,
     key: Option<ShadowKey>,
@@ -240,7 +241,7 @@ impl ViewportShadow {
             empty: depth_texture(device, "shadow_empty", 1),
             map: None,
             size: SHADOW_MAP_SIZE.min(device.limits().max_texture_dimension_2d),
-            flat: [FlatIndices::new("shadow_flat_indices"), FlatIndices::new("shadow_flat_indices")],
+            flat: std::array::from_fn(|_| FlatIndices::new("shadow_flat_indices")),
             wants: Vec::new(),
             key: None,
             renders: 0,
@@ -298,7 +299,7 @@ impl SceneRenderer {
         if !sh.wants.iter().any(|w| *w) {
             if sh.map.take().is_some() {
                 sh.key = None;
-                sh.flat = [FlatIndices::new("shadow_flat_indices"), FlatIndices::new("shadow_flat_indices")];
+                sh.flat = std::array::from_fn(|_| FlatIndices::new("shadow_flat_indices"));
                 self.rebind_cameras(device);
             }
             return;
@@ -317,6 +318,7 @@ impl SceneRenderer {
         let key = ShadowKey {
             meshes: self.meshes.version,
             faces: self.face_meshes.version,
+            textured: self.tex_meshes.version,
             dir: dir.to_array().map(f32::to_bits),
             bounds: casters.map(|(lo, hi)| {
                 let [a, b, c] = lo.to_array().map(f32::to_bits);
@@ -341,9 +343,10 @@ impl SceneRenderer {
         };
         queue.write_buffer(&sh.ubo, 0, bytemuck::bytes_of(&u));
         let pipes = sh.pipes.get_or_insert_with(|| ShadowPipelines::new(device, &sh.layout));
-        let [flat_meshes, flat_faces] = &mut sh.flat;
+        let [flat_meshes, flat_faces, flat_tex] = &mut sh.flat;
         flat_meshes.update(device, queue, &self.meshes);
         flat_faces.update(device, queue, &self.face_meshes);
+        flat_tex.update(device, queue, &self.tex_meshes);
         let Some(map) = &sh.map else {
             return;
         };
@@ -364,6 +367,7 @@ impl SceneRenderer {
         sh.flat[0].draw(&mut p, &self.meshes);
         p.set_pipeline(&pipes.face);
         sh.flat[1].draw(&mut p, &self.face_meshes);
+        sh.flat[2].draw(&mut p, &self.tex_meshes);
         sh.renders += 1;
     }
 

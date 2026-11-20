@@ -69,6 +69,7 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("antialias", "Display", "antialias off|2|4|8"),
     ("grid", "Display", "grid [on|off]"),
     ("axes", "Display", "axes [on|off]"),
+    ("textures", "Display", "textures [on|off]"),
     ("backedges", "Display", "backedges [on|off]"),
     ("depthcue", "Display", "depthcue [on|off] [px]"),
     ("edgecolor", "Display", "edgecolor layer|same|material|axis [#rrggbb]"),

@@ -50,6 +50,9 @@ pub enum AppVerb {
     /// Show or hide the world X/Y/Z axes (`axes [on|off]`, #364). `None`
     /// means bare toggle.
     Axes(Option<bool>),
+    /// Show or hide material textures (`textures [on|off]`, #360, SketchUp's
+    /// Shaded with Textures). `None` means bare toggle.
+    Textures(Option<bool>),
     /// Parallel projection of the active view (`parallel [on|off]` / `ortho
     /// view`, #364); same as `camera parallel` / `camera persp`. `None` means
     /// bare toggle.
@@ -604,6 +607,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         // bare or single on/off word is the view toggle.
         "grid" if line.split_whitespace().count() <= 2 => AppVerb::Grid(on_off(words.next())?),
         "axes" => AppVerb::Axes(on_off(words.next())?),
+        "textures" => AppVerb::Textures(on_off(words.next())?),
         "parallel" | "parallelprojection" => AppVerb::Parallel(on_off(words.next())?),
         "backedges" => AppVerb::BackEdges(on_off(words.next())?),
         "depthcue" => {
@@ -724,6 +728,8 @@ mod tests {
         assert_eq!(classify("grid ON"), Some(AppVerb::Grid(Some(true))));
         assert_eq!(classify("axes hide"), Some(AppVerb::Axes(Some(false))));
         assert_eq!(classify("axes toggle"), Some(AppVerb::Axes(None)));
+        assert_eq!(classify("textures off"), Some(AppVerb::Textures(Some(false))));
+        assert_eq!(classify("textures"), Some(AppVerb::Textures(None)));
         assert_eq!(classify("parallel on"), Some(AppVerb::Parallel(Some(true))));
         assert_eq!(classify("parallel"), Some(AppVerb::Parallel(None)));
         assert_eq!(classify("grid sideways"), None);
@@ -1182,6 +1188,7 @@ mod tests {
         "gumball",
         "grid",
         "axes",
+        "textures",
         "parallel",
         "backedges",
         "depthcue",
@@ -1288,6 +1295,7 @@ mod tests {
             "snap",
             "grid",
             "axes",
+            "textures",
             "parallel",
             "parallelprojection",
             "backedges",

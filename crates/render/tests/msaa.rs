@@ -63,7 +63,8 @@ fn view_proj() -> (Mat4, Vec3) {
 }
 
 /// A scene touching every pipeline: meshes, face meshes, curves, edges,
-/// dashed curves and edges, profile ribbons, points, underlay and basemap.
+/// dashed curves and edges, profile ribbons, points, textured meshes,
+/// underlay and basemap.
 fn full_scene() -> SceneData {
     let tri = || quad_mesh([[-1.5, 5.0, 10.5], [1.5, 5.0, 13.5], [1.5, 5.0, 10.5]]);
     let underlay = || UnderlayData {
@@ -86,6 +87,15 @@ fn full_scene() -> SceneData {
         underlay: Some(underlay()),
         basemap: Some(underlay()),
         show_lineweights: true,
+        // A textured mesh: the texture pipelines (#360).
+        textured: vec![itsjustcad_render::TexturedMesh {
+            uvs: itsjustcad_render::box_uvs(&tri(), [1.0, 1.0]),
+            mesh: tri(),
+            color: [0.5, 0.0, 0.5, 1.0],
+            material: [0.5, 0.0],
+            image: checker_image().id(),
+            pixels: checker_image(),
+        }],
     }
 }
 
@@ -301,6 +311,7 @@ fn diagonal_edge_is_smoothed() {
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let off = render(&g, &scene, 1, DisplayMode::Shaded);
     let solid = off.chunks(4).filter(|p| p[3] == 255).count();
@@ -334,6 +345,7 @@ fn dashed_lines_draw_gaps_at_every_sample_count() {
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let drawn = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[3] > 8).count();
     for &n in &g.counts {
@@ -412,6 +424,7 @@ fn back_edges_draw_hidden_edges_dashed_at_every_sample_count() {
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let blue = |rgba: &[u8]| -> Vec<Vec<u8>> {
         rgba.chunks(4).filter(|p| p[2] as i32 > p[0] as i32 + 20).map(<[u8]>::to_vec).collect()
@@ -453,6 +466,7 @@ fn depth_cue_widens_near_edges_at_every_sample_count() {
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let drawn = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[3] > 8).count();
     let cue = EdgeStyle { depth_cue: true, depth_cue_px: 6.0, ..Default::default() };
@@ -525,6 +539,7 @@ fn fog_fades_far_geometry_and_leaves_near_untouched_at_every_sample_count() {
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let green = |p: &[u8]| p[1] as i32 > p[0] as i32 + 40 && p[1] as i32 > p[2] as i32 + 40;
     let blue = |p: &[u8]| p[2] as i32 > p[0] as i32 + 40 && p[2] as i32 > p[1] as i32 + 40;
@@ -606,6 +621,7 @@ fn corner_scene() -> (SceneData, Mat4, Vec3) {
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let eye = Vec3::new(0.0, -5.0, 5.0);
     let view = Mat4::look_at_rh(eye, Vec3::new(0.0, 3.0, 1.0), Vec3::Z);
@@ -752,6 +768,7 @@ fn box_scene(floor: bool) -> (SceneData, Mat4, Vec3) {
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let eye = Vec3::new(0.0, -7.0, 6.0);
     let view = Mat4::look_at_rh(eye, Vec3::new(0.0, 0.0, 0.5), Vec3::Z);
@@ -934,6 +951,7 @@ fn draw_section(
         underlay: None,
         basemap: None,
         show_lineweights: false,
+        textured: Vec::new(),
     };
     let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Z);
     let vp = Mat4::perspective_rh(50f32.to_radians(), W as f32 / H as f32, 0.05, 1000.0) * view;
@@ -1012,4 +1030,120 @@ fn section_cut_clips_and_fills_a_box_at_every_sample_count() {
         let i = px(vp, Vec3::new(1.0, -0.3, 0.2));
         assert!(!is_fill(&xr[i..i + 4]), "{n}x x-ray: no fill");
     }
+}
+
+/// A 2 × 2 red/blue checker PNG and its stored form (#360).
+fn checker_image() -> itsjustcad_doc::StoredImage {
+    let img = image::RgbaImage::from_fn(2, 2, |x, y| {
+        if (x + y) % 2 == 0 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) }
+    });
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut bytes, image::ImageFormat::Png).expect("png");
+    itsjustcad_doc::StoredImage { width: 2, height: 2, bytes: bytes.into_inner().into() }
+}
+
+/// The box scene with the box textured by the checker, tiled every 0.5 m,
+/// its flat colour the checker's average (purple).
+fn textured_box_scene(copies: usize) -> (SceneData, Mat4, Vec3) {
+    let (mut scene, vp, eye) = box_scene(false);
+    let (mesh, _, rm) = scene.meshes.remove(0);
+    let pixels = checker_image();
+    for i in 0..copies {
+        let mut mesh = RenderMesh {
+            positions: mesh.positions.clone(),
+            normals: mesh.normals.clone(),
+            indices: mesh.indices.clone(),
+        };
+        for p in &mut mesh.positions {
+            p[0] += 3.0 * i as f32;
+        }
+        let uvs = itsjustcad_render::box_uvs(&mesh, [0.5, 0.5]);
+        scene.textured.push(itsjustcad_render::TexturedMesh {
+            mesh,
+            uvs,
+            color: [0.5, 0.0, 0.5, 1.0],
+            material: rm,
+            image: pixels.id(),
+            pixels: pixels.clone(),
+        });
+    }
+    (scene, vp, eye)
+}
+
+/// Render the textured box at `n` samples with textures `on`, sun shadows
+/// and ambient occlusion on (so every pass reads the textured batch);
+/// validation errors fail the test.
+fn draw_textured(g: &Gpu, n: u32, on: bool) -> Vec<u8> {
+    let (scene, vp, eye) = textured_box_scene(1);
+    let mode = DisplayMode::Shaded;
+    let scope = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut r = SceneRenderer::with_samples(&g.device, FORMAT, n);
+    r.set_scene(&g.device, &g.queue, &scene, 1);
+    let mut cam = camera_uniform_ex(vp, eye, mode, Default::default(), Some(EAST_SUN), false)
+        .with_overlays(false, false)
+        .with_textures(on)
+        .with_shadows(&ShadowStyle { on: true, ..Default::default() }, mode, Some(EAST_SUN))
+        .with_ao(&AoStyle { on: true, ..Default::default() }, mode);
+    cam.screen = [W as f32, H as f32, 0.0, 1.0];
+    r.write_camera(&g.device, &g.queue, 0, &cam);
+    let mut enc = g.device.create_command_encoder(&Default::default());
+    r.render_shadow(&g.device, &g.queue, &mut enc, 0);
+    r.render_ao(&g.device, &g.queue, &mut enc, 0, [W, H]);
+    let rgba = if n > 1 {
+        r.render_msaa_pane(&g.device, &mut enc, 0, [W, H], mode, false);
+        g.queue.submit([enc.finish()]);
+        read_rgba(g, r.msaa_target(0).expect("target").resolve_texture())
+    } else {
+        g.queue.submit([enc.finish()]);
+        window_pass(g, wgpu::Color::TRANSPARENT, |pass| r.paint(pass, 0, mode, false))
+    };
+    let err = pollster::block_on(scope.pop());
+    assert!(err.is_none(), "{n}x textures {on}: {err:?}");
+    rgba
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn checker_texture_shows_on_the_box_and_textures_off_is_flat_at_every_sample_count() {
+    // #360: the south face of the textured box shows both checker colours;
+    // `textures off` draws it in the flat average (purple: neither red nor
+    // blue dominates).
+    let g = gpu();
+    let (_, vp, _) = textured_box_scene(1);
+    let face: Vec<Vec3> = (0..8)
+        .flat_map(|i| (0..16).map(move |j| Vec3::new(-0.4 + 0.1 * i as f32, -0.5, 0.1 + 0.11 * j as f32)))
+        .collect();
+    let count = |rgba: &[u8]| {
+        let (mut red, mut blue) = (0, 0);
+        for p in &face {
+            let ndc = vp.project_point3(*p);
+            let x = ((ndc.x * 0.5 + 0.5) * W as f32) as usize;
+            let y = ((0.5 - ndc.y * 0.5) * H as f32) as usize;
+            let i = (y * W as usize + x) * 4;
+            let (r, b) = (rgba[i] as i32, rgba[i + 2] as i32);
+            if r > b + 40 {
+                red += 1;
+            } else if b > r + 40 {
+                blue += 1;
+            }
+        }
+        (red, blue)
+    };
+    for &n in &g.counts {
+        let (red, blue) = count(&draw_textured(&g, n, true));
+        assert!(red >= 8 && blue >= 8, "{n}x: checker visible ({red} red, {blue} blue)");
+        let (red, blue) = count(&draw_textured(&g, n, false));
+        assert_eq!((red, blue), (0, 0), "{n}x: textures off is the flat average");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn one_gpu_texture_per_image_freed_when_unused() {
+    let g = gpu();
+    let mut r = SceneRenderer::new(&g.device, FORMAT);
+    r.set_scene(&g.device, &g.queue, &textured_box_scene(3).0, 1);
+    assert_eq!(r.texture_count(), 1, "three meshes share one image");
+    r.set_scene(&g.device, &g.queue, &box_scene(false).0, 2);
+    assert_eq!(r.texture_count(), 0, "freed once no mesh uses it");
 }
