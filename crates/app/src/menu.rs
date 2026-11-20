@@ -438,6 +438,8 @@ pub struct ViewState {
     pub fog: ViewFog,
     /// Ambient occlusion on — the check on View ▸ Ambient Occlusion (#358).
     pub ao: bool,
+    /// Sun shadows on — the check on View ▸ Shadows (#357).
+    pub shadows: bool,
     /// The built-in style the active pane matches — the check in View ▸
     /// Styles (#362). `None` when a saved style (or none) matches.
     pub style: Option<itsjustcad_render::BuiltinStyle>,
@@ -864,6 +866,10 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             // Ambient occlusion (#358): the toggle; distance, intensity and
             // colour are typed (`ao distance 5%`, `ao intensity 0.6`).
             radio("ao", tr("menu.view.ao"), "ao", view.ao),
+            // Sun shadows (#357): the toggle, and the panel with the time,
+            // date, light and dark sliders.
+            radio("shadows", tr("menu.view.shadows"), "shadows", view.shadows),
+            ex("shadow_panel", tr("menu.view.shadow_panel"), "shadows panel"),
             NativeItem::Separator,
             // Viewport layout.
             ex("vp1", tr("menu.view.vp1"), "viewports 1"),
@@ -1383,6 +1389,7 @@ pub fn demo_open(
         edges: ViewEdges::default(),
         fog: ViewFog::default(),
         ao: false,
+        shadows: false,
         style: Some(itsjustcad_render::BuiltinStyle::Modelling),
     };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
@@ -2156,6 +2163,33 @@ mod tests {
         assert!(crate::app_verbs::classify("ao").is_some());
         assert_eq!(view_check(ViewState::default(), "View/ao"), Some(false));
         assert_eq!(view_check(ViewState { ao: true, ..Default::default() }, "View/ao"), Some(true));
+    }
+
+    #[test]
+    fn view_shadows_toggle_checks_and_the_panel_item_fires_the_verb() {
+        // #357: View ▸ Shadows toggles with the verb and is checked when on;
+        // View ▸ Shadow Settings… opens the panel.
+        let menus = native_model(MenuStyle::Modeler, true, ViewState::default());
+        let view = menus.iter().find(|m| m.title == tr("menu.view")).expect("View menu");
+        let items = flat(&view.items);
+        let action = |want: &str| {
+            items.iter().find_map(|it| match it {
+                NativeItem::Check { id, label, action, .. } | NativeItem::Leaf { id, label, action, .. }
+                    if id == want =>
+                {
+                    Some((label.clone(), action.clone()))
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(action("View/shadows"), Some((tr("menu.view.shadows").to_string(), MenuAction::Execute("shadows".into()))));
+        assert_eq!(
+            action("View/shadow_panel"),
+            Some((tr("menu.view.shadow_panel").to_string(), MenuAction::Execute("shadows panel".into())))
+        );
+        assert!(crate::app_verbs::classify("shadows").is_some() && crate::app_verbs::classify("shadows panel").is_some());
+        assert_eq!(view_check(ViewState::default(), "View/shadows"), Some(false));
+        assert_eq!(view_check(ViewState { shadows: true, ..Default::default() }, "View/shadows"), Some(true));
     }
 
     #[test]

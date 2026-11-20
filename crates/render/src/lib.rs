@@ -16,6 +16,8 @@ mod msaa;
 mod pano;
 mod batch;
 mod renderer;
+mod shadow;
+mod shadow_style;
 mod sketchy;
 mod snapshot;
 mod viewport_callback;
@@ -37,6 +39,7 @@ pub use edge_style::{
 };
 pub use ao::{ao_resolution, AoTarget};
 pub use ao_style::{AoStyle, AoUnits, AO_DISTANCE, AO_INTENSITY};
+pub use shadow_style::{ShadowStyle, DEFAULT_SUN_DIR, SHADOW_DARK, SHADOW_LIGHT};
 pub use fog_style::{FogColor, FogStyle, FOG_END, FOG_START};
 pub use layout::ViewportLayout;
 pub use renderer::{
@@ -110,6 +113,8 @@ pub fn camera_uniform_ex(
         fog_color: [0.0; 4],
         ao: [0.0; 4],
         ao_color: [0.0; 4],
+        shadow: [0.0; 4],
+        shadow_dir: [0.0; 4],
     }
 }
 

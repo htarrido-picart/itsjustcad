@@ -75,6 +75,9 @@ pub enum AppVerb {
     /// Ambient occlusion (#358): `ao [on|off]`, `ao distance <n%|n[m]>`,
     /// `ao intensity <0..1>`, `ao colour #rrggbb` (`ambientocclusion` too).
     Ao(AoVerb),
+    /// Sun shadows (#357): `shadows [on|off]`, `shadows light|dark <0..1>`,
+    /// `shadows ground on|off`, `shadows panel` (`shadow` too).
+    Shadows(ShadowVerb),
     /// Named viewport styles (#362): `style <name> [all]`, `style
     /// save|update|delete <name>`, `style [list]`.
     Style(crate::view_styles::StyleVerb),
@@ -409,6 +412,64 @@ pub fn apply_ao_style(mut style: itsjustcad_render::AoStyle, verb: &AppVerb) -> 
     style
 }
 
+/// One `shadows` verb (#357).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShadowVerb {
+    /// `shadows [on|off|toggle]`; `None` = bare toggle.
+    Toggle(Option<bool>),
+    /// `shadows light <0..1>` (or `<n>%`): the direct sun. Turns them on.
+    Light(f32),
+    /// `shadows dark <0..1>` (or `<n>%`): the ambient. Turns them on.
+    Dark(f32),
+    /// `shadows ground [on|off|toggle]`: the ground catches them.
+    Ground(Option<bool>),
+    /// `shadows panel`: show or hide the Shadows panel (time, date, light).
+    Panel,
+}
+
+/// A 0..1 level, `0.6` or `60%`.
+fn unit_level(w: &str) -> Option<f32> {
+    let v = match w.strip_suffix('%') {
+        Some(p) => p.parse::<f32>().ok()? / 100.0,
+        None => w.parse::<f32>().ok()?,
+    };
+    (0.0..=1.0).contains(&v).then_some(v)
+}
+
+/// The words after `shadows`.
+fn parse_shadows<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<ShadowVerb> {
+    let out = match words.next().map(str::to_ascii_lowercase).as_deref() {
+        Some("light") => ShadowVerb::Light(unit_level(words.next()?)?),
+        Some("dark") => ShadowVerb::Dark(unit_level(words.next()?)?),
+        Some("ground" | "onground") => ShadowVerb::Ground(on_off(words.next())?),
+        Some("panel" | "settings") => ShadowVerb::Panel,
+        w => ShadowVerb::Toggle(on_off(w)?),
+    };
+    words.next().is_none().then_some(out)
+}
+
+/// A `shadows` verb applied to `style` (#357), shared by the app and the
+/// headless runner. Other verbs (and `shadows panel`) leave it unchanged.
+pub fn apply_shadow_style(
+    mut style: itsjustcad_render::ShadowStyle,
+    verb: &AppVerb,
+) -> itsjustcad_render::ShadowStyle {
+    match *verb {
+        AppVerb::Shadows(ShadowVerb::Toggle(on)) => style.on = on.unwrap_or(!style.on),
+        AppVerb::Shadows(ShadowVerb::Light(v)) => {
+            style.on = true;
+            style.light = v;
+        }
+        AppVerb::Shadows(ShadowVerb::Dark(v)) => {
+            style.on = true;
+            style.dark = v;
+        }
+        AppVerb::Shadows(ShadowVerb::Ground(on)) => style.ground = on.unwrap_or(!style.ground),
+        _ => {}
+    }
+    style
+}
+
 /// `edgecolor [layer|same|material|axis] [#rrggbb]`.
 fn parse_edge_color<'a>(
     mut words: impl Iterator<Item = &'a str>,
@@ -505,6 +566,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         }
         "fog" => AppVerb::Fog(parse_fog(words)?),
         "ao" | "ambientocclusion" => AppVerb::Ao(parse_ao(words)?),
+        "shadows" | "shadow" => AppVerb::Shadows(parse_shadows(words)?),
         "style" => AppVerb::Style(crate::view_styles::parse(words)?),
         "antialias" | "aa" => AppVerb::AntiAlias(match words.next() {
             None => None,
@@ -729,6 +791,50 @@ mod tests {
         ] {
             assert_eq!(classify(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn classifies_shadow_verbs() {
+        // #357: toggle, light, dark, ground, panel.
+        let sh = |v| Some(AppVerb::Shadows(v));
+        assert_eq!(classify("shadows"), sh(ShadowVerb::Toggle(None)));
+        assert_eq!(classify("shadows on"), sh(ShadowVerb::Toggle(Some(true))));
+        assert_eq!(classify("shadow off"), sh(ShadowVerb::Toggle(Some(false))));
+        assert_eq!(classify("shadows light 0.6"), sh(ShadowVerb::Light(0.6)));
+        assert_eq!(classify("shadows dark 30%"), sh(ShadowVerb::Dark(0.3)));
+        assert_eq!(classify("shadows ground off"), sh(ShadowVerb::Ground(Some(false))));
+        assert_eq!(classify("shadows ground"), sh(ShadowVerb::Ground(None)));
+        assert_eq!(classify("shadows panel"), sh(ShadowVerb::Panel));
+        for bad in [
+            "shadows light",
+            "shadows light 2",
+            "shadows dark -0.1",
+            "shadows dark x",
+            "shadows ground maybe",
+            "shadows thick",
+            "shadows on off",
+            "shadows light 0.5 0.6",
+        ] {
+            assert_eq!(classify(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn shadow_verbs_apply_to_the_style() {
+        use itsjustcad_render::ShadowStyle;
+        let mut s = ShadowStyle::default();
+        s = apply_shadow_style(s, &classify("shadows light 0.5").unwrap());
+        assert!(s.on && s.light == 0.5, "a level turns shadows on");
+        s = apply_shadow_style(s, &classify("shadows").unwrap());
+        assert!(!s.on);
+        s = apply_shadow_style(s, &classify("shadows dark 0.2").unwrap());
+        assert!(s.on && s.dark == 0.2);
+        s = apply_shadow_style(s, &classify("shadows ground").unwrap());
+        assert!(!s.ground);
+        s = apply_shadow_style(s, &classify("shadows ground on").unwrap());
+        assert!(s.ground);
+        assert_eq!(apply_shadow_style(s, &classify("shadows panel").unwrap()), s);
+        assert_eq!(apply_shadow_style(s, &classify("ao on").unwrap()), s);
     }
 
     #[test]
@@ -1003,6 +1109,7 @@ mod tests {
         "extension",
         "fog",
         "ao",
+        "shadows",
         "style",
         "ze",
         "zoomextents",
@@ -1056,6 +1163,7 @@ mod tests {
         "parallelprojection", // alias of `parallel`
         "edgecolour",   // alias of `edgecolor`
         "ambientocclusion", // alias of `ao`
+        "shadow",       // alias of `shadows`
     ];
 
     #[test]
@@ -1109,6 +1217,8 @@ mod tests {
             "fog",
             "ao",
             "ambientocclusion",
+            "shadows",
+            "shadow",
             "style",
             "camera",
             "save",
@@ -1178,6 +1288,8 @@ mod tests {
             "fog colour bg",
             "ao on",
             "ao distance 5%",
+            "shadows on",
+            "shadows light 0.8",
             "style presentation",
             "style save review",
             "ze",
@@ -1252,6 +1364,11 @@ mod tests {
             "ao distance 0.5",
             "ao intensity 0.6",
             "ao colour #000000",
+            "shadows on",
+            "shadows light 0.8",
+            "shadows dark 0.45",
+            "shadows ground off",
+            "shadows panel",
             "style presentation",
             "style sketch all",
             "style save review",
@@ -1279,6 +1396,8 @@ mod tests {
         assert!(h.contains("fog colour bg|#rrggbb"));
         assert!(h.contains("ao on|off") && h.contains("ao distance <n%|n>"));
         assert!(h.contains("ao intensity <0..1>") && h.contains("ao colour #rrggbb"));
+        assert!(h.contains("shadows on|off") && h.contains("shadows light <0..1>"));
+        assert!(h.contains("shadows dark <0..1>") && h.contains("shadows ground on|off"));
         assert!(h.contains("style <name> [all]") && h.contains("style save|update|delete <name>"));
         for b in itsjustcad_render::BuiltinStyle::ALL {
             assert!(h.contains(b.name()), "{}", b.name());

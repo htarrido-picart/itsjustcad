@@ -31,6 +31,7 @@ fn all_shaders_parse_and_validate() {
         ("curve.wgsl", scene!("curve.wgsl")),
         ("underlay.wgsl", scene!("underlay.wgsl")),
         ("ao.wgsl", scene!("ao.wgsl")),
+        ("shadow.wgsl", include_str!("../src/shaders/shadow.wgsl")),
         ("control.wgsl", include_str!("../src/shaders/control.wgsl")),
         ("pano.wgsl", include_str!("../src/shaders/pano.wgsl")),
     ] {

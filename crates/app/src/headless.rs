@@ -163,6 +163,8 @@ pub struct HeadlessView {
     pub fog_style: itsjustcad_render::FogStyle,
     /// Ambient occlusion, from `ao` (#358). Off by default.
     pub ao_style: itsjustcad_render::AoStyle,
+    /// Sun shadows, from `shadows` (#357). Off by default.
+    pub shadow_style: itsjustcad_render::ShadowStyle,
     /// Sky/ground gradient from a named style (#362); `None` follows
     /// `profile_edges`.
     pub background_gradient: Option<bool>,
@@ -181,6 +183,7 @@ impl HeadlessView {
             edges: self.edge_style,
             fog: self.fog_style,
             ao: self.ao_style,
+            shadows: self.shadow_style,
             grid: self.show_grid,
             axes: self.show_axes,
             gradient: self.background_gradient,
@@ -198,6 +201,7 @@ impl HeadlessView {
         self.edge_style = s.edges;
         self.fog_style = s.fog;
         self.ao_style = s.ao;
+        self.shadow_style = s.shadows;
         self.show_grid = s.grid;
         self.show_axes = s.axes;
         self.background_gradient = s.gradient;
@@ -223,6 +227,7 @@ impl Default for HeadlessView {
             edge_style: Default::default(),
             fog_style: Default::default(),
             ao_style: Default::default(),
+            shadow_style: Default::default(),
             background_gradient: None,
         }
     }
@@ -297,6 +302,10 @@ pub fn run_script_lines(
             }
             Some(verb @ AppVerb::Ao(_)) => {
                 view.ao_style = crate::app_verbs::apply_ao_style(view.ao_style, &verb)
+            }
+            // The panel is a window: nothing to show headless.
+            Some(verb @ AppVerb::Shadows(_)) => {
+                view.shadow_style = crate::app_verbs::apply_shadow_style(view.shadow_style, &verb)
             }
             Some(AppVerb::Style(verb)) => {
                 use crate::view_styles::{self as vs, StyleVerb};
@@ -880,7 +889,8 @@ pub fn render_headless(
     let cam = itsjustcad_render::CameraUniform { screen: [W as f32, H as f32, 0.0, 1.0], ..cam }
         .with_edge_style(&view.edge_style, 1.0)
         .with_fog(&view.fog_style, theme.background())
-        .with_ao(&view.ao_style, mode);
+        .with_ao(&view.ao_style, mode)
+        .with_shadows(&view.shadow_style, mode, sun_dir);
     renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -910,6 +920,8 @@ pub fn render_headless(
     let mut encoder = device.create_command_encoder(&Default::default());
     // Ambient occlusion (#358) before the scene; a no-op when off.
     renderer.render_ao(&device, &queue, &mut encoder, 0, [W, H]);
+    // Sun shadows (#357): the map, when on.
+    renderer.render_shadow(&device, &queue, &mut encoder, 0);
     {
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("hl_pass"),
@@ -1063,6 +1075,7 @@ mod tests {
         assert_eq!(view.light, LightMode::Sun);
         assert!(view.profile_edges && view.fog_style.on && view.edge_style.depth_cue);
         assert!(view.ao_style.on, "presentation turns AO on (#358)");
+        assert!(view.shadow_style.on, "presentation turns shadows on (#357)");
         // Save the current settings, switch away, switch back.
         let lines: Vec<String> =
             ["display xray", "grid off", "style save mine", "style modelling", "style mine"]
@@ -1077,6 +1090,18 @@ mod tests {
         assert!(run_script_lines(Session::default(), &bad).err().expect("fails").1.contains("no style"));
         let bad: Vec<String> = ["style save sketch"].map(String::from).to_vec();
         assert!(run_script_lines(Session::default(), &bad).err().expect("fails").1.contains("read-only"));
+    }
+
+    #[test]
+    fn shadow_verbs_affect_view() {
+        use itsjustcad_render::ShadowStyle;
+        // #357: the shadows verb runs headless and accumulates; the panel
+        // verb is accepted and changes nothing.
+        assert_eq!(HeadlessView::default().shadow_style, ShadowStyle::default());
+        let lines: Vec<String> =
+            ["shadows light 0.7", "shadows dark 0.2", "shadows ground off", "shadows panel"].map(String::from).to_vec();
+        let (_, view) = run_script_lines(Session::default(), &lines).expect("verbs run");
+        assert_eq!(view.shadow_style, ShadowStyle { on: true, light: 0.7, dark: 0.2, ground: false });
     }
 
     #[test]

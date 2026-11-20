@@ -5,7 +5,8 @@
 //!
 //! A [`ViewStyle`] carries the display mode, colour mode, lighting, profile
 //! and mesh edges, the sketchy character, the edge style (#361), the fog
-//! (#363), ambient occlusion (#358), the grid/axes overlays and the background
+//! (#363), ambient occlusion (#358), sun shadows (#357), the grid/axes
+//! overlays and the background
 //! gradient. Missing keys
 //! take the defaults, which are today's look, so a style saved by an older
 //! build keeps loading, and unknown keys from a newer one are ignored.
@@ -17,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AoStyle, ColorMode, DisplayMode, EdgeStyle, FogStyle, LightMode, SketchyParams};
+use crate::{AoStyle, ColorMode, DisplayMode, EdgeStyle, FogStyle, LightMode, ShadowStyle, SketchyParams};
 
 /// Every display setting a style switches (#362).
 ///
@@ -39,6 +40,8 @@ pub struct ViewStyle {
     pub fog: FogStyle,
     /// Ambient occlusion (#358); off when a style saved before it loads.
     pub ao: AoStyle,
+    /// Sun shadows (#357); off when a style saved before them loads.
+    pub shadows: ShadowStyle,
     pub grid: bool,
     pub axes: bool,
     /// Sky/ground gradient behind the scene. `None` follows
@@ -60,6 +63,7 @@ impl Default for ViewStyle {
             edges: EdgeStyle::default(),
             fog: FogStyle::default(),
             ao: AoStyle::default(),
+            shadows: ShadowStyle::default(),
             grid: true,
             axes: true,
             gradient: None,
@@ -79,8 +83,8 @@ impl ViewStyle {
 pub enum BuiltinStyle {
     /// Today's default look.
     Modelling,
-    /// Profiles, depth cue, sun light, ambient occlusion, light fog and the
-    /// sky gradient.
+    /// Profiles, depth cue, sun light, ambient occlusion, sun shadows, light
+    /// fog and the sky gradient.
     Presentation,
     /// Hand-drawn edges on paper.
     Sketch,
@@ -135,6 +139,7 @@ impl BuiltinStyle {
                 edges: EdgeStyle { depth_cue: true, ..EdgeStyle::default() },
                 fog: FogStyle { on: true, start: 0.5, end: 1.0, ..FogStyle::default() },
                 ao: AoStyle { on: true, ..AoStyle::default() },
+                shadows: ShadowStyle { on: true, ..ShadowStyle::default() },
                 gradient: Some(true),
                 ..d
             },
@@ -189,6 +194,11 @@ mod tests {
         assert_eq!(partial.ao, AoStyle::default());
         let with_ao: ViewStyle = serde_json::from_str(r#"{"ao":{"on":true,"intensity":0.9}}"#).unwrap();
         assert_eq!(with_ao.ao, AoStyle { on: true, intensity: 0.9, ..AoStyle::default() });
+        // Likewise shadows (#357).
+        assert_eq!(partial.shadows, ShadowStyle::default());
+        assert!(!d.shadows.on, "shadows off by default (#357)");
+        let with_sh: ViewStyle = serde_json::from_str(r#"{"shadows":{"on":true,"dark":0.2}}"#).unwrap();
+        assert_eq!(with_sh.shadows, ShadowStyle { on: true, dark: 0.2, ..ShadowStyle::default() });
     }
 
     #[test]
@@ -201,10 +211,11 @@ mod tests {
                 intensity: 0.3,
                 color: [10, 20, 30],
             },
+            shadows: ShadowStyle { on: true, light: 0.6, dark: 0.3, ground: false },
             ..ViewStyle::default()
         };
         let back: ViewStyle = serde_json::from_value(serde_json::to_value(custom).unwrap()).unwrap();
-        assert_eq!(back, custom, "AO round trip");
+        assert_eq!(back, custom, "AO and shadows round trip");
         for b in BuiltinStyle::ALL {
             let s = b.style();
             let back: ViewStyle = serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap();
@@ -218,6 +229,7 @@ mod tests {
         assert!(p.profiles && p.edges.depth_cue && p.fog.on && p.ao.on && p.gradient_on());
         for b in BuiltinStyle::ALL {
             assert_eq!(b.style().ao.on, b == BuiltinStyle::Presentation, "{}", b.name());
+            assert_eq!(b.style().shadows.on, b == BuiltinStyle::Presentation, "{}", b.name());
         }
         assert_eq!(p.light, LightMode::Sun);
         let s = BuiltinStyle::Sketch.style();

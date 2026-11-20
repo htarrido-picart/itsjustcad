@@ -69,6 +69,13 @@ Ambient occlusion:
   ao intensity <0..1>                           how dark occluded faces get                              e.g. ao intensity 0.6
   ao colour #rrggbb                             what they darken toward (black default)                  e.g. ao colour #000000
 
+Sun shadows (from the document sun: sun / location / geocode; default sun when unset):
+  shadows on|off                                faces cast on faces and the ground (shaded, pencil)      e.g. shadows on
+  shadows light <0..1>                          direct sun intensity (0.8 default)                       e.g. shadows light 0.8
+  shadows dark <0..1>                           ambient intensity in shadow (0.45 default)               e.g. shadows dark 0.45
+  shadows ground on|off                         the ground plane catches shadows                         e.g. shadows ground off
+  shadows panel                                 time-of-day and date sliders (they set the sun)          e.g. shadows panel
+
 Styles (one-step bundles of the display settings above):
   style <name> [all]                            modelling|presentation|sketch|hiddenline|xray|massing    e.g. style presentation
                                                 or a saved one; active pane (all: every pane)

@@ -2,7 +2,9 @@
 // shader, analytic anti-aliased lines at 1m and 10m, depth written so meshes
 // occlude the grid correctly.
 
-// Camera, unproject() and sky_ground() come from common.wgsl.
+// Camera, unproject(), sky_ground() and ground_shadow() (#357) come from
+// common.wgsl. The ground catches the sun shadows: it darkens under the
+// gradient's lines, or as a translucent black over a flat background.
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -95,7 +97,7 @@ fn fs_main(in: VsOut) -> FsOut {
         // and ground read as one continuous background (SketchUp look). The
         // ground colour comes from the down-facing gradient, lifted slightly.
         // Fog (#363) fades the lines into the ground, or toward its colour.
-        let ground = ground_haze(dist);
+        let ground = ground_haze(dist) * (1.0 - ground_shadow(hit));
         let lit = fogged(vec4(mix(ground, color, clamp(alpha, 0.0, 1.0)), 1.0), hit).rgb;
         var out: FsOut;
         out.color = vec4(lit, 1.0); // opaque
@@ -103,12 +105,15 @@ fn fs_main(in: VsOut) -> FsOut {
         return out;
     }
 
-    if (alpha < 0.003) {
+    // Shadow on the ground (#357): black under the lines, fading with fog.
+    let shade = ground_shadow(hit) * (1.0 - fog_amount(hit));
+    if (alpha < 0.003 && shade <= 0.0) {
         discard;
     }
 
     var out: FsOut;
-    out.color = vec4(fogged(vec4(color, 1.0), hit).rgb * alpha, alpha); // premultiplied
+    // Premultiplied: the lines over the shadow.
+    out.color = vec4(fogged(vec4(color, 1.0), hit).rgb * alpha, alpha + shade * (1.0 - alpha));
     out.depth = depth;
     return out;
 }

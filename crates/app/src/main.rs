@@ -4,6 +4,7 @@
 mod api_keys;
 mod app;
 mod app_verbs;
+mod shadow_clock;
 mod basemap;
 mod boxsel;
 mod chat_crypto;
