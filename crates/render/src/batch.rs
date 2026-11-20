@@ -25,13 +25,26 @@ pub(crate) struct ObjectParams {
     /// metal), z,w spare. Drives the specular term in the mesh shader so
     /// `material2` presets read differently (glass shiny, concrete matte).
     pub material: [f32; 4],
+    /// Screen-space dash pattern of a stroke in logical px, `[on, off, on,
+    /// off]` (#364); all zero draws it solid. Read by `curve.wgsl`.
+    pub dash: [f32; 4],
 }
 
 impl ObjectParams {
     /// Parameters for an unlit stroke or point: color plus the default
     /// mid-rough dielectric material.
     pub fn stroke(color: [f32; 4]) -> Self {
-        Self { color, material: [0.5, 0.0, 0.0, 0.0] }
+        Self::surface(color, [0.5, 0.0, 0.0, 0.0])
+    }
+
+    /// Parameters for a solid (undashed) draw with an explicit material.
+    pub fn surface(color: [f32; 4], material: [f32; 4]) -> Self {
+        Self { color, material, dash: [0.0; 4] }
+    }
+
+    /// A stroke drawn with the dash pattern `dash` (see [`Self::dash`]).
+    pub fn dashed(color: [f32; 4], dash: [f32; 4]) -> Self {
+        Self { dash, ..Self::stroke(color) }
     }
 }
 
@@ -74,7 +87,7 @@ pub(crate) struct Staged {
 
 impl std::fmt::Debug for ObjectParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ObjectParams({:?}, {:?})", self.color, self.material)
+        write!(f, "ObjectParams({:?}, {:?}, {:?})", self.color, self.material, self.dash)
     }
 }
 
@@ -146,6 +159,24 @@ impl Staged {
             slot: self.params.len() as u32,
         });
         self.vertices.extend(points.iter().flatten());
+        self.params.push(params);
+    }
+
+    /// Append a dashed line-list soup (#364): `[x, y, z, s]` per vertex, two
+    /// per segment, where `s` is the world distance along the stroke that
+    /// the dash pattern is measured from.
+    pub fn push_dashed(&mut self, verts: &[[f32; 4]], params: ObjectParams) {
+        let n = verts.len() / 2 * 2;
+        if n == 0 {
+            return;
+        }
+        self.draws.push(Draw {
+            first: (self.vertices.len() / 4) as u32,
+            count: n as u32,
+            base_vertex: 0,
+            slot: self.params.len() as u32,
+        });
+        self.vertices.extend(verts[..n].iter().flatten());
         self.params.push(params);
     }
 

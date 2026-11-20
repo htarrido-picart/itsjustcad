@@ -44,6 +44,11 @@ pub struct ViewportCallback {
     /// MSAA sample count for the scene, already clamped to what the device
     /// supports (1 = off, draw straight into egui's pass). #356.
     pub samples: u32,
+    /// Ground grid lines shown (`grid on|off`, #364). The gradient background
+    /// stays either way.
+    pub show_grid: bool,
+    /// World X/Y/Z axes shown (`axes on|off`, #364).
+    pub show_axes: bool,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -76,9 +81,10 @@ impl CallbackTrait for ViewportCallback {
             screen: {
                 let ppp = screen_desc.pixels_per_point;
                 let [w, h] = self.size_points;
-                [w * ppp, h * ppp, self.mode.line_px(ppp), 0.0]
+                [w * ppp, h * ppp, self.mode.line_px(ppp), ppp]
             },
-        };
+        }
+        .with_overlays(self.show_grid, self.show_axes);
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene
             && (renderer.generation != self.generation || self.force)

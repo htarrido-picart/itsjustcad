@@ -197,10 +197,10 @@ impl NativeMenuBar {
                 it.set_checked(view.lighting == Some(tag));
             }
         }
-        // Camera-projection radios: exactly the active one checked (none for
-        // ortho standard views, where projection is implied by the view).
+        // Camera-projection radios: exactly the active one checked.
         for (id, tag) in [
             ("View/cam_persp", CameraTag::Perspective),
+            ("View/cam_parallel", CameraTag::Parallel),
             ("View/cam_2point", CameraTag::TwoPoint),
             ("View/cam_pano", CameraTag::Panorama),
             ("View/cam_fisheye", CameraTag::Fisheye),
@@ -213,6 +213,12 @@ impl NativeMenuBar {
         for (id, n) in [("View/aa_off", 1), ("View/aa_2x", 2), ("View/aa_4x", 4), ("View/aa_8x", 8)] {
             if let Some(it) = self.check_items.get(id) {
                 it.set_checked(view.antialias.max(1) == n);
+            }
+        }
+        // Show Grid / Show Axes checks (#364).
+        for (id, on) in [("View/grid", view.show_grid), ("View/axes", view.show_axes)] {
+            if let Some(it) = self.check_items.get(id) {
+                it.set_checked(on);
             }
         }
         // Skin radios (Theme ▸ Skin): exactly the active skin checked.

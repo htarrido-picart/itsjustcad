@@ -149,6 +149,13 @@ pub struct HeadlessView {
     /// by `plantsymbols [on|off]`. When on, each `plant:<id>` mesh also draws
     /// its plan drafting glyph flat on the ground.
     pub plant_symbols: bool,
+    /// Ground grid lines, from `grid [on|off]` (#364). ON by default.
+    pub show_grid: bool,
+    /// World X/Y/Z axes, from `axes [on|off]` (#364). ON by default.
+    pub show_axes: bool,
+    /// Parallel projection for the view, from `camera parallel|persp` /
+    /// `parallel [on|off]` (#364). `None` keeps the view's own projection.
+    pub parallel: Option<bool>,
 }
 
 impl Default for HeadlessView {
@@ -164,6 +171,9 @@ impl Default for HeadlessView {
             sketchy: SketchyParams::default(),
             shaded_edges: true,
             plant_symbols: false,
+            show_grid: true,
+            show_axes: true,
+            parallel: None,
         }
     }
 }
@@ -224,6 +234,12 @@ pub fn run_script_lines(
             }
             Some(AppVerb::ShadedEdges(on)) => {
                 view.shaded_edges = on.unwrap_or(!view.shaded_edges)
+            }
+            Some(AppVerb::Grid(on)) => view.show_grid = on.unwrap_or(!view.show_grid),
+            Some(AppVerb::Axes(on)) => view.show_axes = on.unwrap_or(!view.show_axes),
+            Some(AppVerb::Parallel(on)) => {
+                let on = on.unwrap_or(view.parallel != Some(true));
+                apply_camera(&mut view, Some(if on { "parallel" } else { "persp" }), None)
             }
             Some(AppVerb::PlantSymbols(on)) => {
                 view.plant_symbols = on.unwrap_or(!view.plant_symbols)
@@ -374,19 +390,28 @@ pub fn run_script_lines(
 fn apply_camera(view: &mut HeadlessView, arg: Option<&str>, arg2: Option<&str>) {
     let Some(arg) = arg else { return };
     match arg {
+        "parallel" | "ortho" | "orthographic" => {
+            view.parallel = Some(true);
+            view.two_point = None;
+            view.pano = None;
+        }
         "2point" | "twopoint" | "2pt" => {
             view.two_point = Some(true);
+            view.parallel = None;
             view.pano = None;
         }
         "persp" | "perspective" | "1point" | "normal" => {
             view.two_point = Some(false);
+            view.parallel = Some(false);
             view.pano = None;
         }
         "pano" | "panorama" | "equirect" | "360" => {
             view.pano = Some(PanoProjection::Equirect);
+            view.parallel = None;
         }
         "fisheye" | "fish" => {
             view.pano = Some(parse_fisheye(arg2));
+            view.parallel = None;
         }
         // `camera phone <preset>`: named phone lens (bare = main wide).
         "phone" => {
@@ -459,6 +484,9 @@ fn build_headless_camera(session: &Session, view: &HeadlessView, aspect: f32) ->
         camera.pano = Some(p);
         camera.ortho = false;
         camera.two_point = false;
+    }
+    if let Some(on) = view.parallel {
+        camera.set_parallel(on);
     }
     if let Some(bb) = session.doc.scene_aabb() {
         let c = bb.center();
@@ -762,7 +790,10 @@ pub fn render_headless(
         view.light,
         sun_dir,
         view.profile_edges, // SketchUp preset → gradient background
-    );
+    )
+    .with_overlays(view.show_grid, view.show_axes);
+    // Target size for the dash patterns (#364); no fat-stroke width.
+    let cam = itsjustcad_render::CameraUniform { screen: [W as f32, H as f32, 0.0, 1.0], ..cam };
     renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -930,6 +961,32 @@ mod tests {
         assert_eq!(view.view, Some(StandardView::Front));
         assert_eq!(view.focal_mm, Some(35.0));
         assert_eq!(view.display, DisplayMode::Pencil);
+    }
+
+    #[test]
+    fn grid_axes_and_parallel_verbs_affect_view() {
+        // #364: the view toggles run headless too, and a structural grid
+        // still reaches the substrate.
+        let lines: Vec<String> = [
+            "grid off",
+            "axes",
+            "camera parallel",
+            "grid A x A:0 B:5 y 1:0 2:4",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (out, view) = run_script_lines(Session::default(), &lines).expect("toggles run");
+        assert!(!view.show_grid && !view.show_axes);
+        assert_eq!(view.parallel, Some(true));
+        assert!(!out.doc.grids.is_empty(), "structural grid defined");
+        let aspect = 1.5;
+        let cam = build_headless_camera(&out, &view, aspect);
+        assert!(cam.ortho, "parallel projection applied");
+        let lines = ["camera parallel", "parallel"].map(String::from).to_vec();
+        let (out, view) = run_script_lines(Session::default(), &lines).expect("toggle back");
+        assert_eq!(view.parallel, Some(false));
+        assert!(!build_headless_camera(&out, &view, aspect).ortho);
+        assert!(HeadlessView::default().show_grid && HeadlessView::default().show_axes);
     }
 
     #[test]

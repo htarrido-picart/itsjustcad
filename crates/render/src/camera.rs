@@ -378,6 +378,18 @@ impl OrbitCamera {
         self.ortho = false;
     }
 
+    /// Switch between parallel and perspective projection for the current
+    /// view (#364, SketchUp's Camera > Parallel Projection): yaw, pitch,
+    /// target and distance are kept, so the view direction stays and the
+    /// parallel view's height equals the perspective frustum's at the target
+    /// (the same scale there). Leaves two-point and panorama/fisheye modes,
+    /// which only make sense in perspective.
+    pub fn set_parallel(&mut self, on: bool) {
+        self.ortho = on;
+        self.two_point = false;
+        self.pano = None;
+    }
+
     /// Rhino-style standard views. Keeps target and distance.
     pub fn set_view(&mut self, view: StandardView) {
         use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
@@ -625,6 +637,34 @@ mod tests {
         assert_eq!(cam.distance, landscape, "bad aspect counts as square");
         cam.frame(Vec3::ZERO, 1.0, 1.0, 5.0);
         assert_eq!(cam.distance, 5.0);
+    }
+
+    #[test]
+    fn parallel_toggle_keeps_direction_and_scale_at_target() {
+        // #364: any view goes parallel and back; the look direction is kept
+        // and a point at the target depth keeps (about) its screen position.
+        let aspect = 1.5;
+        let mut cam = OrbitCamera {
+            yaw: 0.7,
+            pitch: 0.35,
+            target: Vec3::new(3.0, -2.0, 1.0),
+            ..OrbitCamera::default()
+        };
+        let dir = |c: &OrbitCamera| (c.target - c.eye()).normalize();
+        let (right, up, _) = cam.view_basis();
+        let probe = cam.target + right * 4.0 + up * 2.5;
+        let ndc = |c: &OrbitCamera| c.view_proj(aspect).project_point3(probe).truncate();
+        let (d0, p0) = (dir(&cam), ndc(&cam));
+        cam.two_point = true;
+        cam.set_parallel(true);
+        assert!(cam.ortho && !cam.two_point && cam.pano.is_none());
+        assert!(dir(&cam).abs_diff_eq(d0, 1e-6), "direction kept");
+        let p1 = ndc(&cam);
+        assert!(p1.abs_diff_eq(p0, 1e-3), "scale at target: {p0} vs {p1}");
+        cam.set_parallel(false);
+        assert!(!cam.ortho);
+        assert!(dir(&cam).abs_diff_eq(d0, 1e-6));
+        assert!(ndc(&cam).abs_diff_eq(p0, 1e-4), "back to the same image");
     }
 
     #[test]
