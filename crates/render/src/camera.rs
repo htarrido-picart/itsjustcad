@@ -73,6 +73,83 @@ impl OrbitCamera {
         );
     }
 
+    /// Orbit by a drag delta about `pivot`, the point under the cursor at drag
+    /// start (#366), instead of the target. Yaw and pitch change exactly as in
+    /// [`Self::orbit`] (yaw about world Z, pitch clamped to ±90°, no roll, so
+    /// verticals stay vertical), and the camera then moves so `pivot` keeps
+    /// its pixel and its depth: the point with the pivot's old normalized
+    /// device coordinates under the new view is found and the camera
+    /// translated onto it. This holds in perspective, two-point and parallel
+    /// views alike, and across the straight-down/up up-vector switch.
+    /// Afterwards the target moves along the view axis to the pivot's depth
+    /// ([`Self::retarget`]), which leaves the image unchanged but keeps later
+    /// orbit and zoom steps consistent. A panorama/fisheye, a non-finite pivot
+    /// or one behind the camera orbits about the target.
+    pub fn orbit_about(&mut self, pivot: Vec3, dx: f32, dy: f32) {
+        let p = pivot.as_dvec3();
+        let clip = self.view_proj(1.0).as_dmat4() * p.extend(1.0);
+        if self.pano.is_some() || !p.is_finite() || clip.w <= 1e-9 {
+            self.orbit(dx, dy);
+            return;
+        }
+        // The projection is unchanged by an orbit, only the view turns: the
+        // point with the same NDC (depth included) under the new view is
+        // where the pivot must be, so translate the camera by the gap.
+        let ndc = clip.truncate() / clip.w;
+        self.orbit(dx, dy);
+        let q = self.view_proj(1.0).as_dmat4().inverse().project_point3(ndc);
+        let shift = (p - q).as_vec3();
+        if shift.is_finite() {
+            self.target += shift;
+        }
+        self.retarget(pivot);
+    }
+
+    /// Move the target along the view axis to `pivot`'s depth without
+    /// changing the image: in perspective and two-point the eye stays put and
+    /// `distance` becomes that depth; in a parallel view the eye slides along
+    /// the axis with it and `distance` (the view height) is kept. A
+    /// panorama/fisheye, or a pivot nearer than the minimum distance or out of
+    /// range, leaves the camera alone.
+    pub fn retarget(&mut self, pivot: Vec3) {
+        if self.pano.is_some() || !pivot.is_finite() {
+            return;
+        }
+        let eye = self.view_eye();
+        let fwd = (self.target - eye).normalize_or_zero();
+        if self.ortho {
+            self.target += fwd * (pivot - self.target).dot(fwd);
+            return;
+        }
+        let depth = (pivot - eye).dot(fwd);
+        if (MIN_DISTANCE..=MAX_DISTANCE).contains(&depth) {
+            self.target = eye + fwd * depth;
+            self.distance = depth;
+        }
+    }
+
+    /// Recentre the view on `focus` (#366, middle-button double-click): pan,
+    /// keeping the orientation, so `focus` becomes the target and the orbit
+    /// pivot. In perspective the camera moves sideways only (`distance`
+    /// becomes the depth of `focus`, so the apparent scale is kept) and
+    /// `focus` lands on the view centre; in two-point it lands on the centre
+    /// column (the vertical shift of the pitch remains); a parallel view keeps
+    /// its scale. A point behind the camera is ignored.
+    pub fn recentre(&mut self, focus: Vec3) {
+        if !focus.is_finite() {
+            return;
+        }
+        if !self.ortho && self.pano.is_none() {
+            let eye = self.view_eye();
+            let depth = (focus - eye).dot((self.target - eye).normalize_or_zero());
+            if !depth.is_finite() || depth <= 0.0 {
+                return;
+            }
+            self.distance = depth.clamp(MIN_DISTANCE, MAX_DISTANCE);
+        }
+        self.target = focus;
+    }
+
     /// Pan in screen space; keeps the point under the cursor roughly fixed.
     pub fn pan(&mut self, dx: f32, dy: f32) {
         let eye = self.eye();
@@ -694,5 +771,89 @@ mod tests {
         let sky = cam.cursor_focus(eye, up, None);
         let fwd = (cam.target - cam.eye()).normalize().as_dvec3();
         assert!(((sky - eye).dot(fwd) - f64::from(cam.distance)).abs() < 1e-3, "{sky}");
+    }
+
+    fn ndc(cam: &OrbitCamera, p: Vec3) -> glam::Vec2 {
+        screen_xy(cam.view_proj(1.6), p)
+    }
+
+    /// #366: an off-centre pivot keeps its pixel over many orbit steps, in
+    /// every pinhole mode and through the straight-down up-vector switch.
+    #[test]
+    fn orbit_about_keeps_the_pivot_on_its_pixel() {
+        let pivot = Vec3::new(4.0, -3.0, 2.0);
+        let modes = [
+            OrbitCamera::default(),
+            OrbitCamera { ortho: true, ..OrbitCamera::default() },
+            OrbitCamera { two_point: true, ..OrbitCamera::default() },
+            OrbitCamera { pitch: 1.5, ..OrbitCamera::default() },
+        ];
+        for (i, mut cam) in modes.into_iter().enumerate() {
+            let px = ndc(&cam, pivot);
+            for step in 0..40 {
+                cam.orbit_about(pivot, 7.0, if step < 20 { -9.0 } else { 6.0 });
+                let now = ndc(&cam, pivot);
+                assert!((now - px).length() < 1e-3, "mode {i} step {step}: {px} -> {now}");
+            }
+            assert!(cam.yaw != OrbitCamera::default().yaw, "mode {i} turned");
+        }
+    }
+
+    /// #366: orbit gravity. Yaw turns about world Z and the pitch clamps, so
+    /// the camera never rolls: its right axis stays horizontal and the
+    /// vertical through the view centre stays vertical on screen.
+    #[test]
+    fn orbit_about_keeps_verticals_vertical() {
+        let mut cam = OrbitCamera::default();
+        let pivot = Vec3::new(-6.0, 2.0, 0.0);
+        for step in 0..200 {
+            cam.orbit_about(pivot, 13.0, if step % 80 < 40 { 11.0 } else { -11.0 });
+            assert!(cam.pitch.abs() <= std::f32::consts::FRAC_PI_2);
+            if cam.pitch.abs() > 1.5 {
+                continue; // looking straight down/up a vertical is a point
+            }
+            let (right, _, _) = cam.view_basis();
+            assert!(right.z.abs() < 1e-5, "rolled: {right}");
+            let (a, b) = (ndc(&cam, cam.target), ndc(&cam, cam.target + Vec3::Z));
+            assert!((a.x - b.x).abs() < 1e-4, "vertical leans: {a} {b}");
+        }
+    }
+
+    /// The retarget after each orbit step moves the target to the pivot's
+    /// depth without moving the image; a panorama orbits about its target.
+    #[test]
+    fn orbit_about_retargets_without_a_jump_and_pano_ignores_the_pivot() {
+        let pivot = Vec3::new(5.0, 5.0, 0.0);
+        let probe = Vec3::new(-2.0, 3.0, 1.0);
+        let mut cam = OrbitCamera::default();
+        let before = cam;
+        cam.retarget(pivot);
+        assert!((ndc(&cam, probe) - ndc(&before, probe)).length() < 1e-4);
+        let eye = cam.view_eye();
+        let depth = (pivot - eye).dot((cam.target - eye).normalize());
+        assert!((cam.distance - depth).abs() < 1e-3, "{} vs {depth}", cam.distance);
+        let mut pano = OrbitCamera { pano: Some(PanoProjection::Equirect), ..OrbitCamera::default() };
+        let mut plain = pano;
+        pano.orbit_about(pivot, 30.0, 10.0);
+        plain.orbit(30.0, 10.0);
+        assert_eq!((pano.target, pano.yaw, pano.pitch), (plain.target, plain.yaw, plain.pitch));
+    }
+
+    /// #366: recentring pans so the point lands on the view centre at the
+    /// same apparent scale; a point behind the camera is ignored.
+    #[test]
+    fn recentre_puts_the_point_on_the_view_centre() {
+        let focus = Vec3::new(6.0, -4.0, 0.0);
+        for ortho in [false, true] {
+            let mut cam = OrbitCamera { ortho, ..OrbitCamera::default() };
+            let (yaw, pitch) = (cam.yaw, cam.pitch);
+            cam.recentre(focus);
+            assert!(ndc(&cam, focus).length() < 1e-4, "ortho {ortho}");
+            assert_eq!((cam.yaw, cam.pitch), (yaw, pitch));
+        }
+        let mut cam = OrbitCamera::default();
+        let before = cam;
+        cam.recentre(cam.eye() * 2.0 - cam.target);
+        assert_eq!(cam.target, before.target);
     }
 }

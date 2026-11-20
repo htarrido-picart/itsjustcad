@@ -89,6 +89,10 @@ enum CamOp {
     Dolly(f32),
     /// Zoom by a factor toward the point under a drawable pixel (#365).
     ZoomAt(f32, f32, f32),
+    /// Orbit by a delta about the point under a drawable pixel (#366).
+    OrbitAt(f32, f32, f32, f32),
+    /// Recentre on the point under a drawable pixel (#366).
+    RecentreAt(f32, f32),
     Frame,
 }
 
@@ -1194,6 +1198,15 @@ fn apply_camera(app: &mut AppHandle, op: CamOp) {
         CamOp::Pan(dx, dy) => app.camera.pan(dx, dy),
         CamOp::Dolly(d) => app.camera.dolly(d),
         CamOp::ZoomAt(factor, x, y) => zoom_camera_at(app, factor, x, y),
+        CamOp::OrbitAt(dx, dy, x, y) => match focus_at_pixel(app, x, y) {
+            Some(pivot) => app.camera.orbit_about(pivot, dx, dy),
+            None => app.camera.orbit(dx, dy),
+        },
+        CamOp::RecentreAt(x, y) => {
+            if let Some(focus) = focus_at_pixel(app, x, y) {
+                app.camera.recentre(focus);
+            }
+        }
         CamOp::Frame => frame_camera(app),
     }
 }
@@ -1573,6 +1586,61 @@ pub unsafe extern "C" fn ijc_camera_orbit(h: *mut AppHandle, dx: f32, dy: f32) {
     })
 }
 
+/// Orbit like [`ijc_camera_orbit`], but about the point under `(x_px, y_px)`
+/// (#366), in physical drawable pixels as [`ijc_pick`] takes. Pass the
+/// gesture's START point on every step of a drag: the pivot is the nearest
+/// visible geometry under it, else the ground plane, else the point at the
+/// target's depth, and the orbit keeps that point on that pixel, so each step
+/// finds the same pivot. Yaw turns about world Z and the pitch is clamped, so
+/// verticals stay vertical. A parallel view keeps its projection and pivot.
+/// In a panorama/fisheye, or with no known viewport, it orbits about the
+/// target like [`ijc_camera_orbit`]. Acts on the active camera; applied on the
+/// next `ijc_render_frame`.
+///
+/// Headless handle ([`ijc_init_headless`]): moves only the in-memory camera,
+/// on the next [`ijc_flush`], using the size from [`ijc_resize`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_orbit_at(h: *mut AppHandle, dx: f32, dy: f32, x_px: f32, y_px: f32) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
+        if !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::OrbitAt(dx, dy, x_px, y_px)));
+        }
+    })
+}
+
+/// Recentre the view on the point under `(x_px, y_px)` (#366; desktop:
+/// middle-button double-click), in physical drawable pixels: the camera pans
+/// so that point becomes the target, on the view centre, at the same apparent
+/// scale. The point is found as in [`ijc_camera_orbit_at`]. No-op with no
+/// known viewport. Acts on the active camera; applied on the next
+/// `ijc_render_frame`.
+///
+/// Headless handle ([`ijc_init_headless`]): moves only the in-memory camera,
+/// on the next [`ijc_flush`], using the size from [`ijc_resize`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_recentre_at(h: *mut AppHandle, x_px: f32, y_px: f32) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::RecentreAt(x_px, y_px)));
+        }
+    })
+}
+
 /// Pan the camera by a screen-space delta in points. `dx`/`dy` are incremental
 /// finger translation; the core scales them by the view distance so the point
 /// under the fingers stays roughly fixed. Applied on the next `ijc_render_frame`.
@@ -1660,14 +1728,21 @@ pub unsafe extern "C" fn ijc_camera_zoom_at(h: *mut AppHandle, factor: f32, x_px
 /// Apply [`ijc_camera_zoom_at`]: zoom the active camera toward the point under
 /// the pixel, or toward its target when the pixel or viewport is unusable.
 fn zoom_camera_at(app: &mut AppHandle, factor: f32, x_px: f32, y_px: f32) {
-    let focus = viewport_size(app).and_then(|(w, h)| {
-        let vp = app.camera.view_proj(w / h.max(1.0));
-        let (origin, dir) = screen_ray(vp, w, h, x_px, y_px)?;
-        let (size, pos) = (glam::Vec2::new(w, h), glam::Vec2::new(x_px, y_px));
-        let hit = itsjustcad_doc::pick::ray_hit(&app.session.doc, vp, size, pos, origin, dir);
-        Some(app.camera.cursor_focus(origin, dir, hit).as_vec3())
-    });
+    let focus = focus_at_pixel(app, x_px, y_px);
     app.camera.zoom_at(focus.unwrap_or(app.camera.target), factor);
+}
+
+/// The point under a drawable pixel for the active camera
+/// ([`OrbitCamera::cursor_focus`]): the nearest geometry, else the ground,
+/// else the point at the target's depth. `None` with no known viewport or an
+/// unusable pixel.
+fn focus_at_pixel(app: &AppHandle, x_px: f32, y_px: f32) -> Option<glam::Vec3> {
+    let (w, h) = viewport_size(app)?;
+    let vp = app.camera.view_proj(w / h.max(1.0));
+    let (origin, dir) = screen_ray(vp, w, h, x_px, y_px)?;
+    let (size, pos) = (glam::Vec2::new(w, h), glam::Vec2::new(x_px, y_px));
+    let hit = itsjustcad_doc::pick::ray_hit(&app.session.doc, vp, size, pos, origin, dir);
+    Some(app.camera.cursor_focus(origin, dir, hit).as_vec3())
 }
 
 /// Zoom-to-fit: frame the entire scene (center on its bounding box and back the
@@ -9278,6 +9353,50 @@ mod headless_tests {
                     assert!(depth(&c2) >= itsjustcad_render::ZOOM_STANDOFF * 0.99, "overshot: {}", depth(&c2));
                     assert!(depth(&c2) < depth(&c1));
                 }
+                ijc_free(h);
+            }
+        }
+    }
+
+    /// #366: orbiting about a pixel keeps the box point under it on that
+    /// pixel, in perspective and in a parallel view; recentring brings the
+    /// point under a pixel to the view centre.
+    #[test]
+    fn orbit_at_keeps_the_pivot_on_its_pixel_and_recentre_centres_it() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            ijc_camera_orbit_at(nil, 1.0, 1.0, 1.0, 1.0);
+            ijc_camera_recentre_at(nil, 1.0, 1.0);
+        }
+        let (w, ht) = (800.0f32, 600.0f32);
+        let (x, y) = (430.0f32, 260.0f32);
+        let size = glam::Vec2::new(w, ht);
+        for view in ["persp", "front"] {
+            let h = ijc_init_headless();
+            unsafe {
+                take(ijc_run_command_result(h, c("box -5,-5,0 10,10,10").as_ptr()));
+                take(ijc_run_command_result(h, c(view).as_ptr()));
+                ijc_resize(h, w as u32, ht as u32);
+                ijc_camera_zoom_extents(h);
+                assert!(ijc_flush(h));
+                let vp = |h: *mut AppHandle| handle_ref(h).unwrap().camera.view_proj(w / ht);
+                let (o, d) = screen_ray(vp(h), w, ht, x, y).unwrap();
+                let doc = &handle_ref(h).unwrap().session.doc;
+                let t = itsjustcad_doc::pick::ray_hit(doc, vp(h), size, glam::Vec2::new(x, y), o, d)
+                    .expect("the box is under the finger");
+                let pivot = o + d * t;
+                let yaw = handle_ref(h).unwrap().camera.yaw;
+                for _ in 0..10 {
+                    ijc_camera_orbit_at(h, 12.0, -5.0, x, y);
+                }
+                assert!(ijc_flush(h));
+                assert!(handle_ref(h).unwrap().camera.yaw != yaw, "{view}: turned");
+                let px = itsjustcad_doc::pick::project(vp(h), size, pivot).unwrap();
+                assert!((px - glam::Vec2::new(x, y)).length() < 0.5, "{view}: {px}");
+                ijc_camera_recentre_at(h, x, y);
+                assert!(ijc_flush(h));
+                let px = itsjustcad_doc::pick::project(vp(h), size, pivot).unwrap();
+                assert!((px - size * 0.5).length() < 0.5, "{view} recentred: {px}");
                 ijc_free(h);
             }
         }

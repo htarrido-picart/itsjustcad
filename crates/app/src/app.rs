@@ -901,6 +901,10 @@ pub struct App {
     drill: itsjustcad_commands::lot::hierarchy::Drill,
     /// Hover pre-highlight (#374): what a click would select, under the cursor.
     hover: crate::hover::Hover,
+    /// Orbit about the cursor (#366): the pane being orbited and the pivot,
+    /// the point that was under the cursor when the orbit drag started. Kept
+    /// for the whole drag; dropped by a pan step or when the drag ends.
+    orbit_pivot: Option<(usize, glam::Vec3)>,
     /// Site plan optimizer form / running search / results (#145).
     optimize: optimize_panel::OptimizePanel,
     /// Address lookup for the site location (`geocode`, #215).
@@ -1646,6 +1650,7 @@ impl App {
             focus_site_override: None,
             drill: Default::default(),
             hover: Default::default(),
+            orbit_pivot: None,
             optimize: Default::default(),
             geocode: Default::default(),
             geo_hook: std::sync::Arc::new(crate::geocode::Nominatim::desktop()),
@@ -5024,19 +5029,40 @@ impl App {
             }
 
             // Rhino muscle memory: RMB orbit, Shift+RMB pan, scroll dolly.
+            // Orbit pivots on the point under the cursor at drag start (#366).
             if response.dragged_by(egui::PointerButton::Secondary)
                 || response.dragged_by(egui::PointerButton::Middle)
             {
                 let delta = response.drag_delta();
                 let shift = ui.input(|i| i.modifiers.shift);
                 if shift {
+                    self.orbit_pivot = None;
                     self.cameras[cam_idx].pan(delta.x, delta.y);
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 } else {
-                    self.cameras[cam_idx].orbit(delta.x, delta.y);
+                    let pivot = match self.orbit_pivot {
+                        Some((p, pivot)) if p == pane => pivot,
+                        _ => {
+                            // Where the button went down, not where the drag
+                            // threshold was crossed.
+                            let pos = ui
+                                .input(|i| i.pointer.press_origin())
+                                .or(response.interact_pointer_pos());
+                            let pivot = match pos {
+                                Some(pos) => self.cursor_focus(cam_idx, rect, pos).as_vec3(),
+                                None => self.cameras[cam_idx].target,
+                            };
+                            self.orbit_pivot = Some((pane, pivot));
+                            pivot
+                        }
+                    };
+                    self.cameras[cam_idx].orbit_about(pivot, delta.x, delta.y);
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                 }
-            } else if response.hovered()
+            } else if self.orbit_pivot.is_some_and(|(p, _)| p == pane) {
+                self.orbit_pivot = None;
+            }
+            if response.hovered()
                 && ui.input(|i| {
                     i.pointer
                         .button_down(egui::PointerButton::Secondary)
@@ -5058,6 +5084,16 @@ impl App {
                         None => self.cameras[cam_idx].dolly(scroll),
                     }
                 }
+            }
+            // Middle-button double-click recentres the view on the point under
+            // the cursor (#366; SketchUp's binding). A left double-click stays
+            // drill-in / reveal-block, and a right click repeats the last
+            // command, so neither is taken.
+            if response.double_clicked_by(egui::PointerButton::Middle)
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let focus = self.cursor_focus(cam_idx, rect, pos).as_vec3();
+                self.cameras[cam_idx].recentre(focus);
             }
             let aspect = rect.width() / rect.height().max(1.0);
             let view_proj = self.cameras[cam_idx].view_proj(aspect);
@@ -5217,6 +5253,11 @@ impl App {
             }
             if self.hover.pane() == Some(pane) {
                 self.paint_hover(ui, rect, view_proj);
+            }
+            if let Some((p, pivot)) = self.orbit_pivot
+                && p == pane
+            {
+                paint_orbit_pivot(ui, rect, view_proj, pivot);
             }
 
             // Per-pane view-name TAG (Rhino/SketchUp): the pane's name in its
@@ -11560,6 +11601,18 @@ fn obj_matches_box(
 }
 
 /// Rubber box: solid stroke for a window drag, dashed for a crossing drag.
+/// The orbit pivot marker (#366): a small ring with a dot at the pivot while
+/// an orbit drag is live.
+fn paint_orbit_pivot(ui: &egui::Ui, rect: egui::Rect, view_proj: glam::Mat4, pivot: glam::Vec3) {
+    let Some(c) = project(view_proj, rect, pivot.as_dvec3()) else {
+        return;
+    };
+    let painter = ui.painter_at(rect);
+    let color = crate::hover::color(ui.visuals().dark_mode);
+    painter.circle_stroke(c, 6.0, egui::Stroke::new(1.5, color));
+    painter.circle_filled(c, 2.0, color);
+}
+
 fn draw_rubber_box(
     painter: &egui::Painter,
     drag: egui::Rect,
@@ -14404,6 +14457,56 @@ mod tests {
             });
             h.run_steps(2);
             assert!(h.state().hover.pane().is_none(), "orbiting: no hover");
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_orbit_pivots_on_the_cursor_and_mmb_double_click_recentres() {
+        // #366: an RMB drag started over the box orbits about the box point
+        // under the press, which stays on its pixel; the pivot drops when the
+        // drag ends; a middle double-click recentres on the point under it.
+        run_app_journey(|h| {
+            for line in ["box -5,-5,0 10,10,10", "persp", "ze"] {
+                h.state_mut().execute_line(line.to_string());
+                h.run_steps(2);
+            }
+            let start = world_to_screen(h, glam::DVec3::new(0.0, -5.0, 8.0));
+            let m = egui::Modifiers::default();
+            let button = |pressed, pos, button| egui::Event::PointerButton { pos, button, pressed, modifiers: m };
+            h.input_mut().events.push(egui::Event::PointerMoved(start));
+            h.input_mut().events.push(button(true, start, egui::PointerButton::Secondary));
+            h.run_steps(1);
+            let mut pos = start;
+            for _ in 0..8 {
+                pos += egui::vec2(9.0, 4.0);
+                h.input_mut().events.push(egui::Event::PointerMoved(pos));
+                h.run_steps(1);
+            }
+            let (_, pivot) = h.state().orbit_pivot.expect("orbiting about a pivot");
+            assert!((pivot.y + 5.0).abs() < 0.05, "pivot on the box face: {pivot}");
+            h.run_steps(1);
+            let px = world_to_screen(h, pivot.as_dvec3());
+            assert!((px - start).length() < 1.0, "pivot kept its pixel: {px} vs {start}");
+            h.input_mut().events.push(button(false, pos, egui::PointerButton::Secondary));
+            h.run_steps(2);
+            assert!(h.state().orbit_pivot.is_none(), "drag over: no pivot");
+
+            let at = pane_point(h, 0.4, 0.6);
+            let (_, before) = active_viewport(h);
+            h.input_mut().events.push(egui::Event::PointerMoved(at));
+            h.run_steps(1);
+            // One frame: kittest steps 0.25 s, past the double-click delay.
+            for pressed in [true, false, true, false] {
+                h.input_mut().events.push(button(pressed, at, egui::PointerButton::Middle));
+            }
+            h.run_steps(2);
+            let (rect, _) = active_viewport(h);
+            let target = h.state().cameras[h.state().effective_camera_index(0)].target;
+            let centre = world_to_screen(h, target.as_dvec3());
+            assert!((centre - rect.center()).length() < 1.0, "target on the centre");
+            let was = project(before, rect, target.as_dvec3()).expect("in front");
+            assert!((was - at).length() < 1.0, "recentred on the clicked point: {was} vs {at}");
         });
     }
 

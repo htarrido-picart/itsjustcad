@@ -71,9 +71,10 @@ Now use the mouse in the viewport:
 
 | Mouse | Does |
 |---|---|
-| **Right-drag** | Orbit |
+| **Right-drag** or **middle-drag** | Orbit about the point under the cursor; verticals stay vertical |
 | **Shift + right-drag** | Pan |
 | **Scroll wheel** | Zoom toward the point under the cursor |
+| **Middle double-click** | Recentre the view on the point under the cursor |
 
 ---
 
