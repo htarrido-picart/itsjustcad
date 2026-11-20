@@ -48,6 +48,11 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("zoomwindow", "View", ""),
     ("viewprev", "View", ""),
     ("viewnext", "View", ""),
+    // Walkthrough (#369); an optional eye height in m.
+    ("poscam", "View", "[eye height]"),
+    ("positioncamera", "View", "[eye height]"),
+    ("lookaround", "View", "[eye height]"),
+    ("walk", "View", "[eye height]"),
     // Standard views.
     ("top", "View", ""),
     ("bottom", "View", ""),

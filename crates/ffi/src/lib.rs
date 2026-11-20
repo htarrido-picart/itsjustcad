@@ -93,6 +93,13 @@ enum CamOp {
     OrbitAt(f32, f32, f32, f32),
     /// Recentre on the point under a drawable pixel (#366).
     RecentreAt(f32, f32),
+    /// Position Camera on the point under a drawable pixel at an eye height
+    /// in m (#369).
+    PositionAt(f32, f32, f32),
+    /// Look Around: turn left / tilt up in radians (#369).
+    Look(f32, f32),
+    /// Walk: metres ahead, right, up (#369).
+    Walk(f32, f32, f32),
     Frame,
 }
 
@@ -1208,8 +1215,35 @@ fn apply_camera(app: &mut AppHandle, op: CamOp) {
                 app.camera.recentre(focus);
             }
         }
+        CamOp::PositionAt(x, y, height) => position_camera_at(app, x, y, height),
+        CamOp::Look(turn_left, tilt_up) => app.camera.look(turn_left, tilt_up),
+        CamOp::Walk(ahead, right, up) => {
+            let (a, r) = app.camera.walk_axes();
+            let delta = (a * ahead + r * right + glam::Vec3::Z * up).as_dvec3();
+            let eye = itsjustcad_doc::walk::step(&app.session.doc, app.camera.eye().as_dvec3(), delta, true);
+            app.camera.move_eye(eye.as_vec3());
+        }
         CamOp::Frame => frame_camera(app),
     }
+}
+
+/// Apply [`ijc_camera_position_at`]: stand on the face (else the ground)
+/// under the pixel, `height` above it, looking level the way the view faces.
+fn position_camera_at(app: &mut AppHandle, x_px: f32, y_px: f32, height: f32) {
+    let Some((w, h)) = viewport_size(app) else { return };
+    let vp = app.camera.view_proj(w / h.max(1.0));
+    let Some((origin, dir)) = screen_ray(vp, w, h, x_px, y_px) else { return };
+    let doc = &app.session.doc;
+    let Some(p) = itsjustcad_doc::pick::face_at(doc, origin, dir)
+        .map(|f| f.point)
+        .or_else(|| itsjustcad_doc::pick::FacePlane::horizontal(glam::DVec3::ZERO).ray(origin, dir))
+    else {
+        return;
+    };
+    let height = if height.is_finite() && height > 0.0 { f64::from(height) } else { itsjustcad_doc::walk::EYE_HEIGHT };
+    let eye = itsjustcad_doc::walk::stand(p, height).as_vec3();
+    let (ahead, _) = app.camera.walk_axes();
+    app.camera.place_eye(eye, ahead, 5.0);
 }
 
 /// The JSON [`ijc_run_command_result`] returns.
@@ -1638,6 +1672,85 @@ pub unsafe extern "C" fn ijc_camera_recentre_at(h: *mut AppHandle, x_px: f32, y_
         };
         if let Ok(mut pending) = app.pending.lock() {
             pending.push(PendingOp::Camera(CamOp::RecentreAt(x_px, y_px)));
+        }
+    })
+}
+
+/// Position Camera (#369, SketchUp): stand the eye `eye_height` metres above
+/// the face under `(x_px, y_px)` (physical drawable pixels, as [`ijc_pick`]),
+/// else above the ground plane there, looking level the way the view faces.
+/// A parallel, two-point or panorama view becomes a plain perspective; the
+/// field of view is kept. `eye_height` <= 0 or not finite uses 1.68 m
+/// (SketchUp's 5'6"). No-op when the pixel sees neither a face nor the
+/// ground, or with no known viewport. Follow with [`ijc_camera_look`] for
+/// Look Around. View state: not logged, not saved; the view history records
+/// it once it holds still. Acts on the active camera; applied on the next
+/// `ijc_render_frame` ([`ijc_flush`] when headless).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_position_at(h: *mut AppHandle, x_px: f32, y_px: f32, eye_height: f32) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
+        if !x_px.is_finite() || !y_px.is_finite() {
+            return;
+        }
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::PositionAt(x_px, y_px, eye_height)));
+        }
+    })
+}
+
+/// Look Around (#369): turn the active camera in place, the eye fixed.
+/// `dyaw` is radians turned left (counter-clockwise seen from above);
+/// `dpitch` is radians tilted up, clamped short of straight up/down. No
+/// roll: verticals stay vertical. The target follows at the same distance,
+/// so orbit and zoom carry on without a jump. Applied on the next
+/// `ijc_render_frame` ([`ijc_flush`] when headless).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_look(h: *mut AppHandle, dyaw: f32, dpitch: f32) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
+        if !dyaw.is_finite() || !dpitch.is_finite() {
+            return;
+        }
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::Look(dyaw, dpitch)));
+        }
+    })
+}
+
+/// Walk (#369): move the active camera's eye `forward` metres ahead (level,
+/// the way the view faces), `strafe` metres to the right and `up` metres up,
+/// keeping the look direction. As on the desktop: the eye keeps its height
+/// above the floor below it (stairs, ramps, ledges), stops 0.3 m short of a
+/// face ahead and refuses a rise above 0.6 m; flying down stops just above
+/// the floor. Collision is always on here (the desktop's Alt walks through).
+/// The host turns with [`ijc_camera_look`] and scales the step by its own
+/// frame time. Applied on the next `ijc_render_frame` ([`ijc_flush`] when
+/// headless).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_walk(h: *mut AppHandle, forward: f32, strafe: f32, up: f32) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
+        if !forward.is_finite() || !strafe.is_finite() || !up.is_finite() {
+            return;
+        }
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::Walk(forward, strafe, up)));
         }
     })
 }
@@ -9437,6 +9550,54 @@ mod headless_tests {
             ijc_run_command_result(h, c("location 37.42 -122.08 -7 Mountain View, CA").as_ptr())
                 .pipe_free();
             assert_eq!(r(ijc_location_json(h))["place"], "Mountain View, CA");
+            ijc_free(h);
+        }
+    }
+
+    /// #369: Position Camera stands the eye above the face under the pixel,
+    /// Look Around keeps it, Walk climbs onto the box's floor level and stops
+    /// short of a wall.
+    #[test]
+    fn walkthrough_positions_looks_and_walks() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            ijc_camera_position_at(nil, 1.0, 1.0, 1.7);
+            ijc_camera_look(nil, 0.1, 0.1);
+            ijc_camera_walk(nil, 1.0, 0.0, 0.0);
+        }
+        let (w, ht) = (800.0f32, 600.0f32);
+        let h = ijc_init_headless();
+        unsafe {
+            // A 1 m platform, and a wall 3 m past its +X edge.
+            take(ijc_run_command_result(h, c("box -2,-2,0 4,4,1").as_ptr()));
+            take(ijc_run_command_result(h, c("box 5,-5,0 0.2,10,3").as_ptr()));
+            take(ijc_run_command_result(h, c("top").as_ptr()));
+            ijc_resize(h, w as u32, ht as u32);
+            ijc_camera_zoom_extents(h);
+            assert!(ijc_flush(h));
+            let cam = |h: *mut AppHandle| handle_ref(h).unwrap().camera;
+            let vp = cam(h).view_proj(w / ht);
+            let px = itsjustcad_doc::pick::project(vp, glam::Vec2::new(w, ht), glam::DVec3::ZERO).unwrap();
+            ijc_camera_position_at(h, px.x, px.y, 1.7);
+            assert!(ijc_flush(h));
+            let c0 = cam(h);
+            assert!(!c0.ortho && c0.pitch.abs() < 1e-6, "level perspective");
+            assert!((c0.eye() - glam::Vec3::new(0.0, 0.0, 2.7)).length() < 0.05, "{}", c0.eye());
+            ijc_camera_look(h, 0.5, 0.2);
+            assert!(ijc_flush(h));
+            let c1 = cam(h);
+            assert!((c1.eye() - c0.eye()).length() < 1e-4 && c1.forward().z > 0.0);
+            // Face +X (the wall), level, then walk 20 m: off the platform
+            // (the eye drops 1 m) and stopped 0.3 m before the wall.
+            ijc_camera_look(h, -c1.yaw - std::f32::consts::PI, -c1.forward().z.asin());
+            assert!(ijc_flush(h));
+            assert!((cam(h).forward() - glam::Vec3::X).length() < 1e-4, "{}", cam(h).forward());
+            for _ in 0..100 {
+                ijc_camera_walk(h, 0.2, 0.0, 0.0);
+            }
+            assert!(ijc_flush(h));
+            let e = cam(h).eye();
+            assert!((e.x - 4.7).abs() < 1e-3 && (e.z - 1.7).abs() < 1e-3, "{e}");
             ijc_free(h);
         }
     }

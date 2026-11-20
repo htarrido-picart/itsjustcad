@@ -28,7 +28,7 @@ mod view_style;
 
 pub use camera::{
     fov_for_focal_mm, phone_preset, preset_focal_mm, OrbitCamera, PhonePreset, StandardView,
-    PHONE_PRESETS, ZOOM_STANDOFF,
+    LOOK_PITCH_MAX, PHONE_PRESETS, ZOOM_STANDOFF,
 };
 pub use control::{render_control_images, ControlImagePaths};
 pub use cubemap::{render_pano_image, PanoImage};

@@ -445,7 +445,78 @@ impl OrbitCamera {
         self.target = center;
         self.distance = d.max(min_distance);
     }
+
+    /// Unit look direction, from the eye toward the target.
+    pub fn forward(&self) -> Vec3 {
+        let (sp, cp) = self.pitch.sin_cos();
+        let (sy, cy) = self.yaw.sin_cos();
+        -Vec3::new(cp * cy, cp * sy, sp)
+    }
+
+    /// Position Camera (#369, SketchUp): stand the eye at `eye` looking along
+    /// `look` (any length; a zero or non-finite one keeps the current
+    /// direction), with the target `distance` ahead (clamped to the orbit
+    /// range). Leaves parallel, two-point and panorama/fisheye for a plain
+    /// perspective; the field of view is kept. The pitch is held inside
+    /// [`LOOK_PITCH_MAX`], so verticals stay vertical.
+    pub fn place_eye(&mut self, eye: Vec3, look: Vec3, distance: f32) {
+        if !eye.is_finite() {
+            return;
+        }
+        self.ortho = false;
+        self.two_point = false;
+        self.pano = None;
+        if let Some(f) = look.try_normalize().filter(|f| f.is_finite()) {
+            // eye - target = d * (cp cy, cp sy, sp) = -d * f.
+            self.pitch = (-f.z).clamp(-1.0, 1.0).asin();
+            if f.x.hypot(f.y) > 1e-6 {
+                self.yaw = (-f.y).atan2(-f.x);
+            }
+        }
+        self.pitch = self.pitch.clamp(-LOOK_PITCH_MAX, LOOK_PITCH_MAX);
+        if distance.is_finite() && distance > 0.0 {
+            self.distance = distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
+        }
+        self.target = eye + self.forward() * self.distance;
+    }
+
+    /// Look Around (#369): turn the view in place, the eye fixed.
+    /// `turn_left` is radians about world Z, counter-clockwise seen from
+    /// above (positive turns left); `tilt_up` is radians of pitch (positive
+    /// looks up), clamped to [`LOOK_PITCH_MAX`]. No roll: the right axis stays
+    /// horizontal, so verticals stay vertical. The target follows the look
+    /// direction at the same distance, so orbit and zoom carry on from here.
+    pub fn look(&mut self, turn_left: f32, tilt_up: f32) {
+        if !turn_left.is_finite() || !tilt_up.is_finite() {
+            return;
+        }
+        let eye = self.eye();
+        self.yaw = (self.yaw + turn_left).rem_euclid(std::f32::consts::TAU);
+        self.pitch = (self.pitch - tilt_up).clamp(-LOOK_PITCH_MAX, LOOK_PITCH_MAX);
+        self.target = eye + self.forward() * self.distance;
+    }
+
+    /// Move the eye to `eye` keeping the look direction and distance: the
+    /// target moves with it (Walk, #369).
+    pub fn move_eye(&mut self, eye: Vec3) {
+        if eye.is_finite() {
+            self.target += eye - self.eye();
+        }
+    }
+
+    /// The horizontal walking frame: unit `(ahead, right)` on the ground from
+    /// the yaw, whatever the pitch (straight down still walks the way the
+    /// view faces).
+    pub fn walk_axes(&self) -> (Vec3, Vec3) {
+        let (sy, cy) = self.yaw.sin_cos();
+        let ahead = Vec3::new(-cy, -sy, 0.0);
+        (ahead, ahead.cross(Vec3::Z))
+    }
 }
+
+/// Steepest look up or down in the eye-centric tools (#369), just short of
+/// the vertical where the view's up vector switches from Z to Y.
+pub const LOOK_PITCH_MAX: f32 = 1.5;
 
 /// Horizontal angle of view for a full-frame (36mm-wide sensor) lens:
 /// `fov = 2*atan(18/f)`. Returned in radians.
@@ -1019,5 +1090,69 @@ mod tests {
         let before = cam;
         cam.recentre(cam.eye() * 2.0 - cam.target);
         assert_eq!(cam.target, before.target);
+    }
+
+    /// #369: Position Camera stands the eye where asked, looking the way
+    /// asked, in perspective; level when the look is horizontal.
+    #[test]
+    fn place_eye_stands_and_looks() {
+        let mut cam = OrbitCamera { ortho: true, ..OrbitCamera::default() };
+        let eye = Vec3::new(2.0, -3.0, 1.68);
+        cam.place_eye(eye, Vec3::new(0.0, 1.0, 0.0), 5.0);
+        assert!(!cam.ortho && !cam.two_point && cam.pano.is_none());
+        assert!((cam.eye() - eye).length() < 1e-4, "{}", cam.eye());
+        assert!((cam.forward() - Vec3::Y).length() < 1e-5, "{}", cam.forward());
+        assert!(cam.pitch.abs() < 1e-6);
+        assert!((cam.distance - 5.0).abs() < 1e-6);
+        // Straight down clamps short of the vertical.
+        cam.place_eye(eye, -Vec3::Z, 5.0);
+        assert!((cam.pitch - LOOK_PITCH_MAX).abs() < 1e-6);
+        assert!((cam.eye() - eye).length() < 1e-4);
+    }
+
+    /// #369: Look Around keeps the eye and never rolls; positive turns left
+    /// and tilts up.
+    #[test]
+    fn look_keeps_the_eye_and_verticals_vertical() {
+        let mut cam = OrbitCamera::default();
+        let eye = Vec3::new(1.0, 2.0, 1.7);
+        cam.place_eye(eye, Vec3::X, 4.0);
+        cam.look(std::f32::consts::FRAC_PI_2, 0.0);
+        assert!((cam.forward() - Vec3::Y).length() < 1e-5, "left of +X is +Y: {}", cam.forward());
+        cam.look(0.0, 0.3);
+        assert!(cam.forward().z > 0.29, "tilted up: {}", cam.forward());
+        for step in 0..300 {
+            cam.look(0.07, if step % 100 < 50 { 0.05 } else { -0.05 });
+            assert!((cam.eye() - eye).length() < 1e-3, "eye moved: {}", cam.eye());
+            assert!(cam.pitch.abs() <= LOOK_PITCH_MAX);
+            let (right, _, _) = cam.view_basis();
+            assert!(right.z.abs() < 1e-5, "rolled: {right}");
+            let (a, b) = (ndc(&cam, cam.target), ndc(&cam, cam.target + Vec3::Z));
+            assert!((a.x - b.x).abs() < 1e-4, "vertical leans: {a} {b}");
+        }
+    }
+
+    /// #369: after walking, orbit and zoom carry on from the walked view
+    /// without a jump: a zero orbit or zoom leaves the image unchanged.
+    #[test]
+    fn orbit_after_walking_has_no_jump() {
+        let mut cam = OrbitCamera::default();
+        cam.place_eye(Vec3::new(0.0, 0.0, 1.68), Vec3::X, 5.0);
+        let (ahead, right) = cam.walk_axes();
+        assert!((ahead - Vec3::X).length() < 1e-6 && (right + Vec3::Y).length() < 1e-6);
+        cam.move_eye(cam.eye() + ahead * 3.0 + right);
+        cam.look(0.4, -0.1);
+        let probe = Vec3::new(9.0, 1.0, 0.5);
+        let before = cam;
+        let mut orbited = cam;
+        orbited.orbit(0.0, 0.0);
+        orbited.orbit_about(probe, 0.0, 0.0);
+        assert!((ndc(&orbited, probe) - ndc(&before, probe)).length() < 1e-4);
+        let mut zoomed = cam;
+        zoomed.zoom_at(probe, 1.0);
+        assert!((ndc(&zoomed, probe) - ndc(&before, probe)).length() < 1e-4);
+        // A small orbit moves the image a little, not a lot.
+        orbited.orbit(2.0, 0.0);
+        assert!((ndc(&orbited, probe) - ndc(&before, probe)).length() < 0.1);
     }
 }
