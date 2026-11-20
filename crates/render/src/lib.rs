@@ -15,6 +15,7 @@ mod renderer;
 mod sketchy;
 mod snapshot;
 mod viewport_callback;
+mod view_history;
 
 pub use camera::{
     fov_for_focal_mm, phone_preset, preset_focal_mm, OrbitCamera, PhonePreset, StandardView,
@@ -43,6 +44,7 @@ pub use msaa::{
     MSAA_CHOICES,
 };
 pub use viewport_callback::ViewportCallback;
+pub use view_history::{ViewHistory, HISTORY_CAP, SETTLE_SECS};
 
 pub fn camera_uniform(view_proj: glam::Mat4, eye: glam::Vec3) -> CameraUniform {
     camera_uniform_with_mode(view_proj, eye, DisplayMode::default())
