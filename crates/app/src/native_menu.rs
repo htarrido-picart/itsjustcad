@@ -60,6 +60,12 @@ pub struct NativeMenuBar {
     /// Last View state we pushed (active display / lighting mode + panel
     /// visibility), so we only touch the OS menu when it changes.
     last_view: Option<crate::menu::ViewState>,
+    /// View ▸ Styles (#362), whose saved-style checks follow the document.
+    styles_menu: Option<Submenu>,
+    /// The saved-style checks now in [`Self::styles_menu`].
+    saved_style_items: Vec<CheckMenuItem>,
+    /// Last `(saved names, active style)` pushed, to skip redundant calls.
+    last_styles: Option<(Vec<String>, Option<String>)>,
 }
 
 impl NativeMenuBar {
@@ -82,7 +88,7 @@ impl NativeMenuBar {
     {
         // Build with no selection initially; `sync_selection` enables items once
         // the app has a selection.
-        let (menu, routes, selection_items, check_items, panel_item) = build_menu(style)?;
+        let (menu, routes, selection_items, check_items, panel_item, styles_menu) = build_menu(style)?;
 
         #[cfg(target_os = "macos")]
         {
@@ -100,6 +106,9 @@ impl NativeMenuBar {
                 last_toggles: None,
                 panel_item,
                 last_view: None,
+                styles_menu,
+                saved_style_items: Vec::new(),
+                last_styles: None,
             })
         }
 
@@ -121,6 +130,9 @@ impl NativeMenuBar {
                 last_toggles: None,
                 panel_item,
                 last_view: None,
+                styles_menu,
+                saved_style_items: Vec::new(),
+                last_styles: None,
             })
         }
 
@@ -128,7 +140,7 @@ impl NativeMenuBar {
         // so we do not attach a native bar; the in-window egui bar remains.
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let _ = (menu, routes, selection_items, check_items, panel_item);
+            let _ = (menu, routes, selection_items, check_items, panel_item, styles_menu);
             None
         }
     }
@@ -237,6 +249,15 @@ impl NativeMenuBar {
                 it.set_checked(on);
             }
         }
+
+        // View ▸ Styles built-ins (#362).
+        for b in itsjustcad_render::BuiltinStyle::ALL {
+            let (id, on) = (format!("View/style_{}", b.name()), view.style == Some(b));
+            if let Some(it) = self.check_items.get(&id) {
+                it.set_checked(on);
+            }
+        }
+
         // Skin radios (Theme ▸ Skin): exactly the active skin checked.
         for (id, origin) in crate::menu::skin_radio_items() {
             if let Some(it) = self.check_items.get(&format!("Theme/{id}")) {
@@ -258,6 +279,40 @@ impl NativeMenuBar {
         // Panel item label flip.
         if let Some(it) = &self.panel_item {
             it.set_text(if view.panel_visible { "Hide Panel" } else { "Show Panel" });
+        }
+    }
+
+    /// Rebuild the saved-style checks of View ▸ Styles when the document's
+    /// styles change, and check the active one (#362). The built-ins are part
+    /// of the static bar and checked by [`Self::sync_view_state`].
+    pub fn sync_saved_styles(&mut self, saved: &[String], active: Option<&str>) {
+        let state = (saved.to_vec(), active.map(str::to_string));
+        if self.last_styles.as_ref() == Some(&state) {
+            return;
+        }
+        let names_changed = self.last_styles.as_ref().map(|(n, _)| n) != Some(&state.0);
+        self.last_styles = Some(state);
+        let Some(menu) = &self.styles_menu else { return };
+        if names_changed {
+            for it in self.saved_style_items.drain(..) {
+                let _ = menu.remove(&it);
+                self.routes.remove(it.id().as_ref());
+            }
+            let at = itsjustcad_render::BuiltinStyle::ALL.len();
+            for (i, name) in saved.iter().enumerate() {
+                if let NativeItem::Check { id, label, action, checked, enabled } =
+                    crate::menu::saved_style_item(name, false)
+                {
+                    let ci = CheckMenuItem::with_id(id.as_str(), &label, enabled, checked, None);
+                    if menu.insert(&ci, at + i).is_ok() {
+                        self.routes.insert(id, action);
+                        self.saved_style_items.push(ci);
+                    }
+                }
+            }
+        }
+        for (it, name) in self.saved_style_items.iter().zip(saved) {
+            it.set_checked(Some(name.as_str()) == active);
         }
     }
 
@@ -302,6 +357,7 @@ fn build_menu(
     Vec<MenuItem>,
     HashMap<String, CheckMenuItem>,
     Option<MenuItem>,
+    Option<Submenu>,
 )> {
     let menu = Menu::new();
     let mut routes: HashMap<String, MenuAction> = HashMap::new();
@@ -309,6 +365,7 @@ fn build_menu(
     let mut check_items: HashMap<String, CheckMenuItem> = HashMap::new();
     // Live handle to the View ▸ Panel item, so its label can flip each frame.
     let mut panel_item: Option<MenuItem> = None;
+    let mut styles_menu: Option<Submenu> = None;
 
     // macOS: the FIRST submenu is the bold app-name menu. muda does not create it
     // for us, so the auto app menu had no Quit — leaving ⌘Q unreachable from the
@@ -368,8 +425,11 @@ fn build_menu(
                 }
                 // One level deep (View ▸ Edges, #361): leaves, checks and
                 // separators, routed and synced by their own ids.
-                NativeItem::Submenu { label, items, .. } => {
+                NativeItem::Submenu { id, label, items } => {
                     let nested = Submenu::new(label, true);
+                    if id == "View/styles" {
+                        styles_menu = Some(nested.clone());
+                    }
                     for sub in items {
                         match sub {
                             NativeItem::Separator => {
@@ -396,7 +456,7 @@ fn build_menu(
         }
         menu.append(&submenu).ok()?;
     }
-    Some((menu, routes, selection_items, check_items, panel_item))
+    Some((menu, routes, selection_items, check_items, panel_item, styles_menu))
 }
 
 /// Whether a native leaf id (`"<Menu>/<verb>"`) is a selection-dependent verb,

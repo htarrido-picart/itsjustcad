@@ -237,6 +237,12 @@ enum Inverse {
         name: String,
         prev: Option<NamedView>,
     },
+    /// `style save` / `style delete` (#362): restore the previous style of
+    /// that name (if any).
+    StyleSaved {
+        name: String,
+        prev: Option<serde_json::Value>,
+    },
     /// `group`: drop the group, restoring the binding it overwrote (if any).
     GroupSet {
         name: String,
@@ -1407,6 +1413,13 @@ impl Session {
                 match prev {
                     Some(view) => self.doc.named_views.insert(name.clone(), *view),
                     None => self.doc.named_views.remove(name),
+                };
+                self.doc.generation += 1;
+            }
+            Inverse::StyleSaved { name, prev } => {
+                match prev {
+                    Some(style) => self.doc.named_styles.insert(name.clone(), style.clone()),
+                    None => self.doc.named_styles.remove(name),
                 };
                 self.doc.generation += 1;
             }
@@ -15596,6 +15609,45 @@ fn apply_forward(
                 },
             ))
         }
+        Command::StyleSave { name, style } => {
+            let Some(style) = style else {
+                // Only the app knows the live display settings; parse leaves None.
+                return Err(ExecError::Invalid(format!(
+                    "style save needs the live viewport — run 'style save {name}' from the app command line"
+                )));
+            };
+            let prev = doc.named_styles.insert(name.clone(), style.clone());
+            doc.generation += 1;
+            let verb = if prev.is_some() { "updated" } else { "saved" };
+            Ok((
+                Command::StyleSave { name: name.clone(), style: Some(style) },
+                Inverse::StyleSaved { name: name.clone(), prev },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "style '{name}' {verb} ({} saved style(s))",
+                        doc.named_styles.len()
+                    ),
+                },
+            ))
+        }
+        Command::StyleDelete { name } => {
+            let Some(style) = doc.named_styles.remove(&name) else {
+                return Err(ExecError::Invalid(format!("style delete: no saved style '{name}'")));
+            };
+            doc.generation += 1;
+            Ok((
+                Command::StyleDelete { name: name.clone() },
+                Inverse::StyleSaved { name: name.clone(), prev: Some(style) },
+                ApplyOutcome {
+                    created: Vec::new(),
+                    message: format!(
+                        "style '{name}' deleted ({} saved style(s))",
+                        doc.named_styles.len()
+                    ),
+                },
+            ))
+        }
         Command::ViewList => {
             let names: Vec<&str> = doc.named_views.keys().map(String::as_str).collect();
             Ok((
@@ -18036,6 +18088,8 @@ fn describe(cmd: &Command) -> &'static str {
         Command::ViewRestore { .. } => "view",
         Command::ViewList => "view list",
         Command::ViewDelete { .. } => "view delete",
+        Command::StyleSave { .. } => "style save",
+        Command::StyleDelete { .. } => "style delete",
         Command::Select { .. } => "select",
         Command::SelectNone => "selectnone",
         Command::Distance { .. } => "distance",
@@ -19542,6 +19596,36 @@ mod tests {
         let err = s.run(parse("view save a").unwrap()).unwrap_err();
         assert!(err.to_string().contains("viewport camera"), "{err}");
         assert!(s.doc.named_views.is_empty());
+    }
+
+    #[test]
+    fn style_save_delete_undo_redo_and_replay() {
+        // #362: saved styles are logged ops; undo/redo restore them and a
+        // replay of the log rebuilds the identical document.
+        let mut s = Session::default();
+        let a = serde_json::json!({ "display": "xray" });
+        let b = serde_json::json!({ "display": "pencil", "grid": false });
+        let out = s.run(Command::StyleSave { name: "r".into(), style: Some(a.clone()) }).unwrap();
+        assert!(out.message.contains("saved"), "{}", out.message);
+        let out = s.run(Command::StyleSave { name: "r".into(), style: Some(b.clone()) }).unwrap();
+        assert!(out.message.contains("updated"), "{}", out.message);
+        run(&mut s, "undo");
+        assert_eq!(s.doc.named_styles["r"], a);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.named_styles["r"], b);
+        s.run(Command::StyleDelete { name: "r".into() }).unwrap();
+        assert!(s.doc.named_styles.is_empty());
+        run(&mut s, "undo");
+        assert_eq!(s.doc.named_styles["r"], b);
+        let err = s.run(Command::StyleDelete { name: "nope".into() }).unwrap_err();
+        assert!(err.to_string().contains("no saved style"), "{err}");
+        let err = s.run(Command::StyleSave { name: "x".into(), style: None }).unwrap_err();
+        assert!(err.to_string().contains("live viewport"), "{err}");
+        let mut replayed = Session::default();
+        for cmd in s.save_log() {
+            replayed.run(cmd).unwrap();
+        }
+        assert_eq!(replayed.doc.named_styles, s.doc.named_styles);
     }
 
     #[test]

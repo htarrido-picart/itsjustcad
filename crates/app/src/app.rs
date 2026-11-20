@@ -681,6 +681,10 @@ pub struct App {
     /// colour. Off by default; persisted to `ui.json` as one object (#362
     /// named styles bundle it). GPU-only view state, never logged.
     fog_style: itsjustcad_render::FogStyle,
+    /// Sky/ground gradient behind the scene, set by a named style (#362).
+    /// `None` (the default) follows `profile_edges`, the coupling the
+    /// `massing` preset has always had. View state, never logged.
+    background_gradient: Option<bool>,
     /// Requested viewport anti-aliasing: MSAA sample count 1 (off), 2, 4 or 8
     /// (#356). Default 4x; set by `antialias off|2|4|8` / View menu. Persisted
     /// to `ui.json`. The count drawn is the highest supported one not above it.
@@ -1639,6 +1643,7 @@ impl App {
             show_axes: view_overlays(&load_ui_json()).1,
             edge_style: edge_style_from(&load_ui_json()),
             fog_style: fog_style_from(&load_ui_json()),
+            background_gradient: None,
             msaa: load_msaa().unwrap_or(itsjustcad_render::DEFAULT_MSAA),
             msaa_supported,
             plant_symbols: false,
@@ -2344,6 +2349,10 @@ impl App {
             Some("fog") => match crate::app_verbs::classify(line) {
                 Some(verb) => self.apply_fog_verb(verb),
                 None => self.command_line.push_line(FOG_USAGE),
+            },
+            Some("style") => match crate::app_verbs::classify(line) {
+                Some(crate::app_verbs::AppVerb::Style(verb)) => self.run_style_verb(line, verb),
+                _ => self.command_line.push_line(crate::view_styles::STYLE_USAGE),
             },
             Some("grid" | "axes" | "parallel" | "parallelprojection")
                 if crate::app_verbs::classify(line).is_some() =>
@@ -3704,6 +3713,90 @@ impl App {
         self.fog_style = crate::app_verbs::apply_fog_style(self.fog_style, &verb);
         save_fog_style(&self.fog_style);
         self.command_line.push_line(self.fog_style.summary());
+    }
+
+    /// The display settings of the active pane as a named style (#362).
+    fn current_view_style(&self) -> itsjustcad_render::ViewStyle {
+        let slot = self.effective_camera_index(self.active_pane);
+        itsjustcad_render::ViewStyle {
+            display: self.display_modes[slot],
+            color: self.color_modes[slot],
+            light: self.light_mode,
+            profiles: self.profile_edges,
+            mesh_edges: self.shaded_edges,
+            sketchy: self.sketchy,
+            edges: self.edge_style,
+            fog: self.fog_style,
+            grid: self.show_grid,
+            axes: self.show_axes,
+            gradient: self.background_gradient,
+        }
+    }
+
+    /// Apply a named style (#362): the display and colour modes to the
+    /// active pane (`all`: every pane), the rest app-wide. Settings the
+    /// standalone verbs persist to ui.json are persisted here too.
+    fn apply_view_style(&mut self, s: &itsjustcad_render::ViewStyle, all: bool) {
+        let slots = if all { 0..4 } else {
+            let slot = self.effective_camera_index(self.active_pane);
+            slot..slot + 1
+        };
+        for slot in slots {
+            self.display_modes[slot] = s.display;
+            self.color_modes[slot] = s.color;
+        }
+        self.light_mode = s.light;
+        self.profile_edges = s.profiles;
+        self.sketchy = s.sketchy;
+        self.background_gradient = s.gradient;
+        self.shaded_edges = s.mesh_edges;
+        save_shaded_edges(s.mesh_edges);
+        self.show_grid = s.grid;
+        save_view_overlay(GRID_KEY, s.grid);
+        self.show_axes = s.axes;
+        save_view_overlay(AXES_KEY, s.axes);
+        self.edge_style = s.edges;
+        save_edge_style(&s.edges);
+        self.fog_style = s.fog;
+        save_fog_style(&s.fog);
+    }
+
+    /// The name of the style the active pane's settings match (#362).
+    fn active_style_name(&self) -> Option<String> {
+        crate::view_styles::active_name(&self.session.doc, &self.current_view_style())
+    }
+
+    /// Run one `style` verb (#362).
+    fn run_style_verb(&mut self, line: &str, verb: crate::view_styles::StyleVerb) {
+        use crate::view_styles::{self as vs, StyleVerb};
+        let doc = &self.session.doc;
+        let cmd = match verb {
+            StyleVerb::List => {
+                let msg = vs::list_line(doc, self.active_style_name().as_deref());
+                self.command_line.push_line(msg);
+                return;
+            }
+            StyleVerb::Apply { name, all } => {
+                match vs::resolve(doc, &name) {
+                    Ok(s) => {
+                        self.apply_view_style(&s, all);
+                        let target = if all { "all panes" } else { "active pane" };
+                        self.command_line.push_line(format!("style: {name} ({target})"));
+                    }
+                    Err(e) => self.command_line.push_line(e),
+                }
+                return;
+            }
+            StyleVerb::Save(name) => vs::save_command(doc, &name, false, &self.current_view_style()),
+            StyleVerb::Update(name) => vs::save_command(doc, &name, true, &self.current_view_style()),
+            StyleVerb::Delete(name) => vs::delete_command(doc, &name),
+        };
+        match cmd {
+            Ok(cmd) => {
+                self.command_line.execute_command(&mut self.session, line, cmd);
+            }
+            Err(e) => self.command_line.push_line(e),
+        }
     }
 
     /// `camera <parallel|2point|persp|pano|fisheye [fov]|15|24|35|50|85|phone|phonewide>`.
@@ -5559,7 +5652,7 @@ impl App {
                         mode: self.display_modes[cam_idx],
                         sun_dir,
                         light: self.light_mode,
-                        background_gradient: self.profile_edges,
+                        background_gradient: self.background_gradient.unwrap_or(self.profile_edges),
                         edges_enabled: self.shaded_edges,
                         force: force_upload,
                         size_points: [rect.width(), rect.height()],
@@ -10346,6 +10439,7 @@ impl App {
         }
         let has_selection = !self.session.doc.selection.is_empty();
         let view = self.view_state();
+        let (saved_styles, active_style) = self.style_menu_state();
         let bar = egui::Panel::top("menu_bar").resizable(false).show(ui, |ui| {
             crate::menu::ui(
                 ui,
@@ -10358,6 +10452,7 @@ impl App {
                     terse: self.deck_pane.terse_enabled(),
                 },
                 view,
+                (&saved_styles, active_style.as_deref()),
             )
         });
         // Dev/screenshot hook: force one menu open to show grouped items.
@@ -10444,7 +10539,16 @@ impl App {
             show_axes: self.show_axes,
             edges: self.edge_style.into(),
             fog: self.fog_style.into(),
+            style: self
+                .active_style_name()
+                .and_then(|n| itsjustcad_render::BuiltinStyle::parse(&n)),
         }
+    }
+
+    /// The saved style names (#362) and the active style's name, for View ▸
+    /// Styles.
+    fn style_menu_state(&self) -> (Vec<String>, Option<String>) {
+        (self.session.doc.named_styles.keys().cloned().collect(), self.active_style_name())
     }
 
     /// Apply + persist the mouse-navigation preset (verb, menu and Settings
@@ -10573,6 +10677,8 @@ impl App {
     /// (+ app verbs) and reset the query / selection.
     fn open_palette(&mut self) {
         self.palette_entries = crate::palette::entries();
+        self.palette_entries
+            .extend(crate::palette::style_entries(&crate::view_styles::names(&self.session.doc)));
         self.palette_query.clear();
         self.palette_sel = 0;
         self.show_palette = true;
@@ -12553,6 +12659,7 @@ impl eframe::App for App {
             // Live View state (active display / lighting mode + panel visibility)
             // for the stateful View menu radios + Panel flip.
             let view = self.view_state();
+            let (saved_styles, active_style) = self.style_menu_state();
             if let Some(native) = &mut self.native_menu {
                 // Disable-don't-hide: keep the selection-dependent native items'
                 // enabled state in sync with the current selection.
@@ -12563,6 +12670,7 @@ impl eframe::App for App {
                 // Mirror the active display/lighting mode + panel visibility onto
                 // the native View menu (radio checks + Hide/Show Panel label).
                 native.sync_view_state(view);
+                native.sync_saved_styles(&saved_styles, active_style.as_deref());
                 let action = native.poll();
                 if let Some(action) = action {
                     let ctx = ui.ctx().clone();

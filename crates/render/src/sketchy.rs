@@ -28,7 +28,8 @@
 /// Tunable parameters for the sketchy edge look. All amounts are in *world
 /// units* (metres at building scale) except the unitless flags; `0` disables an
 /// effect, so `SketchyParams::default()` is a clean (non-sketchy) pass.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SketchyParams {
     /// Master switch. When `false` the transform is the identity.
     pub enabled: bool,

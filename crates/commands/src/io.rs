@@ -541,6 +541,43 @@ mod tests {
     }
 
     #[test]
+    fn save_load_preserves_named_styles() {
+        // #362: saved styles ride the op log; reopening replays them verbatim
+        // (unknown keys included) and the save is replay-stable.
+        let mut s = Session::default();
+        let a = serde_json::json!({ "display": "xray", "fog": { "on": true }, "later": [1, 2] });
+        let b = serde_json::json!({ "grid": false });
+        s.run(crate::Command::StyleSave { name: "review".into(), style: Some(a.clone()) }).unwrap();
+        s.run(crate::Command::StyleSave { name: "plan".into(), style: Some(b) }).unwrap();
+        s.run(crate::Command::StyleDelete { name: "plan".into() }).unwrap();
+        let json = to_json(&s);
+        assert!(json.contains("style_save") && json.contains("style_delete"), "{json}");
+        let loaded = from_json(&json).unwrap();
+        assert_eq!(loaded.doc.named_styles, s.doc.named_styles);
+        assert_eq!(loaded.doc.named_styles.len(), 1);
+        assert_eq!(loaded.doc.named_styles["review"], a);
+        assert_eq!(to_json(&loaded), json, "replay-stable");
+    }
+
+    #[test]
+    fn pre_named_styles_file_loads_unchanged() {
+        // Files from before #362 have no style ops: no styles, and the
+        // document snapshot does not gain a `named_styles` key.
+        let json = r#"{
+            "mydrafter": 1,
+            "ops": [
+                {"cmd": "box",
+                 "id": "00000000-0000-4000-8000-000000000001",
+                 "corner": [0.0, 0.0, 0.0], "size": [2.0, 2.0, 2.0]}
+            ]
+        }"#;
+        let s = from_json(json).unwrap();
+        assert!(s.doc.named_styles.is_empty());
+        assert!(!serde_json::to_string(&s.doc).unwrap().contains("named_styles"));
+        assert_eq!(to_json(&from_json(&to_json(&s)).unwrap()), to_json(&s));
+    }
+
+    #[test]
     fn pre_named_views_file_loads_with_no_views() {
         // Old files have no view ops; they load with an empty view table.
         let json = r#"{
