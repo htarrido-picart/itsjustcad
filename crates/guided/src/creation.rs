@@ -26,6 +26,15 @@ pub static SCRIPTS: &[VerbScript] = &[
         assemble: assemble_extrude,
     },
     VerbScript {
+        verb: "pushpull",
+        needs_selection: true,
+        steps: &[
+            Step::PickPoint { prompt: "Point on the face to push or pull" },
+            Step::Number { prompt: "Distance (negative pushes in)", default: Some(1.0) },
+        ],
+        assemble: assemble_pushpull,
+    },
+    VerbScript {
         verb: "revolve",
         needs_selection: true,
         steps: &[
@@ -202,6 +211,15 @@ fn assemble_extrude(args: &[Input]) -> Result<String, String> {
     let sel = selector(args, "extrude")?;
     let h = num_at(args, 1, "extrude")?;
     Ok(format!("extrude {sel} {}", num(h)))
+}
+
+/// `[Objects(sel), Point(p), Num(d)] -> "pushpull sel <p> <d>"` (#370): the
+/// face is the one under `p`; the logged op gets its normal at apply time.
+fn assemble_pushpull(args: &[Input]) -> Result<String, String> {
+    let sel = selector(args, "pushpull")?;
+    let p = point_at(args, 1, "pushpull")?;
+    let d = num_at(args, 2, "pushpull")?;
+    Ok(format!("pushpull {sel} {} {}", fmt(p), num(d)))
 }
 
 /// `[Objects(sel), Point(start), Point(end), Num(angle)] -> "revolve sel <start> <dir> <angle>"`
@@ -384,6 +402,17 @@ mod tests {
         assert_eq!(t.push_list_point(DVec3::new(1.0, 1.0, 0.0)), StepResult::NeedMore);
         assert_eq!(t.finish_list(), StepResult::Emit("interpcurve 0,0 1,0 1,1".into()));
         assert!(!t.active());
+    }
+
+    #[test]
+    fn assemble_pushpull_pure() {
+        let args = [
+            Input::Objects("sel".into()),
+            Input::Point(DVec3::new(1.0, 1.0, 3.0)),
+            Input::Num(-0.5),
+        ];
+        assert_eq!(assemble_pushpull(&args).unwrap(), "pushpull sel 1,1,3 -0.5");
+        assert!(assemble_pushpull(&args[..2]).is_err());
     }
 
     #[test]

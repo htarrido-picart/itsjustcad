@@ -22,6 +22,7 @@ use crate::{
     RegionMode, Selector, SheetSetOp, SimilarBy,
 };
 
+mod pushpull;
 mod replay;
 mod session_meta;
 pub(crate) mod site_defer;
@@ -10928,6 +10929,9 @@ fn apply_forward(
                 },
             ))
         }
+        Command::PushPull { id, target, point, normal, distance, keep } => {
+            pushpull::apply(doc, id, target, point, normal, distance, keep)
+        }
         Command::Revolve { id, profile, axis_point, axis_dir, angle_deg } => {
             let (src_id, curve) = one_curve(doc, &profile, "revolve")?;
             if !curve.is_closed() {
@@ -17852,6 +17856,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Box { .. } => "box",
         Command::Extrude { .. } => "extrude",
         Command::Revolve { .. } => "revolve",
+        Command::PushPull { .. } => "pushpull",
         Command::Loft { .. } => "loft",
         Command::BlendSurface { .. } => "blend",
         Command::Sweep { .. } => "sweep",

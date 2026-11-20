@@ -48,6 +48,9 @@ pub fn keymap(key: Key, mods: Modifiers, ctx: KeyContext<'_>) -> Option<String> 
         Key::C if bare && !ctx.draw_active => "circle",
         Key::P if bare && !ctx.draw_active => "polyline",
         Key::R if bare && !ctx.draw_active => "rect",
+        // Push/Pull (#370). SketchUp's bare P is the polyline here, so it is
+        // Shift+P.
+        Key::P if mods.shift_only() && !ctx.draw_active => "pushpull",
         // Gumball toggle: Cmd/Ctrl+G flips gizmo visibility. Uses the command
         // modifier (NOT bare G) so it never eats the first letter of a typed
         // command that starts with 'g' (geodesic, grid, group, gaussvault…).
@@ -175,6 +178,9 @@ mod tests {
         assert_eq!(keymap(Key::C, NONE, ctx()).unwrap(), "circle");
         assert_eq!(keymap(Key::P, NONE, ctx()).unwrap(), "polyline");
         assert_eq!(keymap(Key::R, NONE, ctx()).unwrap(), "rect");
+        assert_eq!(keymap(Key::P, Modifiers::SHIFT, ctx()).unwrap(), "pushpull");
+        let drawing = KeyContext { draw_active: true, ..ctx() };
+        assert_eq!(keymap(Key::P, Modifiers::SHIFT, drawing), None);
         // not while a tool is already picking
         let drawing = KeyContext { draw_active: true, ..ctx() };
         for key in [Key::L, Key::C, Key::P, Key::R] {

@@ -47,6 +47,7 @@ mod param_editor;
 mod point_edit;
 mod precise;
 mod preset;
+mod pushpull;
 mod raytrace_ui;
 mod scene;
 mod sd_catalog;

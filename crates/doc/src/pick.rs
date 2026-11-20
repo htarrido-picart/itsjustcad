@@ -550,6 +550,122 @@ pub fn planar_face(m: &kernel_mesh::Mesh, tri: usize) -> Vec<usize> {
     out
 }
 
+/// The closed flat curve (a region, #370) the cursor ray crosses inside,
+/// nearest first, as a hit facing the viewer: `face` is 0, `normal` the
+/// region's plane normal turned toward the ray's origin. Push/Pull makes a
+/// region a solid, so it is a face before it is one.
+pub fn region_at(doc: &Document, origin: DVec3, dir: DVec3) -> Option<FaceHit> {
+    let mut best: Option<FaceHit> = None;
+    for (o, bb) in visible_objects(doc) {
+        let Geometry::Curve(c) = &o.geometry else { continue };
+        let pad = DVec3::splat(1e-6 * (1.0 + bb.max.abs().max_element()));
+        if !c.is_closed() || ray_aabb(origin, dir, bb.min - pad, bb.max + pad).is_none() {
+            continue;
+        }
+        let pts = c.tessellate(0.01);
+        let Some(region) = flat_loop(&pts) else { continue };
+        let n = if region.normal.dot(dir) > 0.0 { -region.normal } else { region.normal };
+        let Some(p) = region.ray(origin, dir) else { continue };
+        let t = (p - origin).dot(dir) / dir.length_squared();
+        if t < 0.0 || best.as_ref().is_some_and(|b| b.t <= t) {
+            continue;
+        }
+        let (u, v) = region.axes();
+        let flat: Vec<(f64, f64)> =
+            pts.iter().map(|q| ((*q - p).dot(u), (*q - p).dot(v))).collect();
+        // Even-odd crossings of the +u ray from the hit point.
+        let mut inside = false;
+        for (i, &(x0, y0)) in flat.iter().enumerate() {
+            let (x1, y1) = flat[(i + 1) % flat.len()];
+            if (y0 > 0.0) != (y1 > 0.0) && x0 + (0.0 - y0) * (x1 - x0) / (y1 - y0) > 0.0 {
+                inside = !inside;
+            }
+        }
+        if inside {
+            best = Some(FaceHit { object: o.id, face: 0, t, point: p, normal: n });
+        }
+    }
+    best
+}
+
+/// The plane of a flat closed loop (Newell's normal), if it has area and
+/// every point lies on it.
+fn flat_loop(pts: &[DVec3]) -> Option<FacePlane> {
+    let mut n = DVec3::ZERO;
+    for (i, p) in pts.iter().enumerate() {
+        let q = pts[(i + 1) % pts.len()];
+        n += DVec3::new((p.y - q.y) * (p.z + q.z), (p.z - q.z) * (p.x + q.x), (p.x - q.x) * (p.y + q.y));
+    }
+    let plane = FacePlane::new(*pts.first()?, n)?;
+    let tol = 1e-6 * (1.0 + pts.iter().fold(0.0f64, |m, p| m.max(p.abs().max_element())));
+    pts.iter().all(|p| plane.contains(*p, tol)).then_some(plane)
+}
+
+/// The outline of the flat face made of triangles `tris` of `m`: the edges
+/// only one of them has (matched by position, as [`planar_face`] joins).
+pub fn face_outline(m: &kernel_mesh::Mesh, tris: &[usize]) -> Vec<[DVec3; 2]> {
+    use std::collections::BTreeMap;
+    type Key = (i64, i64, i64);
+    let key = |p: DVec3| -> Key {
+        let q = (p / 1e-6).round();
+        (q.x as i64, q.y as i64, q.z as i64)
+    };
+    let mut count: BTreeMap<(Key, Key), (usize, [DVec3; 2])> = BTreeMap::new();
+    for v in tris.iter().filter_map(|&i| triangle(m, i)) {
+        for k in 0..3 {
+            let (a, b) = (v[k], v[(k + 1) % 3]);
+            let (ka, kb) = (key(a), key(b));
+            let e = count.entry(if ka < kb { (ka, kb) } else { (kb, ka) }).or_insert((0, [a, b]));
+            e.0 += 1;
+        }
+    }
+    count.into_values().filter(|(n, _)| *n == 1).map(|(_, e)| e).collect()
+}
+
+/// Why a face reference names no face (#370).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceRefMiss {
+    /// No triangle (facing the normal, when one is given) is under the point.
+    Off,
+    /// No normal was given and the point lies on several flat faces (an edge).
+    Ambiguous,
+}
+
+/// The triangle of `m` a face reference names (#370, Push/Pull): one that
+/// `point` lies on to within `tol`, facing `normal` (to about 2.5°) when one
+/// is given, the nearest to the point's plane first. A point and a normal
+/// name a face however it is triangulated, so a logged reference replays.
+/// With no normal the point must lie on one flat face only.
+pub fn face_through(
+    m: &kernel_mesh::Mesh,
+    point: DVec3,
+    normal: Option<DVec3>,
+    tol: f64,
+) -> Result<usize, FaceRefMiss> {
+    let want = normal.and_then(|n| n.try_normalize());
+    let mut hits: Vec<(f64, usize, DVec3)> = Vec::new();
+    for i in 0..m.faces().len() {
+        let Some([a, b, c]) = triangle(m, i) else { continue };
+        let Some(n) = (b - a).cross(c - a).try_normalize() else { continue };
+        if want.is_some_and(|w| w.dot(n) < 0.999) {
+            continue;
+        }
+        let off = (point - a).dot(n);
+        let inside = [(a, b), (b, c), (c, a)]
+            .iter()
+            .all(|&(p, q)| (q - p).cross(point - p).dot(n) >= -tol * (q - p).length());
+        if off.abs() <= tol && inside {
+            hits.push((off.abs(), i, n));
+        }
+    }
+    hits.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+    let &(_, best, n) = hits.first().ok_or(FaceRefMiss::Off)?;
+    if want.is_none() && hits.iter().any(|h| h.2.dot(n) < 0.999) {
+        return Err(FaceRefMiss::Ambiguous);
+    }
+    Ok(best)
+}
+
 /// Creation-order rank and world box of every object, in
 /// [`Document::objects_by_id`] order, for picking (#301). Built on first use
 /// and dropped by every object mutation (`Document` calls
@@ -796,6 +912,36 @@ mod tests {
             .collect();
         let flat = kernel_mesh::Mesh::new(pos, faces);
         assert_eq!(planar_face(&flat, 3), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_point_and_normal_name_a_face_and_its_outline() {
+        let m = kernel_mesh::make_box(DVec3::ZERO, DVec3::new(2.0, 3.0, 4.0));
+        let top = face_through(&m, DVec3::new(1.0, 1.0, 4.0), Some(DVec3::Z), 1e-6).unwrap();
+        assert_eq!(planar_face(&m, top), vec![2, 3]);
+        // On the top/+X edge only the normal tells the faces apart.
+        let edge = DVec3::new(2.0, 1.0, 4.0);
+        assert_eq!(face_through(&m, edge, None, 1e-6), Err(FaceRefMiss::Ambiguous));
+        assert!([10, 11].contains(&face_through(&m, edge, Some(DVec3::X), 1e-6).unwrap()));
+        assert_eq!(face_through(&m, DVec3::new(1.0, 1.0, 4.1), None, 1e-6), Err(FaceRefMiss::Off));
+        let ring = face_outline(&m, &[2, 3]);
+        assert_eq!(ring.len(), 4, "the diagonal is inside");
+        assert!(ring.iter().flatten().all(|p| p.z == 4.0));
+    }
+
+    #[test]
+    fn region_at_finds_a_closed_curve_under_the_ray() {
+        let mut doc = Document::default();
+        let open = add(&mut doc, poly(&[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)], false));
+        assert_eq!(region_at(&doc, DVec3::new(3.0, 1.0, 5.0), DVec3::NEG_Z), None, "{open} is open");
+        let l = add(&mut doc, poly(&[(0.0, 0.0), (4.0, 0.0), (4.0, 2.0), (2.0, 2.0), (2.0, 4.0), (0.0, 4.0)], true));
+        let hit = region_at(&doc, DVec3::new(1.0, 3.0, 5.0), DVec3::NEG_Z).unwrap();
+        assert_eq!(hit.object, l);
+        assert!((hit.point - DVec3::new(1.0, 3.0, 0.0)).length() < 1e-9);
+        assert_eq!(hit.normal, DVec3::Z, "faces the viewer");
+        // From below it faces down; in the L's notch there is no region.
+        assert_eq!(region_at(&doc, DVec3::new(1.0, 3.0, -5.0), DVec3::Z).unwrap().normal, DVec3::NEG_Z);
+        assert_eq!(region_at(&doc, DVec3::new(3.0, 3.0, 5.0), DVec3::NEG_Z), None);
     }
 
     #[test]
