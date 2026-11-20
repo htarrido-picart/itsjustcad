@@ -54,6 +54,21 @@ pub enum AppVerb {
     /// view`, #364); same as `camera parallel` / `camera persp`. `None` means
     /// bare toggle.
     Parallel(Option<bool>),
+    /// Dashed occluded edges in the opaque display modes (`backedges
+    /// [on|off]`, #361). `None` means bare toggle.
+    BackEdges(Option<bool>),
+    /// Depth cue outside Sketchy (`depthcue [on|off] [px]`, #361): nearer
+    /// edges thicker. `.0` `None` = bare toggle (a lone width turns it on),
+    /// `.1` = width of the nearest edges in logical px.
+    DepthCue(Option<bool>, Option<f32>),
+    /// Edge colour (`edgecolor layer|same|material|axis [#rrggbb]`, #361).
+    /// `.0` `None` with no colour reports the setting; a lone colour means
+    /// `same`.
+    EdgeColor(Option<itsjustcad_render::EdgeColor>, Option<[u8; 3]>),
+    /// Edge extension outside Sketchy (`extension [on|off] [m]`, #361).
+    /// `.0` `None` = bare toggle (a lone length turns it on), `.1` = the
+    /// overshoot in m.
+    Extension(Option<bool>, Option<f32>),
     /// Viewport anti-aliasing (`antialias off|2|4|8` / `aa`): the MSAA sample
     /// count, 1 = off (#356). `None` reports the current setting.
     AntiAlias(Option<u32>),
@@ -222,6 +237,86 @@ pub fn on_off(arg: Option<&str>) -> Option<Option<bool>> {
     })
 }
 
+/// `[on|off|toggle] [number]` in either order of presence: the toggle (as
+/// [`on_off`]; a lone number means on) and the positive number, if any.
+/// `None` for anything else.
+fn toggle_with_number<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+    range: std::ops::RangeInclusive<f32>,
+) -> Option<(Option<bool>, Option<f32>)> {
+    let num = |w: &str| {
+        let v: f32 = w.trim_end_matches("px").trim_end_matches('m').parse().ok()?;
+        (v.is_finite() && v > 0.0).then(|| v.clamp(*range.start(), *range.end()))
+    };
+    let out = match words.next() {
+        None => (None, None),
+        Some(w) => match num(w) {
+            Some(v) => (Some(true), Some(v)),
+            None => {
+                let on = on_off(Some(w))?;
+                match words.next() {
+                    None => (on, None),
+                    Some(n) => (on, Some(num(n)?)),
+                }
+            }
+        },
+    };
+    words.next().is_none().then_some(out)
+}
+
+/// `edgecolor [layer|same|material|axis] [#rrggbb]`.
+fn parse_edge_color<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+) -> Option<(Option<itsjustcad_render::EdgeColor>, Option<[u8; 3]>)> {
+    use itsjustcad_render::{parse_hex_rgb, EdgeColor};
+    let out = match words.next() {
+        None => (None, None),
+        Some(w) => match (EdgeColor::parse(w), parse_hex_rgb(w)) {
+            (Some(c), _) => match words.next() {
+                None => (Some(c), None),
+                Some(hex) => (Some(c), Some(parse_hex_rgb(hex)?)),
+            },
+            (None, Some(rgb)) => (Some(EdgeColor::Same), Some(rgb)),
+            (None, None) => return None,
+        },
+    };
+    words.next().is_none().then_some(out)
+}
+
+/// An edge-style verb applied to `style` (#361), shared by the app and the
+/// headless runner. Other verbs leave it unchanged; a bare `edgecolor`
+/// only reports.
+pub fn apply_edge_style(
+    mut style: itsjustcad_render::EdgeStyle,
+    verb: &AppVerb,
+) -> itsjustcad_render::EdgeStyle {
+    match *verb {
+        AppVerb::BackEdges(on) => style.back_edges = on.unwrap_or(!style.back_edges),
+        AppVerb::DepthCue(on, px) => {
+            style.depth_cue = on.unwrap_or(!style.depth_cue);
+            if let Some(px) = px {
+                style.depth_cue_px = px;
+            }
+        }
+        AppVerb::EdgeColor(color, rgb) => {
+            if let Some(c) = color {
+                style.color = c;
+            }
+            if let Some(rgb) = rgb {
+                style.same_rgb = rgb;
+            }
+        }
+        AppVerb::Extension(on, m) => {
+            style.extension = on.unwrap_or(!style.extension);
+            if let Some(m) = m {
+                style.extension_m = m;
+            }
+        }
+        _ => {}
+    }
+    style
+}
+
 /// Classify a command line as an app-level verb, or `None` if it should fall
 /// through to the substrate parser / draw tools. The single source of truth
 /// for which verbs the app owns.
@@ -250,6 +345,19 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         "grid" if line.split_whitespace().count() <= 2 => AppVerb::Grid(on_off(words.next())?),
         "axes" => AppVerb::Axes(on_off(words.next())?),
         "parallel" | "parallelprojection" => AppVerb::Parallel(on_off(words.next())?),
+        "backedges" => AppVerb::BackEdges(on_off(words.next())?),
+        "depthcue" => {
+            let (on, px) = toggle_with_number(words, 1.0..=24.0)?;
+            AppVerb::DepthCue(on, px)
+        }
+        "edgecolor" | "edgecolour" => {
+            let (c, rgb) = parse_edge_color(words)?;
+            AppVerb::EdgeColor(c, rgb)
+        }
+        "extension" => {
+            let (on, m) = toggle_with_number(words, 0.001..=10.0)?;
+            AppVerb::Extension(on, m)
+        }
         "antialias" | "aa" => AppVerb::AntiAlias(match words.next() {
             None => None,
             Some(arg) => Some(parse_msaa(arg)?),
@@ -361,6 +469,41 @@ mod tests {
             classify("camera parallel"),
             Some(AppVerb::Camera(Some("parallel".into()), None))
         );
+    }
+
+    #[test]
+    fn classifies_edge_style_verbs() {
+        use itsjustcad_render::EdgeColor;
+        // #361: back edges, depth cue, edge colour, extension.
+        assert_eq!(classify("backedges"), Some(AppVerb::BackEdges(None)));
+        assert_eq!(classify("backedges on"), Some(AppVerb::BackEdges(Some(true))));
+        assert_eq!(classify("backedges dashed"), None);
+        assert_eq!(classify("depthcue"), Some(AppVerb::DepthCue(None, None)));
+        assert_eq!(classify("depthcue off"), Some(AppVerb::DepthCue(Some(false), None)));
+        assert_eq!(classify("depthcue on 4"), Some(AppVerb::DepthCue(Some(true), Some(4.0))));
+        assert_eq!(classify("depthcue 5px"), Some(AppVerb::DepthCue(Some(true), Some(5.0))));
+        assert_eq!(classify("depthcue on 99"), Some(AppVerb::DepthCue(Some(true), Some(24.0))));
+        assert_eq!(classify("depthcue on wide"), None);
+        assert_eq!(classify("depthcue on 3 4"), None);
+        assert_eq!(classify("depthcue -2"), None);
+        assert_eq!(classify("edgecolor"), Some(AppVerb::EdgeColor(None, None)));
+        assert_eq!(classify("edgecolor axis"), Some(AppVerb::EdgeColor(Some(EdgeColor::Axis), None)));
+        assert_eq!(
+            classify("edgecolor same #ff0000"),
+            Some(AppVerb::EdgeColor(Some(EdgeColor::Same), Some([255, 0, 0])))
+        );
+        assert_eq!(
+            classify("edgecolour 102030"),
+            Some(AppVerb::EdgeColor(Some(EdgeColor::Same), Some([16, 32, 48])))
+        );
+        assert_eq!(classify("edgecolor material"), Some(AppVerb::EdgeColor(Some(EdgeColor::Material), None)));
+        assert_eq!(classify("edgecolor layer"), Some(AppVerb::EdgeColor(Some(EdgeColor::Layer), None)));
+        assert_eq!(classify("edgecolor plaid"), None);
+        assert_eq!(classify("edgecolor same #12"), None);
+        assert_eq!(classify("extension"), Some(AppVerb::Extension(None, None)));
+        assert_eq!(classify("extension on 0.2"), Some(AppVerb::Extension(Some(true), Some(0.2))));
+        assert_eq!(classify("extension 0.3m"), Some(AppVerb::Extension(Some(true), Some(0.3))));
+        assert_eq!(classify("extension off"), Some(AppVerb::Extension(Some(false), None)));
     }
 
     #[test]
@@ -595,6 +738,10 @@ mod tests {
         "grid",
         "axes",
         "parallel",
+        "backedges",
+        "depthcue",
+        "edgecolor",
+        "extension",
         "ze",
         "zoomextents",
         "zs",
@@ -645,6 +792,7 @@ mod tests {
         "osnap",        // object-snap toggle: interactive-input setting, not a view/draw verb
         "snap",         // alias of `osnap`
         "parallelprojection", // alias of `parallel`
+        "edgecolour",   // alias of `edgecolor`
     ];
 
     #[test]
@@ -690,6 +838,11 @@ mod tests {
             "axes",
             "parallel",
             "parallelprojection",
+            "backedges",
+            "depthcue",
+            "edgecolor",
+            "edgecolour",
+            "extension",
             "camera",
             "save",
             "help",
@@ -749,6 +902,10 @@ mod tests {
             "axes on",
             "parallel on",
             "camera parallel",
+            "backedges on",
+            "depthcue on 3",
+            "edgecolor axis",
+            "extension on",
             "ze",
             "zoomextents",
             "top",
@@ -806,6 +963,12 @@ mod tests {
             "axes off",
             "camera parallel",
             "parallel on",
+            "backedges on",
+            "depthcue on 4",
+            "edgecolor same #000000",
+            "edgecolor material",
+            "edgecolor axis",
+            "extension on 0.1",
             "render glass pavilion at dusk",
             "render cancel",
             itsjustcad_deck::FEEDBACK_EXAMPLE_LINE,
@@ -822,6 +985,8 @@ mod tests {
         assert!(h.contains("phone-periscope"));
         assert!(h.contains("zoom to fit"));
         assert!(h.contains("grid on|off") && h.contains("axes on|off"));
+        assert!(h.contains("backedges on|off") && h.contains("depthcue on|off [px]"));
+        assert!(h.contains("edgecolor layer|same|material|axis"));
     }
 
     #[test]

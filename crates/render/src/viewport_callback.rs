@@ -49,6 +49,9 @@ pub struct ViewportCallback {
     pub show_grid: bool,
     /// World X/Y/Z axes shown (`axes on|off`, #364).
     pub show_axes: bool,
+    /// Edge style (#361); only its GPU side (back edges, depth cue) is read
+    /// here, the rest shaped `scene`.
+    pub edge_style: crate::EdgeStyle,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -83,8 +86,11 @@ impl CallbackTrait for ViewportCallback {
                 let [w, h] = self.size_points;
                 [w * ppp, h * ppp, self.mode.line_px(ppp), ppp]
             },
+            edges: [0.0; 4],
+            cue: [0.0; 4],
         }
-        .with_overlays(self.show_grid, self.show_axes);
+        .with_overlays(self.show_grid, self.show_axes)
+        .with_edge_style(&self.edge_style, screen_desc.pixels_per_point);
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene
             && (renderer.generation != self.generation || self.force)

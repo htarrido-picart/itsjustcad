@@ -219,5 +219,6 @@ fn main() {
         samples: 1,
         show_grid: true,
         show_axes: true,
+        edge_style: Default::default(),
     };
 }
