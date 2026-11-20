@@ -436,6 +436,9 @@ pub struct ViewState {
     pub edges: ViewEdges,
     /// Fog — the checks in View ▸ Fog (#363).
     pub fog: ViewFog,
+    /// The built-in style the active pane matches — the check in View ▸
+    /// Styles (#362). `None` when a saved style (or none) matches.
+    pub style: Option<itsjustcad_render::BuiltinStyle>,
 }
 
 /// The View ▸ Fog checks (#363).
@@ -767,6 +770,29 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             NativeItem::Separator,
             // Panel visibility as a stateful "Hide Panel" ⇄ "Show Panel" flip.
             panel_item,
+            NativeItem::Separator,
+            // Named styles (#362): the built-ins as a radio group (saved ones
+            // are inserted after them, see [`insert_saved_styles`]), then
+            // Save Style… (prefills `style save `) and List Styles.
+            NativeItem::Submenu {
+                id: format!("{t}/styles"),
+                label: tr("menu.view.styles").into(),
+                items: {
+                    use itsjustcad_render::BuiltinStyle;
+                    let mut items: Vec<NativeItem> = BuiltinStyle::ALL
+                        .into_iter()
+                        .map(|b| {
+                            let id = format!("style_{}", b.name());
+                            let key = format!("menu.view.{id}");
+                            radio(&id, tr(&key), &format!("style {}", b.name()), view.style == Some(b))
+                        })
+                        .collect();
+                    items.push(NativeItem::Separator);
+                    items.push(wired_leaf(t, "style_save", tr("menu.view.style_save"), MenuAction::Insert("style save ".into())));
+                    items.push(ex("style_list", tr("menu.view.style_list"), "style list"));
+                    items
+                },
+            },
             NativeItem::Separator,
             // Display modes — radio: the active one carries a check.
             radio("disp_shaded", tr("menu.view.disp_shaded"), "display shaded", view.display == Some(DisplayModeTag::Shaded)),
@@ -1148,9 +1174,12 @@ pub fn ui(
     has_selection: bool,
     toggles: MenuToggles,
     view: ViewState,
+    // The document's saved styles and the active style's name (#362).
+    (saved_styles, active_style): (&[String], Option<&str>),
 ) -> Option<MenuAction> {
     let mut action = None;
-    let model = native_model(style, has_selection, view);
+    let mut model = native_model(style, has_selection, view);
+    insert_saved_styles(&mut model, saved_styles, active_style);
     egui::MenuBar::new().ui(ui, |ui| {
         for menu in &model {
             ui.menu_button(&menu.title, |ui| {
@@ -1162,6 +1191,37 @@ pub fn ui(
         appearance_controls(ui, icons);
     });
     action
+}
+
+/// Id prefix of the saved-style checks in View ▸ Styles (#362).
+pub const SAVED_STYLE_ID: &str = "View/style_saved:";
+
+/// The View ▸ Styles check of the saved style `name` (#362).
+pub fn saved_style_item(name: &str, checked: bool) -> NativeItem {
+    NativeItem::Check {
+        id: format!("{SAVED_STYLE_ID}{name}"),
+        label: name.to_string(),
+        action: MenuAction::Execute(format!("style {name}")),
+        checked,
+        enabled: true,
+    }
+}
+
+/// Insert the document's saved styles into View ▸ Styles, after the
+/// built-ins (#362); `active` carries the check. The model itself lists only
+/// the built-ins, which are the same in every document.
+pub fn insert_saved_styles(model: &mut [NativeMenu], saved: &[String], active: Option<&str>) {
+    let Some(view) = model.iter_mut().find(|m| m.title == tr("menu.view")) else { return };
+    for it in &mut view.items {
+        if let NativeItem::Submenu { id, items, .. } = it
+            && id == "View/styles"
+        {
+            let at = itsjustcad_render::BuiltinStyle::ALL.len();
+            for (i, name) in saved.iter().enumerate() {
+                items.insert(at + i, saved_style_item(name, Some(name.as_str()) == active));
+            }
+        }
+    }
 }
 
 /// One in-window menu item ([`ui`]); a submenu draws its items nested.
@@ -1317,6 +1377,7 @@ pub fn demo_open(
         show_axes: true,
         edges: ViewEdges::default(),
         fog: ViewFog::default(),
+        style: Some(itsjustcad_render::BuiltinStyle::Modelling),
     };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
         return;
@@ -1965,6 +2026,61 @@ mod tests {
         let style = itsjustcad_render::EdgeStyle { back_edges: true, color: EdgeColor::Same, ..Default::default() };
         let e = ViewEdges::from(style);
         assert!(e.back_edges && !e.depth_cue && e.color == EdgeColor::Same);
+    }
+
+    #[test]
+    fn view_styles_submenu_checks_and_fires_verbs() {
+        use itsjustcad_render::BuiltinStyle;
+        // #362: View ▸ Styles lists the built-ins as radios (the active one
+        // checked), then Save Style… (prefills) and List Styles.
+        let styles = |view: ViewState, saved: &[String], active: Option<&str>| {
+            let mut menus = native_model(MenuStyle::Modeler, true, view);
+            insert_saved_styles(&mut menus, saved, active);
+            let view = menus.into_iter().find(|m| m.title == tr("menu.view")).expect("View menu");
+            view.items
+                .into_iter()
+                .find_map(|it| match it {
+                    NativeItem::Submenu { id, label, items } if id == "View/styles" => Some((label, items)),
+                    _ => None,
+                })
+                .expect("View ▸ Styles")
+        };
+        let v = ViewState { style: Some(BuiltinStyle::Sketch), ..Default::default() };
+        let (label, items) = styles(v, &[], None);
+        assert_eq!(label, tr("menu.view.styles"));
+        let checks: Vec<(String, MenuAction, bool)> = items
+            .iter()
+            .filter_map(|it| match it {
+                NativeItem::Check { id, action, checked, .. } => Some((id.clone(), action.clone(), *checked)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks.len(), BuiltinStyle::ALL.len());
+        for ((id, action, checked), b) in checks.iter().zip(BuiltinStyle::ALL) {
+            let line = format!("style {}", b.name());
+            assert_eq!(id, &format!("View/style_{}", b.name()));
+            assert_eq!(*action, MenuAction::Execute(line.clone()));
+            assert!(crate::app_verbs::classify(&line).is_some(), "{line}");
+            assert_eq!(*checked, b == BuiltinStyle::Sketch, "{line}");
+            assert_ne!(tr(&format!("menu.view.style_{}", b.name())), format!("menu.view.style_{}", b.name()));
+        }
+        let leaf = |id: &str| {
+            items.iter().find_map(|it| match it {
+                NativeItem::Leaf { id: i, action, .. } if i == id => Some(action.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(leaf("View/style_save"), Some(MenuAction::Insert("style save ".into())));
+        assert_eq!(leaf("View/style_list"), Some(MenuAction::Execute("style list".into())));
+        // Saved styles follow the built-ins; the active one is checked.
+        let saved = ["plan".to_string(), "review".to_string()];
+        let (_, items) = styles(ViewState::default(), &saved, Some("review"));
+        let n = BuiltinStyle::ALL.len();
+        assert_eq!(items[n], saved_style_item("plan", false));
+        assert_eq!(items[n + 1], saved_style_item("review", true));
+        assert!(matches!(&items[n + 1], NativeItem::Check { action, .. }
+            if *action == MenuAction::Execute("style review".into())));
+        assert!(matches!(items[n + 2], NativeItem::Separator));
     }
 
     #[test]

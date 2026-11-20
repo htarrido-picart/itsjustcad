@@ -139,7 +139,8 @@ impl CameraUniform {
 ///   black. No specular.
 /// * `Presentation`: adds Blinn-Phong specular driven by the material presets
 ///   (glass shiny, concrete matte) on top of the Working fill.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LightMode {
     #[default]
     Working,
@@ -179,7 +180,8 @@ impl LightMode {
 }
 
 /// Per-viewport display mode. View state, not model state: never logged.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DisplayMode {
     #[default]
     Shaded,
@@ -318,7 +320,8 @@ impl DisplayMode {
 }
 
 /// How object colors are resolved in the viewport. View state — never logged.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ColorMode {
     /// Object color → layer color → theme default (current behavior).
     #[default]
