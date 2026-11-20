@@ -16,6 +16,7 @@ mod catalog;
 mod formfind;
 mod mesh;
 mod primitives;
+mod pushpull;
 mod section;
 mod solids;
 mod stairs;
@@ -41,6 +42,7 @@ pub use formfind::{
 };
 pub use mesh::{Mesh, RenderMesh};
 pub use primitives::{extrude_profile, make_box};
+pub use pushpull::{PushPullError, PushPullHow, push_pull};
 pub use section::{slice, SliceCurve};
 pub use stairs::{
     ramp_centerline, ramp_centerline_curved, ramp_centerline_turning, ramp_layout,
