@@ -11,7 +11,7 @@
 use glam::{Mat4, Vec3};
 use itsjustcad_render::{
     camera_uniform, camera_uniform_ex, pick_sample_count, supported_sample_counts, AoStyle, AoUnits, DisplayMode,
-    EdgeStyle, FogColor, FogStyle, SceneData, ShadowStyle,
+    EdgeStyle, FogColor, FogStyle, SceneData, SectionStyle, ShadowStyle,
     SceneRenderer, UnderlayData, DEPTH_FORMAT,
 };
 use itsjustcad_doc::LineType;
@@ -885,4 +885,131 @@ fn shadow_map_redraws_only_for_geometry_or_sun() {
     frame(&mut r, vp, [0.0, -0.6, 0.8], &ShadowStyle::default());
     assert!(!r.has_shadow_map(), "freed when off");
     g.queue.submit([enc.finish()]);
+}
+
+/// A closed box `lo..hi`, one outward winding per face, as a solid's mesh:
+/// back faces cull, so the section fill (#359) sees them through a cut.
+fn solid_box(lo: Vec3, hi: Vec3) -> RenderMesh {
+    let (mut positions, mut normals, mut indices) = (Vec::new(), Vec::new(), Vec::new());
+    for axis in 0..3 {
+        for side in [0.0f32, 1.0] {
+            let (b, c) = ((axis + 1) % 3, (axis + 2) % 3);
+            let i = positions.len() as u32;
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                let mut p = lo;
+                p[axis] = lo[axis] + (hi[axis] - lo[axis]) * side;
+                p[b] = lo[b] + (hi[b] - lo[b]) * u;
+                p[c] = lo[c] + (hi[c] - lo[c]) * v;
+                positions.push(p.to_array());
+                let mut n = [0.0; 3];
+                n[axis] = side * 2.0 - 1.0;
+                normals.push(n);
+            }
+            // (b, c) run counter-clockwise about +axis: outward on the far side.
+            indices.extend(if side > 0.5 { [i, i + 1, i + 2, i, i + 2, i + 3] } else { [i, i + 2, i + 1, i, i + 3, i + 2] });
+        }
+    }
+    RenderMesh { positions, normals, indices }
+}
+
+/// Render the 2 m cube at the origin, with a black edge on its far (-X)
+/// face, from `eye` at `n` samples, cut by `plane` with `style`.
+fn draw_section(
+    g: &Gpu,
+    n: u32,
+    mode: DisplayMode,
+    eye: Vec3,
+    plane: Option<[[f32; 3]; 2]>,
+    style: &SectionStyle,
+) -> (Vec<u8>, Mat4) {
+    let scene = SceneData {
+        meshes: vec![(solid_box(Vec3::splat(-1.0), Vec3::splat(1.0)), [0.8, 0.8, 0.8, 1.0], [0.5, 0.0])],
+        face_meshes: vec![],
+        lines: vec![],
+        edges: vec![(vec![[-1.0, -0.6, 0.0], [-1.0, 0.6, 0.0], [-1.0, 0.0, -0.6], [-1.0, 0.0, 0.6]], [0.0, 0.0, 0.0, 1.0], 0.25)],
+        line_types: vec![],
+        edge_types: vec![],
+        profile_edges: vec![],
+        points: vec![],
+        underlay: None,
+        basemap: None,
+        show_lineweights: false,
+    };
+    let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Z);
+    let vp = Mat4::perspective_rh(50f32.to_radians(), W as f32 / H as f32, 0.05, 1000.0) * view;
+    let scope = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut r = SceneRenderer::with_samples(&g.device, FORMAT, n);
+    r.set_scene(&g.device, &g.queue, &scene, 1);
+    let mut cam = camera_uniform_ex(vp, eye, mode, Default::default(), None, false).with_overlays(false, false);
+    cam.screen = [W as f32, H as f32, 0.0, 1.0];
+    r.write_camera(&g.device, &g.queue, 0, &cam.with_section(plane, style));
+    let rgba = if n > 1 {
+        let mut enc = g.device.create_command_encoder(&Default::default());
+        r.render_msaa_pane(&g.device, &mut enc, 0, [W, H], mode, true);
+        g.queue.submit([enc.finish()]);
+        read_rgba(g, r.msaa_target(0).expect("target").resolve_texture())
+    } else {
+        window_pass(g, wgpu::Color::TRANSPARENT, |pass| r.paint(pass, 0, mode, true))
+    };
+    let err = pollster::block_on(scope.pop());
+    assert!(err.is_none(), "{n}x {mode:?} section: {err:?}");
+    (rgba, vp)
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn section_cut_clips_and_fills_a_box_at_every_sample_count() {
+    // #359: a cut through the middle (removing x > 0), seen from the cut
+    // side: the near half is gone, the opening shows the fill, and the far
+    // face's edge behind the cap does not show through it. From the kept
+    // side nothing fills; no plane (or cuts off) is today's image.
+    let g = gpu();
+    let px = |vp: Mat4, p: Vec3| {
+        let ndc = vp.project_point3(p);
+        let x = ((ndc.x * 0.5 + 0.5) * W as f32) as usize;
+        let y = ((0.5 - ndc.y * 0.5) * H as f32) as usize;
+        (y * W as usize + x) * 4
+    };
+    let magenta = SectionStyle { fill_rgb: [255, 0, 255], ..SectionStyle::default() };
+    let plane = Some([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]);
+    let is_fill = |c: &[u8]| c[0] > 230 && c[1] < 30 && c[2] > 230 && c[3] > 250;
+    let cut_side = Vec3::new(6.0, -5.0, 4.0);
+    for &n in &g.counts {
+        for mode in [DisplayMode::Shaded, DisplayMode::Pencil] {
+            let (plain, vp) = draw_section(&g, n, mode, cut_side, None, &magenta);
+            let (cut, _) = draw_section(&g, n, mode, cut_side, plane, &magenta);
+            // On the removed half's faces: the fill now.
+            for p in [Vec3::new(1.0, -0.3, 0.2), Vec3::new(0.5, -1.0, 0.0)] {
+                let i = px(vp, p);
+                assert!(!is_fill(&plain[i..i + 4]), "{n}x {mode:?} {p}: box before the cut");
+                assert!(is_fill(&cut[i..i + 4]), "{n}x {mode:?} {p}: fill {:?}", &cut[i..i + 4]);
+            }
+            // The kept half's wall is untouched.
+            let i = px(vp, Vec3::new(-0.5, -1.0, 0.0));
+            assert_eq!(plain[i..i + 4], cut[i..i + 4], "{n}x {mode:?}: kept wall");
+            // The far face's edge stays behind the cap.
+            let c = px(vp, Vec3::new(-1.0, 0.0, 0.0)) as isize;
+            for d in [-2isize, -1, 0, 1, 2] {
+                for e in [-2isize, -1, 0, 1, 2] {
+                    let i = (c + (d * W as isize + e) * 4) as usize;
+                    assert!(is_fill(&cut[i..i + 4]), "{n}x {mode:?}: edge through the cap at {d},{e}");
+                }
+            }
+            // Fill off: the opening shows the empty inside (back faces cull).
+            let (open, _) = draw_section(&g, n, mode, cut_side, plane, &SectionStyle { fill: false, ..magenta });
+            let i = px(vp, Vec3::new(1.0, -0.3, 0.2));
+            assert!(!is_fill(&open[i..i + 4]) && open[i + 3] < 255, "{n}x {mode:?}: open {:?}", &open[i..i + 4]);
+            // Cuts off, or no plane: the plain image.
+            let (off, _) = draw_section(&g, n, mode, cut_side, plane, &SectionStyle { cuts: false, ..magenta });
+            assert_eq!(off, plain, "{n}x {mode:?}: cuts off");
+        }
+        // From the kept side the cut face is behind the solid: no fill.
+        let kept_side = Vec3::new(-6.0, -5.0, 4.0);
+        let (cut, _) = draw_section(&g, n, DisplayMode::Shaded, kept_side, plane, &magenta);
+        assert!(!cut.chunks(4).any(is_fill), "{n}x: no fill from the kept side");
+        // X-ray cuts but never fills.
+        let (xr, vp) = draw_section(&g, n, DisplayMode::XRay, cut_side, plane, &magenta);
+        let i = px(vp, Vec3::new(1.0, -0.3, 0.2));
+        assert!(!is_fill(&xr[i..i + 4]), "{n}x x-ray: no fill");
+    }
 }

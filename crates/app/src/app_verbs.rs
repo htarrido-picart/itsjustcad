@@ -78,6 +78,9 @@ pub enum AppVerb {
     /// Sun shadows (#357): `shadows [on|off]`, `shadows light|dark <0..1>`,
     /// `shadows ground on|off`, `shadows panel` (`shadow` too).
     Shadows(ShadowVerb),
+    /// Section display (#359): `sections [planes|cuts|fill] [on|off]`,
+    /// `sections fill #rrggbb`.
+    Sections(SectionsVerb),
     /// Named viewport styles (#362): `style <name> [all]`, `style
     /// save|update|delete <name>`, `style [list]`.
     Style(crate::view_styles::StyleVerb),
@@ -470,6 +473,57 @@ pub fn apply_shadow_style(
     style
 }
 
+/// One `sections` verb (#359).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SectionsVerb {
+    /// Bare `sections`: report the settings.
+    Report,
+    /// `sections planes [on|off]`: the plane widgets; `None` toggles.
+    Planes(Option<bool>),
+    /// `sections cuts [on|off]`: the active plane cuts the view.
+    Cuts(Option<bool>),
+    /// `sections fill [on|off]`: cap the cut solids.
+    Fill(Option<bool>),
+    /// `sections fill #rrggbb`: the fill colour (turns the fill on).
+    FillColour([u8; 3]),
+}
+
+/// The words after `sections`.
+fn parse_sections<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<SectionsVerb> {
+    let out = match words.next().map(str::to_ascii_lowercase).as_deref() {
+        None => SectionsVerb::Report,
+        Some("planes" | "plane") => SectionsVerb::Planes(on_off(words.next())?),
+        Some("cuts" | "cut") => SectionsVerb::Cuts(on_off(words.next())?),
+        Some("fill") => match words.next() {
+            Some(w) if itsjustcad_render::parse_hex_rgb(w).is_some() => {
+                SectionsVerb::FillColour(itsjustcad_render::parse_hex_rgb(w)?)
+            }
+            w => SectionsVerb::Fill(on_off(w)?),
+        },
+        _ => return None,
+    };
+    words.next().is_none().then_some(out)
+}
+
+/// A `sections` verb applied to `style` (#359), shared by the app and the
+/// headless runner. Other verbs leave it unchanged.
+pub fn apply_section_style(
+    mut style: itsjustcad_render::SectionStyle,
+    verb: &AppVerb,
+) -> itsjustcad_render::SectionStyle {
+    match *verb {
+        AppVerb::Sections(SectionsVerb::Planes(on)) => style.planes = on.unwrap_or(!style.planes),
+        AppVerb::Sections(SectionsVerb::Cuts(on)) => style.cuts = on.unwrap_or(!style.cuts),
+        AppVerb::Sections(SectionsVerb::Fill(on)) => style.fill = on.unwrap_or(!style.fill),
+        AppVerb::Sections(SectionsVerb::FillColour(rgb)) => {
+            style.fill = true;
+            style.fill_rgb = rgb;
+        }
+        _ => {}
+    }
+    style
+}
+
 /// `edgecolor [layer|same|material|axis] [#rrggbb]`.
 fn parse_edge_color<'a>(
     mut words: impl Iterator<Item = &'a str>,
@@ -567,6 +621,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         "fog" => AppVerb::Fog(parse_fog(words)?),
         "ao" | "ambientocclusion" => AppVerb::Ao(parse_ao(words)?),
         "shadows" | "shadow" => AppVerb::Shadows(parse_shadows(words)?),
+        "sections" => AppVerb::Sections(parse_sections(words)?),
         "style" => AppVerb::Style(crate::view_styles::parse(words)?),
         "antialias" | "aa" => AppVerb::AntiAlias(match words.next() {
             None => None,
@@ -817,6 +872,31 @@ mod tests {
         ] {
             assert_eq!(classify(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn classifies_and_applies_section_verbs() {
+        use itsjustcad_render::SectionStyle;
+        // #359: the three toggles and the fill colour.
+        let sv = |v| Some(AppVerb::Sections(v));
+        assert_eq!(classify("sections"), sv(SectionsVerb::Report));
+        assert_eq!(classify("sections planes off"), sv(SectionsVerb::Planes(Some(false))));
+        assert_eq!(classify("sections cuts"), sv(SectionsVerb::Cuts(None)));
+        assert_eq!(classify("sections fill on"), sv(SectionsVerb::Fill(Some(true))));
+        assert_eq!(classify("sections fill #ff0080"), sv(SectionsVerb::FillColour([255, 0, 128])));
+        for bad in ["sections walls", "sections fill plaid", "sections cuts on off", "sections planes maybe"] {
+            assert_eq!(classify(bad), None, "{bad}");
+        }
+        let mut s = SectionStyle::default();
+        s = apply_section_style(s, &classify("sections cuts").unwrap());
+        assert!(!s.cuts && s.planes && s.fill);
+        s = apply_section_style(s, &classify("sections fill off").unwrap());
+        s = apply_section_style(s, &classify("sections planes off").unwrap());
+        assert!(!s.fill && !s.planes);
+        s = apply_section_style(s, &classify("sections fill #102030").unwrap());
+        assert!(s.fill && s.fill_rgb == [16, 32, 48], "a colour turns the fill on");
+        assert_eq!(apply_section_style(s, &classify("sections").unwrap()), s, "report only");
+        assert_eq!(apply_section_style(s, &classify("shadows on").unwrap()), s);
     }
 
     #[test]
@@ -1110,6 +1190,7 @@ mod tests {
         "fog",
         "ao",
         "shadows",
+        "sections",
         "style",
         "ze",
         "zoomextents",
@@ -1219,6 +1300,7 @@ mod tests {
             "ambientocclusion",
             "shadows",
             "shadow",
+            "sections",
             "style",
             "camera",
             "save",
@@ -1290,6 +1372,8 @@ mod tests {
             "ao distance 5%",
             "shadows on",
             "shadows light 0.8",
+            "sections cuts off",
+            "sections fill #303030",
             "style presentation",
             "style save review",
             "ze",
@@ -1369,6 +1453,10 @@ mod tests {
             "shadows dark 0.45",
             "shadows ground off",
             "shadows panel",
+            "sections planes on",
+            "sections cuts off",
+            "sections fill on",
+            "sections fill #303030",
             "style presentation",
             "style sketch all",
             "style save review",
@@ -1398,6 +1486,7 @@ mod tests {
         assert!(h.contains("ao intensity <0..1>") && h.contains("ao colour #rrggbb"));
         assert!(h.contains("shadows on|off") && h.contains("shadows light <0..1>"));
         assert!(h.contains("shadows dark <0..1>") && h.contains("shadows ground on|off"));
+        assert!(h.contains("sections planes|cuts|fill on|off") && h.contains("sections fill #rrggbb"));
         assert!(h.contains("style <name> [all]") && h.contains("style save|update|delete <name>"));
         for b in itsjustcad_render::BuiltinStyle::ALL {
             assert!(h.contains(b.name()), "{}", b.name());

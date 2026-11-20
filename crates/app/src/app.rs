@@ -7,6 +7,7 @@ mod optimize_panel;
 mod geocode_ui;
 mod osmfetch_ui;
 mod pushpull_ui;
+mod section_ui;
 
 use itsjustcad_commands::Session;
 use itsjustcad_commands::lot::hierarchy::LevelKind;
@@ -690,6 +691,13 @@ pub struct App {
     /// it). View state, never logged: the sun they fall from is the
     /// document's (`sun`, `location`).
     shadow_style: itsjustcad_render::ShadowStyle,
+    /// Section display (#359): plane widgets, live cut, fill and its colour.
+    /// All on by default; persisted to `ui.json` as one object (named styles
+    /// bundle it). View state, never logged: the planes and the active cut
+    /// are the document's (`sectionplane`).
+    section_style: itsjustcad_render::SectionStyle,
+    /// The Section Plane tool (#359), armed by a bare `sectionplane`.
+    section_tool: crate::section_tool::SectionPlaneTool,
     /// The Shadows panel's local clock (#357), in `ui.json`; releasing a
     /// slider sets the document sun from it.
     shadow_clock: crate::shadow_clock::ShadowClock,
@@ -1662,6 +1670,8 @@ impl App {
             fog_style: fog_style_from(&load_ui_json()),
             ao_style: ao_style_from(&load_ui_json()),
             shadow_style: shadow_style_from(&load_ui_json()),
+            section_style: section_style_from(&load_ui_json()),
+            section_tool: Default::default(),
             shadow_clock: shadow_clock_from(&load_ui_json()),
             show_shadow_panel: false,
             shadow_preview_sun: None,
@@ -2384,6 +2394,16 @@ impl App {
                 Some(verb) => self.apply_shadow_verb(verb),
                 None => self.command_line.push_line(SHADOW_USAGE),
             },
+            // Section display (#359): view state, never logged; ui.json.
+            Some("sections") => match crate::app_verbs::classify(line) {
+                Some(verb) => self.apply_section_verb(verb),
+                None => self.command_line.push_line(SECTIONS_USAGE),
+            },
+            // `sectionplane align [name]` (#359): the camera, not the model.
+            Some("sectionplane") if line.split_whitespace().nth(1).is_some_and(|w| w.eq_ignore_ascii_case("align")) => {
+                let name = line.split_whitespace().nth(2);
+                self.align_view_to_section(name);
+            }
             Some("style") => match crate::app_verbs::classify(line) {
                 Some(crate::app_verbs::AppVerb::Style(verb)) => self.run_style_verb(line, verb),
                 _ => self.command_line.push_line(crate::view_styles::STYLE_USAGE),
@@ -2812,7 +2832,17 @@ impl App {
                 self.pending_critique = Some(question);
             }
             _ => {
+                if self.section_tool.try_start(line) {
+                    self.pushpull.cancel();
+                    self.draw_tool.cancel();
+                    self.guided.cancel();
+                    if let Some(prompt) = self.section_tool.prompt() {
+                        self.command_line.push_line(prompt);
+                    }
+                    return;
+                }
                 if self.pushpull.try_start(line) {
+                    self.section_tool.cancel();
                     self.draw_tool.cancel();
                     self.guided.cancel();
                     if let Some(prompt) = self.pushpull.prompt() {
@@ -2822,6 +2852,7 @@ impl App {
                 }
                 if self.draw_tool.try_start(line) {
                     self.pushpull.cancel();
+                    self.section_tool.cancel();
                     if let Some(prompt) = self.draw_tool.prompt() {
                         self.command_line.push_line(prompt);
                     }
@@ -2833,6 +2864,7 @@ impl App {
                 match self.guided.try_start(line, selection.as_deref()) {
                     StartResult::Started => {
                         self.pushpull.cancel();
+                        self.section_tool.cancel();
                         // Fresh guided flow → reset the trim command-panel options.
                         self.trim_extend = false;
                         self.trim_apparent = true;
@@ -3756,6 +3788,13 @@ impl App {
         self.command_line.push_line(self.ao_style.summary());
     }
 
+    /// Apply a `sections` verb (#359), persist the setting and report it.
+    fn apply_section_verb(&mut self, verb: crate::app_verbs::AppVerb) {
+        self.section_style = crate::app_verbs::apply_section_style(self.section_style, &verb);
+        save_section_style(&self.section_style);
+        self.command_line.push_line(self.section_style.summary());
+    }
+
     /// Apply a `shadows` verb (#357), persist the setting and report it;
     /// `shadows panel` shows or hides the panel.
     fn apply_shadow_verb(&mut self, verb: crate::app_verbs::AppVerb) {
@@ -3879,6 +3918,7 @@ impl App {
             fog: self.fog_style,
             ao: self.ao_style,
             shadows: self.shadow_style,
+            sections: self.section_style,
             grid: self.show_grid,
             axes: self.show_axes,
             gradient: self.background_gradient,
@@ -3915,6 +3955,8 @@ impl App {
         save_ao_style(&s.ao);
         self.shadow_style = s.shadows;
         save_shadow_style(&s.shadows);
+        self.section_style = s.sections;
+        save_section_style(&s.sections);
     }
 
     /// The name of the style the active pane's settings match (#362).
@@ -4115,6 +4157,7 @@ impl App {
             || self.draw_tool.active()
             || self.guided.active()
             || self.pushpull.active()
+            || self.section_tool.active()
             || chat_composing
             || !self.command_line.is_empty()
             || other_text_field_focused
@@ -4668,6 +4711,7 @@ impl App {
             || self.box_drag.is_some()
             || self.draw_tool.active()
             || self.pushpull.active()
+            || self.section_tool.active()
         {
             return false;
         }
@@ -5399,7 +5443,10 @@ impl App {
         if self.maximized.is_some() {
             // Only one pane exists while maximized; everything targets it.
             self.active_pane = 0;
-        } else if (self.draw_tool.active() || self.guided.active() || self.pushpull.active())
+        } else if (self.draw_tool.active()
+            || self.guided.active()
+            || self.pushpull.active()
+            || self.section_tool.active())
             && let Some(pos) = ui.ctx().pointer_latest_pos()
             && let Some(pane) = self.layout.pane_at(full, pos)
         {
@@ -5411,6 +5458,8 @@ impl App {
         } else {
             scene::Theme::Light
         };
+        // `sections cuts off` (#359) is view state the picks read off the doc.
+        self.session.doc.section_cuts_hidden = !self.section_style.cuts;
         let generation = self.session.doc.generation;
         // Color mode of the active pane drives the snapshot; changes stale it.
         let active_color_mode = self.color_modes[self.effective_camera_index(self.active_pane)];
@@ -5674,6 +5723,13 @@ impl App {
                     }
                     self.pushpull_input(ui, rect, &response, view_proj);
                 }
+            } else if self.section_tool.active() {
+                if pane == self.active_pane {
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    }
+                    self.section_tool_input(ui, rect, &response, view_proj);
+                }
             } else if self.draw_tool.active() || self.guided.active() {
                 // Draw/osnap only in the active pane; one prompt, one ghost.
                 if pane == self.active_pane {
@@ -5743,6 +5799,7 @@ impl App {
                 if !consumed
                     && response.double_clicked()
                     && let Some(pos) = response.interact_pointer_pos()
+                    && !self.toggle_section_at(view_proj, rect, pos)
                     && !self.drill_down(view_proj, rect, pos)
                 {
                     self.double_click_viewport(view_proj, rect, pos);
@@ -5822,12 +5879,19 @@ impl App {
                         fog: self.fog_style,
                         ao: self.ao_style,
                         shadows: self.shadow_style,
+                        section: self.session.doc.section_cut().map(|p| {
+                            [p.point.as_vec3().to_array(), p.normal.as_vec3().to_array()]
+                        }),
+                        sections: self.section_style,
                         background: self.viewport_background(ui.visuals().dark_mode),
                     },
                 ));
             }
             if self.hover.pane() == Some(pane) {
                 self.paint_hover(ui, rect, view_proj);
+            }
+            if self.section_style.planes {
+                self.paint_section_planes(ui, rect, view_proj);
             }
             if let Some((p, pivot)) = self.orbit_pivot
                 && p == pane
@@ -8709,15 +8773,18 @@ impl App {
         // While a guided flow OR a draw tool is running, the command line must NOT
         // hijack a bare Space/Enter to re-run the last verb — those keys belong to
         // the active flow (the viewport handler finishes the step/tool).
-        let flow_active =
-            self.guided.active() || self.draw_tool.active() || self.pushpull.active();
+        let flow_active = self.guided.active()
+            || self.draw_tool.active()
+            || self.pushpull.active()
+            || self.section_tool.active();
         // Inline guided prompt → the input placeholder changes per step; the
         // TextEdit id is stable so focus is held across steps (LOCKED #5).
         let prompt = self
             .guided
             .prompt()
             .or_else(|| self.draw_tool.prompt())
-            .or_else(|| self.pushpull.prompt());
+            .or_else(|| self.pushpull.prompt())
+            .or_else(|| self.section_tool.prompt());
         if let Some(line) = self.command_line.commands_segment_ui(
             ui,
             &object_names,
@@ -10701,6 +10768,11 @@ impl App {
             fog: self.fog_style.into(),
             ao: self.ao_style.on,
             shadows: self.shadow_style.on,
+            sections: crate::menu::ViewSections {
+                planes: self.section_style.planes,
+                cuts: self.section_style.cuts,
+                fill: self.section_style.fill,
+            },
             style: self
                 .active_style_name()
                 .and_then(|n| itsjustcad_render::BuiltinStyle::parse(&n)),
@@ -12071,6 +12143,25 @@ const SHADOW_USAGE: &str =
 
 /// The shadows saved in ui.json contents; defaults (off) for missing or
 /// unreadable keys.
+/// ui.json key of the section display (#359).
+const SECTION_STYLE_KEY: &str = "section_style";
+
+/// Usage of the `sections` verb (#359).
+const SECTIONS_USAGE: &str =
+    "usage: sections planes|cuts|fill [on|off] · sections fill #rrggbb";
+
+/// The section display saved in ui.json contents; defaults (all on) for
+/// missing or unreadable keys.
+fn section_style_from(ui: &serde_json::Value) -> itsjustcad_render::SectionStyle {
+    serde_json::from_value(ui[SECTION_STYLE_KEY].clone()).unwrap_or_default()
+}
+
+fn save_section_style(style: &itsjustcad_render::SectionStyle) {
+    let mut v = load_ui_json();
+    v[SECTION_STYLE_KEY] = serde_json::to_value(style).unwrap_or_default();
+    save_ui_json(&v);
+}
+
 fn shadow_style_from(ui: &serde_json::Value) -> itsjustcad_render::ShadowStyle {
     serde_json::from_value(ui[SHADOW_STYLE_KEY].clone()).unwrap_or_default()
 }
@@ -13607,7 +13698,8 @@ impl eframe::App for App {
                     typing,
                     draw_active: self.draw_tool.active()
                         || self.guided.active()
-                        || self.pushpull.active(),
+                        || self.pushpull.active()
+                        || self.section_tool.active(),
                     has_selection: !self.session.doc.selection.is_empty(),
                     last_command: self.last_line.as_deref(),
                 },
@@ -13717,6 +13809,7 @@ impl eframe::App for App {
             && !self.draw_tool.active()
             && !self.guided.active()
             && !self.pushpull.active()
+            && !self.section_tool.active()
             && !self.viewport_interacted
             && ctx.memory(|m| m.focused()).is_none()
         {
@@ -13926,6 +14019,93 @@ mod tests {
         for v in ["offset", "box", "line"] {
             assert!(!is_destructive_verb(v), "{v} should NOT be destructive");
         }
+    }
+
+    #[test]
+    fn section_verbs_apply_and_persist_in_ui_json() {
+        use crate::app_verbs::{apply_section_style, classify};
+        use itsjustcad_render::SectionStyle;
+        // #359: no key (or a broken one) shows everything.
+        assert_eq!(section_style_from(&serde_json::json!({})), SectionStyle::default());
+        assert_eq!(section_style_from(&serde_json::json!({ SECTION_STYLE_KEY: 3 })), SectionStyle::default());
+        let mut st = SectionStyle::default();
+        for line in ["sections planes off", "sections fill #112233", "sections cuts off"] {
+            st = apply_section_style(st, &classify(line).unwrap());
+        }
+        assert!(!st.planes && !st.cuts && st.fill && st.fill_rgb == [0x11, 0x22, 0x33]);
+        let ui = serde_json::json!({ "zoom": 1.0, SECTION_STYLE_KEY: serde_json::to_value(st).unwrap() });
+        assert_eq!(section_style_from(&ui), st);
+        assert_eq!(shadow_style_from(&ui), itsjustcad_render::ShadowStyle::default());
+        for form in ["sections planes|cuts|fill [on|off]", "sections fill #rrggbb"] {
+            assert!(SECTIONS_USAGE.contains(form), "{form}");
+        }
+    }
+
+    #[test]
+    fn section_plane_tool_places_toggles_and_aligns() {
+        run_app_journey(|h| {
+            for line in ["box 0,0,0 4,4,3", "front", "ze"] {
+                h.state_mut().execute_line(line.into());
+                h.run_steps(2);
+            }
+            h.state_mut().execute_line("sectionplane".into());
+            h.run_steps(1);
+            assert!(h.state().section_tool.active(), "bare `sectionplane` armed the tool");
+            // Click the front (-Y) wall: a plane on it, facing out, active.
+            let at = world_to_screen(h, glam::DVec3::new(2.0, 0.0, 1.5));
+            click_at(h, at);
+            h.run_steps(1);
+            assert!(!h.state().section_tool.active(), "placing ends the tool");
+            let doc = &h.state().session.doc;
+            assert_eq!(doc.active_section.as_deref(), Some("section1"), "{:?}", transcript(h.state()));
+            let p = doc.section_cut().unwrap();
+            assert!((p.normal - glam::DVec3::NEG_Y).length() < 1e-9 && p.point.y.abs() < 1e-9, "{p:?}");
+            // A typed plane through the middle, facing back: the new cut.
+            h.state_mut().execute_line("sectionplane 2,2,0 0,1,0 mid".into());
+            h.run_steps(1);
+            assert_eq!(h.state().session.doc.active_section.as_deref(), Some("mid"));
+            // `sections cuts off` hides the cut from the picks too.
+            h.state_mut().execute_line("sections cuts off".into());
+            h.run_steps(1);
+            assert!(h.state().session.doc.section_cut().is_none());
+            h.state_mut().execute_line("sections cuts on".into());
+            h.run_steps(1);
+            assert!(h.state().session.doc.section_cut().is_some());
+            // Double-click the active frame's side edge: the cut goes off.
+            h.state_mut().active_camera().distance *= 3.0;
+            h.run_steps(1);
+            let doc = h.state().session.doc.clone();
+            let (center, half) = h.state_mut().section_tool.frame(&doc);
+            let plane = h.state().session.doc.section_plane("mid").unwrap().clone();
+            let (u, _) = itsjustcad_doc::pick::plane_axes(plane.normal);
+            let edge = center - plane.normal * plane.signed(center) + u * half;
+            let at = world_to_screen(h, edge);
+            h.input_mut().events.push(egui::Event::PointerMoved(at));
+            for _ in 0..2 {
+                for pressed in [true, false] {
+                    h.input_mut().events.push(egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+                h.run_steps(1);
+            }
+            h.run_steps(1);
+            assert!(h.state().session.doc.active_section.is_none(), "{:?}", transcript(h.state()));
+            // Align View: parallel, looking along the plane's normal.
+            h.state_mut().execute_line("sectionplane align mid".into());
+            h.run_steps(1);
+            let cam = *h.state_mut().active_camera();
+            assert!(cam.ortho);
+            let look = (cam.eye() - cam.target).normalize();
+            assert!((look.y - 1.0).abs() < 1e-4, "{look}");
+            // One undo brings the cut back.
+            h.state_mut().execute_line("undo".into());
+            h.run_steps(1);
+            assert_eq!(h.state().session.doc.active_section.as_deref(), Some("mid"));
+        });
     }
 
     #[test]

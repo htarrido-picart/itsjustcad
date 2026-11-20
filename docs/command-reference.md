@@ -197,6 +197,8 @@ Inputs are consumed; one result mesh replaces them.
 | `section` | `section <selector> <point> <normal>` — plane cut |
 | `plan` | `plan <height>` — horizontal plan cut at z |
 | `elevation` | `elevation <north\|south\|east\|west> [depth]` |
+| `sectionplane` | `sectionplane <point> <normal> [name]` — place a live section plane (normal = the side cut away) and make it the active cut · `activate <name>` · `deactivate` · `reverse [name]` · `delete [name]` · `slice [name]` (section curves, as `section all`) · `list` · `align [name]` (view only). Bare `sectionplane` = the Section Plane tool (click a face; ← → ↑ lock the normal; Shift holds it) |
+| `sections` | `sections planes\|cuts\|fill [on\|off]` · `sections fill #rrggbb` — section display (view state, `ui.json`) |
 | `sheet` | `sheet <name> [a4\|a3\|a2\|a1\|a0]` |
 | `sheetview` | `sheetview <sheet> <top\|front\|right\|persp> <scale>` |
 | `sheetdim` | `sheetdim <sheet> <x1,y1> <x2,y2> [offset mm]` |

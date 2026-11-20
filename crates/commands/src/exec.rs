@@ -24,6 +24,8 @@ use crate::{
 
 mod pushpull;
 mod replay;
+mod section_plane;
+pub(crate) use section_plane::valid_name as valid_section_plane_name;
 mod session_meta;
 pub(crate) mod site_defer;
 
@@ -344,6 +346,11 @@ enum Inverse {
     SectionDef {
         name: String,
         prev: Option<itsjustcad_doc::Section>,
+    },
+    /// `sectionplane` (#359): the planes and the active cut before the op.
+    SectionPlanes {
+        planes: Vec<itsjustcad_doc::SectionPlane>,
+        active: Option<String>,
     },
     /// `material`: restore the previous named material binding (None if new).
     MaterialDef {
@@ -1588,6 +1595,10 @@ impl Session {
             Inverse::Replace { created, consumed } => {
                 self.doc.remove_many(created);
                 self.doc.restore_many(consumed);
+            }
+            Inverse::SectionPlanes { planes, active } => {
+                self.doc.section_planes = planes.clone();
+                self.doc.active_section = active.clone();
             }
             Inverse::SectionDef { name, prev } => {
                 match prev {
@@ -10945,6 +10956,7 @@ fn apply_forward(
         Command::PushPull { id, target, point, normal, distance, keep } => {
             pushpull::apply(doc, id, target, point, normal, distance, keep)
         }
+        Command::SectionPlane(op) => section_plane::apply(doc, op),
         Command::Revolve { id, profile, axis_point, axis_dir, angle_deg } => {
             let (src_id, curve) = one_curve(doc, &profile, "revolve")?;
             if !curve.is_closed() {
@@ -18045,6 +18057,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::SheetViewSet { .. } => "sheetviewset",
         Command::Print { .. } => "print",
         Command::SheetSet(..) => "sheetset",
+        Command::SectionPlane(..) => "sectionplane",
         Command::Export { .. } => "export",
         Command::ControlImages { .. } => "controlimages",
         Command::Import { .. } => "import",
@@ -20571,6 +20584,60 @@ mod tests {
         let json1 = crate::io::to_json(&s);
         let json2 = crate::io::to_json(&crate::io::from_json(&json1).unwrap());
         assert_eq!(json1, json2);
+    }
+
+    #[test]
+    fn section_plane_ops_undo_and_replay() {
+        // #359: place (auto-named, active), place a named one, switch,
+        // reverse, deactivate; every step undoes and the log replays.
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 4,4,4");
+        run(&mut s, "sectionplane 0,0,2 0,0,3");
+        assert_eq!(s.doc.active_section.as_deref(), Some("section1"));
+        assert_eq!(s.doc.section_cut().unwrap().normal, DVec3::Z, "normalized");
+        run(&mut s, "sectionplane 2,0,0 1,0,0 east");
+        assert_eq!(s.doc.active_section.as_deref(), Some("east"), "placing activates");
+        run(&mut s, "sectionplane activate section1");
+        run(&mut s, "sectionplane reverse");
+        assert_eq!(s.doc.section_plane("section1").unwrap().normal, DVec3::NEG_Z);
+        run(&mut s, "sectionplane 2,1,0 1,0,0 east");
+        assert_eq!(s.doc.section_planes.len(), 2, "a known name moves the plane");
+        assert_eq!(s.doc.section_plane("east").unwrap().point, DVec3::new(2.0, 1.0, 0.0));
+        run(&mut s, "sectionplane deactivate");
+        assert!(s.doc.section_cut().is_none());
+        // `list` is a query: not logged.
+        let n = s.save_log().len();
+        assert!(run(&mut s, "sectionplane list").message.contains("east"));
+        assert_eq!(s.save_log().len(), n);
+        // The logged ops carry the filled-in names.
+        assert!(s.save_log().iter().any(|c| matches!(
+            c,
+            Command::SectionPlane(crate::SectionPlaneOp::Reverse { name: Some(n) }) if n == "section1"
+        )));
+        assert_replay_stable(&s);
+        // Undo walks back: reactivated, moved back, unreversed.
+        run(&mut s, "undo");
+        assert_eq!(s.doc.active_section.as_deref(), Some("east"));
+        run(&mut s, "undo");
+        assert_eq!(s.doc.section_plane("east").unwrap().point, DVec3::new(2.0, 0.0, 0.0));
+        run(&mut s, "undo");
+        assert_eq!(s.doc.section_plane("section1").unwrap().normal, DVec3::Z);
+        run(&mut s, "redo");
+        assert_eq!(s.doc.section_plane("section1").unwrap().normal, DVec3::NEG_Z);
+        // Delete the active plane clears the cut; slice runs `section`.
+        run(&mut s, "sectionplane activate east");
+        let out = run(&mut s, "sectionplane slice");
+        assert!(!out.created.is_empty(), "the slice made section curves");
+        assert!(matches!(s.save_log().last(), Some(Command::Section { .. })), "logged as section");
+        run(&mut s, "sectionplane delete");
+        assert!(s.doc.active_section.is_none() && s.doc.section_plane("east").is_none());
+        assert_replay_stable(&s);
+        // Bad input.
+        for bad in ["sectionplane", "sectionplane align", "sectionplane 0,0,0", "sectionplane 0,0,0 0,0,1 list"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(s.run(parse("sectionplane activate nope").unwrap()).is_err());
+        assert!(s.run(parse("sectionplane 0,0,0 0,0,0").unwrap()).is_err());
     }
 
     #[test]

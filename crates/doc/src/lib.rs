@@ -15,6 +15,7 @@ mod object;
 pub mod param_schema;
 pub mod pick;
 mod plotstyle;
+mod section_plane;
 mod sheet;
 mod structure;
 mod underlay;
@@ -42,6 +43,7 @@ pub use param_schema::{
     FieldKind, GeneratorKind, ParamField, ParamMap, ParamSchema, ParamValue, Unit, Widget,
 };
 pub use plotstyle::{PlotStyleEntry, PlotStyleTable, ResolvedPen};
+pub use section_plane::{section_plane_name, SectionPlane};
 pub use sheet::{
     PageRect, PaperSize, ScheduleRow, Sheet, SheetDim, SheetDisplayMode, SheetLeader, SheetSet,
     SheetTable, SheetTag, SheetText, SheetView, TagShape, TitleBlock, ViewDirection,

@@ -5,7 +5,8 @@
 //!
 //! A [`ViewStyle`] carries the display mode, colour mode, lighting, profile
 //! and mesh edges, the sketchy character, the edge style (#361), the fog
-//! (#363), ambient occlusion (#358), sun shadows (#357), the grid/axes
+//! (#363), ambient occlusion (#358), sun shadows (#357), the section
+//! display (#359), the grid/axes
 //! overlays and the background
 //! gradient. Missing keys
 //! take the defaults, which are today's look, so a style saved by an older
@@ -18,7 +19,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AoStyle, ColorMode, DisplayMode, EdgeStyle, FogStyle, LightMode, ShadowStyle, SketchyParams};
+use crate::{
+    AoStyle, ColorMode, DisplayMode, EdgeStyle, FogStyle, LightMode, SectionStyle, ShadowStyle, SketchyParams,
+};
 
 /// Every display setting a style switches (#362).
 ///
@@ -42,6 +45,9 @@ pub struct ViewStyle {
     pub ao: AoStyle,
     /// Sun shadows (#357); off when a style saved before them loads.
     pub shadows: ShadowStyle,
+    /// Section planes, cuts and fill (#359); all shown when a style saved
+    /// before them loads.
+    pub sections: SectionStyle,
     pub grid: bool,
     pub axes: bool,
     /// Sky/ground gradient behind the scene. `None` follows
@@ -64,6 +70,7 @@ impl Default for ViewStyle {
             fog: FogStyle::default(),
             ao: AoStyle::default(),
             shadows: ShadowStyle::default(),
+            sections: SectionStyle::default(),
             grid: true,
             axes: true,
             gradient: None,
@@ -199,6 +206,10 @@ mod tests {
         assert!(!d.shadows.on, "shadows off by default (#357)");
         let with_sh: ViewStyle = serde_json::from_str(r#"{"shadows":{"on":true,"dark":0.2}}"#).unwrap();
         assert_eq!(with_sh.shadows, ShadowStyle { on: true, dark: 0.2, ..ShadowStyle::default() });
+        // Section display (#359): all on when missing.
+        assert_eq!(partial.sections, SectionStyle::default());
+        let with_sec: ViewStyle = serde_json::from_str(r#"{"sections":{"fill":false}}"#).unwrap();
+        assert_eq!(with_sec.sections, SectionStyle { fill: false, ..SectionStyle::default() });
     }
 
     #[test]

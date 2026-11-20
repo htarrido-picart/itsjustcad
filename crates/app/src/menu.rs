@@ -440,9 +440,19 @@ pub struct ViewState {
     pub ao: bool,
     /// Sun shadows on — the check on View ▸ Shadows (#357).
     pub shadows: bool,
+    /// Section display — the checks in View ▸ Sections (#359).
+    pub sections: ViewSections,
     /// The built-in style the active pane matches — the check in View ▸
     /// Styles (#362). `None` when a saved style (or none) matches.
     pub style: Option<itsjustcad_render::BuiltinStyle>,
+}
+
+/// The View ▸ Sections checks (#359).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewSections {
+    pub planes: bool,
+    pub cuts: bool,
+    pub fill: bool,
 }
 
 /// The View ▸ Fog checks (#363).
@@ -870,6 +880,24 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             // date, light and dark sliders.
             radio("shadows", tr("menu.view.shadows"), "shadows", view.shadows),
             ex("shadow_panel", tr("menu.view.shadow_panel"), "shadows panel"),
+            // Section planes (#359): the tool, the display toggles and the
+            // active cut's actions. Names and the fill colour are typed.
+            NativeItem::Submenu {
+                id: format!("{t}/sections"),
+                label: tr("menu.view.sections").into(),
+                items: vec![
+                    ex("section_tool", tr("menu.view.section_tool"), "sectionplane"),
+                    NativeItem::Separator,
+                    radio("sections_planes", tr("menu.view.sections_planes"), "sections planes", view.sections.planes),
+                    radio("sections_cuts", tr("menu.view.sections_cuts"), "sections cuts", view.sections.cuts),
+                    radio("sections_fill", tr("menu.view.sections_fill"), "sections fill", view.sections.fill),
+                    NativeItem::Separator,
+                    ex("section_reverse", tr("menu.view.section_reverse"), "sectionplane reverse"),
+                    ex("section_align", tr("menu.view.section_align"), "sectionplane align"),
+                    ex("section_slice", tr("menu.view.section_slice"), "sectionplane slice"),
+                    ex("section_clear", tr("menu.view.section_clear"), "sectionplane deactivate"),
+                ],
+            },
             NativeItem::Separator,
             // Viewport layout.
             ex("vp1", tr("menu.view.vp1"), "viewports 1"),
@@ -1390,6 +1418,7 @@ pub fn demo_open(
         fog: ViewFog::default(),
         ao: false,
         shadows: false,
+        sections: ViewSections { planes: true, cuts: true, fill: true },
         style: Some(itsjustcad_render::BuiltinStyle::Modelling),
     };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
@@ -2094,6 +2123,58 @@ mod tests {
         assert!(matches!(&items[n + 1], NativeItem::Check { action, .. }
             if *action == MenuAction::Execute("style review".into())));
         assert!(matches!(items[n + 2], NativeItem::Separator));
+    }
+
+    #[test]
+    fn view_sections_submenu_checks_and_fires_verbs() {
+        // #359: View ▸ Sections holds the tool, the three display toggles and
+        // the active cut's actions; each fires the line the command line uses.
+        let menus = native_model(MenuStyle::Modeler, true, ViewState::default());
+        let view = menus.iter().find(|m| m.title == tr("menu.view")).expect("View menu");
+        let items = view
+            .items
+            .iter()
+            .find_map(|it| match it {
+                NativeItem::Submenu { id, label, items } if id == "View/sections" => {
+                    assert_eq!(label, tr("menu.view.sections"));
+                    Some(items)
+                }
+                _ => None,
+            })
+            .expect("View ▸ Sections");
+        let actions: Vec<(String, MenuAction)> = items
+            .iter()
+            .filter_map(|it| match it {
+                NativeItem::Check { id, action, .. } | NativeItem::Leaf { id, action, .. } => {
+                    Some((id.clone(), action.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let want = [
+            ("View/section_tool", "sectionplane"),
+            ("View/sections_planes", "sections planes"),
+            ("View/sections_cuts", "sections cuts"),
+            ("View/sections_fill", "sections fill"),
+            ("View/section_reverse", "sectionplane reverse"),
+            ("View/section_align", "sectionplane align"),
+            ("View/section_slice", "sectionplane slice"),
+            ("View/section_clear", "sectionplane deactivate"),
+        ];
+        assert_eq!(actions.len(), want.len());
+        for ((id, action), (want_id, line)) in actions.iter().zip(want) {
+            assert_eq!(id, want_id);
+            assert_eq!(*action, MenuAction::Execute(line.into()));
+        }
+        for line in ["sections planes", "sections cuts", "sections fill"] {
+            assert!(crate::app_verbs::classify(line).is_some(), "{line}");
+        }
+        for line in ["sectionplane reverse", "sectionplane slice", "sectionplane deactivate"] {
+            assert!(itsjustcad_commands::parse(line).is_ok(), "{line}");
+        }
+        let off = ViewSections { planes: true, cuts: false, fill: true };
+        assert_eq!(view_check(ViewState { sections: off, ..Default::default() }, "View/sections_cuts"), Some(false));
+        assert_eq!(view_check(ViewState { sections: off, ..Default::default() }, "View/sections_fill"), Some(true));
     }
 
     #[test]
