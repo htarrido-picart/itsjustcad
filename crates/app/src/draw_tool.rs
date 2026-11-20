@@ -2,6 +2,7 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 use glam::DVec3;
+use itsjustcad_doc::pick::FacePlane;
 
 /// Rhino-style interactive drawing: type a bare verb ("rect"), pick points on
 /// the canvas, the tool emits the equivalent command string — so click-drawn
@@ -28,6 +29,9 @@ pub struct DrawTool {
     /// Live side count for the polygon tool; set from the typed buffer before
     /// the center is picked (see `sync_polygon_sides`).
     sides: usize,
+    /// Plane a rect/circle/polygon is drawn on, fixed by its first click
+    /// (#371): the face clicked, else the horizontal plane through the point.
+    plane: Option<FacePlane>,
 }
 
 /// World-space radius around the polyline's first point that snap-closes the
@@ -35,6 +39,16 @@ pub struct DrawTool {
 /// the on-screen highlight ([`DrawTool::close_target`]) so the affordance is
 /// visible, not guessed.
 const CLOSE_SNAP: f64 = 0.5;
+
+/// A plane normal for a `normal x,y,z` argument (#371): six decimals, so a
+/// shape on a sloped face stays on it to a micron per metre.
+fn fmt_normal(n: DVec3) -> String {
+    let c = |v: f64| {
+        let r = (v * 1e6).round() / 1e6 + 0.0;
+        format!("{r}")
+    };
+    format!("{},{},{}", c(n.x), c(n.y), c(n.z))
+}
 
 /// Millimeter rounding and coordinate formatting for emitted command strings,
 /// shared with the guided engine so both emit identical numbers.
@@ -59,6 +73,7 @@ impl DrawTool {
             self.sides = POLYGON_DEFAULT_SIDES;
         }
         self.state = Some((verb, Vec::new()));
+        self.plane = None;
         self.input.clear();
         true
     }
@@ -75,6 +90,7 @@ impl DrawTool {
 
     pub fn cancel(&mut self) {
         self.state = None;
+        self.plane = None;
         self.input.clear();
     }
 
@@ -140,7 +156,37 @@ impl DrawTool {
     /// caller (osnap hit or grid). Returns the finished command string when
     /// the shape is complete.
     pub fn on_click(&mut self, world: DVec3) -> Option<String> {
+        self.on_click_on(world, None)
+    }
+
+    /// The plane a rect/circle/polygon is being drawn on once its first point
+    /// is down (#371); the cursor stays on it until the shape is finished.
+    pub fn plane(&self) -> Option<FacePlane> {
+        match &self.state {
+            Some((Verb::Rect | Verb::Circle | Verb::Polygon, p)) if p.len() == 1 => self.plane,
+            _ => None,
+        }
+    }
+
+    /// [`Self::on_click`] on a face (#371): a rect/circle/polygon's first
+    /// click fixes its plane to `face` (the face under the cursor, or a held
+    /// plane), else to the horizontal plane through `world`; its second click
+    /// is taken on that plane.
+    pub fn on_click_on(&mut self, world: DVec3, face: Option<FacePlane>) -> Option<String> {
         let (verb, mut points) = self.state.take()?;
+        let shaped = matches!(verb, Verb::Rect | Verb::Circle | Verb::Polygon);
+        let world = match self.plane.filter(|_| shaped && !points.is_empty()) {
+            Some(pl) => pl.project(world),
+            None => world,
+        };
+        if shaped && points.is_empty() {
+            self.plane = Some(
+                face.map(|f| FacePlane { origin: world, normal: f.normal })
+                    .unwrap_or_else(|| FacePlane::horizontal(world)),
+            );
+        }
+        let on = self.plane.filter(|p| shaped && !p.is_horizontal()).map(|p| fmt_normal(p.normal));
+        let suffix = on.map(|n| format!(" normal {n}")).unwrap_or_default();
         match verb {
             Verb::Line => {
                 if points.is_empty() {
@@ -158,14 +204,20 @@ impl DrawTool {
                     None
                 } else {
                     let a = points[0];
-                    let corner = a.min(world);
-                    let size = (world - a).abs();
-                    if size.x < 1e-9 || size.y < 1e-9 {
+                    let (x, y) = self.plane.map_or((DVec3::X, DVec3::Y), |p| p.axes());
+                    let (du, dv) = ((world - a).dot(x), (world - a).dot(y));
+                    if du.abs() < 1e-9 || dv.abs() < 1e-9 {
                         // zero-area drag; keep waiting
                         self.state = Some((verb, points));
                         return None;
                     }
-                    Some(format!("rect {} {} {}", fmt(corner), num(size.x), num(size.y)))
+                    let corner = a + x * du.min(0.0) + y * dv.min(0.0);
+                    Some(format!(
+                        "rect {} {} {}{suffix}",
+                        fmt(corner),
+                        num(du.abs()),
+                        num(dv.abs())
+                    ))
                 }
             }
             Verb::Circle => {
@@ -179,7 +231,7 @@ impl DrawTool {
                         self.state = Some((verb, points));
                         return None;
                     }
-                    Some(format!("circle {} {r}", fmt(points[0])))
+                    Some(format!("circle {} {r}{suffix}", fmt(points[0])))
                 }
             }
             Verb::Polygon => {
@@ -195,7 +247,7 @@ impl DrawTool {
                         self.state = Some((verb, points));
                         return None;
                     }
-                    Some(format!("polygon {} {r} {}", fmt(points[0]), self.sides))
+                    Some(format!("polygon {} {r} {}{suffix}", fmt(points[0]), self.sides))
                 }
             }
             Verb::Polyline => {
@@ -261,26 +313,26 @@ impl DrawTool {
                 if strip.len() >= 2 { vec![strip] } else { Vec::new() }
             }
             Verb::Rect => match (points.first(), cursor) {
-                (Some(&a), Some(b)) => vec![vec![
-                    a,
-                    DVec3::new(b.x, a.y, a.z),
-                    b,
-                    DVec3::new(a.x, b.y, a.z),
-                    a,
-                ]],
+                (Some(&a), Some(b)) => {
+                    let (x, y) = self.plane.map_or((DVec3::X, DVec3::Y), |p| p.axes());
+                    let (u, v) = (x * (b - a).dot(x), y * (b - a).dot(y));
+                    vec![vec![a, a + u, a + u + v, a + v, a]]
+                }
                 _ => Vec::new(),
             },
             Verb::Circle => match (points.first(), cursor) {
                 (Some(&c), Some(edge)) => {
+                    let edge = self.plane.map_or(edge, |p| p.project(edge));
                     let r = c.distance(edge);
                     if r < 1e-9 {
                         return Vec::new();
                     }
+                    let (x, y) = self.plane.map_or((DVec3::X, DVec3::Y), |p| p.axes());
                     let n = 48;
                     let mut strip: Vec<DVec3> = (0..=n)
                         .map(|i| {
                             let t = std::f64::consts::TAU * (i as f64) / (n as f64);
-                            c + DVec3::new(r * t.cos(), r * t.sin(), 0.0)
+                            c + (x * t.cos() + y * t.sin()) * r
                         })
                         .collect();
                     strip.push(strip[0]);
@@ -292,18 +344,20 @@ impl DrawTool {
             },
             Verb::Polygon => match (points.first(), cursor) {
                 (Some(&c), Some(edge)) => {
+                    let edge = self.plane.map_or(edge, |p| p.project(edge));
                     let r = c.distance(edge);
                     if r < 1e-9 {
                         return Vec::new();
                     }
+                    let (x, y) = self.plane.map_or((DVec3::X, DVec3::Y), |p| p.axes());
                     // The circumradius vertex sits under the cursor; step by the
                     // side count and close the loop by repeating the first point.
                     let n = self.sides.max(3);
-                    let a0 = (edge.y - c.y).atan2(edge.x - c.x);
+                    let a0 = (edge - c).dot(y).atan2((edge - c).dot(x));
                     let mut strip: Vec<DVec3> = (0..n)
                         .map(|i| {
                             let t = a0 + std::f64::consts::TAU * (i as f64) / (n as f64);
-                            c + DVec3::new(r * t.cos(), r * t.sin(), 0.0)
+                            c + (x * t.cos() + y * t.sin()) * r
                         })
                         .collect();
                     strip.push(strip[0]);
@@ -487,6 +541,46 @@ mod tests {
         t.on_click(DVec3::new(1.0, 2.0, 0.0));
         t.on_click(DVec3::new(4.0, 2.0, 0.0));
         assert_eq!(t.last_point(), Some(DVec3::new(4.0, 2.0, 0.0)));
+    }
+
+    #[test]
+    fn rect_on_a_vertical_face_emits_its_normal() {
+        let wall = FacePlane::new(DVec3::new(2.0, 0.0, 0.0), DVec3::X);
+        let mut t = DrawTool::default();
+        t.try_start("rect");
+        assert_eq!(t.plane(), None);
+        assert!(t.on_click_on(DVec3::new(2.0, 1.5, 2.5), wall).is_none());
+        let pl = t.plane().unwrap();
+        assert_eq!(pl.normal, DVec3::X);
+        // The second corner is taken on the wall, whatever depth it came at.
+        let preview = t.preview(Some(DVec3::new(2.0, 0.5, 0.5)));
+        assert!(preview[0].iter().all(|p| p.x == 2.0), "{preview:?}");
+        assert_eq!(
+            t.on_click_on(DVec3::new(2.3, 0.5, 0.5), None).unwrap(),
+            "rect 2,0.5,0.5 1 2 normal 1,0,0"
+        );
+        assert_eq!(t.plane(), None, "finished");
+    }
+
+    #[test]
+    fn shapes_on_a_top_face_stay_plain_xy() {
+        let top = FacePlane::new(DVec3::new(0.0, 0.0, 3.0), DVec3::Z);
+        let mut t = DrawTool::default();
+        t.try_start("rect");
+        t.on_click_on(DVec3::new(0.0, 0.0, 3.0), top);
+        // Off the box, the ground point is pulled back up onto z = 3.
+        assert_eq!(t.on_click(DVec3::new(4.0, 6.0, 0.0)).unwrap(), "rect 0,0,3 4 6");
+        t.try_start("circle");
+        t.on_click(DVec3::new(1.0, 1.0, 0.0));
+        assert_eq!(t.plane().unwrap(), FacePlane::horizontal(DVec3::new(1.0, 1.0, 0.0)));
+        assert_eq!(t.on_click(DVec3::new(3.0, 1.0, 0.0)).unwrap(), "circle 1,1 2");
+        t.try_start("circle");
+        let slope = FacePlane::new(DVec3::ZERO, DVec3::new(0.0, -0.6, 0.8));
+        t.on_click_on(DVec3::ZERO, slope);
+        assert_eq!(
+            t.on_click(DVec3::new(1.0, 0.0, 0.0)).unwrap(),
+            "circle 0,0 1 normal 0,-0.6,0.8"
+        );
     }
 
     #[test]

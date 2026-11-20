@@ -999,12 +999,12 @@ mod tests {
         // ~190 verbs vs the full prompt's ~45 KB command table. The cap tracks the
         // growing verb count (CAD-parity batch added ~28 verbs; ramp/stair added 2;
         // lotset/lotreset added 2; insertpoint/deletepoint added 2; osmfetch
-        // added 1); it stays
+        // added 1; rect/circle/polygon took `[normal x,y,z]`); it stays
         // well under the full table so the compact prompt keeps its size
         // advantage.
         let catalog = compact_command_catalog();
         assert!(
-            catalog.len() < 16_600,
+            catalog.len() < 16_700,
             "compact catalog bloated to {} bytes",
             catalog.len()
         );

@@ -1064,7 +1064,7 @@ fn record_entity(
         },
         "CIRCLE" => match (record_point(fields, 10), record_num(fields, 40)) {
             (Some(center), Some(radius)) if radius > 0.0 => {
-                Some(Command::Circle { id: None, center, radius })
+                Some(Command::Circle { id: None, center, radius, normal: None })
             }
             _ => None,
         },

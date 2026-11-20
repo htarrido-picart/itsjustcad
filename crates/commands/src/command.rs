@@ -560,12 +560,22 @@ pub enum Command {
         corner: DVec3,
         width: f64,
         height: f64,
+        /// Normal of the plane it lies on (#371, drawn on a face): its
+        /// in-plane axes are [`itsjustcad_doc::pick::plane_axes`]. Absent =
+        /// the XY plane through the anchor (every file before #371).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        normal: Option<DVec3>,
     },
     Circle {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<ObjectId>,
         center: DVec3,
         radius: f64,
+        /// Normal of the plane it lies on (#371, drawn on a face): its
+        /// in-plane axes are [`itsjustcad_doc::pick::plane_axes`]. Absent =
+        /// the XY plane through the anchor (every file before #371).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        normal: Option<DVec3>,
     },
     /// Circle of the given `radius` tangent to two curves (TTR: tangent-tangent-
     /// radius). Currently the LINE–LINE case is solid: both lines are offset by
@@ -600,6 +610,11 @@ pub enum Command {
         center: DVec3,
         radius: f64,
         sides: u32,
+        /// Normal of the plane it lies on (#371, drawn on a face): its
+        /// in-plane axes are [`itsjustcad_doc::pick::plane_axes`]. Absent =
+        /// the XY plane through the anchor (every file before #371).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        normal: Option<DVec3>,
     },
     /// NURBS curve by control points ("curve" on the command line).
     Curve {

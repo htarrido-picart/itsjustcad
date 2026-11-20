@@ -830,6 +830,14 @@ pub struct App {
     shift_hold: itsjustcad_guided::inference::AxisLock,
     /// Shift was down last frame (edge detection for `shift_hold`).
     shift_was_down: bool,
+    /// Shift pressed over a face (off any axis): the face plane it holds
+    /// while down (#371, SketchUp). Session state, never logged.
+    plane_hold: Option<itsjustcad_doc::pick::FacePlane>,
+    /// The unsnapped face under the cursor last frame (#371): what a Shift
+    /// press holds.
+    face_shown: Option<itsjustcad_doc::pick::FaceHit>,
+    /// The flat face the hover cue tints, cached until the hit leaves it.
+    face_cue: Option<crate::face_draw::FaceCue>,
     /// Axis the rubber band ran along last frame (colour + Shift hold).
     axis_shown: Option<char>,
     /// Persistent SmartTrack toggle: when on, dwelling on an osnap point
@@ -1653,6 +1661,9 @@ impl App {
             axis_lock: Default::default(),
             shift_hold: Default::default(),
             shift_was_down: false,
+            plane_hold: None,
+            face_shown: None,
+            face_cue: None,
             axis_shown: None,
             smarttrack: load_smarttrack(),
             st_acquired: crate::smarttrack::Acquired::new(),
@@ -6945,12 +6956,23 @@ impl App {
         // Shift pressed while the band runs along an axis holds that axis for
         // as long as Shift stays down (SketchUp); pressed off-axis it is the
         // momentary Ortho it always was.
+        // Shift (#372, #371): on an axis it holds the axis; over a face, the
+        // face's plane; else it is ortho. Either hold lasts while it is down.
         if !shift {
             self.shift_hold.clear();
-        } else if !self.shift_was_down
-            && let (Some(anchor), Some(a)) = (axis_anchor, self.axis_shown)
-        {
-            self.shift_hold.toggle(a, anchor);
+            self.plane_hold = None;
+        } else if !self.shift_was_down {
+            use crate::face_draw::ShiftHold;
+            let on_axis = axis_anchor.and(self.axis_shown);
+            match crate::face_draw::shift_press(on_axis, self.face_shown.map(|f| f.plane())) {
+                ShiftHold::Axis(a) => {
+                    if let Some(anchor) = axis_anchor {
+                        self.shift_hold.toggle(a, anchor);
+                    }
+                }
+                ShiftHold::Plane(p) => self.plane_hold = Some(p),
+                ShiftHold::Ortho => {}
+            }
         }
         self.shift_was_down = shift;
         let locked_axis = self
@@ -7096,11 +7118,44 @@ impl App {
         // Grid fallback only when the grid toggle is on; otherwise the raw
         // ground-plane point is used (osnap-only precision, no rounding).
         let grid_on = snap_settings.grid;
-        let mut cursor_world = snap_hit.map(|(p, _)| p).or_else(|| {
-            cursor_px
-                .and_then(|pos| ground_point(view_proj, rect, pos))
-                .map(|p| if grid_on { crate::osnap::grid_snap(p) } else { p })
-        });
+        let cursor_ray = cursor_px.map(|pos| screen_ray(view_proj, rect, pos));
+        // On Face (#371): a draw tool or guided point pick lands on the
+        // nearest face under the cursor when nothing snaps, else the ground.
+        let picks_faces = if guided_active {
+            self.guided.current_is_point()
+        } else {
+            self.draw_tool.active()
+        };
+        let face_hit = cursor_ray
+            .filter(|_| picks_faces)
+            .and_then(|(o, d)| itsjustcad_doc::pick::face_at(&self.session.doc, o, d));
+        let ground = cursor_px
+            .and_then(|pos| ground_point(view_proj, rect, pos))
+            .map(|p| if grid_on { crate::osnap::grid_snap(p) } else { p });
+        // The grid applies on a level plane (a top face) as on the ground.
+        let grid_on_plane = |pl: itsjustcad_doc::pick::FacePlane, p: glam::DVec3| {
+            if grid_on && snap_hit.is_none() && pl.is_horizontal() {
+                pl.project(crate::osnap::grid_snap(p))
+            } else {
+                p
+            }
+        };
+        let mut cursor_world =
+            crate::face_draw::base_cursor(snap_hit.map(|(p, _)| p), face_hit.as_ref(), ground);
+        if let Some(f) = face_hit.filter(|_| snap_hit.is_none()) {
+            cursor_world = cursor_world.map(|p| grid_on_plane(f.plane(), p));
+        }
+        // The plane the cursor keeps to: a rect/circle/polygon's own, else
+        // the one Shift holds.
+        let draw_plane = (!guided_active)
+            .then(|| self.draw_tool.plane())
+            .flatten()
+            .or(self.plane_hold);
+        if let Some(pl) = draw_plane {
+            cursor_world =
+                crate::face_draw::on_plane(pl, snap_hit.map(|(p, _)| p), cursor_ray, cursor_world)
+                    .map(|p| grid_on_plane(pl, p));
+        }
         // World-space tolerance = SNAP_RADIUS_PX converted through the current
         // view scale (world units per screen pixel on the ground plane). Derived
         // by projecting two ground points one pixel apart; falls back to a small
@@ -7162,8 +7217,9 @@ impl App {
         //   (5) else the plain ground/grid point resolved above.
         // An axis lock (arrow key or Shift hold) overrides all of these: the
         // point stays on the axis line, an osnap only setting its distance.
-        let apply_ortho = self.ortho || shift;
-        let cursor_ray = cursor_px.map(|pos| screen_ray(view_proj, rect, pos));
+        // Ortho squares to world X/Y, so not on a held upright plane.
+        let apply_ortho = (self.ortho || (shift && self.plane_hold.is_none()))
+            && draw_plane.is_none_or(|p| p.is_horizontal());
         let along_grid = |anchor: glam::DVec3, a: char, p: glam::DVec3| {
             if !grid_on {
                 return p;
@@ -7223,6 +7279,7 @@ impl App {
                 let band = glam::Vec2::new(pos.x - anchor_px.x, pos.y - anchor_px.y);
                 if let Some(a) = inference::infer_axis(band, axis_px, inference::INFER_TOL_DEG)
                     && let Some(u) = itsjustcad_guided::axis_vector(a)
+                    && draw_plane.is_none_or(|pl| u.dot(pl.normal).abs() < 1e-9)
                     && let Some(p) = inference::closest_on_line_to_ray(anchor, u, ro, rd)
                 {
                     cursor_world = Some(along_grid(anchor, a, p));
@@ -7236,7 +7293,22 @@ impl App {
                 cursor_world = Some(crate::precise::ortho_lock(last, c));
             }
         }
+        // Whatever moved it (SmartTrack, ortho), an unlocked cursor stays on
+        // the held plane.
+        if let Some(pl) = draw_plane
+            && locked_axis.is_none()
+        {
+            cursor_world = cursor_world.map(|c| pl.project(c));
+        }
         self.status_snap = snap_hit.map(|(_, kind)| kind.label());
+        self.face_shown = face_hit.filter(|_| snap_hit.is_none());
+        // The face plane a click lands on: the held one, else the face under
+        // the cursor when the point is on it (a snap to its corner included).
+        let click_face = self.plane_hold.or_else(|| {
+            face_hit
+                .map(|f| f.plane())
+                .filter(|p| cursor_world.is_some_and(|c| crate::face_draw::lies_on(*p, c)))
+        });
         // The axis the rubber band runs along, however the point got there
         // (inference, lock, ortho, a snap): colours the band + tip, and is
         // what a Shift press next frame holds.
@@ -7487,7 +7559,7 @@ impl App {
                 }
                 return;
             }
-            if let Some(cmd) = self.draw_tool.on_click(world) {
+            if let Some(cmd) = self.draw_tool.on_click_on(world, click_face) {
                 self.execute_line(cmd);
                 return;
             } else if let Some(prompt) = self.draw_tool.prompt() {
@@ -7546,6 +7618,26 @@ impl App {
             }
         }
 
+        // Face hover cue (#371): a faint tint over the flat face the next
+        // click lands on.
+        if let Some(f) = self
+            .face_shown
+            .filter(|f| cursor_world.is_some_and(|c| crate::face_draw::lies_on(f.plane(), c)))
+        {
+            let fill = egui::Color32::from_rgba_unmultiplied(90, 160, 255, 36);
+            let mut mesh = egui::Mesh::default();
+            for tri in crate::face_draw::face_cue(&mut self.face_cue, &self.session.doc, &f) {
+                if let [Some(a), Some(b), Some(c)] = tri.map(|p| project(view_proj, rect, p)) {
+                    let i = mesh.vertices.len() as u32;
+                    for p in [a, b, c] {
+                        mesh.colored_vertex(p, fill);
+                    }
+                    mesh.add_triangle(i, i + 1, i + 2);
+                }
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        }
+
         // Ghost preview + prompt overlay
         // A guided rotate's protractor takes its axis colour.
         let stroke = egui::Stroke::new(
@@ -7591,6 +7683,24 @@ impl App {
                 axis_tip(a, locked_axis == Some(a)),
                 egui::TextStyle::Small.resolve(ui.style()),
                 axis_color(a),
+            );
+        } else if snap_hit.is_none()
+            && click_face.is_some()
+            && let Some(pos) = cursor_px
+        {
+            // "On Face" (#371), "· locked" while Shift holds the plane.
+            let on = crate::i18n::t("face.on");
+            let tip = if self.plane_hold.is_some() {
+                format!("{on} · {}", crate::i18n::t("axis.locked"))
+            } else {
+                on.to_string()
+            };
+            painter.text(
+                pos + egui::vec2(14.0, 14.0),
+                egui::Align2::LEFT_TOP,
+                tip,
+                egui::TextStyle::Small.resolve(ui.style()),
+                egui::Color32::from_rgb(90, 160, 255),
             );
         }
 

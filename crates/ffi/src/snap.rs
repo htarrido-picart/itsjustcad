@@ -113,9 +113,10 @@ fn grid_snap(plane: &CPlane, world: DVec3, step: f64) -> DVec3 {
     plane.to_world(DVec3::new(r(l.x), r(l.y), 0.0))
 }
 
-/// The snap at a cursor: the winning object snap, else the cplane point
-/// (grid-snapped when on). `(point, kind, objects)`; `None` when the ray
-/// misses the plane and no object snap hit.
+/// The snap at a cursor: the winning object snap, else the nearest face of a
+/// solid under it (#371, On Face), else the cplane point (grid-snapped when
+/// on). `(point, kind, objects, face normal)`; `None` when the ray misses the
+/// plane and nothing else hit.
 fn snap_at(
     doc: &Document,
     vp: glam::Mat4,
@@ -123,7 +124,7 @@ fn snap_at(
     cursor: Vec2,
     modes: &Modes,
     grid: f64,
-) -> Option<(DVec3, &'static str, Vec<String>)> {
+) -> Option<(DVec3, &'static str, Vec<String>, Option<DVec3>)> {
     let keep = |bb: kernel_mesh::Aabb| {
         let mut lo = Vec2::splat(f32::INFINITY);
         let mut hi = Vec2::splat(f32::NEG_INFINITY);
@@ -155,14 +156,17 @@ fn snap_at(
             .flatten()
             .map(|id| id.to_string())
             .collect();
-        return Some((c.point, c.kind.key(), ids));
+        return Some((c.point, c.kind.key(), ids, None));
     }
     let (origin, dir) = screen_ray(vp, w, h, cursor.x, cursor.y)?;
+    if let Some(f) = itsjustcad_doc::pick::face_at(doc, origin, dir) {
+        return Some((f.point, "face", vec![f.object.to_string()], Some(f.normal)));
+    }
     let p = origin + dir * ray_plane(&doc.cplane, origin, dir)?;
     if modes.settings.grid {
-        Some((grid_snap(&doc.cplane, p, grid), "grid", Vec::new()))
+        Some((grid_snap(&doc.cplane, p, grid), "grid", Vec::new(), None))
     } else {
-        Some((p, "plane", Vec::new()))
+        Some((p, "plane", Vec::new(), None))
     }
 }
 
@@ -177,10 +181,13 @@ fn snap_at(
 /// (world), needed by perpendicular and tangent. `radius_px` defaults to 10;
 /// pass it in physical pixels (10 × the screen scale).
 ///
-/// Returns `{"point":[x,y,z],"cplane":[u,v,w],"kind","object","objects":[…]}`:
-/// `point` in world coordinates, `cplane` the same point in the active
-/// construction plane (what commands take); `kind` is the snap key above, or
-/// `"grid"` (on the cplane, rounded to [`ijc_set_grid_spacing`] in plane
+/// Returns `{"point":[x,y,z],"cplane":[u,v,w],"kind","object","objects":[…],
+/// "normal"}`: `point` in world coordinates, `cplane` the same point in the
+/// active construction plane (what commands take); `kind` is the snap key
+/// above, or `"face"` (no snap, on the nearest face of a solid under the
+/// cursor, #371: `object` is the solid and `normal` the face's unit normal —
+/// pass it as `rect`/`circle`/`polygon … normal x,y,z` to draw on that face),
+/// or `"grid"` (on the cplane, rounded to [`ijc_set_grid_spacing`] in plane
 /// coordinates) or `"plane"` (on the cplane, grid off); `object` the short id
 /// of the snapped object (`null` for grid/plane) and `objects` every object
 /// it comes from (two for an intersection). `{"point":null,…}` when the ray
@@ -226,15 +233,17 @@ pub unsafe extern "C" fn ijc_osnap(
         let cursor = Vec2::new(x_px, y_px);
         let v3 = |p: DVec3| [p.x, p.y, p.z];
         let out = match snap_at(doc, vp, size, cursor, &modes, app.grid_spacing) {
-            Some((p, kind, objects)) => serde_json::json!({
+            Some((p, kind, objects, normal)) => serde_json::json!({
                 "point": v3(p),
                 "cplane": v3(doc.cplane.to_cplane(p)),
                 "kind": kind,
                 "object": objects.first(),
                 "objects": objects,
+                "normal": normal.map(v3),
             }),
             None => serde_json::json!({
                 "point": null, "cplane": null, "kind": null, "object": null, "objects": [],
+                "normal": null,
             }),
         };
         into_c_string(out.to_string())
@@ -459,6 +468,30 @@ mod tests {
                 r(ijc_osnap(h, 1.0, 1.0, std::ptr::null()))["error"].is_string(),
                 "no viewport"
             );
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn osnap_lands_on_the_face_under_the_cursor() {
+        let h = ijc_init_headless();
+        unsafe {
+            ijc_resize(h, 800, 600);
+            let b = ok(h, "box 0,0,0 4,4,3")["created"][0].as_str().unwrap().to_string();
+            ok(h, "top");
+            ok(h, "ze");
+            assert!(ijc_flush(h));
+            let (x, y) = px(h, [1.3, 2.7, 3.0]);
+            let v = r(ijc_osnap(h, x, y, c(r#"{"kinds":["end"],"grid":false}"#).as_ptr()));
+            assert_eq!(v["kind"], "face", "{v}");
+            assert_eq!(v["object"], b.as_str());
+            assert!((v["point"][2].as_f64().unwrap() - 3.0).abs() < 1e-6, "on the top: {v}");
+            assert!(close(&v["normal"], [0.0, 0.0, 1.0]), "{v}");
+            // Off the box: the plane, no normal.
+            let (x, y) = px(h, [8.0, 2.0, 0.0]);
+            let v = r(ijc_osnap(h, x, y, c(r#"{"kinds":["end"],"grid":false}"#).as_ptr()));
+            assert_eq!(v["kind"], "plane", "{v}");
+            assert!(v["normal"].is_null(), "{v}");
             ijc_free(h);
         }
     }
