@@ -80,6 +80,38 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 keep,
             })
         }
+        "sectionplane" => {
+            // sectionplane <point> <normal> [name] | activate <name> |
+            // deactivate | reverse|delete|slice [name] | list (#359). Bare
+            // `sectionplane` (the tool) and `align` (the camera) are app verbs.
+            use crate::SectionPlaneOp as Op;
+            let usage = "a point and a normal [name], or activate <name>, deactivate, reverse|delete|slice [name], list";
+            let one_name = |rest: &[&str]| match rest {
+                [] => Ok(None),
+                [n] => Ok(Some((*n).to_string())),
+                _ => wrong("sectionplane", usage, &args),
+            };
+            let op = match args.first().map(|w| w.to_ascii_lowercase()).as_deref() {
+                None | Some("align") => return wrong("sectionplane", usage, &args),
+                Some("activate") => match &args[1..] {
+                    [n] => Op::Activate { name: (*n).to_string() },
+                    _ => return wrong("sectionplane", usage, &args),
+                },
+                Some("deactivate" | "off") if args.len() == 1 => Op::Deactivate,
+                Some("reverse") => Op::Reverse { name: one_name(&args[1..])? },
+                Some("delete") => Op::Delete { name: one_name(&args[1..])? },
+                Some("slice") => Op::Slice { name: one_name(&args[1..])? },
+                Some("list") if args.len() == 1 => Op::List,
+                _ => match args[..] {
+                    [p, n] => Op::Place { name: None, point: point(p)?, normal: point(n)? },
+                    [p, n, name] if crate::exec::valid_section_plane_name(name) => {
+                        Op::Place { name: Some(name.to_string()), point: point(p)?, normal: point(n)? }
+                    }
+                    _ => return wrong("sectionplane", usage, &args),
+                },
+            };
+            Ok(Command::SectionPlane(op))
+        }
         "revolve" => {
             // Exactly one profile, so 'last' never takes a count: a bare
             // number after it is the angle, not an object count.

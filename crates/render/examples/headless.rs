@@ -223,6 +223,8 @@ fn main() {
         fog: Default::default(),
         ao: Default::default(),
         shadows: Default::default(),
+        section: None,
+        sections: Default::default(),
         background: [0.0; 4],
     };
 }

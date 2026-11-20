@@ -2645,6 +2645,59 @@ pub unsafe extern "C" fn ijc_pushpull(
     })
 }
 
+/// Place a live section plane (#359) through `(px, py, pz)` facing `(nx, ny,
+/// nz)` (the side it cuts away; a face's outward normal from
+/// [`snap::ijc_osnap`] keeps that face) and make it the active cut: the
+/// undoable, op-logged `sectionplane`. It is named `section1`, `section2`, ….
+/// Returns `false` on a null/invalid handle, non-finite input or a zero
+/// normal.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_section_plane_add(
+    h: *mut AppHandle,
+    px: f64,
+    py: f64,
+    pz: f64,
+    nx: f64,
+    ny: f64,
+    nz: f64,
+) -> bool {
+    guard_ffi(false, || {
+        let (point, normal) = (glam::DVec3::new(px, py, pz), glam::DVec3::new(nx, ny, nz));
+        if !point.is_finite() || !normal.is_finite() {
+            return false;
+        }
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let op = itsjustcad_commands::SectionPlaneOp::Place { name: None, point, normal };
+        app.session.run(Command::SectionPlane(op)).is_ok()
+    })
+}
+
+/// Make the section plane `name` the active cut (#359), or clear the cut
+/// when `name` is null. Logged and undoable. Returns `false` on a
+/// null/invalid handle or an unknown name.
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `name` must be null
+/// or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_section_activate(h: *mut AppHandle, name: *const c_char) -> bool {
+    guard_ffi(false, || {
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let op = match unsafe { c_str(name) } {
+            Some(n) => itsjustcad_commands::SectionPlaneOp::Activate { name: n.to_string() },
+            None => itsjustcad_commands::SectionPlaneOp::Deactivate,
+        };
+        app.session.run(Command::SectionPlane(op)).is_ok()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Gumball (full on-screen transform gizmo): live ghost preview + commit
 // ---------------------------------------------------------------------------
@@ -3294,6 +3347,10 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
         app.mode.line_px(app.pixel_scale),
         app.pixel_scale,
     ];
+    // The document's active section plane cuts the view live (#359), with
+    // the default display (cut and fill on); no plane leaves it unchanged.
+    let cut = app.session.doc.section_cut().map(|p| [p.point.as_vec3().to_array(), p.normal.as_vec3().to_array()]);
+    let cam = cam.with_section(cut, &itsjustcad_render::SectionStyle::default());
     gpu.renderer.write_camera(&gpu.device, &gpu.queue, 0, &cam);
 
     let (target, config, depth_view) = match gpu.panes.get(&surface) {
@@ -7958,6 +8015,28 @@ mod headless_tests {
             assert!(!ijc_pushpull(std::ptr::null_mut(), id.as_ptr(), 1.0, 1.0, 5.0, 0.0, 0.0, 1.0, 1.0, false));
             take(ijc_run_command_result(h, c("undo").as_ptr()));
             assert_eq!(top(h), 3.0);
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn section_plane_add_and_activate() {
+        // #359: place (active), clear, reactivate by name; one undo each.
+        let h = ijc_init_headless();
+        unsafe {
+            let active = |h| handle_ref(h).unwrap().session.doc.active_section.clone();
+            assert!(ijc_section_plane_add(h, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0));
+            assert_eq!(active(h).as_deref(), Some("section1"));
+            assert!(ijc_section_activate(h, std::ptr::null()));
+            assert_eq!(active(h), None);
+            assert!(ijc_section_activate(h, c("section1").as_ptr()));
+            assert_eq!(active(h).as_deref(), Some("section1"));
+            assert!(!ijc_section_activate(h, c("nope").as_ptr()));
+            assert!(!ijc_section_plane_add(h, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0), "zero normal");
+            assert!(!ijc_section_plane_add(h, f64::NAN, 0.0, 1.0, 0.0, 0.0, 1.0));
+            assert!(!ijc_section_plane_add(std::ptr::null_mut(), 0.0, 0.0, 1.0, 0.0, 0.0, 1.0));
+            take(ijc_run_command_result(h, c("undo").as_ptr()));
+            assert_eq!(active(h), None);
             ijc_free(h);
         }
     }

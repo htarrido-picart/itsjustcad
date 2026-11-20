@@ -7,6 +7,7 @@
 
 struct ObjectParams {
     color: vec4<f32>,
+    // w = 1: never cut by the section plane (the world axes, #359).
     material: vec4<f32>,
     // Dash pattern in logical px: on, off, on, off. All zero = solid (#364).
     dash: vec4<f32>,
@@ -39,7 +40,15 @@ fn vs_axis(@location(0) position: vec3<f32>) -> LineOut {
 
 @fragment
 fn fs_main(in: LineOut) -> @location(0) vec4<f32> {
+    if (stroke_cut(in.world)) {
+        discard;
+    }
     return fogged(ink(), in.world);
+}
+
+// Whether the live section cut (#359) removes this stroke at world point `p`.
+fn stroke_cut(p: vec3<f32>) -> bool {
+    return object.material.w < 0.5 && cut_away(p);
 }
 
 fn ink() -> vec4<f32> {
@@ -169,6 +178,9 @@ fn fat_quad(vi: u32, a: vec3<f32>, b: vec3<f32>, width: f32) -> FatOut {
 
 @fragment
 fn fs_fat(in: FatOut) -> @location(0) vec4<f32> {
+    if (stroke_cut(in.world)) {
+        discard;
+    }
     return fogged(fat_ink(in.local, in.len_px, in.width), in.world);
 }
 
@@ -234,6 +246,9 @@ fn vs_dash(@location(0) p: vec4<f32>) -> DashOut {
 
 @fragment
 fn fs_dash(in: DashOut) -> @location(0) vec4<f32> {
+    if (stroke_cut(in.world)) {
+        discard;
+    }
     if (!dash_on(in.s, in.w)) {
         discard;
     }
@@ -271,6 +286,9 @@ fn vs_fat_dash(
 
 @fragment
 fn fs_fat_dash(in: FatDashOut) -> @location(0) vec4<f32> {
+    if (stroke_cut(in.world)) {
+        discard;
+    }
     if (!dash_on(in.s, in.w)) {
         discard;
     }
@@ -304,6 +322,9 @@ const BACK_ALPHA: f32 = 0.4;
 
 @fragment
 fn fs_back(in: FatOut) -> @location(0) vec4<f32> {
+    if (stroke_cut(in.world)) {
+        discard;
+    }
     let pat = BACK_DASH * max(camera.edges.z, 1.0);
     if (fract(max(in.local.y, 0.0) / (pat.x + pat.y)) * (pat.x + pat.y) >= pat.x) {
         discard;

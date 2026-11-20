@@ -51,6 +51,7 @@ mod preset;
 mod pushpull;
 mod raytrace_ui;
 mod scene;
+mod section_tool;
 mod sd_catalog;
 mod smarttrack;
 mod statusbar;

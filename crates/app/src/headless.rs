@@ -165,6 +165,9 @@ pub struct HeadlessView {
     pub ao_style: itsjustcad_render::AoStyle,
     /// Sun shadows, from `shadows` (#357). Off by default.
     pub shadow_style: itsjustcad_render::ShadowStyle,
+    /// Section display, from `sections` (#359). The cut is the document's
+    /// active section plane.
+    pub section_style: itsjustcad_render::SectionStyle,
     /// Sky/ground gradient from a named style (#362); `None` follows
     /// `profile_edges`.
     pub background_gradient: Option<bool>,
@@ -184,6 +187,7 @@ impl HeadlessView {
             fog: self.fog_style,
             ao: self.ao_style,
             shadows: self.shadow_style,
+            sections: self.section_style,
             grid: self.show_grid,
             axes: self.show_axes,
             gradient: self.background_gradient,
@@ -202,6 +206,7 @@ impl HeadlessView {
         self.fog_style = s.fog;
         self.ao_style = s.ao;
         self.shadow_style = s.shadows;
+        self.section_style = s.sections;
         self.show_grid = s.grid;
         self.show_axes = s.axes;
         self.background_gradient = s.gradient;
@@ -228,6 +233,7 @@ impl Default for HeadlessView {
             fog_style: Default::default(),
             ao_style: Default::default(),
             shadow_style: Default::default(),
+            section_style: Default::default(),
             background_gradient: None,
         }
     }
@@ -306,6 +312,9 @@ pub fn run_script_lines(
             // The panel is a window: nothing to show headless.
             Some(verb @ AppVerb::Shadows(_)) => {
                 view.shadow_style = crate::app_verbs::apply_shadow_style(view.shadow_style, &verb)
+            }
+            Some(verb @ AppVerb::Sections(_)) => {
+                view.section_style = crate::app_verbs::apply_section_style(view.section_style, &verb)
             }
             Some(AppVerb::Style(verb)) => {
                 use crate::view_styles::{self as vs, StyleVerb};
@@ -890,7 +899,11 @@ pub fn render_headless(
         .with_edge_style(&view.edge_style, 1.0)
         .with_fog(&view.fog_style, theme.background())
         .with_ao(&view.ao_style, mode)
-        .with_shadows(&view.shadow_style, mode, sun_dir);
+        .with_shadows(&view.shadow_style, mode, sun_dir)
+        .with_section(
+            session.doc.active_section_plane().map(|p| [p.point.as_vec3().to_array(), p.normal.as_vec3().to_array()]),
+            &view.section_style,
+        );
     renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -1115,6 +1128,20 @@ mod tests {
         let a = view.ao_style;
         assert!(a.on);
         assert_eq!((a.distance, a.units, a.intensity, a.color), (0.5, AoUnits::World, 0.8, [16, 32, 48]));
+    }
+
+    #[test]
+    fn section_verbs_affect_view() {
+        use itsjustcad_render::SectionStyle;
+        // #359: `sections` runs headless; the plane ops reach the document.
+        assert_eq!(HeadlessView::default().section_style, SectionStyle::default());
+        let lines: Vec<String> =
+            ["box 0,0,0 2,2,2", "sectionplane 1,1,1 1,0,0", "sections fill #ff0000", "sections planes off"]
+                .map(String::from)
+                .to_vec();
+        let (session, view) = run_script_lines(Session::default(), &lines).expect("verbs run");
+        assert_eq!(view.section_style, SectionStyle { planes: false, fill_rgb: [255, 0, 0], ..SectionStyle::default() });
+        assert_eq!(session.doc.active_section.as_deref(), Some("section1"));
     }
 
     #[test]

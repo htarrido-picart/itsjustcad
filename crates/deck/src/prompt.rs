@@ -76,6 +76,11 @@ Sun shadows (from the document sun: sun / location / geocode; default sun when u
   shadows ground on|off                         the ground plane catches shadows                         e.g. shadows ground off
   shadows panel                                 time-of-day and date sliders (they set the sun)          e.g. shadows panel
 
+Section display (planes come from sectionplane; one active cut per document):
+  sections planes|cuts|fill on|off              plane frames / live cut / cut-face fill                  e.g. sections fill off
+  sections fill #rrggbb                         section fill colour                                      e.g. sections fill #303030
+  sectionplane align [name]                     look straight at a section plane                         e.g. sectionplane align
+
 Styles (one-step bundles of the display settings above):
   style <name> [all]                            modelling|presentation|sketch|hiddenline|xray|massing    e.g. style presentation
                                                 or a saved one; active pane (all: every pane)
@@ -1031,12 +1036,13 @@ mod tests {
         // ~190 verbs vs the full prompt's ~45 KB command table. The cap tracks the
         // growing verb count (CAD-parity batch added ~28 verbs; ramp/stair added 2;
         // lotset/lotreset added 2; insertpoint/deletepoint added 2; osmfetch
-        // added 1; rect/circle/polygon took `[normal x,y,z]`); it stays
+        // added 1; rect/circle/polygon took `[normal x,y,z]`; sectionplane
+    // added 1); it stays
         // well under the full table so the compact prompt keeps its size
         // advantage.
         let catalog = compact_command_catalog();
         assert!(
-            catalog.len() < 16_700,
+            catalog.len() < 16_800,
             "compact catalog bloated to {} bytes",
             catalog.len()
         );

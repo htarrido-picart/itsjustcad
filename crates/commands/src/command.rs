@@ -737,6 +737,10 @@ pub enum Command {
         b_corner: DVec3,
         b_size: DVec3,
     },
+    /// Live section planes (#359, SketchUp's Section Plane): place, activate,
+    /// reverse, delete or slice a named plane that cuts the viewport. See
+    /// [`SectionPlaneOp`]. Every op but `List` is logged.
+    SectionPlane(SectionPlaneOp),
     // -- sections (mesh/plane cuts -> polylines on layer "sections") --
     /// Cut meshes, parametric objects and block instances with a plane; each
     /// intersection becomes a polyline on layer "sections" (closed for a loop
@@ -2890,6 +2894,48 @@ pub enum SheetSetOp {
     Publish { path: Option<String> },
 }
 
+/// A `sectionplane` op (#359). Planes live on the document
+/// (`Document::section_planes`); one at most is active and cuts the model.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SectionPlaneOp {
+    /// Place a plane through `point` facing `normal` (the side it cuts away)
+    /// and make it the active cut. An existing `name` is moved instead. The
+    /// name is filled at apply time (`section1`, `section2`, …) so replay
+    /// makes the same plane.
+    Place {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        point: DVec3,
+        normal: DVec3,
+    },
+    /// Make `name` the active cut.
+    Activate { name: String },
+    /// No active cut: the whole model shows.
+    Deactivate,
+    /// Flip a plane's normal (the active one when `name` is absent; filled
+    /// at apply time).
+    Reverse {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Remove a plane (the active one when `name` is absent; filled at
+    /// apply time). Removing the active plane clears the cut.
+    Delete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// SketchUp's Create Group from Slice: cut every object with the plane
+    /// (the active one when `name` is absent) as the `section` command does.
+    /// Logged as that `section` op.
+    Slice {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// List the planes (query, not logged).
+    List,
+}
+
 /// Which property of an existing `SheetView` a `sheetviewset` edits. One variant
 /// per editable field so the op-log stays explicit and the inverse is a simple
 /// restore of the prior value.
@@ -2979,6 +3025,7 @@ impl Command {
                 // plotstyle list is a read-only query; the mutating sub-ops
                 // (new/set/apply/none/delete) fall through to logged.
                 | Command::PlotStyle(PlotStyleOp::List { .. })
+                | Command::SectionPlane(SectionPlaneOp::List)
         )
     }
 

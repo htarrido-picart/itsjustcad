@@ -188,6 +188,10 @@ pub fn pick_object_where(
                 Geometry::Instance { .. } => doc.geometry_aabb(&o.geometry),
                 _ => bb,
             };
+            // What the active section cut removes whole is not there (#359).
+            if doc.section_cut().is_some_and(|c| c.cuts_box(bb.min, bb.max)) {
+                continue;
+            }
             slots[rank as usize] = Some((o, bb));
         }
     }
@@ -224,6 +228,7 @@ pub fn pick_object_where_fresh(
         .objects()
         .filter(|o| o.visible && doc.layer_visible(&o.layer) && keep(o))
         .map(|o| (o, doc.geometry_aabb(&o.geometry)))
+        .filter(|(_, bb)| doc.section_cut().is_none_or(|c| !c.cuts_box(bb.min, bb.max)))
         .collect();
     pick_among(&cands, vp, size, pos, |seen| {
         let boxes: Vec<_> = cands.iter().map(|&(_, bb)| bb).collect();
@@ -306,6 +311,8 @@ pub fn ray_hit(
     dir: DVec3,
 ) -> Option<f64> {
     let mut best: Option<f64> = None;
+    let cut = doc.section_cut();
+    let kept = |t: f64| cut.is_none_or(|c| c.keeps(origin + dir * t));
     for (o, bb) in visible_objects(doc) {
         let t = match &o.geometry {
             Geometry::Curve(c) => {
@@ -314,15 +321,15 @@ pub fn ray_hit(
                     pos.x < lo.x || pos.y < lo.y || pos.x > hi.x || pos.y > hi.y
                 });
                 match curve_pick(c, None, vp, size, pos) {
-                    Ok((d, _)) if !far && d <= PICK_PX => ray_curve_t(c, origin, dir),
+                    Ok((d, _)) if !far && d <= PICK_PX => ray_curve_t(c, origin, dir).filter(|t| kept(*t)),
                     _ => None,
                 }
             }
             g => match g.mesh().filter(|m| !m.faces().is_empty()) {
                 Some(m) => ray_aabb(origin, dir, bb.min, bb.max)
-                    .and_then(|_| mesh_hit(m, origin, dir))
+                    .and_then(|_| mesh_hit(m, origin, dir, cut))
                     .map(|(_, t)| t),
-                None => ray_aabb(origin, dir, bb.min, bb.max),
+                None => ray_aabb(origin, dir, bb.min, bb.max).filter(|t| kept(*t)),
             },
         };
         if let Some(t) = t.filter(|t| t.is_finite())
@@ -335,8 +342,10 @@ pub fn ray_hit(
 }
 
 /// Every visible object (visible itself, on a visible layer, in the creation
-/// order) with its world box, for the ray queries.
+/// order) with its world box, for the ray queries. Objects the active
+/// section cut removes whole (#359) are left out.
 fn visible_objects(doc: &Document) -> impl Iterator<Item = (&crate::SceneObject, kernel_mesh::Aabb)> {
+    let cut = doc.section_cut();
     let cached = doc.pick_boxes.get(doc);
     let hidden: Vec<&str> =
         doc.layers.iter().filter(|(_, l)| !l.visible).map(|(n, _)| n.as_str()).collect();
@@ -349,10 +358,18 @@ fn visible_objects(doc: &Document) -> impl Iterator<Item = (&crate::SceneObject,
             Geometry::Instance { .. } => (o, doc.geometry_aabb(&o.geometry)),
             _ => (o, bb),
         })
+        .filter(move |(_, bb)| cut.is_none_or(|c| !c.cuts_box(bb.min, bb.max)))
 }
 
 /// The nearest triangle of `m` the ray crosses: `(triangle index, ray t)`.
-fn mesh_hit(m: &kernel_mesh::Mesh, origin: DVec3, dir: DVec3) -> Option<(usize, f64)> {
+/// With a section `cut` (#359), hits on the cut side do not count: the ray
+/// passes through what the viewport does not draw.
+fn mesh_hit(
+    m: &kernel_mesh::Mesh,
+    origin: DVec3,
+    dir: DVec3,
+    cut: Option<&crate::SectionPlane>,
+) -> Option<(usize, f64)> {
     let p = m.positions();
     m.faces()
         .iter()
@@ -361,7 +378,7 @@ fn mesh_hit(m: &kernel_mesh::Mesh, origin: DVec3, dir: DVec3) -> Option<(usize, 
             let v = |k: usize| p.get(f[k] as usize).copied();
             kernel_mesh::ray_triangle(origin, dir, v(0)?, v(1)?, v(2)?).map(|t| (i, t))
         })
-        .filter(|(_, t)| t.is_finite())
+        .filter(|(_, t)| t.is_finite() && cut.is_none_or(|c| c.keeps(origin + dir * *t)))
         .min_by(|a, b| a.1.total_cmp(&b.1))
 }
 
@@ -472,7 +489,7 @@ pub fn face_at(doc: &Document, origin: DVec3, dir: DVec3) -> Option<FaceHit> {
         if best.is_some_and(|(_, _, bt)| near > bt) {
             continue;
         }
-        if let Some((i, t)) = mesh_hit(m, origin, dir)
+        if let Some((i, t)) = mesh_hit(m, origin, dir, doc.section_cut())
             && best.is_none_or(|(_, _, bt)| t < bt)
         {
             best = Some((o, i, t));
@@ -567,7 +584,7 @@ pub fn region_at(doc: &Document, origin: DVec3, dir: DVec3) -> Option<FaceHit> {
         let n = if region.normal.dot(dir) > 0.0 { -region.normal } else { region.normal };
         let Some(p) = region.ray(origin, dir) else { continue };
         let t = (p - origin).dot(dir) / dir.length_squared();
-        if t < 0.0 || best.as_ref().is_some_and(|b| b.t <= t) {
+        if t < 0.0 || best.as_ref().is_some_and(|b| b.t <= t) || doc.section_cut().is_some_and(|c| !c.keeps(p)) {
             continue;
         }
         let (u, v) = region.axes();
@@ -863,6 +880,34 @@ mod tests {
     fn solid(corner: DVec3, size: DVec3) -> SceneObject {
         let mesh = kernel_mesh::make_box(corner, size);
         SceneObject { geometry: Geometry::Mesh(mesh), ..poly(&[], false) }
+    }
+
+    #[test]
+    fn picks_skip_what_the_section_cut_removes() {
+        // #359: a cut at z = 2 facing up removes the top half of a 4 m box.
+        let mut doc = Document::default();
+        let b = add(&mut doc, solid(DVec3::ZERO, DVec3::new(2.0, 2.0, 4.0)));
+        let above = add(&mut doc, solid(DVec3::new(0.0, 0.0, 6.0), DVec3::new(2.0, 2.0, 1.0)));
+        let (o, d) = (DVec3::new(1.0, 1.0, 10.0), DVec3::NEG_Z);
+        assert_eq!(face_at(&doc, o, d).unwrap().object, above);
+        doc.section_planes.push(crate::SectionPlane::new("s", DVec3::new(0.0, 0.0, 2.0), DVec3::Z).unwrap());
+        doc.active_section = Some("s".into());
+        // The box above is cut whole; the ray passes the cut top of `b` and
+        // meets its bottom (z = 0) from inside.
+        let hit = face_at(&doc, o, d).unwrap();
+        assert_eq!(hit.object, b);
+        assert!(hit.point.z.abs() < 1e-9, "{hit:?}");
+        let vp = Mat4::IDENTITY;
+        let size = Vec2::splat(100.0);
+        let t = ray_hit(&doc, vp, size, Vec2::splat(50.0), o, d).unwrap();
+        assert!((t - 10.0).abs() < 1e-9, "ray_hit skips the cut part too: {t}");
+        // A side ray below the cut still meets the wall.
+        let side = face_at(&doc, DVec3::new(-5.0, 1.0, 1.0), DVec3::X).unwrap();
+        assert!((side.point.x).abs() < 1e-9);
+        assert_eq!(pick_object(&doc, vp, size, Vec2::splat(50.0), o, d), Some(b), "the cut-away box is not picked");
+        // Hidden cuts (view state) pick the whole model again.
+        doc.section_cuts_hidden = true;
+        assert_eq!(face_at(&doc, o, d).unwrap().object, above);
     }
 
     #[test]
