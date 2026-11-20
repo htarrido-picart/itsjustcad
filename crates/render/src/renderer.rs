@@ -58,6 +58,13 @@ pub struct CameraUniform {
     pub ao: [f32; 4],
     /// The colour occluded faces darken toward (RGBA).
     pub ao_color: [f32; 4],
+    /// Sun shadows (#357): x = 1 on, y = direct light (0..1), z = ambient
+    /// (0..1), w = 1 the ground catches them. See
+    /// [`CameraUniform::with_shadows`].
+    pub shadow: [f32; 4],
+    /// Unit direction toward the sun the shadows fall from (xyz), which is
+    /// also the key light while they are on.
+    pub shadow_dir: [f32; 4],
 }
 
 impl CameraUniform {
@@ -145,6 +152,28 @@ impl CameraUniform {
     /// Whether the pane draws ambient occlusion.
     pub fn has_ao(&self) -> bool {
         self.ao[0] > 0.5
+    }
+
+    /// The same camera with the sun shadows (#357), on only when `style` is
+    /// on and `mode` has an opaque fill ([`DisplayMode::takes_ao`]). `sun`
+    /// is the document's direction toward the sun, `None` for the default
+    /// ([`crate::ShadowStyle::sun_dir`]). Off leaves the camera as it was.
+    pub fn with_shadows(mut self, style: &crate::ShadowStyle, mode: DisplayMode, sun: Option<[f32; 3]>) -> Self {
+        if !style.on || !mode.takes_ao() {
+            self.shadow = [0.0; 4];
+            self.shadow_dir = [0.0; 4];
+            return self;
+        }
+        let ground = if style.ground { 1.0 } else { 0.0 };
+        self.shadow = [1.0, style.light_level(), style.dark_level(), ground];
+        let [x, y, z] = crate::ShadowStyle::sun_dir(sun);
+        self.shadow_dir = [x, y, z, 0.0];
+        self
+    }
+
+    /// Whether the pane draws sun shadows.
+    pub fn has_shadows(&self) -> bool {
+        self.shadow[0] > 0.5
     }
 
     /// Whether the camera depends on the scene bounds: the depth ramp, or an
@@ -298,8 +327,8 @@ impl DisplayMode {
         self != DisplayMode::Wireframe
     }
 
-    /// Whether ambient occlusion (#358) darkens this mode's fill: the opaque
-    /// fills (Shaded, Pencil, Sketchy). Wireframe has none, X-ray and
+    /// Whether ambient occlusion (#358) and sun shadows (#357) darken this
+    /// mode's fill: the opaque fills (Shaded, Pencil, Sketchy). Wireframe has none, X-ray and
     /// Ghosted see through, and Hidden Line shows the background.
     pub fn takes_ao(self) -> bool {
         matches!(self, DisplayMode::Shaded | DisplayMode::Pencil | DisplayMode::Sketchy)
@@ -1192,6 +1221,8 @@ pub struct SceneRenderer {
     pub(crate) msaa: crate::msaa::ViewportMsaa,
     /// Per-pane ambient-occlusion targets and passes (#358).
     pub(crate) ao: crate::ao::ViewportAo,
+    /// The sun shadow map shared by every pane (#357).
+    pub(crate) shadow: crate::shadow::ViewportShadow,
     /// LineList copies of `lines` (strips) for the fat-stroke pass.
     curve_segments: Batch,
     /// Per pane: whether its last camera asked for fat strokes.
@@ -1204,6 +1235,9 @@ pub struct SceneRenderer {
     /// World bounds `(min, max)` of the uploaded scene's strokes and meshes,
     /// for the depth-cue ramp (#361).
     scene_bounds: Option<(glam::Vec3, glam::Vec3)>,
+    /// World bounds of the faces alone (`meshes` and `face_meshes`), which
+    /// the sun shadow map is fitted to (#357).
+    pub(crate) caster_bounds: Option<(glam::Vec3, glam::Vec3)>,
     pub(crate) camera_layout: wgpu::BindGroupLayout,
     /// One camera UBO + bind group per viewport pane. egui-wgpu runs every
     /// callback's `prepare` before any `paint`, so panes must not share a
@@ -1277,6 +1311,11 @@ impl SceneRenderer {
                 },
                 // The pane's ambient occlusion (#358), read by the fills.
                 crate::ao::occlusion_entry(1),
+                // The sun shadow map (#357): its light uniform, depth and
+                // comparison sampler, shared by every pane.
+                crate::shadow::uniform_entry(5),
+                crate::shadow::map_entry(6),
+                crate::shadow::sampler_entry(7),
             ],
         });
         let object_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1355,11 +1394,13 @@ impl SceneRenderer {
             sample_count: samples,
             msaa: Default::default(),
             ao: crate::ao::ViewportAo::new(device),
+            shadow: crate::shadow::ViewportShadow::new(device),
             curve_segments: Batch::new("curve_segments"),
             fat_lines: Vec::new(),
             axes_hidden: Vec::new(),
             last_cameras: Vec::new(),
             scene_bounds: None,
+            caster_bounds: None,
             camera_layout,
             cameras: Vec::new(),
             scene_params: ParamBuffer::new(device),
@@ -1466,6 +1507,12 @@ impl SceneRenderer {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(self.ao.occlusion_view(viewport)),
                 },
+                wgpu::BindGroupEntry { binding: 5, resource: self.shadow.uniform().as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(self.shadow.map_view()),
+                },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(self.shadow.sampler()) },
             ],
         })
     }
@@ -1482,6 +1529,7 @@ impl SceneRenderer {
         self.meshes.set(device, queue, stage_meshes(meshes));
         self.write_scene_params(device, queue);
         self.generation = generation;
+        self.caster_bounds = bounds_of(meshes.iter().flat_map(|m| m.0.positions.iter()));
     }
 
     /// Upload a scene snapshot into the shared batches (#269). Unchanged
@@ -1569,6 +1617,13 @@ impl SceneRenderer {
 
         // Depth cue (#361) and fog (#363): new bounds re-send the panes that
         // use the ramp.
+        self.caster_bounds = bounds_of(
+            scene
+                .meshes
+                .iter()
+                .flat_map(|m| m.0.positions.iter())
+                .chain(scene.face_meshes.iter().flat_map(|m| m.0.positions.iter())),
+        );
         let bounds = scene_bounds(scene);
         if bounds != self.scene_bounds {
             self.scene_bounds = bounds;
@@ -1904,16 +1959,21 @@ impl SceneRenderer {
 
 /// World bounds of a scene's meshes, strokes and points, `None` when empty.
 fn scene_bounds(scene: &SceneData) -> Option<(glam::Vec3, glam::Vec3)> {
-    let points = scene
-        .meshes
-        .iter()
-        .flat_map(|m| m.0.positions.iter())
-        .chain(scene.face_meshes.iter().flat_map(|m| m.0.positions.iter()))
-        .chain(scene.edges.iter().flat_map(|e| e.0.iter()))
-        .chain(scene.lines.iter().flat_map(|l| l.0.iter()))
-        .chain(scene.points.iter().flat_map(|p| p.0.iter()))
-        .map(|p| glam::Vec3::from(*p));
-    points.fold(None, |acc, p| match acc {
+    bounds_of(
+        scene
+            .meshes
+            .iter()
+            .flat_map(|m| m.0.positions.iter())
+            .chain(scene.face_meshes.iter().flat_map(|m| m.0.positions.iter()))
+            .chain(scene.edges.iter().flat_map(|e| e.0.iter()))
+            .chain(scene.lines.iter().flat_map(|l| l.0.iter()))
+            .chain(scene.points.iter().flat_map(|p| p.0.iter())),
+    )
+}
+
+/// World bounds of `points`, `None` when empty.
+fn bounds_of<'a>(points: impl Iterator<Item = &'a [f32; 3]>) -> Option<(glam::Vec3, glam::Vec3)> {
+    points.map(|p| glam::Vec3::from(*p)).fold(None, |acc, p| match acc {
         None => Some((p, p)),
         Some((lo, hi)) => Some((lo.min(p), hi.max(p))),
     })

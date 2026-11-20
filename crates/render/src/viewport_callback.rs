@@ -19,8 +19,9 @@ pub struct ViewportCallback {
     pub viewport: usize,
     /// Display mode of this pane (shaded/wireframe/x-ray/ghosted).
     pub mode: DisplayMode,
-    /// Unit vector toward the sun (X=East, Y=North, Z=Up). Only consulted by
-    /// the `Sun` lighting mode; `None` leaves the sun slot zeroed.
+    /// Unit vector toward the sun (X=East, Y=North, Z=Up). Consulted by the
+    /// `Sun` lighting mode and the shadows (#357); `None` leaves the sun slot
+    /// zeroed (the shadows then use the default sun).
     pub sun_dir: Option<[f32; 3]>,
     /// Lighting model for the mesh fill (Working / Sun / Presentation).
     pub light: LightMode,
@@ -57,6 +58,9 @@ pub struct ViewportCallback {
     /// Ambient occlusion (#358), GPU-only; applied when `mode` has an opaque
     /// fill.
     pub ao: crate::AoStyle,
+    /// Sun shadows (#357), GPU-only; cast from `sun_dir` (else the default
+    /// sun) when `mode` has an opaque fill.
+    pub shadows: crate::ShadowStyle,
     /// The flat colour behind the scene (the clear colour: theme or paper),
     /// the fog's background colour when the gradient is off.
     pub background: [f32; 4],
@@ -100,11 +104,14 @@ impl CallbackTrait for ViewportCallback {
             fog_color: [0.0; 4],
             ao: [0.0; 4],
             ao_color: [0.0; 4],
+            shadow: [0.0; 4],
+            shadow_dir: [0.0; 4],
         }
         .with_overlays(self.show_grid, self.show_axes)
         .with_edge_style(&self.edge_style, screen_desc.pixels_per_point)
         .with_fog(&self.fog, self.background)
-        .with_ao(&self.ao, self.mode);
+        .with_ao(&self.ao, self.mode)
+        .with_shadows(&self.shadows, self.mode, self.sun_dir);
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene
             && (renderer.generation != self.generation || self.force)
@@ -119,7 +126,10 @@ impl CallbackTrait for ViewportCallback {
             screen_desc.size_in_pixels,
         );
         let size_px = [vp.width_px.max(0) as u32, vp.height_px.max(0) as u32];
-        // Ambient occlusion (#358) first, for either path: the fills read it.
+        // The sun shadow map (#357), redrawn only when the geometry or the
+        // sun moved; then ambient occlusion (#358), for either path: the
+        // fills read both.
+        renderer.render_shadow(device, queue, encoder, self.viewport);
         renderer.render_ao(device, queue, encoder, self.viewport, size_px);
         if renderer.sample_count() > 1 {
             renderer.render_msaa_pane(

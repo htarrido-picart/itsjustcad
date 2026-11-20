@@ -10,8 +10,8 @@
 
 use glam::{Mat4, Vec3};
 use itsjustcad_render::{
-    camera_uniform, pick_sample_count, supported_sample_counts, AoStyle, AoUnits, DisplayMode,
-    EdgeStyle, FogColor, FogStyle, SceneData,
+    camera_uniform, camera_uniform_ex, pick_sample_count, supported_sample_counts, AoStyle, AoUnits, DisplayMode,
+    EdgeStyle, FogColor, FogStyle, SceneData, ShadowStyle,
     SceneRenderer, UnderlayData, DEPTH_FORMAT,
 };
 use itsjustcad_doc::LineType;
@@ -705,5 +705,184 @@ fn ao_targets_rebuild_only_on_resize_and_free_when_off() {
     r.write_camera(&g.device, &g.queue, 0, &cam);
     r.render_ao(&g.device, &g.queue, &mut enc, 0, [W / 2, H]);
     assert!(r.ao_target(0).is_none(), "freed when off");
+    g.queue.submit([enc.finish()]);
+}
+
+/// A closed box `lo..hi`, both windings per face (outward normals), so back
+/// faces never cull it away.
+fn cuboid(lo: Vec3, hi: Vec3) -> RenderMesh {
+    let (mut positions, mut normals, mut indices) = (Vec::new(), Vec::new(), Vec::new());
+    for axis in 0..3 {
+        for side in [0.0f32, 1.0] {
+            let (b, c) = ((axis + 1) % 3, (axis + 2) % 3);
+            let i = positions.len() as u32;
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                let mut p = lo;
+                p[axis] = lo[axis] + (hi[axis] - lo[axis]) * side;
+                p[b] = lo[b] + (hi[b] - lo[b]) * u;
+                p[c] = lo[c] + (hi[c] - lo[c]) * v;
+                positions.push(p.to_array());
+                let mut n = [0.0; 3];
+                n[axis] = side * 2.0 - 1.0;
+                normals.push(n);
+            }
+            indices.extend([i, i + 1, i + 2, i, i + 2, i + 3, i, i + 2, i + 1, i, i + 3, i + 2]);
+        }
+    }
+    RenderMesh { positions, normals, indices }
+}
+
+/// A 1 x 1 x 2 box standing at the origin, optionally on a floor face, seen
+/// from the south above; the sun stands in the east at 45°.
+fn box_scene(floor: bool) -> (SceneData, Mat4, Vec3) {
+    let grey = [0.8, 0.8, 0.8, 1.0];
+    let mut meshes = vec![(cuboid(Vec3::new(-0.5, -0.5, 0.0), Vec3::new(0.5, 0.5, 2.0)), grey, [0.5, 0.0])];
+    if floor {
+        meshes.push((cuboid(Vec3::new(-4.0, -4.0, -0.2), Vec3::new(4.0, 4.0, 0.0)), grey, [0.5, 0.0]));
+    }
+    let scene = SceneData {
+        meshes,
+        face_meshes: vec![],
+        lines: vec![],
+        edges: vec![],
+        line_types: vec![],
+        edge_types: vec![],
+        profile_edges: vec![],
+        points: vec![],
+        underlay: None,
+        basemap: None,
+        show_lineweights: false,
+    };
+    let eye = Vec3::new(0.0, -7.0, 6.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(0.0, 0.0, 0.5), Vec3::Z);
+    let proj = Mat4::perspective_rh(50f32.to_radians(), W as f32 / H as f32, 0.05, 1000.0);
+    (scene, proj * view, eye)
+}
+
+const EAST_SUN: [f32; 3] = [std::f32::consts::FRAC_1_SQRT_2, 0.0, std::f32::consts::FRAC_1_SQRT_2];
+
+/// Render `scene` at `n` samples in `mode` with `shadows` from `sun`, over
+/// the gradient ground (or the flat clear); validation errors fail the test.
+fn draw_shadow(
+    g: &Gpu,
+    n: u32,
+    mode: DisplayMode,
+    (scene, vp, eye): &(SceneData, Mat4, Vec3),
+    shadows: Option<&ShadowStyle>,
+    gradient: bool,
+) -> Vec<u8> {
+    let scope = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut r = SceneRenderer::with_samples(&g.device, FORMAT, n);
+    r.set_scene(&g.device, &g.queue, scene, 1);
+    let mut cam = camera_uniform_ex(*vp, *eye, mode, Default::default(), Some(EAST_SUN), gradient)
+        .with_overlays(false, false);
+    cam.screen = [W as f32, H as f32, 0.0, 1.0];
+    if let Some(s) = shadows {
+        cam = cam.with_shadows(s, mode, Some(EAST_SUN));
+    }
+    r.write_camera(&g.device, &g.queue, 0, &cam);
+    let mut enc = g.device.create_command_encoder(&Default::default());
+    r.render_shadow(&g.device, &g.queue, &mut enc, 0);
+    assert_eq!(r.has_shadow_map(), cam.has_shadows(), "{n}x {mode:?}: map only with shadows");
+    let rgba = if n > 1 {
+        r.render_msaa_pane(&g.device, &mut enc, 0, [W, H], mode, false);
+        g.queue.submit([enc.finish()]);
+        read_rgba(g, r.msaa_target(0).expect("target").resolve_texture())
+    } else {
+        g.queue.submit([enc.finish()]);
+        window_pass(g, wgpu::Color::TRANSPARENT, |pass| r.paint(pass, 0, mode, false))
+    };
+    let err = pollster::block_on(scope.pop());
+    assert!(err.is_none(), "{n}x {mode:?} shadows: {err:?}");
+    rgba
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn box_casts_a_shadow_on_the_anti_sun_side_at_every_sample_count() {
+    // #357: with the sun in the east, the box shades the ground (the grid's
+    // catcher, and a floor face) to its west and not to its east, at every
+    // sample count. Shadows off (or a mode without them) is today's image.
+    let g = gpu();
+    let on = ShadowStyle { on: true, ..Default::default() };
+    let px = |vp: Mat4, p: Vec3| {
+        let ndc = vp.project_point3(p);
+        let x = ((ndc.x * 0.5 + 0.5) * W as f32) as usize;
+        let y = ((0.5 - ndc.y * 0.5) * H as f32) as usize;
+        (y * W as usize + x) * 4
+    };
+    let luma = |rgba: &[u8], i: usize| rgba[i] as i32 + rgba[i + 1] as i32 + rgba[i + 2] as i32;
+    // West (in the shadow) and east (sunlit) of the box, on the ground.
+    let (west, east) = (Vec3::new(-1.6, 0.0, 0.0), Vec3::new(1.6, 0.0, 0.0));
+    for &n in &g.counts {
+        for floor in [false, true] {
+            let s = box_scene(floor);
+            let vp = s.1;
+            for mode in [DisplayMode::Shaded, DisplayMode::Pencil] {
+                let plain = draw_shadow(&g, n, mode, &s, None, true);
+                let lit = draw_shadow(&g, n, mode, &s, Some(&on), true);
+                let (a, b) = (luma(&plain, px(vp, west)), luma(&lit, px(vp, west)));
+                assert!(b * 10 < a * 9, "{n}x {mode:?} floor {floor}: west in shadow ({a} -> {b})");
+                let (a, b) = (luma(&plain, px(vp, east)), luma(&lit, px(vp, east)));
+                // Sunlit: only the key's angle moves (the sun replaces the
+                // Working key), a few percent at most.
+                assert!(a.abs_diff(b) * 100 <= a.unsigned_abs() * 3 + 6, "{n}x {mode:?} floor {floor}: east sunlit ({a} -> {b})");
+                let west_east = (luma(&lit, px(vp, west)), luma(&lit, px(vp, east)));
+                assert!(west_east.0 * 10 < west_east.1 * 9, "{n}x {mode:?} floor {floor}: {west_east:?}");
+                // Off with other settings changed is the default image.
+                let off = ShadowStyle { on: false, light: 0.1, dark: 0.9, ground: false };
+                assert_eq!(draw_shadow(&g, n, mode, &s, Some(&off), true), plain, "{n}x {mode:?}: off");
+            }
+            for mode in [DisplayMode::XRay, DisplayMode::HiddenLine, DisplayMode::Wireframe, DisplayMode::Ghosted] {
+                let plain = draw_shadow(&g, n, mode, &s, None, true);
+                assert_eq!(draw_shadow(&g, n, mode, &s, Some(&on), true), plain, "{n}x {mode:?}: skipped");
+            }
+        }
+        // Over a flat background the ground's shadow is translucent black;
+        // `shadows ground off` leaves the background alone.
+        let s = box_scene(false);
+        let plain = draw_shadow(&g, n, DisplayMode::Shaded, &s, None, false);
+        let lit = draw_shadow(&g, n, DisplayMode::Shaded, &s, Some(&on), false);
+        let i = px(s.1, west) + 3;
+        assert!(lit[i] > plain[i] + 40, "{n}x flat: west alpha {} -> {}", plain[i], lit[i]);
+        let no_ground = ShadowStyle { ground: false, ..on };
+        let bare = draw_shadow(&g, n, DisplayMode::Shaded, &s, Some(&no_ground), false);
+        assert_eq!(bare[i - 3..=i], plain[i - 3..=i], "{n}x: ground off leaves the background");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn shadow_map_redraws_only_for_geometry_or_sun() {
+    // #357: orbiting never redraws the map; a sun or geometry change does,
+    // and turning every pane's shadows off frees it.
+    let g = gpu();
+    let (scene, vp, eye) = box_scene(true);
+    let mut r = SceneRenderer::new(&g.device, FORMAT);
+    r.set_scene(&g.device, &g.queue, &scene, 1);
+    let on = ShadowStyle { on: true, ..Default::default() };
+    let mut enc = g.device.create_command_encoder(&Default::default());
+    let mut frame = |r: &mut SceneRenderer, vp: Mat4, sun: [f32; 3], on: &ShadowStyle| {
+        let cam = camera_uniform(vp, eye).with_shadows(on, DisplayMode::Shaded, Some(sun));
+        r.write_camera(&g.device, &g.queue, 0, &cam);
+        r.render_shadow(&g.device, &g.queue, &mut enc, 0);
+    };
+    frame(&mut r, vp, EAST_SUN, &on);
+    assert_eq!(r.shadow_map_renders(), 1);
+    for yaw in 1..10 {
+        frame(&mut r, vp * Mat4::from_rotation_z(yaw as f32 * 0.3), EAST_SUN, &on);
+    }
+    frame(&mut r, vp, EAST_SUN, &ShadowStyle { light: 0.2, dark: 0.7, ..on });
+    assert_eq!(r.shadow_map_renders(), 1, "camera and slider changes keep the map");
+    r.set_scene(&g.device, &g.queue, &scene, 2);
+    frame(&mut r, vp, EAST_SUN, &on);
+    assert_eq!(r.shadow_map_renders(), 1, "an unchanged re-upload keeps the map");
+    frame(&mut r, vp, [0.0, -0.6, 0.8], &on);
+    assert_eq!(r.shadow_map_renders(), 2, "a new sun redraws");
+    r.set_scene(&g.device, &g.queue, &box_scene(false).0, 3);
+    frame(&mut r, vp, [0.0, -0.6, 0.8], &on);
+    assert_eq!(r.shadow_map_renders(), 3, "new geometry redraws");
+    frame(&mut r, vp, [0.0, -0.6, 0.8], &ShadowStyle::default());
+    assert!(!r.has_shadow_map(), "freed when off");
     g.queue.submit([enc.finish()]);
 }

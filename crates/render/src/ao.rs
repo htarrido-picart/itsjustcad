@@ -265,8 +265,9 @@ pub(crate) struct ViewportAo {
     flat: [FlatIndices; 2],
 }
 
-/// A batch's indices made absolute, for one prepass draw.
-struct FlatIndices {
+/// A batch's indices made absolute, for one draw of the whole batch (the
+/// AO prepass, the shadow map #357).
+pub(crate) struct FlatIndices {
     /// [`Batch::version`] the buffer was built from.
     version: Option<u64>,
     buf: GrowBuffer,
@@ -274,12 +275,12 @@ struct FlatIndices {
 }
 
 impl FlatIndices {
-    fn new() -> Self {
-        Self { version: None, buf: GrowBuffer::new("ao_flat_indices", wgpu::BufferUsages::INDEX), count: 0 }
+    pub(crate) fn new(label: &'static str) -> Self {
+        Self { version: None, buf: GrowBuffer::new(label, wgpu::BufferUsages::INDEX), count: 0 }
     }
 
     /// Bring the buffer up to date with `batch`.
-    fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, batch: &Batch) {
+    pub(crate) fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, batch: &Batch) {
         if self.version != Some(batch.version) {
             let indices = batch.flat_indices();
             self.buf.write(device, queue, bytemuck::cast_slice(&indices));
@@ -289,7 +290,7 @@ impl FlatIndices {
     }
 
     /// Draw `batch` (its vertex buffer) through the flat indices.
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, batch: &Batch) {
+    pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, batch: &Batch) {
         let (Some(vb), Some(ib)) = (batch.vertex_slice(), self.buf.buf.as_ref()) else {
             return;
         };
@@ -307,7 +308,7 @@ impl ViewportAo {
             pipes: None,
             panes: Vec::new(),
             empty: texture(device, "ao_empty", OCCLUSION, [1, 1]),
-            flat: [FlatIndices::new(), FlatIndices::new()],
+            flat: [FlatIndices::new("ao_flat_indices"), FlatIndices::new("ao_flat_indices")],
         }
     }
 
@@ -378,7 +379,7 @@ impl SceneRenderer {
                 *slot = None;
                 self.rebind_camera(device, viewport);
                 if self.ao.panes.iter().all(Option::is_none) {
-                    self.ao.flat = [FlatIndices::new(), FlatIndices::new()];
+                    self.ao.flat = [FlatIndices::new("ao_flat_indices"), FlatIndices::new("ao_flat_indices")];
                 }
             }
             return;
@@ -418,9 +419,9 @@ impl SceneRenderer {
         p.draw(0..3, 0..1);
     }
 
-    /// Rebuild pane `viewport`'s camera bind group after its occlusion
-    /// texture changed.
-    fn rebind_camera(&mut self, device: &wgpu::Device, viewport: usize) {
+    /// Rebuild pane `viewport`'s camera bind group after its occlusion (or
+    /// the shadow map, #357) changed.
+    pub(crate) fn rebind_camera(&mut self, device: &wgpu::Device, viewport: usize) {
         if let Some((buf, _)) = self.cameras.get(viewport) {
             let group = self.camera_bind_group(device, buf, viewport);
             self.cameras[viewport].1 = group;
