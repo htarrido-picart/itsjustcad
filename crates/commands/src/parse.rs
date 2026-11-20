@@ -410,20 +410,24 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
             })
         }
         "rect" | "rectangle" => {
-            let [corner, w, h] = take::<3>("rect", "a corner point, width and height", &args)?;
+            let (args, normal) = plane_normal(&args)?;
+            let [corner, w, h] = take::<3>("rect", "a corner point, width and height", args)?;
             Ok(Command::Rectangle {
                 id: None,
                 corner: point(corner)?,
                 width: number(w)?,
                 height: number(h)?,
+                normal,
             })
         }
         "circle" => {
-            let [center, r] = take::<2>("circle", "a center point and a radius", &args)?;
+            let (args, normal) = plane_normal(&args)?;
+            let [center, r] = take::<2>("circle", "a center point and a radius", args)?;
             Ok(Command::Circle {
                 id: None,
                 center: point(center)?,
                 radius: number(r)?,
+                normal,
             })
         }
         "circletan" | "circlettr" => {
@@ -458,7 +462,8 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
             })
         }
         "polygon" => {
-            let [center, r, sides] = take::<3>("polygon", "a center point, radius and side count", &args)?;
+            let (args, normal) = plane_normal(&args)?;
+            let [center, r, sides] = take::<3>("polygon", "a center point, radius and side count", args)?;
             Ok(Command::Polygon {
                 id: None,
                 center: point(center)?,
@@ -466,6 +471,7 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 sides: sides
                     .parse()
                     .map_err(|_| ParseError::BadNumber(sides.to_string()))?,
+                normal,
             })
         }
         "curve" => {
@@ -4002,6 +4008,15 @@ fn parse_fromlayer(args: &[&str]) -> Result<Command, ParseError> {
             level,
             created: Vec::new(),
         }),
+    }
+}
+
+/// A trailing `normal <x,y,z>` (#371: a shape drawn on a face's plane) split
+/// off the args.
+fn plane_normal<'a, 'b>(args: &'b [&'a str]) -> Result<(&'b [&'a str], Option<DVec3>), ParseError> {
+    match args {
+        [rest @ .., "normal", n] => Ok((rest, Some(point(n)?))),
+        _ => Ok((args, None)),
     }
 }
 

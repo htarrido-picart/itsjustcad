@@ -224,14 +224,14 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "rect",
-            usage: "rect <corner x,y,z> <width> <height>",
-            summary: "Rectangle in the XY plane. Example: rect 0,0,0 4 6",
+            usage: "rect <corner x,y,z> <width> <height> [normal x,y,z]",
+            summary: "Rectangle in the XY plane, or with `normal` on the plane with that normal through the corner (width along its horizontal axis, height up the face; what drawing on a face emits). Example: rect 0,0,0 4 6 or rect 2,0,0 4 3 normal 1,0,0",
             category: Category::Draw2d,
         },
         CommandSpec {
             name: "circle",
-            usage: "circle <center x,y,z> <radius>",
-            summary: "Circle in the XY plane. Example: circle 0,0,0 2.5",
+            usage: "circle <center x,y,z> <radius> [normal x,y,z]",
+            summary: "Circle in the XY plane, or with `normal` on the plane with that normal through the center (what drawing on a face emits). Example: circle 0,0,0 2.5 or circle 2,1,1 0.5 normal 1,0,0",
             category: Category::Draw2d,
         },
         CommandSpec {
@@ -254,8 +254,8 @@ pub fn registry() -> &'static [CommandSpec] {
         },
         CommandSpec {
             name: "polygon",
-            usage: "polygon <center x,y,z> <radius> <sides>",
-            summary: "Regular polygon in the XY plane. Example: polygon 0,0,0 3 6",
+            usage: "polygon <center x,y,z> <radius> <sides> [normal x,y,z]",
+            summary: "Regular polygon in the XY plane, or with `normal` on the plane with that normal through the center (first vertex along its horizontal axis). Example: polygon 0,0,0 3 6",
             category: Category::Draw2d,
         },
         CommandSpec {
@@ -734,7 +734,7 @@ pub fn registry() -> &'static [CommandSpec] {
         CommandSpec {
             name: "cplane",
             usage: "cplane [world | origin <x,y,z> normal <x,y,z> | 3point <o> <px> <py> | save <name> | <name>]",
-            summary: "Construction plane (CPlane/UCS): the frame typed coordinates are measured against. `cplane` reports it; `cplane world` resets to world XY; `cplane origin 0,0,10 normal 0,0,1` lifts the drawing plane to elevation 10; `cplane 3point <origin> <on-X> <in-XY>` builds a frame from three points; `cplane save top` / `cplane top` store & recall. CPlane-aware verbs: line, polyline (any plane); rect, circle, box (translated/upright planes). Logged geometry always stores WORLD coords, so the CPlane never affects replay. Example: cplane origin 0,0,10 normal 0,0,1",
+            summary: "Construction plane (CPlane/UCS): the frame typed coordinates are measured against. `cplane` reports it; `cplane world` resets to world XY; `cplane origin 0,0,10 normal 0,0,1` lifts the drawing plane to elevation 10; `cplane 3point <origin> <on-X> <in-XY>` builds a frame from three points; `cplane save top` / `cplane top` store & recall. CPlane-aware verbs: line, polyline (any plane); rect, circle, box (translated/upright planes; rect and circle with a `normal` on any plane). Logged geometry always stores WORLD coords, so the CPlane never affects replay. Example: cplane origin 0,0,10 normal 0,0,1",
             category: Category::Tools,
         },
         CommandSpec {

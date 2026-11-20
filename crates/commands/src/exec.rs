@@ -2387,7 +2387,12 @@ impl Session {
                 ),
                 // No point primitive: a 0.5 m marker circle stands in.
                 GeoFeature::Point { name, at } => (
-                    Command::Circle { id: None, center: DVec3::new(at.x, at.y, 0.0), radius: 0.5 },
+                    Command::Circle {
+                        id: None,
+                        center: DVec3::new(at.x, at.y, 0.0),
+                        radius: 0.5,
+                        normal: None,
+                    },
                     name,
                 ),
             };
@@ -10514,6 +10519,34 @@ fn describe_cplane(c: &itsjustcad_doc::CPlane) -> String {
     )
 }
 
+/// In-plane axes of a `rect`/`circle`/`polygon` drawn with a `normal` (#371):
+/// `None` for the world XY plane (no normal, or ±Z, the pre-#371 geometry),
+/// else [`itsjustcad_doc::pick::plane_axes`] of it.
+fn shape_axes(normal: Option<DVec3>, verb: &str) -> Result<Option<(DVec3, DVec3)>, ExecError> {
+    let Some(n) = normal else {
+        return Ok(None);
+    };
+    let n = n
+        .try_normalize()
+        .ok_or_else(|| ExecError::Invalid(format!("{verb} normal must be a non-zero vector")))?;
+    let (x, y) = itsjustcad_doc::pick::plane_axes(n);
+    Ok((x != DVec3::X || y != DVec3::Y).then_some((x, y)))
+}
+
+/// Exact circle of `radius` about `center` in the plane of unit axes `x`, `y`:
+/// the rational quadratic NURBS (nine points on a square, corners weighted
+/// √2/2), starting on `x` and running towards `y`. [`Curve::Arc`] is XY-only.
+fn circle_on_plane(center: DVec3, radius: f64, x: DVec3, y: DVec3) -> Curve {
+    let w = std::f64::consts::FRAC_1_SQRT_2;
+    let dirs = [(1., 0.), (1., 1.), (0., 1.), (-1., 1.), (-1., 0.), (-1., -1.), (0., -1.), (1., -1.), (1., 0.)];
+    Curve::Nurbs {
+        control: dirs.iter().map(|&(u, v)| center + (x * u + y * v) * radius).collect(),
+        weights: (0..9).map(|i| if i % 2 == 1 { w } else { 1.0 }).collect(),
+        knots: vec![0., 0., 0., 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1., 1., 1.],
+        degree: 2,
+    }
+}
+
 /// Rewrite a typed geometry command's CPlane-space point arguments into WORLD
 /// coordinates via the active plane, so the op that gets logged carries world
 /// coords (replay-stability invariant). World XY (the default) is a no-op.
@@ -10533,6 +10566,8 @@ fn cplane_resolve(doc: &Document, cmd: Command) -> Result<Command, ExecError> {
         return Ok(cmd);
     }
     let tw = |p: DVec3| doc.cplane_to_world(p);
+    let c = &doc.cplane;
+    let tv = |v: DVec3| c.x_axis * v.x + c.y_axis * v.y + c.normal * v.z;
     // rect/box/circle only transform their anchor — their extents stay
     // world-axis-aligned. That's exact for a translation-only (e.g. +Z-offset)
     // plane, but silently mis-orients on a ROTATED plane. Guard rather than emit
@@ -10554,17 +10589,19 @@ fn cplane_resolve(doc: &Document, cmd: Command) -> Result<Command, ExecError> {
             id,
             positions: positions.into_iter().map(tw).collect(),
         },
-        Command::Rectangle { id, corner, width, height } => {
-            if rotated {
+        // With a `normal` (#371) the shape carries its own plane, so a rotated
+        // CPlane only turns that normal.
+        Command::Rectangle { id, corner, width, height, normal } => {
+            if rotated && normal.is_none() {
                 return Err(guard());
             }
-            Command::Rectangle { id, corner: tw(corner), width, height }
+            Command::Rectangle { id, corner: tw(corner), width, height, normal: normal.map(tv) }
         }
-        Command::Circle { id, center, radius } => {
-            if rotated {
+        Command::Circle { id, center, radius, normal } => {
+            if rotated && normal.is_none() {
                 return Err(guard());
             }
-            Command::Circle { id, center: tw(center), radius }
+            Command::Circle { id, center: tw(center), radius, normal: normal.map(tv) }
         }
         Command::Box { id, corner, size } => {
             if rotated {
@@ -11772,35 +11809,34 @@ fn apply_forward(
                 outcome,
             ))
         }
-        Command::Rectangle { id, corner, width, height } => {
+        Command::Rectangle { id, corner, width, height, normal } => {
             if width <= 0.0 || height <= 0.0 {
                 return Err(ExecError::Invalid("rect width/height must be positive".into()));
             }
+            let (x, y) = shape_axes(normal, "rect")?.unwrap_or((DVec3::X, DVec3::Y));
             let c = corner;
             let curve = Curve::Polyline {
-                points: vec![
-                    c,
-                    c + DVec3::new(width, 0.0, 0.0),
-                    c + DVec3::new(width, height, 0.0),
-                    c + DVec3::new(0.0, height, 0.0),
-                ],
+                points: vec![c, c + x * width, c + x * width + y * height, c + y * height],
                 closed: true,
             };
             let (id, outcome) = insert_curve(doc, id, curve, "rect");
             Ok((
-                Command::Rectangle { id: Some(id), corner, width, height },
+                Command::Rectangle { id: Some(id), corner, width, height, normal },
                 Inverse::DeleteCreated(vec![id]),
                 outcome,
             ))
         }
-        Command::Circle { id, center, radius } => {
+        Command::Circle { id, center, radius, normal } => {
             if radius <= 0.0 {
                 return Err(ExecError::Invalid("circle radius must be positive".into()));
             }
-            let curve = Curve::Arc { center, radius, start: 0.0, end: std::f64::consts::TAU };
+            let curve = match shape_axes(normal, "circle")? {
+                Some((x, y)) => circle_on_plane(center, radius, x, y),
+                None => Curve::Arc { center, radius, start: 0.0, end: std::f64::consts::TAU },
+            };
             let (id, outcome) = insert_curve(doc, id, curve, "circle");
             Ok((
-                Command::Circle { id: Some(id), center, radius },
+                Command::Circle { id: Some(id), center, radius, normal },
                 Inverse::DeleteCreated(vec![id]),
                 outcome,
             ))
@@ -11867,23 +11903,24 @@ fn apply_forward(
                 outcome,
             ))
         }
-        Command::Polygon { id, center, radius, sides } => {
+        Command::Polygon { id, center, radius, sides, normal } => {
             if sides < 3 {
                 return Err(ExecError::Invalid("polygon needs at least 3 sides".into()));
             }
             if radius <= 0.0 {
                 return Err(ExecError::Invalid("polygon radius must be positive".into()));
             }
+            let (x, y) = shape_axes(normal, "polygon")?.unwrap_or((DVec3::X, DVec3::Y));
             let points = (0..sides)
                 .map(|i| {
                     let t = std::f64::consts::TAU * f64::from(i) / f64::from(sides);
-                    center + DVec3::new(radius * t.cos(), radius * t.sin(), 0.0)
+                    center + (x * t.cos() + y * t.sin()) * radius
                 })
                 .collect();
             let curve = Curve::Polyline { points, closed: true };
             let (id, outcome) = insert_curve(doc, id, curve, "polygon");
             Ok((
-                Command::Polygon { id: Some(id), center, radius, sides },
+                Command::Polygon { id: Some(id), center, radius, sides, normal },
                 Inverse::DeleteCreated(vec![id]),
                 outcome,
             ))
@@ -20140,6 +20177,87 @@ mod tests {
 
         let err = s.run(parse("railrevolve prof rail 0,0,0 0,0,0").unwrap()).unwrap_err();
         assert!(err.to_string().contains("axis"), "{err}");
+    }
+
+    #[test]
+    fn shapes_on_a_vertical_face_replay_identically() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,3");
+        // On the box's +X wall (x = 2): width along +Y, height up +Z.
+        run(&mut s, "rect 2,0.5,0.5 1 2 normal 1,0,0");
+        run(&mut s, "circle 2,1,1.5 0.4 normal 1,0,0");
+        run(&mut s, "polygon 2,1,1.5 0.3 6 normal 1,0,0");
+        // A sloped face, and a top face (±Z is the plain XY shape).
+        run(&mut s, "rect 0,0,0 1 1 normal 0,-0.6,0.8");
+        run(&mut s, "rect 0,0,3 1 1 normal 0,0,1");
+        let curves: Vec<Curve> = s
+            .doc
+            .objects()
+            .filter_map(|o| match &o.geometry {
+                Geometry::Curve(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        let Curve::Polyline { points, .. } = &curves[0] else { panic!("{:?}", curves[0]) };
+        assert_eq!(
+            points,
+            &vec![
+                DVec3::new(2.0, 0.5, 0.5),
+                DVec3::new(2.0, 1.5, 0.5),
+                DVec3::new(2.0, 1.5, 2.5),
+                DVec3::new(2.0, 0.5, 2.5),
+            ]
+        );
+        for c in &curves[1..3] {
+            for p in c.tessellate(1e-4) {
+                assert!((p.x - 2.0).abs() < 1e-9, "on the wall: {p}");
+            }
+        }
+        let rim = curves[1].tessellate(1e-4);
+        for p in &rim {
+            assert!(((*p - DVec3::new(2.0, 1.0, 1.5)).length() - 0.4).abs() < 1e-6, "round: {p}");
+        }
+        let Curve::Polyline { points, .. } = &curves[3] else { panic!() };
+        let n = DVec3::new(0.0, -0.6, 0.8);
+        assert!(points.iter().all(|p| p.dot(n).abs() < 1e-12), "on the slope");
+        assert!(matches!(&curves[4], Curve::Polyline { points, .. } if points[2] == DVec3::new(1.0, 1.0, 3.0)));
+
+        let log = s.save_log();
+        assert!(matches!(&log[1], Command::Rectangle { normal: Some(n), .. } if *n == DVec3::X));
+        let replayed = Session::replay(log.clone()).unwrap();
+        let a: Vec<_> = s.doc.objects().collect();
+        let b: Vec<_> = replayed.doc.objects().collect();
+        assert_eq!(a, b);
+        let json1 = crate::io::to_json(&s);
+        let json2 = crate::io::to_json(&crate::io::from_json(&json1).unwrap());
+        assert_eq!(json1, json2);
+        let err = s.run(parse("rect 0,0,0 1 1 normal 0,0,0").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("non-zero"), "{err}");
+    }
+
+    #[test]
+    fn shapes_logged_before_the_normal_field_load_unchanged() {
+        // Ops as files before #371 stored them: no `normal` key.
+        let old = r#"[{"cmd":"rectangle","corner":[1.0,2.0,0.0],"width":4.0,"height":6.0},
+            {"cmd":"circle","center":[0.0,0.0,0.0],"radius":2.5},
+            {"cmd":"polygon","center":[0.0,0.0,0.0],"radius":3.0,"sides":6}]"#;
+        let log: Vec<Command> = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            log[0],
+            Command::Rectangle {
+                id: None,
+                corner: DVec3::new(1.0, 2.0, 0.0),
+                width: 4.0,
+                height: 6.0,
+                normal: None
+            }
+        );
+        let s = Session::replay(log).unwrap();
+        let shapes: Vec<_> = s.doc.objects().map(|o| o.geometry.clone()).collect();
+        assert!(matches!(&shapes[1], Geometry::Curve(Curve::Arc { radius, .. }) if *radius == 2.5));
+        // ...and a shape without a normal still saves without the key.
+        let saved = serde_json::to_string(&s.save_log()).unwrap();
+        assert!(!saved.contains("normal"), "{saved}");
     }
 
     #[test]

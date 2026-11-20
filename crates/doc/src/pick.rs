@@ -305,18 +305,8 @@ pub fn ray_hit(
     origin: DVec3,
     dir: DVec3,
 ) -> Option<f64> {
-    let cached = doc.pick_boxes.get(doc);
-    let hidden: Vec<&str> =
-        doc.layers.iter().filter(|(_, l)| !l.visible).map(|(n, _)| n.as_str()).collect();
     let mut best: Option<f64> = None;
-    for (o, &(rank, bb)) in doc.objects_by_id().zip(cached.iter()) {
-        if rank == u32::MAX || !o.visible || hidden.contains(&o.layer.as_str()) {
-            continue;
-        }
-        let bb = match o.geometry {
-            Geometry::Instance { .. } => doc.geometry_aabb(&o.geometry),
-            _ => bb,
-        };
+    for (o, bb) in visible_objects(doc) {
         let t = match &o.geometry {
             Geometry::Curve(c) => {
                 let far = screen_box(vp, size, bb).is_some_and(|(lo, hi)| {
@@ -329,16 +319,9 @@ pub fn ray_hit(
                 }
             }
             g => match g.mesh().filter(|m| !m.faces().is_empty()) {
-                Some(m) => ray_aabb(origin, dir, bb.min, bb.max).and_then(|_| {
-                    let p = m.positions();
-                    m.faces()
-                        .iter()
-                        .filter_map(|f| {
-                            let v = |k: usize| p.get(f[k] as usize).copied();
-                            kernel_mesh::ray_triangle(origin, dir, v(0)?, v(1)?, v(2)?)
-                        })
-                        .min_by(f64::total_cmp)
-                }),
+                Some(m) => ray_aabb(origin, dir, bb.min, bb.max)
+                    .and_then(|_| mesh_hit(m, origin, dir))
+                    .map(|(_, t)| t),
                 None => ray_aabb(origin, dir, bb.min, bb.max),
             },
         };
@@ -349,6 +332,222 @@ pub fn ray_hit(
         }
     }
     best
+}
+
+/// Every visible object (visible itself, on a visible layer, in the creation
+/// order) with its world box, for the ray queries.
+fn visible_objects(doc: &Document) -> impl Iterator<Item = (&crate::SceneObject, kernel_mesh::Aabb)> {
+    let cached = doc.pick_boxes.get(doc);
+    let hidden: Vec<&str> =
+        doc.layers.iter().filter(|(_, l)| !l.visible).map(|(n, _)| n.as_str()).collect();
+    doc.objects_by_id()
+        .zip((0..cached.len()).map(move |i| cached[i]))
+        .filter(move |(o, (rank, _))| {
+            *rank != u32::MAX && o.visible && !hidden.contains(&o.layer.as_str())
+        })
+        .map(move |(o, (_, bb))| match o.geometry {
+            Geometry::Instance { .. } => (o, doc.geometry_aabb(&o.geometry)),
+            _ => (o, bb),
+        })
+}
+
+/// The nearest triangle of `m` the ray crosses: `(triangle index, ray t)`.
+fn mesh_hit(m: &kernel_mesh::Mesh, origin: DVec3, dir: DVec3) -> Option<(usize, f64)> {
+    let p = m.positions();
+    m.faces()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let v = |k: usize| p.get(f[k] as usize).copied();
+            kernel_mesh::ray_triangle(origin, dir, v(0)?, v(1)?, v(2)?).map(|t| (i, t))
+        })
+        .filter(|(_, t)| t.is_finite())
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+}
+
+/// A plane a face lies on, or that a drawing is held to (#371): through
+/// `origin`, with unit `normal`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FacePlane {
+    pub origin: DVec3,
+    pub normal: DVec3,
+}
+
+impl FacePlane {
+    /// The plane through `origin` with normal `normal` (normalized); `None`
+    /// for a zero or non-finite normal.
+    pub fn new(origin: DVec3, normal: DVec3) -> Option<Self> {
+        let n = normal.try_normalize()?;
+        (origin.is_finite()).then_some(Self { origin, normal: n })
+    }
+
+    /// The horizontal (world XY) plane through `origin`.
+    pub fn horizontal(origin: DVec3) -> Self {
+        Self { origin, normal: DVec3::Z }
+    }
+
+    /// The in-plane axes a shape drawn on it uses ([`plane_axes`]).
+    pub fn axes(&self) -> (DVec3, DVec3) {
+        plane_axes(self.normal)
+    }
+
+    /// Whether the plane is world-horizontal (normal ±Z).
+    pub fn is_horizontal(&self) -> bool {
+        self.normal.z.abs() > 1.0 - 1e-9
+    }
+
+    /// `p` moved onto the plane along its normal.
+    pub fn project(&self, p: DVec3) -> DVec3 {
+        p - self.normal * (p - self.origin).dot(self.normal)
+    }
+
+    /// Where the ray `origin + t·dir` (t > 0) meets the plane, or `None` when
+    /// it runs parallel or points away.
+    pub fn ray(&self, origin: DVec3, dir: DVec3) -> Option<DVec3> {
+        let den = dir.dot(self.normal);
+        if den.abs() < 1e-12 {
+            return None;
+        }
+        let t = (self.origin - origin).dot(self.normal) / den;
+        (t > 0.0 && t.is_finite()).then(|| origin + dir * t)
+    }
+
+    /// Whether `p` lies on the plane within `tol`.
+    pub fn contains(&self, p: DVec3, tol: f64) -> bool {
+        (p - self.origin).dot(self.normal).abs() <= tol
+    }
+}
+
+/// The in-plane `(x, y)` unit axes for a plane with normal `n`: world X and
+/// Y for a horizontal plane (either way up), else `x` horizontal (Z × n) and
+/// `y = n × x`, up the slope (up a wall). The same rule the `rect`/`circle`/
+/// `polygon` commands use for their `normal` argument, so a shape drawn on a
+/// face replays from the normal alone.
+pub fn plane_axes(n: DVec3) -> (DVec3, DVec3) {
+    let n = n.normalize_or_zero();
+    if n.z.abs() > 1.0 - 1e-9 || n == DVec3::ZERO {
+        return (DVec3::X, DVec3::Y);
+    }
+    let x = DVec3::Z.cross(n).normalize();
+    (x, n.cross(x))
+}
+
+/// What the cursor ray meets on a solid's surface (#371): the face picking
+/// drawing on faces uses, and Push/Pull builds on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceHit {
+    /// The object hit.
+    pub object: ObjectId,
+    /// The triangle hit, an index into the object's mesh faces;
+    /// [`planar_face`] widens it to the whole flat face.
+    pub face: usize,
+    /// Ray parameter of the hit.
+    pub t: f64,
+    /// World point of the hit.
+    pub point: DVec3,
+    /// Unit normal of the triangle by its winding (outward on a closed solid).
+    pub normal: DVec3,
+}
+
+impl FaceHit {
+    /// The plane of the face hit, through the hit point.
+    pub fn plane(&self) -> FacePlane {
+        FacePlane { origin: self.point, normal: self.normal }
+    }
+}
+
+/// The nearest face of a visible solid (any object with a triangle mesh) the
+/// ray `origin`/`dir` crosses, or `None` when it meets no surface. Unlike
+/// [`ray_hit`], curves and box-only objects (instances, text, point clouds)
+/// neither hit nor occlude: only a surface has a plane to draw on.
+pub fn face_at(doc: &Document, origin: DVec3, dir: DVec3) -> Option<FaceHit> {
+    let mut best: Option<(&crate::SceneObject, usize, f64)> = None;
+    for (o, bb) in visible_objects(doc) {
+        let Some(m) = o.geometry.mesh().filter(|m| !m.faces().is_empty()) else {
+            continue;
+        };
+        let Some(near) = ray_aabb(origin, dir, bb.min, bb.max) else {
+            continue;
+        };
+        if best.is_some_and(|(_, _, bt)| near > bt) {
+            continue;
+        }
+        if let Some((i, t)) = mesh_hit(m, origin, dir)
+            && best.is_none_or(|(_, _, bt)| t < bt)
+        {
+            best = Some((o, i, t));
+        }
+    }
+    let (o, face, t) = best?;
+    let m = o.geometry.mesh()?;
+    let [a, b, c] = triangle(m, face)?;
+    Some(FaceHit {
+        object: o.id,
+        face,
+        t,
+        point: origin + dir * t,
+        normal: (b - a).cross(c - a).try_normalize()?,
+    })
+}
+
+/// Corners of triangle `i` of `m`.
+pub fn triangle(m: &kernel_mesh::Mesh, i: usize) -> Option<[DVec3; 3]> {
+    let f = m.faces().get(i)?;
+    let p = m.positions();
+    Some([p.get(f[0] as usize)?, p.get(f[1] as usize)?, p.get(f[2] as usize)?].map(|v| *v))
+}
+
+/// The flat face triangle `tri` belongs to: every triangle of `m` coplanar
+/// with it (same normal, same plane) and joined to it edge to edge, sorted.
+/// Edges join by position, so an unwelded (flat-shaded) mesh still forms one
+/// face. The face identity Push/Pull and the face hover cue use.
+pub fn planar_face(m: &kernel_mesh::Mesh, tri: usize) -> Vec<usize> {
+    use std::collections::HashMap;
+    let Some([a, b, c]) = triangle(m, tri) else {
+        return Vec::new();
+    };
+    let Some(n) = (b - a).cross(c - a).try_normalize() else {
+        return vec![tri];
+    };
+    let tol = 1e-6 * (1.0 + a.abs().max_element() + (b - a).length().max((c - a).length()));
+    type Key = (i64, i64, i64);
+    let key = |p: DVec3| -> Key {
+        let q = (p / 1e-6).round();
+        (q.x as i64, q.y as i64, q.z as i64)
+    };
+    // Coplanar candidates and the edges they own.
+    let mut edges: HashMap<(Key, Key), Vec<usize>> = HashMap::new();
+    for i in 0..m.faces().len() {
+        let Some(v) = triangle(m, i) else { continue };
+        let same = (v[1] - v[0])
+            .cross(v[2] - v[0])
+            .try_normalize()
+            .is_some_and(|ni| ni.dot(n) > 1.0 - 1e-9)
+            && v.iter().all(|p| (*p - a).dot(n).abs() <= tol);
+        if !same {
+            continue;
+        }
+        for k in 0..3 {
+            let (p, q) = (key(v[k]), key(v[(k + 1) % 3]));
+            edges.entry(if p < q { (p, q) } else { (q, p) }).or_default().push(i);
+        }
+    }
+    let mut seen: std::collections::HashSet<usize> = [tri].into();
+    let mut stack = vec![tri];
+    while let Some(i) = stack.pop() {
+        let Some(v) = triangle(m, i) else { continue };
+        for k in 0..3 {
+            let (p, q) = (key(v[k]), key(v[(k + 1) % 3]));
+            for &j in edges.get(&if p < q { (p, q) } else { (q, p) }).into_iter().flatten() {
+                if seen.insert(j) {
+                    stack.push(j);
+                }
+            }
+        }
+    }
+    let mut out: Vec<usize> = seen.into_iter().collect();
+    out.sort_unstable();
+    out
 }
 
 /// Creation-order rank and world box of every object, in
@@ -543,6 +742,78 @@ mod tests {
             doc.get_mut(id).unwrap().visible = false;
         }
         assert_eq!(hit(&doc, 60.0, 140.0), None);
+    }
+
+    fn solid(corner: DVec3, size: DVec3) -> SceneObject {
+        let mesh = kernel_mesh::make_box(corner, size);
+        SceneObject { geometry: Geometry::Mesh(mesh), ..poly(&[], false) }
+    }
+
+    #[test]
+    fn face_at_is_the_nearest_face_and_occluded_faces_lose() {
+        let mut doc = Document::default();
+        // A low box, and a tall one beside it: a ray from the side meets the
+        // tall one's -X wall first, so the low box behind it is occluded.
+        let low = add(&mut doc, solid(DVec3::new(4.0, 0.0, 0.0), DVec3::new(2.0, 2.0, 1.0)));
+        let tall = add(&mut doc, solid(DVec3::new(0.0, 0.0, 0.0), DVec3::new(2.0, 2.0, 3.0)));
+        let side = face_at(&doc, DVec3::new(-5.0, 1.0, 0.5), DVec3::X).unwrap();
+        assert_eq!(side.object, tall);
+        assert!((side.point - DVec3::new(0.0, 1.0, 0.5)).length() < 1e-9);
+        assert!((side.normal - DVec3::NEG_X).length() < 1e-9, "outward wall normal");
+        // From above, the low box's top (z = 1) is the nearest face there.
+        let top = face_at(&doc, DVec3::new(5.0, 1.0, 10.0), DVec3::NEG_Z).unwrap();
+        assert_eq!(top.object, low);
+        assert!((top.point.z - 1.0).abs() < 1e-9 && top.normal.z > 0.99);
+        // Nothing under the ray: no face (the caller falls back to the ground).
+        assert_eq!(face_at(&doc, DVec3::new(20.0, 20.0, 10.0), DVec3::NEG_Z), None);
+        // A curve is not a face and does not occlude one.
+        add(&mut doc, poly(&[(4.5, 1.0), (5.5, 1.0)], false));
+        assert_eq!(face_at(&doc, DVec3::new(5.0, 1.0, 10.0), DVec3::NEG_Z).unwrap().object, low);
+        // A hidden solid neither hits nor occludes.
+        doc.get_mut(tall).unwrap().visible = false;
+        let through = face_at(&doc, DVec3::new(-5.0, 1.0, 0.5), DVec3::X).unwrap();
+        assert_eq!(through.object, low);
+        assert!((through.point.x - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn planar_face_widens_a_triangle_to_its_flat_face() {
+        let m = kernel_mesh::make_box(DVec3::ZERO, DVec3::new(2.0, 3.0, 4.0));
+        // Triangles 2 and 3 are the top; 10 and 11 the +X wall.
+        assert_eq!(planar_face(&m, 2), vec![2, 3]);
+        assert_eq!(planar_face(&m, 11), vec![10, 11]);
+        // Unwelded (one vertex per corner per triangle) still joins by position.
+        let p = m.positions();
+        let mut pos = Vec::new();
+        let faces = m
+            .faces()
+            .iter()
+            .map(|f| {
+                let b = pos.len() as u32;
+                pos.extend(f.iter().map(|&i| p[i as usize]));
+                [b, b + 1, b + 2]
+            })
+            .collect();
+        let flat = kernel_mesh::Mesh::new(pos, faces);
+        assert_eq!(planar_face(&flat, 3), vec![2, 3]);
+    }
+
+    #[test]
+    fn plane_axes_are_horizontal_x_and_up_the_face() {
+        assert_eq!(plane_axes(DVec3::Z), (DVec3::X, DVec3::Y));
+        assert_eq!(plane_axes(DVec3::NEG_Z), (DVec3::X, DVec3::Y));
+        for n in [DVec3::X, DVec3::NEG_Y, DVec3::new(0.0, -0.6, 0.8)] {
+            let (x, y) = plane_axes(n);
+            assert!(x.z.abs() < 1e-12, "x is horizontal");
+            assert!(y.z > 0.0, "y runs up the face");
+            assert!(x.dot(n).abs() < 1e-12 && y.dot(n).abs() < 1e-12);
+            assert!((x.cross(y) - n).length() < 1e-12, "right-handed about n");
+        }
+        let wall = FacePlane::new(DVec3::new(2.0, 0.0, 0.0), DVec3::X).unwrap();
+        let p = wall.ray(DVec3::new(-3.0, 1.0, 1.0), DVec3::X).unwrap();
+        assert!((p - DVec3::new(2.0, 1.0, 1.0)).length() < 1e-12);
+        assert_eq!(wall.ray(DVec3::new(-3.0, 1.0, 1.0), DVec3::Y), None, "parallel");
+        assert_eq!(wall.project(DVec3::new(7.0, 1.0, 1.0)), DVec3::new(2.0, 1.0, 1.0));
     }
 
     /// Every click of a grid over the top view through the cached pick and
