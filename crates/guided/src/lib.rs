@@ -206,6 +206,25 @@ pub struct GuidedTool {
     /// after `seed ++ done` when the flow completes, so the assembler can read
     /// them (fillet's `at` clause).
     captured: Vec<(usize, DVec3)>,
+    /// Rotation axis lock (`'x'`/`'y'`/`'z'`) for [`AXIS_LOCK_VERBS`], set at
+    /// any step by typing the letter or (desktop) an arrow key. `None` keeps
+    /// the verb's default (Z). Appended as an [`Input::Key`] after every other
+    /// input when the flow completes.
+    axis: Option<char>,
+}
+
+/// Verbs whose flow takes a rotation-axis lock (SketchUp: arrow keys lock the
+/// protractor to red/green/blue).
+const AXIS_LOCK_VERBS: &[&str] = &["rotate"];
+
+/// Unit vector of an axis letter (`x`/`y`/`z`, any case).
+pub fn axis_vector(a: char) -> Option<DVec3> {
+    match a.to_ascii_lowercase() {
+        'x' => Some(DVec3::X),
+        'y' => Some(DVec3::Y),
+        'z' => Some(DVec3::Z),
+        _ => None,
+    }
 }
 
 impl GuidedTool {
@@ -236,6 +255,7 @@ impl GuidedTool {
         self.selected.clear();
         self.branch = None;
         self.captured.clear();
+        self.axis = None;
         StartResult::Started
     }
 
@@ -252,6 +272,28 @@ impl GuidedTool {
         self.selected.clear();
         self.branch = None;
         self.captured.clear();
+        self.axis = None;
+    }
+
+    /// True when the running verb takes a rotation-axis lock (`rotate`).
+    pub fn supports_axis_lock(&self) -> bool {
+        self.active_verb().is_some_and(|v| AXIS_LOCK_VERBS.contains(&v))
+    }
+
+    /// Lock the rotation axis (`x`/`y`/`z`, any case). Returns false when the
+    /// running verb takes no axis or the letter is not an axis.
+    pub fn set_axis(&mut self, a: char) -> bool {
+        if !self.supports_axis_lock() || axis_vector(a).is_none() {
+            return false;
+        }
+        self.axis = Some(a.to_ascii_lowercase());
+        true
+    }
+
+    /// The rotation axis letter in effect (`'z'` unless locked), or `None`
+    /// when the running verb takes no axis.
+    pub fn axis(&self) -> Option<char> {
+        self.supports_axis_lock().then(|| self.axis.unwrap_or('z'))
     }
 
     /// Index of the (single, last-if-present) [`Step::Branch`] in the base
@@ -533,6 +575,15 @@ impl GuidedTool {
         if !self.active() {
             return false;
         }
+        // An axis letter locks the rotation axis on any numeric/point step
+        // (letters never reach those buffers otherwise).
+        if !matches!(
+            self.current_step(),
+            Some(Step::Keyword { .. } | Step::Branch { .. } | Step::Text { .. })
+        ) && self.set_axis(c)
+        {
+            return true;
+        }
         let ok = match self.current_step() {
             // Keyword and Branch are both keyword-like: they take option/arm names.
             Some(Step::Keyword { .. } | Step::Branch { .. }) => c.is_alphanumeric(),
@@ -590,6 +641,10 @@ impl GuidedTool {
                 let first = arms.first().map(|a| a.key).unwrap_or("");
                 format!("{prompt} <{first}>:")
             }
+        };
+        let base = match self.axis() {
+            Some(a) => format!("{base}  [axis {}: x/y/z or arrows]", a.to_ascii_uppercase()),
+            None => base,
         };
         Some(if self.input.is_empty() {
             base
@@ -736,6 +791,9 @@ impl GuidedTool {
         if script.verb == "arc" {
             return arc_preview(&pts, cursor);
         }
+        if let (Some(a), [c, ..]) = (self.axis().and_then(axis_vector), pts.as_slice()) {
+            return protractor_preview(*c, a, cursor);
+        }
         // A variadic point list draws a running polyline through the points
         // collected so far plus the cursor (Rhino's `GetPoints` rubber-band) —
         // but only when `connect` is set. Trim's parts-to-remove picks are
@@ -868,6 +926,10 @@ impl GuidedTool {
         // the tail so assemblers that want them (fillet's `at` clause) can read
         // them via `captured_points`; assemblers that don't simply ignore them.
         args.extend(self.captured.iter().map(|&(_, p)| Input::Point(p)));
+        // A locked rotation axis rides last (read by `assemble_rotate`).
+        if let Some(a) = self.axis.filter(|_| self.supports_axis_lock()) {
+            args.push(Input::Key(a.to_string()));
+        }
         let result = match (script.assemble)(&args) {
             Ok(cmd) => StepResult::Emit(cmd),
             Err(e) => StepResult::Error(e),
@@ -919,6 +981,44 @@ fn arc_polyline(center: DVec3, radius: f64, a0: f64, sweep: f64) -> Vec<DVec3> {
             center + DVec3::new(radius * t.cos(), radius * t.sin(), 0.0)
         })
         .collect()
+}
+
+/// In-plane basis `(u, v)` for rotation about `axis`, with `u × v = axis`, so
+/// a positive (right-hand) angle turns `u` toward `v`. Z → (X, Y), X → (Y, Z),
+/// Y → (Z, X); any other axis gets an arbitrary orthonormal pair.
+pub fn rotation_basis(axis: DVec3) -> (DVec3, DVec3) {
+    let n = axis.normalize_or_zero();
+    if n.abs_diff_eq(DVec3::Z, 1e-12) {
+        (DVec3::X, DVec3::Y)
+    } else if n.abs_diff_eq(DVec3::X, 1e-12) {
+        (DVec3::Y, DVec3::Z)
+    } else if n.abs_diff_eq(DVec3::Y, 1e-12) {
+        (DVec3::Z, DVec3::X)
+    } else {
+        let u = n.any_orthonormal_vector();
+        (u, n.cross(u))
+    }
+}
+
+/// Protractor for a guided rotate once the centre is known: a ring in the
+/// plane through `center` normal to `axis`, the 0° baseline, and the spoke to
+/// the cursor projected into that plane. Radius follows the cursor.
+fn protractor_preview(center: DVec3, axis: DVec3, cursor: DVec3) -> Vec<Vec<DVec3>> {
+    let (u, v) = rotation_basis(axis);
+    let d = cursor - center;
+    let in_plane = d - axis * d.dot(axis);
+    let r = in_plane.length();
+    if r < 1e-9 {
+        return Vec::new();
+    }
+    const N: usize = 48;
+    let ring = (0..=N)
+        .map(|i| {
+            let t = std::f64::consts::TAU * i as f64 / N as f64;
+            center + (u * t.cos() + v * t.sin()) * r
+        })
+        .collect();
+    vec![ring, vec![center, center + u * r], vec![center, center + in_plane]]
 }
 
 /// Live ghost for the guided `arc` (center → start point → end point):

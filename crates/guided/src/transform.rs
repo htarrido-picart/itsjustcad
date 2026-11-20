@@ -56,7 +56,13 @@ fn assemble_rotate(args: &[Input]) -> Result<String, String> {
     let sel = selector(args, "rotate")?;
     let center = point_at(args, 1, "rotate")?;
     let angle = num_at(args, 2, "rotate")?;
-    Ok(format!("rotate {sel} {} about {}", num(angle), fmt(center)))
+    // Optional axis lock (x|y), appended by the tool; Z is the parser default
+    // so it stays implicit and the default line is unchanged.
+    let axis = match args.get(3) {
+        Some(Input::Key(k)) if k == "x" || k == "y" => format!(" {k}"),
+        _ => String::new(),
+    };
+    Ok(format!("rotate {sel} {}{axis} about {}", num(angle), fmt(center)))
 }
 
 // ── scale ───────────────────────────────────────────────────────────────────
@@ -384,6 +390,81 @@ mod tests {
         let result = t.commit_typed("45");
         assert_eq!(result, StepResult::Emit("rotate sel 45 about 0,0".into()));
         assert!(!t.active());
+    }
+
+    #[test]
+    fn rotate_axis_lock_typed_letter_emits_axis() {
+        for (key, want) in [
+            ('x', "rotate sel 30 x about 1,2"),
+            ('Y', "rotate sel 30 y about 1,2"),
+        ] {
+            let mut t = GuidedTool::default();
+            t.try_start("rotate", Some("sel"));
+            assert_eq!(t.axis(), Some('z'), "default stays Z");
+            // The letter locks the axis at the point step without typing into it.
+            assert!(t.push_input(key));
+            assert!(
+                t.prompt()
+                    .unwrap()
+                    .contains(&format!("axis {}", key.to_ascii_uppercase()))
+            );
+            t.on_click(DVec3::new(1.0, 2.0, 0.0));
+            assert_eq!(t.commit_typed("30"), StepResult::Emit(want.into()));
+        }
+    }
+
+    #[test]
+    fn rotate_axis_lock_on_angle_step_and_z_stays_implicit() {
+        let mut t = GuidedTool::default();
+        t.try_start("rotate", Some("sel"));
+        t.on_click(DVec3::ZERO);
+        assert!(t.set_axis('y'));
+        assert!(t.set_axis('z'), "re-lock to blue");
+        for c in "45".chars() {
+            assert!(t.push_input(c));
+        }
+        let typed = t.take_input();
+        assert_eq!(
+            t.commit_typed(&typed),
+            StepResult::Emit("rotate sel 45 about 0,0".into())
+        );
+        // The lock does not leak into the next run.
+        t.try_start("rotate", Some("sel"));
+        assert_eq!(t.axis(), Some('z'));
+    }
+
+    #[test]
+    fn axis_lock_only_on_rotate() {
+        let mut t = GuidedTool::default();
+        t.try_start("move", Some("sel"));
+        assert_eq!(t.axis(), None);
+        assert!(!t.set_axis('x'));
+        assert!(
+            !t.push_input('x'),
+            "letters still rejected on a move point step"
+        );
+        t.try_start("rotate", Some("sel"));
+        assert!(!t.set_axis('q'));
+    }
+
+    #[test]
+    fn rotate_preview_is_protractor_in_axis_plane() {
+        let mut t = GuidedTool::default();
+        t.try_start("rotate", Some("sel"));
+        assert!(
+            t.preview(Some(DVec3::X)).is_empty(),
+            "nothing before the centre"
+        );
+        t.on_click(DVec3::new(1.0, 1.0, 1.0));
+        t.set_axis('x');
+        let ghosts = t.preview(Some(DVec3::new(5.0, 1.0, 3.0)));
+        assert_eq!(ghosts.len(), 3, "ring, baseline, spoke");
+        // Every ring point lies in the plane x = 1, radius 2 (cursor's in-plane offset).
+        for p in &ghosts[0] {
+            assert!((p.x - 1.0).abs() < 1e-9);
+            assert!(((*p - DVec3::new(1.0, 1.0, 1.0)).length() - 2.0).abs() < 1e-9);
+        }
+        assert_eq!(ghosts[2][1], DVec3::new(1.0, 1.0, 3.0));
     }
 
     #[test]

@@ -82,6 +82,9 @@ fn state_value(tool: &GuidedTool) -> Value {
         "points": tool.list_points().iter().map(|p| v3(*p)).collect::<Vec<_>>(),
         "selected": tool.selected_objects(),
         "lastPoint": tool.last_point().map(v3),
+        // Rotation axis in effect ("x"|"y"|"z") for verbs that take one
+        // (`rotate`), else null. Change it with `ijc_guided_set_axis`.
+        "axis": tool.axis().map(|a| a.to_string()),
     });
     let (kind, prompt) = match *step {
         Step::PickPoint { prompt } => ("pickPoint", prompt),
@@ -516,6 +519,31 @@ pub unsafe extern "C" fn ijc_guided_back(h: *mut AppHandle) -> *mut c_char {
         } else {
             finish(app, StepResult::Error("nothing to go back to".into()))
         }
+    })
+}
+
+/// Lock the rotation axis of a running guided `rotate` (`"x"`, `"y"` or
+/// `"z"`; SketchUp red/green/blue) at any step. Returns the answer envelope
+/// (`"more"`, with `state.axis` updated; `error` set when the verb takes no
+/// axis or `axis` is not one). The emitted command adds the axis token:
+/// `rotate sel 30 x about 1,2`.
+///
+/// # Safety
+/// `h` must be null or a live handle; `axis` null or a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_guided_set_axis(h: *mut AppHandle, axis: *const c_char) -> *mut c_char {
+    with_active(h, |app| {
+        let mut chars = c_str(axis).unwrap_or_default().trim().chars();
+        let ok = match (chars.next(), chars.next()) {
+            (Some(a), None) => app.guided.tool.set_axis(a),
+            _ => false,
+        };
+        let r = if ok {
+            StepResult::NeedMore
+        } else {
+            StepResult::Error("axis must be x, y or z, on a rotate".into())
+        };
+        finish(app, r)
     })
 }
 

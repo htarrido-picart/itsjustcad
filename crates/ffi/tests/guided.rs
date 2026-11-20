@@ -210,3 +210,32 @@ fn back_cancel_and_need_selection() {
     assert_eq!(r["status"], "idle");
     unsafe { ijc_free(h) };
 }
+
+#[test]
+fn rotate_axis_lock_end_to_end_matches_typed() {
+    let h = ijc_init_headless();
+    run(h, "box 0,0,0 2,1,3");
+    run(h, "select all");
+    let undo0 = unsafe { ijc_undo_len(h) };
+
+    let s = start(h, "rotate");
+    assert_eq!(s["state"]["axis"], "z", "default stays Z");
+    let r = take(unsafe { ijc_guided_set_axis(h, c("x").as_ptr()) });
+    assert_eq!(r["status"], "more", "{r}");
+    assert_eq!(r["state"]["axis"], "x");
+    let bad = take(unsafe { ijc_guided_set_axis(h, c("w").as_ptr()) });
+    assert_eq!(bad["status"], "error");
+    assert_eq!(bad["state"]["axis"], "x", "a bad axis keeps the lock");
+
+    take(unsafe { ijc_guided_answer_point(h, 1.0, 0.5, 1.5) });
+    let done = take(unsafe { ijc_guided_answer_number(h, 90.0) });
+    assert_eq!(unsafe { ijc_undo_len(h) }, undo0 + 1, "one undo step");
+    assert_matches_typed(h, &done, "rotate sel 90 x about 1,0.5,1.5");
+
+    // Not a rotate: no axis, and setting one is an error.
+    let m = start(h, "move");
+    assert!(m["state"]["axis"].is_null());
+    let e = take(unsafe { ijc_guided_set_axis(h, c("x").as_ptr()) });
+    assert_eq!(e["status"], "error");
+    unsafe { ijc_free(h) };
+}

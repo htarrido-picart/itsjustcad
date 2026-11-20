@@ -6568,6 +6568,25 @@ impl App {
                 self.guided.push_input(c);
             }
         }
+        // Arrow keys lock a guided rotate's axis (SketchUp: → red X, ← green Y,
+        // ↑ blue Z). Typing x/y/z does the same through `push_input`.
+        if guided_active && self.guided.supports_axis_lock() {
+            let axis = ui.input(|i| {
+                [
+                    (egui::Key::ArrowRight, 'x'),
+                    (egui::Key::ArrowLeft, 'y'),
+                    (egui::Key::ArrowUp, 'z'),
+                ]
+                .into_iter()
+                .find_map(|(k, a)| i.key_pressed(k).then_some(a))
+            });
+            if let Some(a) = axis
+                && self.guided.set_axis(a)
+            {
+                self.command_line
+                    .push_line(format!("rotate axis: {}", axis_label(a)));
+            }
+        }
         // A guided flow that armed *this* frame set `guided_suppress_enter`: the
         // Enter that submitted the bare verb in the command line is still down,
         // and would otherwise auto-commit the first typed step at its default.
@@ -6650,7 +6669,12 @@ impl App {
                 egui::Event::Text(t) => {
                     for c in t.chars() {
                         if guided_active {
+                            let before = self.guided.axis();
                             self.guided.push_input(c);
+                            if let Some(a) = self.guided.axis().filter(|a| Some(*a) != before) {
+                                self.command_line
+                                    .push_line(format!("rotate axis: {}", axis_label(a)));
+                            }
                         } else {
                             self.draw_tool.push_input(c);
                         }
@@ -7090,7 +7114,16 @@ impl App {
         }
 
         // Ghost preview + prompt overlay
-        let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 160, 255));
+        // A guided rotate's protractor takes its axis colour.
+        let stroke = egui::Stroke::new(
+            1.5,
+            match self.guided.axis().filter(|_| guided_active) {
+                Some('x') => egui::Color32::from_rgb(225, 85, 85),
+                Some('y') => egui::Color32::from_rgb(110, 200, 110),
+                Some(_) => egui::Color32::from_rgb(95, 145, 255),
+                None => egui::Color32::from_rgb(90, 160, 255),
+            },
+        );
         let preview = if guided_active {
             self.guided.preview(cursor_world)
         } else {
@@ -11215,6 +11248,15 @@ fn empty_deletable_layers(doc: &itsjustcad_doc::Document) -> Vec<String> {
         .filter(|n| n.as_str() != itsjustcad_doc::DEFAULT_LAYER && !used.contains(n.as_str()))
         .cloned()
         .collect()
+}
+
+/// Axis letter → command-line label in SketchUp colour words.
+fn axis_label(a: char) -> &'static str {
+    match a {
+        'x' => "X (red)",
+        'y' => "Y (green)",
+        _ => "Z (blue)",
+    }
 }
 
 /// Whether a Space press should act like Enter to finish/advance a step-based
