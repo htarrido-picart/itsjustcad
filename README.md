@@ -888,7 +888,7 @@ and a scene digest; it never touches raw geometry.
 
 | | |
 |---|---|
-| RMB drag / Shift+RMB / scroll | orbit / pan / zoom |
+| RMB drag / Shift+RMB / scroll | orbit / pan / zoom toward the cursor |
 | `l` `r` `c` `p` | line / rect / circle / polyline tools |
 | Delete · Cmd+Z / Cmd+Shift+Z · Cmd+A · Cmd+C/V · Cmd+S | the usual |
 | Tab | accept autosuggest |

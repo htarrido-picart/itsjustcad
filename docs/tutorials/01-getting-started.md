@@ -73,7 +73,7 @@ Now use the mouse in the viewport:
 |---|---|
 | **Right-drag** | Orbit |
 | **Shift + right-drag** | Pan |
-| **Scroll wheel** | Zoom |
+| **Scroll wheel** | Zoom toward the point under the cursor |
 
 ---
 

@@ -87,6 +87,8 @@ enum CamOp {
     Orbit(f32, f32),
     Pan(f32, f32),
     Dolly(f32),
+    /// Zoom by a factor toward the point under a drawable pixel (#365).
+    ZoomAt(f32, f32, f32),
     Frame,
 }
 
@@ -1191,6 +1193,7 @@ fn apply_camera(app: &mut AppHandle, op: CamOp) {
         CamOp::Orbit(dx, dy) => app.camera.orbit(dx, dy),
         CamOp::Pan(dx, dy) => app.camera.pan(dx, dy),
         CamOp::Dolly(d) => app.camera.dolly(d),
+        CamOp::ZoomAt(factor, x, y) => zoom_camera_at(app, factor, x, y),
         CamOp::Frame => frame_camera(app),
     }
 }
@@ -1595,7 +1598,8 @@ pub unsafe extern "C" fn ijc_camera_pan(h: *mut AppHandle, dx: f32, dy: f32) {
 /// `factor > 1` zooms in (closer), `factor < 1` zooms out. The core's `dolly`
 /// takes an additive scroll amount where `distance *= 1 - scroll * 0.002`; we
 /// map the pinch ratio to that scroll so a pinch-apart moves the camera nearer.
-/// Applied on the next `ijc_render_frame`.
+/// Applied on the next `ijc_render_frame`. Zooms toward the view centre; to
+/// zoom toward the pinch centre, use [`ijc_camera_zoom_at`].
 ///
 /// Headless handle ([`ijc_init_headless`]): moves only the in-memory camera,
 /// on the next [`ijc_flush`]; nothing is drawn.
@@ -1621,6 +1625,49 @@ pub unsafe extern "C" fn ijc_camera_zoom(h: *mut AppHandle, factor: f32) {
             pending.push(PendingOp::Camera(CamOp::Dolly(scroll)));
         }
     })
+}
+
+/// Zoom by a multiplicative `factor` toward the point under `(x_px, y_px)`,
+/// the pinch centre: `factor > 1` zooms in, `factor < 1` out, as
+/// [`ijc_camera_zoom`]. The point is in physical drawable pixels, the space
+/// [`ijc_pick`] takes, and it stays on that pixel while zooming. It is the
+/// nearest visible geometry under it, else the ground plane, else the point at
+/// the target's depth; the camera slows down near it and never passes it. In
+/// a panorama/fisheye, or with no known viewport, it zooms toward the target
+/// like [`ijc_camera_zoom`]. Acts on the active camera; applied on the next
+/// `ijc_render_frame`.
+///
+/// Headless handle ([`ijc_init_headless`]): moves only the in-memory camera,
+/// on the next [`ijc_flush`], using the size from [`ijc_resize`].
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_zoom_at(h: *mut AppHandle, factor: f32, x_px: f32, y_px: f32) {
+    guard_ffi((), || {
+        let Some(app) = (unsafe { handle_ref(h) }) else {
+            return;
+        };
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        if let Ok(mut pending) = app.pending.lock() {
+            pending.push(PendingOp::Camera(CamOp::ZoomAt(factor, x_px, y_px)));
+        }
+    })
+}
+
+/// Apply [`ijc_camera_zoom_at`]: zoom the active camera toward the point under
+/// the pixel, or toward its target when the pixel or viewport is unusable.
+fn zoom_camera_at(app: &mut AppHandle, factor: f32, x_px: f32, y_px: f32) {
+    let focus = viewport_size(app).and_then(|(w, h)| {
+        let vp = app.camera.view_proj(w / h.max(1.0));
+        let (origin, dir) = screen_ray(vp, w, h, x_px, y_px)?;
+        let (size, pos) = (glam::Vec2::new(w, h), glam::Vec2::new(x_px, y_px));
+        let hit = itsjustcad_doc::pick::ray_hit(&app.session.doc, vp, size, pos, origin, dir);
+        Some(app.camera.cursor_focus(origin, dir, hit).as_vec3())
+    });
+    app.camera.zoom_at(focus.unwrap_or(app.camera.target), factor);
 }
 
 /// Zoom-to-fit: frame the entire scene (center on its bounding box and back the
@@ -9161,6 +9208,78 @@ mod headless_tests {
                 .pipe_free();
             assert_eq!(r(ijc_location_json(h))["place"], "Mountain View, CA");
             ijc_free(h);
+        }
+    }
+
+    /// #365: a pinch zoom keeps the world point under the pinch centre on its
+    /// pixel, in perspective and in a parallel view, and many big steps never
+    /// carry the camera through the box it is zooming into.
+    #[test]
+    fn zoom_at_keeps_the_pinch_point_on_its_pixel() {
+        let nil = std::ptr::null_mut::<AppHandle>();
+        unsafe {
+            ijc_camera_zoom_at(nil, 2.0, 1.0, 1.0);
+            ijc_camera_zoom_at(nil, f32::NAN, 1.0, 1.0);
+        }
+        let (w, ht) = (800.0f32, 600.0f32);
+        let (x, y) = (430.0f32, 260.0f32);
+        for view in ["persp", "front"] {
+            let h = ijc_init_headless();
+            unsafe {
+                take(ijc_run_command_result(h, c("box -5,-5,0 10,10,10").as_ptr()));
+                take(ijc_run_command_result(h, c(view).as_ptr()));
+                ijc_resize(h, w as u32, ht as u32);
+                ijc_camera_zoom_extents(h);
+                assert!(ijc_flush(h));
+                let state = |h: *mut AppHandle| {
+                    let app = handle_ref(h).unwrap();
+                    (app.camera, app.camera.view_proj(w / ht))
+                };
+                let (cam, vp) = state(h);
+                let (o, d) = screen_ray(vp, w, ht, x, y).unwrap();
+                let size = glam::Vec2::new(w, ht);
+                let t = itsjustcad_doc::pick::ray_hit(
+                    &handle_ref(h).unwrap().session.doc,
+                    vp,
+                    size,
+                    glam::Vec2::new(x, y),
+                    o,
+                    d,
+                )
+                .expect("the box is under the pinch");
+                let focus = o + d * t;
+                let depth = |c: &OrbitCamera| {
+                    let e = c.view_eye();
+                    (focus.as_vec3() - e).dot((c.target - e).normalize())
+                };
+                let check = |h: *mut AppHandle, what: &str| {
+                    let (c, vp) = state(h);
+                    let px = itsjustcad_doc::pick::project(vp, size, focus).unwrap();
+                    assert!((px - glam::Vec2::new(x, y)).length() < 0.5, "{view} {what}: {px}");
+                    c
+                };
+                ijc_camera_zoom_at(h, 1.5, x, y);
+                assert!(ijc_flush(h));
+                let c1 = check(h, "one step");
+                assert!(c1.distance < cam.distance, "{view}: zoomed in");
+                for _ in 0..60 {
+                    ijc_camera_zoom_at(h, 4.0, x, y);
+                }
+                assert!(ijc_flush(h));
+                // Right at the face, a pixel spans ~1e-4 world units: compare
+                // the point under the pinch in world space rather than pixels.
+                let (c2, vp) = state(h);
+                let (o, d) = screen_ray(vp, w, ht, x, y).unwrap();
+                let doc = &handle_ref(h).unwrap().session.doc;
+                let t = itsjustcad_doc::pick::ray_hit(doc, vp, size, glam::Vec2::new(x, y), o, d);
+                let under = o + d * t.expect("still on the box");
+                assert!((under - focus).length() < 1e-3, "{view}: point moved {}", under - focus);
+                if view == "persp" {
+                    assert!(depth(&c2) >= itsjustcad_render::ZOOM_STANDOFF * 0.99, "overshot: {}", depth(&c2));
+                    assert!(depth(&c2) < depth(&c1));
+                }
+                ijc_free(h);
+            }
         }
     }
 
