@@ -78,6 +78,12 @@ impl DrawTool {
         self.input.clear();
     }
 
+    /// The next pick may run along a red/green/blue axis from the last point
+    /// (#372). Not a rect: its opposite corner on an axis is a zero-area rect.
+    pub fn infers_axes(&self) -> bool {
+        self.state.as_ref().is_some_and(|(v, _)| *v != Verb::Rect)
+    }
+
     /// Last picked point — anchor for relative/distance/ortho input.
     pub fn last_point(&self) -> Option<DVec3> {
         self.state.as_ref()?.1.last().copied()

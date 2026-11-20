@@ -17,7 +17,7 @@ use itsjustcad_render::{
 use crate::command_line::CommandLine;
 use crate::deck_pane::DeckPane;
 use crate::draw_tool::DrawTool;
-use itsjustcad_guided::{GuidedTool, ObjFilter, StartResult, StepResult};
+use itsjustcad_guided::{GuidedTool, ObjFilter, StartResult, StepResult, inference};
 use crate::gumball::Gumball;
 use crate::journal::{self, Journal};
 use crate::keymap;
@@ -821,6 +821,17 @@ pub struct App {
     /// constrained to 0/90° from the last picked point every frame. Persisted to
     /// ui.json. UI/session state, never part of the op-log.
     ortho: bool,
+    /// Arrow-key axis lock for the point being picked (→ red X, ← green Y,
+    /// ↑ blue Z; #372). Tied to the last picked point, so the next pick
+    /// releases it. Session state, never logged.
+    axis_lock: itsjustcad_guided::inference::AxisLock,
+    /// Shift held while the rubber band was on an axis: holds that axis (a
+    /// lock that lasts while Shift is down; SketchUp). Session state.
+    shift_hold: itsjustcad_guided::inference::AxisLock,
+    /// Shift was down last frame (edge detection for `shift_hold`).
+    shift_was_down: bool,
+    /// Axis the rubber band ran along last frame (colour + Shift hold).
+    axis_shown: Option<char>,
     /// Persistent SmartTrack toggle: when on, dwelling on an osnap point
     /// acquires it and projects H/V construction guides the cursor snaps to.
     /// Persisted to ui.json. UI/session state, never part of the op-log.
@@ -1639,6 +1650,10 @@ impl App {
             snap_settings: load_snap_settings(),
             osnap_popup_open: false,
             ortho: load_ortho(),
+            axis_lock: Default::default(),
+            shift_hold: Default::default(),
+            shift_was_down: false,
+            axis_shown: None,
             smarttrack: load_smarttrack(),
             st_acquired: crate::smarttrack::Acquired::new(),
             st_dwell: None,
@@ -6831,6 +6846,23 @@ impl App {
         extra
     }
 
+    /// The point a coloured axis band runs from (#372): the last picked point
+    /// of a line/polyline/circle/polygon pick or of a guided point step
+    /// (move, copy, …). `None` before the first point, on a rect corner (an
+    /// axis-aligned rect can't have an on-axis diagonal) and on a guided
+    /// rotate, whose arrows lock the rotation axis instead.
+    fn axis_anchor(&self) -> Option<glam::DVec3> {
+        if self.guided.active() {
+            (self.guided.current_is_point() && !self.guided.supports_axis_lock())
+                .then(|| self.guided.last_point())
+                .flatten()
+        } else if self.draw_tool.infers_axes() {
+            self.draw_tool.last_point()
+        } else {
+            None
+        }
+    }
+
     fn drawing_input(
         &mut self,
         ui: &mut egui::Ui,
@@ -6884,25 +6916,47 @@ impl App {
                 self.guided.push_input(c);
             }
         }
-        // Arrow keys lock a guided rotate's axis (SketchUp: → red X, ← green Y,
-        // ↑ blue Z). Typing x/y/z does the same through `push_input`.
-        if guided_active && self.guided.supports_axis_lock() {
-            let axis = ui.input(|i| {
-                [
-                    (egui::Key::ArrowRight, 'x'),
-                    (egui::Key::ArrowLeft, 'y'),
-                    (egui::Key::ArrowUp, 'z'),
-                ]
+        // Arrow keys (SketchUp: → red X, ← green Y, ↑ blue Z). On a guided
+        // rotate they lock the rotation axis (typing x/y/z does the same
+        // through `push_input`); on a point pick from a previous point they
+        // lock the rubber band to that axis, the same arrow again unlocks
+        // (#372). This pass only runs while a tool is active and the canvas
+        // owns the keyboard, so the command line's ↑/↓ history is untouched.
+        let arrow_axis = ui.input(|i| {
+            ARROW_AXES
                 .into_iter()
                 .find_map(|(k, a)| i.key_pressed(k).then_some(a))
-            });
-            if let Some(a) = axis
-                && self.guided.set_axis(a)
-            {
-                self.command_line
-                    .push_line(format!("rotate axis: {}", axis_label(a)));
+        });
+        let axis_anchor = self.axis_anchor();
+        if let Some(a) = arrow_axis {
+            if guided_active && self.guided.supports_axis_lock() {
+                if self.guided.set_axis(a) {
+                    self.command_line
+                        .push_line(format!("rotate axis: {}", axis_label(a)));
+                }
+            } else if let Some(anchor) = axis_anchor {
+                let now = self.axis_lock.toggle(a, anchor);
+                self.command_line.push_line(match now {
+                    Some(a) => format!("axis lock: {}", axis_label(a)),
+                    None => "axis lock: off".to_string(),
+                });
             }
         }
+        // Shift pressed while the band runs along an axis holds that axis for
+        // as long as Shift stays down (SketchUp); pressed off-axis it is the
+        // momentary Ortho it always was.
+        if !shift {
+            self.shift_hold.clear();
+        } else if !self.shift_was_down
+            && let (Some(anchor), Some(a)) = (axis_anchor, self.axis_shown)
+        {
+            self.shift_hold.toggle(a, anchor);
+        }
+        self.shift_was_down = shift;
+        let locked_axis = self
+            .axis_lock
+            .get(axis_anchor)
+            .or_else(|| self.shift_hold.get(axis_anchor));
         // A guided flow that armed *this* frame set `guided_suppress_enter`: the
         // Enter that submitted the bare verb in the command line is still down,
         // and would otherwise auto-commit the first typed step at its default.
@@ -7102,10 +7156,38 @@ impl App {
         // Cursor resolution precedence:
         //   (1) a DIRECT osnap hit wins — never overridden by a guide;
         //   (2) else SmartTrack guide snap (records active guides to draw);
-        //   (3) else ortho lock (persistent toggle OR momentary Shift);
-        //   (4) else the plain ground/grid point resolved above.
+        //   (3) else axis inference: a band within a few degrees of red/green/
+        //       blue on screen snaps onto that axis (#372);
+        //   (4) else ortho lock (persistent toggle OR momentary Shift);
+        //   (5) else the plain ground/grid point resolved above.
+        // An axis lock (arrow key or Shift hold) overrides all of these: the
+        // point stays on the axis line, an osnap only setting its distance.
         let apply_ortho = self.ortho || shift;
-        if snap_hit.is_none() {
+        let cursor_ray = cursor_px.map(|pos| screen_ray(view_proj, rect, pos));
+        let along_grid = |anchor: glam::DVec3, a: char, p: glam::DVec3| {
+            if !grid_on {
+                return p;
+            }
+            let g = crate::osnap::grid_snap(p);
+            match a {
+                'x' => glam::DVec3::new(g.x, anchor.y, anchor.z),
+                'y' => glam::DVec3::new(anchor.x, g.y, anchor.z),
+                _ => glam::DVec3::new(anchor.x, anchor.y, g.z),
+            }
+        };
+        if let (Some(a), Some(anchor)) = (locked_axis, axis_anchor) {
+            let p = inference::constrain_to_axis(
+                anchor,
+                a,
+                snap_hit.map(|(p, _)| p),
+                cursor_ray,
+            );
+            cursor_world = Some(if snap_hit.is_some() {
+                p
+            } else {
+                along_grid(anchor, a, p)
+            });
+        } else if snap_hit.is_none() {
             let mut handled = false;
             if self.smarttrack
                 && let (Some(c), Some(tol)) = (cursor_world, st_tol)
@@ -7126,6 +7208,28 @@ impl App {
                 }
             }
             if !handled
+                && let (Some(anchor), Some(pos), Some((ro, rd))) =
+                    (axis_anchor, cursor_px, cursor_ray)
+                && let Some(anchor_px) = project(view_proj, rect, anchor)
+            {
+                // Each axis's on-screen direction at the anchor: project a
+                // step of ~100 px worth of world along it.
+                let step = world_per_px.unwrap_or(0.01) * 100.0;
+                let axis_px = |a: char| {
+                    let u = itsjustcad_guided::axis_vector(a)?;
+                    let q = project(view_proj, rect, anchor + u * step)?;
+                    Some(glam::Vec2::new(q.x - anchor_px.x, q.y - anchor_px.y))
+                };
+                let band = glam::Vec2::new(pos.x - anchor_px.x, pos.y - anchor_px.y);
+                if let Some(a) = inference::infer_axis(band, axis_px, inference::INFER_TOL_DEG)
+                    && let Some(u) = itsjustcad_guided::axis_vector(a)
+                    && let Some(p) = inference::closest_on_line_to_ray(anchor, u, ro, rd)
+                {
+                    cursor_world = Some(along_grid(anchor, a, p));
+                    handled = true;
+                }
+            }
+            if !handled
                 && apply_ortho
                 && let (Some(last), Some(c)) = (last_point, cursor_world)
             {
@@ -7133,6 +7237,19 @@ impl App {
             }
         }
         self.status_snap = snap_hit.map(|(_, kind)| kind.label());
+        // The axis the rubber band runs along, however the point got there
+        // (inference, lock, ortho, a snap): colours the band + tip, and is
+        // what a Shift press next frame holds.
+        let band_axis = axis_anchor
+            .zip(cursor_world)
+            .and_then(|(a, c)| inference::axis_of(a, c));
+        self.axis_shown = band_axis;
+        // A typed bare distance runs toward the cursor — along the locked
+        // axis even when the cursor sits on the anchor.
+        let typed_cursor = match axis_anchor {
+            Some(a) => inference::typed_direction_cursor(a, locked_axis, cursor_world),
+            None => cursor_world,
+        };
 
         if enter {
             if guided_active {
@@ -7149,7 +7266,7 @@ impl App {
                     // list if it has enough points.
                     let buffer = self.guided.take_input();
                     if !buffer.is_empty() {
-                        match crate::precise::resolve_input(&buffer, last_point, cursor_world) {
+                        match crate::precise::resolve_input(&buffer, last_point, typed_cursor) {
                             Ok(world) => {
                                 self.guided.push_list_point(world);
                             }
@@ -7176,7 +7293,7 @@ impl App {
                     // A point step: typed coords resolve to a pick; a bare Enter
                     // needs a click, so an empty buffer is a no-op here.
                     if !buffer.is_empty() {
-                        match crate::precise::resolve_input(&buffer, last_point, cursor_world) {
+                        match crate::precise::resolve_input(&buffer, last_point, typed_cursor) {
                             Ok(world) => {
                                 let r = self.guided.on_click(world);
                                 self.handle_guided(r);
@@ -7195,7 +7312,7 @@ impl App {
             let buffer = self.draw_tool.take_input();
             if !buffer.is_empty() {
                 // Precise input: resolve the typed point, feed it as a pick.
-                match crate::precise::resolve_input(&buffer, last_point, cursor_world) {
+                match crate::precise::resolve_input(&buffer, last_point, typed_cursor) {
                     Ok(world) => {
                         if let Some(cmd) = self.draw_tool.on_click(world) {
                             self.execute_line(cmd);
@@ -7434,12 +7551,16 @@ impl App {
         let stroke = egui::Stroke::new(
             1.5,
             match self.guided.axis().filter(|_| guided_active) {
-                Some('x') => egui::Color32::from_rgb(225, 85, 85),
-                Some('y') => egui::Color32::from_rgb(110, 200, 110),
-                Some(_) => egui::Color32::from_rgb(95, 145, 255),
+                Some(a) => axis_color(a),
                 None => egui::Color32::from_rgb(90, 160, 255),
             },
         );
+        // The rubber band (anchor → cursor) on an axis takes that axis colour.
+        let band = axis_anchor.zip(cursor_world).zip(band_axis);
+        let band_stroke = band.map(|(_, a)| egui::Stroke::new(2.0, axis_color(a)));
+        let is_band = |p: glam::DVec3, q: glam::DVec3| {
+            band.is_some_and(|((a, c), _)| (p == a && q == c) || (p == c && q == a))
+        };
         let preview = if guided_active {
             self.guided.preview(cursor_world)
         } else {
@@ -7451,9 +7572,26 @@ impl App {
                     project(view_proj, rect, pair[0]),
                     project(view_proj, rect, pair[1]),
                 ) {
-                    painter.line_segment([a, b], stroke);
+                    let s = match band_stroke {
+                        Some(bs) if is_band(pair[0], pair[1]) => bs,
+                        _ => stroke,
+                    };
+                    painter.line_segment([a, b], s);
                 }
             }
+        }
+        // "On Red Axis" tip below-right of the cursor (SketchUp), clear of the
+        // osnap label that sits above-right of the snap marker.
+        if let (Some(((_, c), a)), Some(pos)) = (band, cursor_px)
+            && project(view_proj, rect, c).is_some()
+        {
+            painter.text(
+                pos + egui::vec2(14.0, 14.0),
+                egui::Align2::LEFT_TOP,
+                axis_tip(a, locked_axis == Some(a)),
+                egui::TextStyle::Small.resolve(ui.style()),
+                axis_color(a),
+            );
         }
 
         // Trim removal hover cue: during the "click parts to remove" phase, the
@@ -11655,6 +11793,38 @@ fn empty_deletable_layers(doc: &itsjustcad_doc::Document) -> Vec<String> {
         .collect()
 }
 
+/// Arrow key → axis it locks (SketchUp: → red X, ← green Y, ↑ blue Z). ↓
+/// (parallel/perpendicular to an edge) is not mapped yet (#373).
+const ARROW_AXES: [(egui::Key, char); 3] = [
+    (egui::Key::ArrowRight, 'x'),
+    (egui::Key::ArrowLeft, 'y'),
+    (egui::Key::ArrowUp, 'z'),
+];
+
+/// SketchUp axis colour: X red, Y green, Z blue (rubber band, rotate ghost).
+fn axis_color(a: char) -> egui::Color32 {
+    match a {
+        'x' => egui::Color32::from_rgb(225, 85, 85),
+        'y' => egui::Color32::from_rgb(110, 200, 110),
+        _ => egui::Color32::from_rgb(95, 145, 255),
+    }
+}
+
+/// Screen tip for a band on axis `a` ("On Red Axis"), with the localized
+/// "locked" suffix under an arrow/Shift lock.
+fn axis_tip(a: char, locked: bool) -> String {
+    let on = crate::i18n::t(match a {
+        'x' => "axis.on_red",
+        'y' => "axis.on_green",
+        _ => "axis.on_blue",
+    });
+    if locked {
+        format!("{on} · {}", crate::i18n::t("axis.locked"))
+    } else {
+        on.to_string()
+    }
+}
+
 /// Axis letter → command-line label in SketchUp colour words.
 fn axis_label(a: char) -> &'static str {
     match a {
@@ -14181,6 +14351,110 @@ mod tests {
                 }
                 other => panic!("expected a Curve polyline, got {other:?}"),
             }
+        });
+    }
+
+    /// #372: → ← ↑ lock red/green/blue, and no arrow is ever a canvas
+    /// shortcut — with no tool armed they stay the command line's (↑/↓
+    /// history, → completion).
+    #[test]
+    fn arrow_keys_lock_sketchup_axes_and_are_no_canvas_shortcut() {
+        assert_eq!(ARROW_AXES.map(|(_, a)| a), ['x', 'y', 'z']);
+        assert_eq!(axis_label('x'), "X (red)");
+        for key in [
+            egui::Key::ArrowRight,
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+        ] {
+            for draw_active in [false, true] {
+                let ctx = keymap::KeyContext {
+                    draw_active,
+                    ..Default::default()
+                };
+                assert_eq!(keymap::keymap(key, egui::Modifiers::NONE, ctx), None, "{key:?}");
+            }
+        }
+    }
+
+    /// #372: with no tool armed ↑ still walks the command-line history; while
+    /// drawing a line the arrows lock red/green/blue (same arrow again
+    /// unlocks) and a typed distance runs along the locked axis — blue too,
+    /// in a top view where the cursor ray never leaves the vertical line.
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_arrow_keys_lock_axis_and_typed_distance_follows_it() {
+        fn ends(h: &egui_kittest::Harness<'_, App>) -> (glam::DVec3, glam::DVec3) {
+            let doc = &h.state().session.doc;
+            match &doc.objects().last().unwrap().geometry {
+                itsjustcad_doc::Geometry::Curve(c) => {
+                    let pts = c.tessellate(0.05);
+                    (*pts.first().unwrap(), *pts.last().unwrap())
+                }
+                other => panic!("expected a line, got {other:?}"),
+            }
+        }
+        fn type_and_enter(h: &mut egui_kittest::Harness<'_, App>, text: &str) {
+            h.input_mut().events.push(egui::Event::Text(text.into()));
+            h.run_steps(1);
+            h.key_press(egui::Key::Enter);
+            h.run_steps(2);
+        }
+        run_app_journey(|h| {
+            // Top ortho, framed (as `top_ortho_view`, through execute_line so
+            // the journey does not lean on where focus starts).
+            for line in ["line 20,20 21,20", "top", "ze"] {
+                h.state_mut().execute_line(line.into());
+                h.run_steps(2);
+            }
+            assert!(h.state().command_line.recall_len() > 0);
+            // No tool: ↑ recalls the last command into the line, no lock.
+            h.state_mut().command_line.focus();
+            h.run_steps(2);
+            h.key_press(egui::Key::ArrowUp);
+            h.run_steps(2);
+            // (Where the harness gives the command line focus, as on CI, ↑
+            // must have recalled into it.)
+            if h.ctx.memory(|m| m.focused()).is_some() {
+                assert!(!h.state().command_line.input.is_empty(), "↑ walked the history");
+            }
+            assert_eq!(transcript(h.state()).iter().filter(|l| l.starts_with("axis lock")).count(), 0);
+            h.state_mut().command_line.input.clear();
+            h.run_steps(1);
+
+            h.state_mut().execute_line("line".into());
+            h.run_steps(1);
+            click_at(h, pane_point(h, 0.5, 0.5));
+            let a = h.state().draw_tool.last_point().expect("first point picked");
+            h.key_press(egui::Key::ArrowRight);
+            h.run_steps(1);
+            assert_eq!(h.state().axis_lock.get(Some(a)), Some('x'));
+            h.key_press(egui::Key::ArrowRight);
+            h.run_steps(1);
+            assert_eq!(h.state().axis_lock.get(Some(a)), None, "same arrow unlocks");
+            h.key_press(egui::Key::ArrowRight);
+            h.run_steps(1);
+            assert!(transcript(h.state()).iter().any(|l| l == "axis lock: X (red)"));
+            // Cursor up-right, off the axis: the typed 5 still runs along red.
+            let off_axis = pane_point(h, 0.6, 0.4);
+            h.input_mut().events.push(egui::Event::PointerMoved(off_axis));
+            h.run_steps(1);
+            type_and_enter(h, "5");
+            let (p, q) = ends(h);
+            assert!(p.distance(a) < 1e-6 && q.distance(a + glam::DVec3::X * 5.0) < 1e-6, "{p} {q}");
+
+            // Blue: the top view looks straight down the vertical line.
+            h.state_mut().execute_line("line".into());
+            h.run_steps(1);
+            click_at(h, pane_point(h, 0.4, 0.6));
+            let a = h.state().draw_tool.last_point().unwrap();
+            h.key_press(egui::Key::ArrowUp);
+            h.run_steps(1);
+            assert_eq!(h.state().axis_lock.get(Some(a)), Some('z'));
+            type_and_enter(h, "3");
+            let (p, q) = ends(h);
+            assert!(p.distance(a) < 1e-6 && q.distance(a + glam::DVec3::Z * 3.0) < 1e-6, "{p} {q}");
+            assert!(!h.state().draw_tool.active());
         });
     }
 
