@@ -44,6 +44,16 @@ pub enum AppVerb {
     /// Toggle the thin mesh feature edges drawn in Shaded mode by default
     /// (`shadededges [on|off]` / `meshedges`). `None` means bare toggle.
     ShadedEdges(Option<bool>),
+    /// Show or hide the ground grid lines (`grid [on|off]`, #364). Not the
+    /// grid snap, which stays `osnap grid`. `None` means bare toggle.
+    Grid(Option<bool>),
+    /// Show or hide the world X/Y/Z axes (`axes [on|off]`, #364). `None`
+    /// means bare toggle.
+    Axes(Option<bool>),
+    /// Parallel projection of the active view (`parallel [on|off]` / `ortho
+    /// view`, #364); same as `camera parallel` / `camera persp`. `None` means
+    /// bare toggle.
+    Parallel(Option<bool>),
     /// Viewport anti-aliasing (`antialias off|2|4|8` / `aa`): the MSAA sample
     /// count, 1 = off (#356). `None` reports the current setting.
     AntiAlias(Option<u32>),
@@ -201,6 +211,17 @@ pub fn parse_msaa(arg: &str) -> Option<u32> {
     })
 }
 
+/// A toggle argument: `Some(None)` for a bare toggle (or `toggle`),
+/// `Some(Some(on))` for on/off, `None` for anything else.
+pub fn on_off(arg: Option<&str>) -> Option<Option<bool>> {
+    Some(match arg.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("toggle") => None,
+        Some("on" | "true" | "1" | "show") => Some(true),
+        Some("off" | "false" | "0" | "hide") => Some(false),
+        _ => return None,
+    })
+}
+
 /// Classify a command line as an app-level verb, or `None` if it should fall
 /// through to the substrate parser / draw tools. The single source of truth
 /// for which verbs the app owns.
@@ -224,6 +245,11 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             None => None,
             _ => return None,
         }),
+        // `grid <name> x A:0 …` defines a structural grid (substrate): only a
+        // bare or single on/off word is the view toggle.
+        "grid" if line.split_whitespace().count() <= 2 => AppVerb::Grid(on_off(words.next())?),
+        "axes" => AppVerb::Axes(on_off(words.next())?),
+        "parallel" | "parallelprojection" => AppVerb::Parallel(on_off(words.next())?),
         "antialias" | "aa" => AppVerb::AntiAlias(match words.next() {
             None => None,
             Some(arg) => Some(parse_msaa(arg)?),
@@ -315,6 +341,26 @@ mod tests {
         assert_eq!(classify("zoomselected"), Some(AppVerb::ZoomSelected));
         assert_eq!(classify("front"), Some(AppVerb::View(StandardView::Front)));
         assert_eq!(classify("persp"), Some(AppVerb::View(StandardView::Perspective)));
+    }
+
+    #[test]
+    fn classifies_grid_axes_and_parallel_toggles() {
+        // #364: view toggles, bare = flip.
+        assert_eq!(classify("grid"), Some(AppVerb::Grid(None)));
+        assert_eq!(classify("grid off"), Some(AppVerb::Grid(Some(false))));
+        assert_eq!(classify("grid ON"), Some(AppVerb::Grid(Some(true))));
+        assert_eq!(classify("axes hide"), Some(AppVerb::Axes(Some(false))));
+        assert_eq!(classify("axes toggle"), Some(AppVerb::Axes(None)));
+        assert_eq!(classify("parallel on"), Some(AppVerb::Parallel(Some(true))));
+        assert_eq!(classify("parallel"), Some(AppVerb::Parallel(None)));
+        assert_eq!(classify("grid sideways"), None);
+        assert_eq!(classify("grid 1 x A:0 B:5"), None, "structural grid stays substrate");
+        // The grid snap stays its own verb.
+        assert_eq!(classify("osnap grid off"), Some(AppVerb::Osnap(Some("grid".into()), Some(false))));
+        assert_eq!(
+            classify("camera parallel"),
+            Some(AppVerb::Camera(Some("parallel".into()), None))
+        );
     }
 
     #[test]
@@ -546,6 +592,9 @@ mod tests {
         "meshedges",
         "plantsymbols",
         "gumball",
+        "grid",
+        "axes",
+        "parallel",
         "ze",
         "zoomextents",
         "zs",
@@ -595,6 +644,7 @@ mod tests {
         "theme_skin",   // alias of `skin`
         "osnap",        // object-snap toggle: interactive-input setting, not a view/draw verb
         "snap",         // alias of `osnap`
+        "parallelprojection", // alias of `parallel`
     ];
 
     #[test]
@@ -636,6 +686,10 @@ mod tests {
             "theme_skin",
             "osnap",
             "snap",
+            "grid",
+            "axes",
+            "parallel",
+            "parallelprojection",
             "camera",
             "save",
             "help",
@@ -691,6 +745,10 @@ mod tests {
             "profiles on",
             "meshedges off",
             "gumball on",
+            "grid off",
+            "axes on",
+            "parallel on",
+            "camera parallel",
             "ze",
             "zoomextents",
             "top",
@@ -744,6 +802,10 @@ mod tests {
             "camera phone phone-ultrawide",
             "basemap sat 800 0.6",
             "basemap off",
+            "grid off",
+            "axes off",
+            "camera parallel",
+            "parallel on",
             "render glass pavilion at dusk",
             "render cancel",
             itsjustcad_deck::FEEDBACK_EXAMPLE_LINE,
@@ -759,6 +821,7 @@ mod tests {
         assert!(h.contains("phone-ultrawide"));
         assert!(h.contains("phone-periscope"));
         assert!(h.contains("zoom to fit"));
+        assert!(h.contains("grid on|off") && h.contains("axes on|off"));
     }
 
     #[test]

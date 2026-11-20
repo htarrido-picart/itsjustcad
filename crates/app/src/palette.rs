@@ -67,9 +67,12 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("profileedges", "Display", "profileedges [on|off]"),
     ("shadededges", "Display", "shadededges [on|off]"),
     ("antialias", "Display", "antialias off|2|4|8"),
+    ("grid", "Display", "grid [on|off]"),
+    ("axes", "Display", "axes [on|off]"),
+    ("parallel", "Camera", "parallel [on|off]"),
     ("edgefx", "Display", "edgefx jitter=.. extension=.."),
     // Camera / lens.
-    ("camera", "Camera", "camera 2point|persp|pano|fisheye [fov]|<n>mm|phone <lens>"),
+    ("camera", "Camera", "camera parallel|persp|2point|pano|fisheye [fov]|<n>mm|phone <lens>"),
     ("basemap", "View", "basemap [osm|sat] [span_m] [opacity] | off"),
     ("geocode", "View", "geocode \"<address>\""),
     // App / session.

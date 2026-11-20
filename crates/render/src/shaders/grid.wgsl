@@ -7,7 +7,8 @@ struct Camera {
     inv_view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     misc: vec4<f32>,
-    // x = lighting mode, y = background gradient flag (1 = sky/ground gradient).
+    // x = lighting mode, y = background gradient flag (1 = sky/ground gradient),
+    // z = 1 hides the grid lines (`grid off`, #364), w = 1 hides the axes.
     light: vec4<f32>,
 };
 
@@ -113,7 +114,9 @@ fn fs_main(in: VsOut) -> FsOut {
     let dist = length(hit - camera.eye.xyz);
     let fade = exp(-dist * 0.008);
 
-    let alpha = max(minor * 0.18, major * 0.42) * fade;
+    // `grid off` keeps the ground (and its depth) but drops the lines.
+    let shown = select(1.0, 0.0, camera.light.z > 0.5);
+    let alpha = max(minor * 0.18, major * 0.42) * fade * shown;
     let color = vec3(0.62, 0.64, 0.68);
     if (gradient) {
         // Composite the grid lines over an opaque gradient ground so the sky

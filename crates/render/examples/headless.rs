@@ -78,6 +78,8 @@ fn main() {
             face_meshes: vec![],
             lines: vec![],
             edges: vec![(edges_a, edge_color, 0.18), (edges_b, edge_color, 0.18)],
+            line_types: vec![],
+            edge_types: vec![],
             profile_edges: vec![],
             points: vec![],
             underlay: None,
@@ -215,5 +217,7 @@ fn main() {
         size_points: [0.0; 2],
         rect: egui::Rect::NOTHING,
         samples: 1,
+        show_grid: true,
+        show_axes: true,
     };
 }

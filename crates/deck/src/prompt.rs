@@ -46,6 +46,10 @@ Display mode (how solids are drawn):
 Lighting:
   light working|sun|presentation                lighting model (alias: lightmode)                        e.g. light sun
 
+Grid & axes:
+  grid on|off                                   show/hide the ground grid lines (not the grid snap)      e.g. grid off
+  axes on|off                                   show/hide the red/green/blue world axes                  e.g. axes off
+
 Feature edges:
   meshedges on|off                              show/hide the default shaded feature edges (alias:       e.g. meshedges off
                                                 shadededges)
@@ -66,6 +70,7 @@ Non-photoreal (NPR) styling:
 Camera projection & lens:
   camera 2point                                 two-point perspective (verticals stay vertical)          e.g. camera 2point
   camera persp                                  ordinary perspective                                     e.g. camera persp
+  camera parallel                               parallel projection, same direction (alias: parallel on) e.g. camera parallel
   camera pano                                   360° equirectangular panorama                            e.g. camera pano
   camera fisheye [fov]                          fisheye projection, optional field of view in degrees    e.g. camera fisheye 120
   camera <n>mm                                  lens by focal length: 15mm 24mm 35mm 50mm 85mm           e.g. camera 35mm

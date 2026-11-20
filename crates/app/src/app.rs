@@ -666,6 +666,12 @@ pub struct App {
     /// edges" default). ON by default; toggled by `shadededges [on|off]`.
     /// Persisted to `ui.json`. View state, never logged.
     shaded_edges: bool,
+    /// Ground grid lines drawn in every viewport (`grid on|off`, View menu,
+    /// #364). ON by default; persisted to `ui.json`. View state, never logged.
+    show_grid: bool,
+    /// World X/Y/Z axes drawn in every viewport (`axes on|off`, #364). ON by
+    /// default; persisted to `ui.json`. View state, never logged.
+    show_axes: bool,
     /// Requested viewport anti-aliasing: MSAA sample count 1 (off), 2, 4 or 8
     /// (#356). Default 4x; set by `antialias off|2|4|8` / View menu. Persisted
     /// to `ui.json`. The count drawn is the highest supported one not above it.
@@ -1618,6 +1624,8 @@ impl App {
             light_mode: itsjustcad_render::LightMode::default(),
             profile_edges: false,
             shaded_edges: load_shaded_edges().unwrap_or(true),
+            show_grid: view_overlays(&load_ui_json()).0,
+            show_axes: view_overlays(&load_ui_json()).1,
             msaa: load_msaa().unwrap_or(itsjustcad_render::DEFAULT_MSAA),
             msaa_supported,
             plant_symbols: false,
@@ -2305,6 +2313,24 @@ impl App {
             }
             Some("viewprev" | "previousview") => self.step_view(false),
             Some("viewnext" | "nextview") => self.step_view(true),
+            // View toggles (#364): ground grid lines, world axes, parallel
+            // projection of the active view. View state, never logged; the grid
+            // and axes persist to ui.json. A structural `grid <name> x …` is
+            // not a toggle and falls through to the substrate.
+            Some("grid" | "axes" | "parallel" | "parallelprojection")
+                if crate::app_verbs::classify(line).is_some() =>
+            {
+                use crate::app_verbs::AppVerb;
+                match crate::app_verbs::classify(line) {
+                    Some(AppVerb::Grid(on)) => self.set_show_grid(on),
+                    Some(AppVerb::Axes(on)) => self.set_show_axes(on),
+                    Some(AppVerb::Parallel(on)) => {
+                        let on = on.unwrap_or(!self.active_camera().ortho);
+                        self.set_camera(Some(if on { "parallel" } else { "persp" }), None);
+                    }
+                    _ => {}
+                }
+            }
             // Display mode of the active viewport. View state, never logged.
             // Verb/mode mapping is shared with the headless runner via app_verbs.
             Some("display") => match words.next().and_then(DisplayMode::parse) {
@@ -3597,7 +3623,25 @@ impl App {
         }
     }
 
-    /// `camera <2point|persp|pano|fisheye [fov]|15|24|35|50|85|phone|phonewide>`.
+    /// Show or hide the ground grid lines (`grid [on|off]`, #364); `None`
+    /// flips. Persisted to ui.json.
+    fn set_show_grid(&mut self, on: Option<bool>) {
+        self.show_grid = on.unwrap_or(!self.show_grid);
+        save_view_overlay(GRID_KEY, self.show_grid);
+        self.command_line
+            .push_line(format!("grid: {}", if self.show_grid { "on" } else { "off" }));
+    }
+
+    /// Show or hide the world axes (`axes [on|off]`, #364); `None` flips.
+    /// Persisted to ui.json.
+    fn set_show_axes(&mut self, on: Option<bool>) {
+        self.show_axes = on.unwrap_or(!self.show_axes);
+        save_view_overlay(AXES_KEY, self.show_axes);
+        self.command_line
+            .push_line(format!("axes: {}", if self.show_axes { "on" } else { "off" }));
+    }
+
+    /// `camera <parallel|2point|persp|pano|fisheye [fov]|15|24|35|50|85|phone|phonewide>`.
     /// Numeric args may carry a trailing "mm". Two-point toggles architectural
     /// perspective; `pano`/`fisheye` switch to a non-pinhole projection rendered
     /// via the cubemap remap; the lens presets set `fov_y` from a full-frame
@@ -3605,12 +3649,16 @@ impl App {
     fn set_camera(&mut self, arg: Option<&str>, arg2: Option<&str>) {
         let aspect = self.active_aspect;
         let Some(arg) = arg else {
-            self.command_line.push_line(
-                "usage: camera 2point|persp|pano|fisheye [fov]|phone [lens]|<15|24|35|50|85>mm",
-            );
+            self.command_line.push_line(CAMERA_USAGE);
             return;
         };
         match arg {
+            // Parallel projection of the current view (#364): direction and
+            // the scale at the target are kept (`OrbitCamera::set_parallel`).
+            "parallel" | "ortho" | "orthographic" => {
+                self.active_camera().set_parallel(true);
+                self.command_line.push_line("camera: parallel projection");
+            }
             "2point" | "twopoint" | "2pt" => {
                 let cam = self.active_camera();
                 cam.ortho = false;
@@ -3619,10 +3667,7 @@ impl App {
                 self.command_line.push_line("camera: two-point perspective");
             }
             "persp" | "perspective" | "1point" | "normal" => {
-                let cam = self.active_camera();
-                cam.ortho = false;
-                cam.two_point = false;
-                cam.pano = None;
+                self.active_camera().set_parallel(false);
                 self.command_line.push_line("camera: perspective");
             }
             "pano" | "panorama" | "equirect" | "360" => {
@@ -3683,9 +3728,7 @@ impl App {
                         self.command_line
                             .push_line(format!("camera: {f:.0}mm{tag} — {fov:.0}° hfov"));
                     }
-                    _ => self.command_line.push_line(
-                        "usage: camera 2point|persp|pano|fisheye [fov]|phone [lens]|<15|24|35|50|85>mm",
-                    ),
+                    _ => self.command_line.push_line(CAMERA_USAGE),
                 }
             }
         }
@@ -5454,6 +5497,8 @@ impl App {
                         size_points: [rect.width(), rect.height()],
                         rect,
                         samples: self.msaa_samples(),
+                        show_grid: self.show_grid,
+                        show_axes: self.show_axes,
                     },
                 ));
             }
@@ -6047,18 +6092,38 @@ impl App {
 
             // Project curve points to screen and draw.
             if let Geometry::Curve(curve) = &obj.geometry {
-                let pts: Vec<egui::Pos2> = curve
+                let mut pts: Vec<egui::Pos2> = curve
                     .tessellate(DISPLAY_TOL)
                     .iter()
                     .filter_map(|&p| project(view_proj, rect, p))
                     .collect();
-                for pair in pts.windows(2) {
-                    painter.line_segment([pair[0], pair[1]], stroke);
-                }
                 if curve.is_closed()
-                    && let (Some(&first), Some(&last)) = (pts.first(), pts.last())
+                    && let Some(&first) = pts.first()
                 {
-                    painter.line_segment([last, first], stroke);
+                    pts.push(first);
+                }
+                // A dashed layer linetype dashes the weighted stroke too
+                // (#364), the pattern stretched with the width.
+                let dash = doc
+                    .layers
+                    .get(&obj.layer)
+                    .and_then(|s| itsjustcad_render::linetype_dash(s.linetype));
+                match dash {
+                    Some([on1, off1, on2, off2]) => {
+                        let k = (width_px * 0.5).max(1.0);
+                        painter.extend(egui::Shape::dashed_line_with_offset(
+                            &pts,
+                            stroke,
+                            &[on1 * k, on2 * k],
+                            &[off1 * k, off2 * k],
+                            0.0,
+                        ));
+                    }
+                    None => {
+                        for pair in pts.windows(2) {
+                            painter.line_segment([pair[0], pair[1]], stroke);
+                        }
+                    }
                 }
             }
         }
@@ -10280,12 +10345,13 @@ impl App {
             LightMode::Sun => Some(LightModeTag::Sun),
             LightMode::Presentation => Some(LightModeTag::Presentation),
         };
-        // Camera projection of the focused viewport: pano/fisheye win (they
+        // Camera projection of the focused viewport: parallel (incl. the
+        // standard plan/elevation views, #364), else pano/fisheye (they
         // replace the pinhole entirely), then two-point, then plain
-        // perspective; ortho standard views check nothing.
+        // perspective.
         let cam = self.cameras[self.effective_camera_index(self.active_pane)];
         let camera = if cam.ortho {
-            None
+            Some(CameraTag::Parallel)
         } else {
             match cam.pano {
                 Some(PanoProjection::Equirect) => Some(CameraTag::Panorama),
@@ -10303,6 +10369,8 @@ impl App {
             skin: self.cad_origin,
             lang: crate::i18n::current_lang(),
             mouse_nav: self.mouse_nav,
+            show_grid: self.show_grid,
+            show_axes: self.show_axes,
         }
     }
 
@@ -11580,6 +11648,25 @@ fn save_msaa(samples: u32) {
     save_ui_json(&v);
 }
 
+/// ui.json keys of the grid and axes toggles (#364).
+const GRID_KEY: &str = "show_grid";
+const AXES_KEY: &str = "show_axes";
+
+/// `(show_grid, show_axes)` from ui.json contents; each ON when absent.
+fn view_overlays(ui: &serde_json::Value) -> (bool, bool) {
+    (ui[GRID_KEY].as_bool().unwrap_or(true), ui[AXES_KEY].as_bool().unwrap_or(true))
+}
+
+fn save_view_overlay(key: &str, on: bool) {
+    let mut v = load_ui_json();
+    v[key] = serde_json::json!(on);
+    save_ui_json(&v);
+}
+
+/// Usage line of the `camera` verb.
+const CAMERA_USAGE: &str =
+    "usage: camera parallel|persp|2point|pano|fisheye [fov]|phone [lens]|<15|24|35|50|85>mm";
+
 /// Restore the persisted Shaded feature-edge toggle (default ON when absent).
 fn load_shaded_edges() -> Option<bool> {
     load_ui_json()["shaded_edges"].as_bool()
@@ -12118,13 +12205,16 @@ const ARROW_AXES: [(egui::Key, char); 3] = [
     (egui::Key::ArrowUp, 'z'),
 ];
 
-/// SketchUp axis colour: X red, Y green, Z blue (rubber band, rotate ghost).
+/// SketchUp axis colour: X red, Y green, Z blue (rubber band, rotate ghost),
+/// the same as the viewport's world axes.
 fn axis_color(a: char) -> egui::Color32 {
-    match a {
-        'x' => egui::Color32::from_rgb(225, 85, 85),
-        'y' => egui::Color32::from_rgb(110, 200, 110),
-        _ => egui::Color32::from_rgb(95, 145, 255),
-    }
+    let [r, g, b, _] = itsjustcad_render::AXIS_RGBA[match a {
+        'x' => 0,
+        'y' => 1,
+        _ => 2,
+    }];
+    let c = |v: f32| (v * 255.0).round() as u8;
+    egui::Color32::from_rgb(c(r), c(g), c(b))
 }
 
 /// Axis letter → command-line label in SketchUp colour words.
@@ -13420,6 +13510,21 @@ mod tests {
         for v in ["offset", "box", "line"] {
             assert!(!is_destructive_verb(v), "{v} should NOT be destructive");
         }
+    }
+
+    #[test]
+    fn grid_and_axes_toggles_persist_in_ui_json() {
+        // #364: both shown when ui.json has no say; each saved key is read
+        // back on its own (the other keeps its default).
+        assert_eq!(view_overlays(&serde_json::json!({})), (true, true));
+        let mut ui = serde_json::json!({ "zoom": 1.2 });
+        ui[GRID_KEY] = serde_json::json!(false);
+        assert_eq!(view_overlays(&ui), (false, true));
+        ui[AXES_KEY] = serde_json::json!(false);
+        ui[GRID_KEY] = serde_json::json!(true);
+        assert_eq!(view_overlays(&ui), (true, false));
+        // The same keys `set_show_grid` / `set_show_axes` write.
+        assert_eq!((GRID_KEY, AXES_KEY), ("show_grid", "show_axes"));
     }
 
     #[test]

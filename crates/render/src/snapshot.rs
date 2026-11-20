@@ -4,7 +4,7 @@
 use glam::{DVec2, DVec3};
 use itsjustcad_doc::{
     hatch::{hatch_ansi, hatch_brick, hatch_concrete, hatch_earth, hatch_insulation, hatch_lines},
-    Annotation, Document, Geometry, HatchPattern, ObjectId, SceneObject,
+    Annotation, Document, Geometry, HatchPattern, LineType, ObjectId, SceneObject,
 };
 
 use crate::renderer::{hue_from_seed, ColorMode, SceneData};
@@ -359,6 +359,8 @@ pub fn snapshot_in_context(
         face_meshes: Vec::new(),
         lines: Vec::new(),
         edges: Vec::new(),
+        line_types: Vec::new(),
+        edge_types: Vec::new(),
         profile_edges: Vec::new(),
         points: Vec::new(),
         // The underlay image is decoded app-side (the app owns the `image`
@@ -374,6 +376,7 @@ pub fn snapshot_in_context(
     // its children (lot/road boundaries coincide with the source and would
     // otherwise overdraw the cue).
     let mut deferred_source_lines: Vec<(Vec<[f32; 3]>, [f32; 4], f32)> = Vec::new();
+    let mut deferred_types: Vec<LineType> = Vec::new();
     for obj in doc.objects() {
         if !obj.visible {
             continue; // hidden object (hideobj)
@@ -729,6 +732,15 @@ pub fn snapshot_in_context(
                 }
             }
         }
+        // Layer linetype (#364): the object's curves and mesh edges draw
+        // dashed. Annotation strokes (hatch patterns, text, dimensions) and
+        // points stay solid.
+        let lt = style.map(|s| s.linetype).unwrap_or_default();
+        if lt != LineType::Continuous && !matches!(obj.geometry, Geometry::Annotation(_)) {
+            mark(&mut scene.line_types, before.1, scene.lines.len(), lt);
+            mark(&mut scene.edge_types, before.2, scene.edges.len(), lt);
+            mark(&mut deferred_types, before.5, deferred_source_lines.len(), lt);
+        }
         if fade {
             let f = |c: &mut [f32; 4]| *c = fade_color(*c, theme);
             scene.meshes[before.0..]
@@ -756,8 +768,19 @@ pub fn snapshot_in_context(
     }
     // Source outlines last, so the live/frozen cue sits visibly on top of its
     // lot/road children (whose boundaries coincide with the source).
+    if !deferred_types.is_empty() {
+        let at = scene.lines.len();
+        mark(&mut scene.line_types, at, at, LineType::Continuous);
+        scene.line_types.extend(deferred_types);
+    }
     scene.lines.extend(deferred_source_lines);
     scene
+}
+
+/// Set `types[from..to]` to `lt`, padding any gap before `from` with solid.
+fn mark(types: &mut Vec<LineType>, from: usize, to: usize, lt: LineType) {
+    types.resize(from, LineType::Continuous);
+    types.resize(to, lt);
 }
 
 // The hatch tessellation functions live in itsjustcad_doc::hatch and are
@@ -846,6 +869,55 @@ mod tests {
         let scene = snapshot(&doc, Theme::Dark);
         assert_eq!((scene.meshes.len(), scene.face_meshes.len()), (1, 0));
         assert_eq!(scene.meshes[0].1, Theme::Dark.selected());
+    }
+
+    #[test]
+    fn dashed_layer_marks_its_curves_and_edges() {
+        // #364: a curve and a mesh on a dashed layer carry its linetype; the
+        // same geometry on the default layer stays solid (no entry or
+        // Continuous).
+        let mut doc = Document::default();
+        doc.layers.insert(
+            "hidden-lines".into(),
+            LayerStyle { linetype: LineType::DashDot, ..LayerStyle::default() },
+        );
+        let curve = |layer: &str| SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: layer.into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            edge_tags: None,
+            street: None,
+            face_values: None,
+            geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
+                points: vec![DVec3::ZERO, DVec3::X],
+                closed: false,
+            }),
+        };
+        doc.insert(curve("default"));
+        insert_tri(&mut doc, "default");
+        doc.insert(curve("hidden-lines"));
+        insert_tri(&mut doc, "hidden-lines");
+        let scene = snapshot(&doc, Theme::Dark);
+        assert_eq!((scene.lines.len(), scene.edges.len()), (2, 2));
+        let want = |layer: &str| {
+            if layer == "hidden-lines" { LineType::DashDot } else { LineType::Continuous }
+        };
+        let types = |list: &[LineType], i| list.get(i).copied().unwrap_or_default();
+        let (mut li, mut ei) = (0, 0);
+        for obj in doc.objects() {
+            let layer = obj.layer.as_str();
+            if matches!(obj.geometry, Geometry::Curve(_)) {
+                assert_eq!(types(&scene.line_types, li), want(layer), "curve on {layer}");
+                li += 1;
+            } else {
+                assert_eq!(types(&scene.edge_types, ei), want(layer), "edges on {layer}");
+                ei += 1;
+            }
+        }
     }
 
     #[test]
