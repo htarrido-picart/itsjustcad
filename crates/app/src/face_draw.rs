@@ -37,8 +37,9 @@ pub(crate) fn shift_press(on_axis: Option<char>, face: Option<FacePlane>) -> Shi
     }
 }
 
-/// The cursor point before any constraint: the object snap, else the face
-/// under the cursor, else the ground point.
+/// The cursor point before any constraint: the object snap (or, #373, the
+/// point on the edge under the cursor), else the face under the cursor,
+/// else the ground point.
 pub(crate) fn base_cursor(
     snap: Option<DVec3>,
     face: Option<&FaceHit>,
