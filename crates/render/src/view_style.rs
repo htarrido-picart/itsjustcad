@@ -5,7 +5,8 @@
 //!
 //! A [`ViewStyle`] carries the display mode, colour mode, lighting, profile
 //! and mesh edges, the sketchy character, the edge style (#361), the fog
-//! (#363), the grid/axes overlays and the background gradient. Missing keys
+//! (#363), ambient occlusion (#358), the grid/axes overlays and the background
+//! gradient. Missing keys
 //! take the defaults, which are today's look, so a style saved by an older
 //! build keeps loading, and unknown keys from a newer one are ignored.
 //!
@@ -16,7 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ColorMode, DisplayMode, EdgeStyle, FogStyle, LightMode, SketchyParams};
+use crate::{AoStyle, ColorMode, DisplayMode, EdgeStyle, FogStyle, LightMode, SketchyParams};
 
 /// Every display setting a style switches (#362).
 ///
@@ -36,6 +37,8 @@ pub struct ViewStyle {
     pub sketchy: SketchyParams,
     pub edges: EdgeStyle,
     pub fog: FogStyle,
+    /// Ambient occlusion (#358); off when a style saved before it loads.
+    pub ao: AoStyle,
     pub grid: bool,
     pub axes: bool,
     /// Sky/ground gradient behind the scene. `None` follows
@@ -56,6 +59,7 @@ impl Default for ViewStyle {
             sketchy: SketchyParams::default(),
             edges: EdgeStyle::default(),
             fog: FogStyle::default(),
+            ao: AoStyle::default(),
             grid: true,
             axes: true,
             gradient: None,
@@ -75,7 +79,8 @@ impl ViewStyle {
 pub enum BuiltinStyle {
     /// Today's default look.
     Modelling,
-    /// Profiles, depth cue, sun light, light fog and the sky gradient.
+    /// Profiles, depth cue, sun light, ambient occlusion, light fog and the
+    /// sky gradient.
     Presentation,
     /// Hand-drawn edges on paper.
     Sketch,
@@ -129,6 +134,7 @@ impl BuiltinStyle {
                 profiles: true,
                 edges: EdgeStyle { depth_cue: true, ..EdgeStyle::default() },
                 fog: FogStyle { on: true, start: 0.5, end: 1.0, ..FogStyle::default() },
+                ao: AoStyle { on: true, ..AoStyle::default() },
                 gradient: Some(true),
                 ..d
             },
@@ -167,6 +173,8 @@ mod tests {
         assert_eq!(d.display, DisplayMode::default());
         assert_eq!(d.edges, EdgeStyle::default());
         assert_eq!(d.fog, FogStyle::default());
+        assert_eq!(d.ao, AoStyle::default());
+        assert!(!d.ao.on, "AO off by default (#358)");
         assert!(d.mesh_edges && d.grid && d.axes && !d.profiles && !d.gradient_on());
         let empty: ViewStyle = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, d);
@@ -176,10 +184,27 @@ mod tests {
         assert!(partial.fog.on);
         assert_eq!(partial.fog.end, FogStyle::default().end);
         assert_eq!(partial.light, LightMode::Working);
+        // A style saved before AO existed loads with AO off; one with AO
+        // keeps it, missing AO keys defaulted.
+        assert_eq!(partial.ao, AoStyle::default());
+        let with_ao: ViewStyle = serde_json::from_str(r#"{"ao":{"on":true,"intensity":0.9}}"#).unwrap();
+        assert_eq!(with_ao.ao, AoStyle { on: true, intensity: 0.9, ..AoStyle::default() });
     }
 
     #[test]
     fn round_trips_through_json() {
+        let custom = ViewStyle {
+            ao: AoStyle {
+                on: true,
+                distance: 0.25,
+                units: crate::AoUnits::World,
+                intensity: 0.3,
+                color: [10, 20, 30],
+            },
+            ..ViewStyle::default()
+        };
+        let back: ViewStyle = serde_json::from_value(serde_json::to_value(custom).unwrap()).unwrap();
+        assert_eq!(back, custom, "AO round trip");
         for b in BuiltinStyle::ALL {
             let s = b.style();
             let back: ViewStyle = serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap();
@@ -190,7 +215,10 @@ mod tests {
     #[test]
     fn builtins_set_their_fields() {
         let p = BuiltinStyle::Presentation.style();
-        assert!(p.profiles && p.edges.depth_cue && p.fog.on && p.gradient_on());
+        assert!(p.profiles && p.edges.depth_cue && p.fog.on && p.ao.on && p.gradient_on());
+        for b in BuiltinStyle::ALL {
+            assert_eq!(b.style().ao.on, b == BuiltinStyle::Presentation, "{}", b.name());
+        }
         assert_eq!(p.light, LightMode::Sun);
         let s = BuiltinStyle::Sketch.style();
         assert_eq!(s.display, DisplayMode::Sketchy);

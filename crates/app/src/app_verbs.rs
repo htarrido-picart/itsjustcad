@@ -72,6 +72,9 @@ pub enum AppVerb {
     /// Fog (#363): `fog [on|off]`, `fog <start%> <end%>`, `fog colour
     /// bg|custom [#rrggbb]|#rrggbb` (`color` too).
     Fog(FogVerb),
+    /// Ambient occlusion (#358): `ao [on|off]`, `ao distance <n%|n[m]>`,
+    /// `ao intensity <0..1>`, `ao colour #rrggbb` (`ambientocclusion` too).
+    Ao(AoVerb),
     /// Named viewport styles (#362): `style <name> [all]`, `style
     /// save|update|delete <name>`, `style [list]`.
     Style(crate::view_styles::StyleVerb),
@@ -343,6 +346,69 @@ pub fn apply_fog_style(
     style
 }
 
+/// One `ao` verb (#358).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AoVerb {
+    /// `ao [on|off|toggle]`; `None` = bare toggle.
+    Toggle(Option<bool>),
+    /// `ao distance <n>%` (a fraction of the scene) or `ao distance <n>[m]`
+    /// (world units). Turns AO on.
+    Distance(f32, itsjustcad_render::AoUnits),
+    /// `ao intensity <0..1>` (or `<n>%`). Turns AO on.
+    Intensity(f32),
+    /// `ao colour #rrggbb|black` (`color` too).
+    Colour([u8; 3]),
+}
+
+/// The words after `ao`.
+fn parse_ao<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<AoVerb> {
+    use itsjustcad_render::{parse_hex_rgb, AoUnits};
+    let num = |w: &str| w.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    let out = match words.next().map(str::to_ascii_lowercase).as_deref() {
+        Some("distance" | "dist" | "radius") => {
+            let w = words.next()?;
+            match w.strip_suffix('%') {
+                Some(p) => AoVerb::Distance(num(p).filter(|v| *v <= 100.0)? / 100.0, AoUnits::Scene),
+                None => AoVerb::Distance(num(w.strip_suffix('m').unwrap_or(w))?, AoUnits::World),
+            }
+        }
+        Some("intensity" | "strength") => {
+            let w = words.next()?;
+            let v = match w.strip_suffix('%') {
+                Some(p) => p.parse::<f32>().ok()? / 100.0,
+                None => w.parse::<f32>().ok()?,
+            };
+            AoVerb::Intensity((0.0..=1.0).contains(&v).then_some(v)?)
+        }
+        Some("colour" | "color") => match words.next()?.to_ascii_lowercase().as_str() {
+            "black" => AoVerb::Colour([0, 0, 0]),
+            hex => AoVerb::Colour(parse_hex_rgb(hex)?),
+        },
+        w => AoVerb::Toggle(on_off(w)?),
+    };
+    words.next().is_none().then_some(out)
+}
+
+/// An `ao` verb applied to `style` (#358), shared by the app and the
+/// headless runner. Other verbs leave it unchanged.
+pub fn apply_ao_style(mut style: itsjustcad_render::AoStyle, verb: &AppVerb) -> itsjustcad_render::AoStyle {
+    match *verb {
+        AppVerb::Ao(AoVerb::Toggle(on)) => style.on = on.unwrap_or(!style.on),
+        AppVerb::Ao(AoVerb::Distance(d, units)) => {
+            style.on = true;
+            style.distance = d;
+            style.units = units;
+        }
+        AppVerb::Ao(AoVerb::Intensity(v)) => {
+            style.on = true;
+            style.intensity = v;
+        }
+        AppVerb::Ao(AoVerb::Colour(rgb)) => style.color = rgb,
+        _ => {}
+    }
+    style
+}
+
 /// `edgecolor [layer|same|material|axis] [#rrggbb]`.
 fn parse_edge_color<'a>(
     mut words: impl Iterator<Item = &'a str>,
@@ -438,6 +504,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             AppVerb::Extension(on, m)
         }
         "fog" => AppVerb::Fog(parse_fog(words)?),
+        "ao" | "ambientocclusion" => AppVerb::Ao(parse_ao(words)?),
         "style" => AppVerb::Style(crate::view_styles::parse(words)?),
         "antialias" | "aa" => AppVerb::AntiAlias(match words.next() {
             None => None,
@@ -632,6 +699,53 @@ mod tests {
         assert_eq!(classify("style delete a"), st(StyleVerb::Delete("a".into())));
         assert_eq!(classify("style save"), None);
         assert_eq!(classify("style a b"), None);
+    }
+
+    #[test]
+    fn classifies_ao_verbs() {
+        use itsjustcad_render::AoUnits;
+        // #358: toggle, distance (scene % or world units), intensity, colour.
+        let ao = |v| Some(AppVerb::Ao(v));
+        assert_eq!(classify("ao"), ao(AoVerb::Toggle(None)));
+        assert_eq!(classify("ao on"), ao(AoVerb::Toggle(Some(true))));
+        assert_eq!(classify("ambientocclusion off"), ao(AoVerb::Toggle(Some(false))));
+        assert_eq!(classify("ao distance 5%"), ao(AoVerb::Distance(0.05, AoUnits::Scene)));
+        assert_eq!(classify("ao distance 0.5"), ao(AoVerb::Distance(0.5, AoUnits::World)));
+        assert_eq!(classify("ao radius 2m"), ao(AoVerb::Distance(2.0, AoUnits::World)));
+        assert_eq!(classify("ao intensity 0.8"), ao(AoVerb::Intensity(0.8)));
+        assert_eq!(classify("ao intensity 50%"), ao(AoVerb::Intensity(0.5)));
+        assert_eq!(classify("ao colour #102030"), ao(AoVerb::Colour([16, 32, 48])));
+        assert_eq!(classify("ao color black"), ao(AoVerb::Colour([0, 0, 0])));
+        for bad in [
+            "ao distance",
+            "ao distance 0",
+            "ao distance -1",
+            "ao distance 150%",
+            "ao intensity 2",
+            "ao intensity -0.1",
+            "ao colour plaid",
+            "ao thick",
+            "ao on off",
+        ] {
+            assert_eq!(classify(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn ao_verbs_apply_to_the_style() {
+        use itsjustcad_render::{AoStyle, AoUnits};
+        let mut a = AoStyle::default();
+        a = apply_ao_style(a, &classify("ao distance 0.4").unwrap());
+        assert!(a.on && (a.distance, a.units) == (0.4, AoUnits::World), "a distance turns AO on");
+        a = apply_ao_style(a, &classify("ao").unwrap());
+        assert!(!a.on);
+        a = apply_ao_style(a, &classify("ao intensity 0.9").unwrap());
+        assert!(a.on && a.intensity == 0.9);
+        a = apply_ao_style(a, &classify("ao colour #ff0000").unwrap());
+        assert_eq!(a.color, [255, 0, 0]);
+        a = apply_ao_style(a, &classify("ao distance 10%").unwrap());
+        assert_eq!((a.distance, a.units), (0.1, AoUnits::Scene));
+        assert_eq!(apply_ao_style(a, &classify("fog on").unwrap()), a);
     }
 
     #[test]
@@ -888,6 +1002,7 @@ mod tests {
         "edgecolor",
         "extension",
         "fog",
+        "ao",
         "style",
         "ze",
         "zoomextents",
@@ -940,6 +1055,7 @@ mod tests {
         "snap",         // alias of `osnap`
         "parallelprojection", // alias of `parallel`
         "edgecolour",   // alias of `edgecolor`
+        "ambientocclusion", // alias of `ao`
     ];
 
     #[test]
@@ -991,6 +1107,8 @@ mod tests {
             "edgecolour",
             "extension",
             "fog",
+            "ao",
+            "ambientocclusion",
             "style",
             "camera",
             "save",
@@ -1058,6 +1176,8 @@ mod tests {
             "fog on",
             "fog 20 100",
             "fog colour bg",
+            "ao on",
+            "ao distance 5%",
             "style presentation",
             "style save review",
             "ze",
@@ -1127,6 +1247,11 @@ mod tests {
             "fog 20 100",
             "fog colour bg",
             "fog colour #ffffff",
+            "ao on",
+            "ao distance 5%",
+            "ao distance 0.5",
+            "ao intensity 0.6",
+            "ao colour #000000",
             "style presentation",
             "style sketch all",
             "style save review",
@@ -1152,6 +1277,8 @@ mod tests {
         assert!(h.contains("edgecolor layer|same|material|axis"));
         assert!(h.contains("fog on|off") && h.contains("fog <start%> <end%>"));
         assert!(h.contains("fog colour bg|#rrggbb"));
+        assert!(h.contains("ao on|off") && h.contains("ao distance <n%|n>"));
+        assert!(h.contains("ao intensity <0..1>") && h.contains("ao colour #rrggbb"));
         assert!(h.contains("style <name> [all]") && h.contains("style save|update|delete <name>"));
         for b in itsjustcad_render::BuiltinStyle::ALL {
             assert!(h.contains(b.name()), "{}", b.name());

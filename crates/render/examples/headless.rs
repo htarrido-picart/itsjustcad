@@ -221,6 +221,7 @@ fn main() {
         show_axes: true,
         edge_style: Default::default(),
         fog: Default::default(),
+        ao: Default::default(),
         background: [0.0; 4],
     };
 }
