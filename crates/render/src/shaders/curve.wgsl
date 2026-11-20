@@ -2,24 +2,8 @@
 // In pencil mode (camera.misc.x < 0) unselected lines render black (ink on
 // paper); high-saturation colours (selection highlights) are preserved.
 
-struct Camera {
-    view_proj: mat4x4<f32>,
-    inv_view_proj: mat4x4<f32>,
-    eye: vec4<f32>,
-    misc: vec4<f32>,
-    light: vec4<f32>,
-    // x,y = target size (device px), z = stroke width (device px); see vs_fat.
-    // w = device px per logical px, scaling the dash patterns (0 reads as 1).
-    screen: vec4<f32>,
-    // Edge styles (#361): x = depth-cue width of the nearest strokes (device
-    // px, 0 = off), y = 1 draws back edges, z = device px per logical px.
-    edges: vec4<f32>,
-    // Depth-cue ramp: dot(p, xyz) + w is 0 at the nearest scene point, 1 at
-    // the farthest.
-    cue: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> camera: Camera;
+// Camera and fogged() come from common.wgsl. Every stroke carries its
+// world position to the fragment for the fog (#363).
 
 struct ObjectParams {
     color: vec4<f32>,
@@ -30,9 +14,14 @@ struct ObjectParams {
 
 @group(1) @binding(0) var<uniform> object: ObjectParams;
 
+struct LineOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) world: vec3<f32>,
+};
+
 @vertex
-fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
-    return camera.view_proj * vec4(position, 1.0);
+fn vs_main(@location(0) position: vec3<f32>) -> LineOut {
+    return LineOut(camera.view_proj * vec4(position, 1.0), position);
 }
 
 // World-axis variant: nudge the clip-space depth a few Depth24Plus ULPs toward
@@ -42,15 +31,15 @@ fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
 // per-pixel and the (opaque, gradient-mode) grid stipples over the axes.
 // A fixed-function depth bias can't be used: wgpu rejects it on line topology.
 @vertex
-fn vs_axis(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+fn vs_axis(@location(0) position: vec3<f32>) -> LineOut {
     var clip = camera.view_proj * vec4(position, 1.0);
     clip.z -= 5e-7 * clip.w; // ~8 ULPs of Depth24Plus in NDC
-    return clip;
+    return LineOut(clip, position);
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return ink();
+fn fs_main(in: LineOut) -> @location(0) vec4<f32> {
+    return fogged(ink(), in.world);
 }
 
 fn ink() -> vec4<f32> {
@@ -83,6 +72,7 @@ struct FatOut {
     @location(1) @interpolate(flat) len_px: f32,
     // Stroke width in device px (the depth cue varies it per segment).
     @location(2) @interpolate(flat) width: f32,
+    @location(3) world: vec3<f32>,
 };
 
 // Fraction of the eye distance a stroke is pulled toward the camera so it wins
@@ -137,6 +127,7 @@ fn fat_quad(vi: u32, a: vec3<f32>, b: vec3<f32>, width: f32) -> FatOut {
         out.pos = vec4(2.0, 2.0, 2.0, 1.0); // fully clipped
         out.local = vec2(0.0);
         out.len_px = 0.0;
+        out.world = a;
         return out;
     }
     if (ca.w < near) {
@@ -162,9 +153,11 @@ fn fat_quad(vi: u32, a: vec3<f32>, b: vec3<f32>, width: f32) -> FatOut {
     let half_w = width * 0.5 + 1.0; // +1 px for the AA ramp
     var clip = ca;
     var along = -1.0;
+    out.world = a;
     if (c.x > 0.5) {
         clip = cb;
         along = 1.0;
+        out.world = b;
     }
     let off = nrm * c.y * half_w + dir * along * half_w;
     clip = vec4(clip.xy + off / half_size * clip.w, clip.z, clip.w);
@@ -176,7 +169,7 @@ fn fat_quad(vi: u32, a: vec3<f32>, b: vec3<f32>, width: f32) -> FatOut {
 
 @fragment
 fn fs_fat(in: FatOut) -> @location(0) vec4<f32> {
-    return fat_ink(in.local, in.len_px, in.width);
+    return fogged(fat_ink(in.local, in.len_px, in.width), in.world);
 }
 
 fn fat_ink(local: vec2<f32>, len_px: f32, width: f32) -> vec4<f32> {
@@ -201,6 +194,7 @@ struct DashOut {
     @location(0) s: f32,
     // Clip w: the eye depth in perspective, 1 in parallel views.
     @location(1) w: f32,
+    @location(2) world: vec3<f32>,
 };
 
 // Whether the dash pattern is "on" at distance `s` along the stroke, for a
@@ -234,6 +228,7 @@ fn vs_dash(@location(0) p: vec4<f32>) -> DashOut {
     out.pos = clip;
     out.s = p.w;
     out.w = clip.w;
+    out.world = p.xyz;
     return out;
 }
 
@@ -242,7 +237,7 @@ fn fs_dash(in: DashOut) -> @location(0) vec4<f32> {
     if (!dash_on(in.s, in.w)) {
         discard;
     }
-    return ink();
+    return fogged(ink(), in.world);
 }
 
 struct FatDashOut {
@@ -252,6 +247,7 @@ struct FatDashOut {
     @location(2) s: f32,
     @location(3) w: f32,
     @location(4) @interpolate(flat) width: f32,
+    @location(5) world: vec3<f32>,
 };
 
 @vertex
@@ -269,6 +265,7 @@ fn vs_fat_dash(
     // Corners 1, 4 and 5 sit at the segment's end (see `corners` above).
     out.s = select(a.w, b.w, vi == 1u || vi == 4u || vi == 5u);
     out.w = q.pos.w;
+    out.world = q.world;
     return out;
 }
 
@@ -277,7 +274,7 @@ fn fs_fat_dash(in: FatDashOut) -> @location(0) vec4<f32> {
     if (!dash_on(in.s, in.w)) {
         discard;
     }
-    return fat_ink(in.local, in.len_px, in.width);
+    return fogged(fat_ink(in.local, in.len_px, in.width), in.world);
 }
 
 // Back edges (#361, SketchUp): the edges hidden behind faces, drawn after the
@@ -311,6 +308,6 @@ fn fs_back(in: FatOut) -> @location(0) vec4<f32> {
     if (fract(max(in.local.y, 0.0) / (pat.x + pat.y)) * (pat.x + pat.y) >= pat.x) {
         discard;
     }
-    let c = fat_ink(in.local, in.len_px, in.width);
+    let c = fogged(fat_ink(in.local, in.len_px, in.width), in.world);
     return vec4(c.rgb, c.a * BACK_ALPHA);
 }

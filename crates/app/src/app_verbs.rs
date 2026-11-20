@@ -69,6 +69,9 @@ pub enum AppVerb {
     /// `.0` `None` = bare toggle (a lone length turns it on), `.1` = the
     /// overshoot in m.
     Extension(Option<bool>, Option<f32>),
+    /// Fog (#363): `fog [on|off]`, `fog <start%> <end%>`, `fog colour
+    /// bg|custom [#rrggbb]|#rrggbb` (`color` too).
+    Fog(FogVerb),
     /// Viewport anti-aliasing (`antialias off|2|4|8` / `aa`): the MSAA sample
     /// count, 1 = off (#356). `None` reports the current setting.
     AntiAlias(Option<u32>),
@@ -264,6 +267,79 @@ fn toggle_with_number<'a>(
     words.next().is_none().then_some(out)
 }
 
+/// One `fog` verb (#363).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FogVerb {
+    /// `fog [on|off|toggle]`; `None` = bare toggle.
+    Toggle(Option<bool>),
+    /// `fog <start%> <end%>`: the fade's start and end as fractions (0..1)
+    /// of the view depth, start below end. Turns the fog on.
+    Range(f32, f32),
+    /// `fog colour [bg|custom] [#rrggbb]`: the colour source and the custom
+    /// colour (a lone colour means custom). Both `None` reports.
+    Colour(Option<itsjustcad_render::FogColor>, Option<[u8; 3]>),
+}
+
+/// The words after `fog`.
+fn parse_fog<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<FogVerb> {
+    use itsjustcad_render::{parse_hex_rgb, FogColor};
+    let pct = |w: &str| {
+        let v: f32 = w.trim_end_matches('%').parse().ok()?;
+        (v.is_finite() && (0.0..=100.0).contains(&v)).then_some(v / 100.0)
+    };
+    let out = match words.next() {
+        Some(w) if w.eq_ignore_ascii_case("colour") || w.eq_ignore_ascii_case("color") => {
+            match words.next().map(str::to_ascii_lowercase).as_deref() {
+                None => FogVerb::Colour(None, None),
+                Some("bg" | "background") => FogVerb::Colour(Some(FogColor::Background), None),
+                Some("custom") => FogVerb::Colour(
+                    Some(FogColor::Custom),
+                    match words.next() {
+                        None => None,
+                        Some(hex) => Some(parse_hex_rgb(hex)?),
+                    },
+                ),
+                Some(hex) => FogVerb::Colour(Some(FogColor::Custom), Some(parse_hex_rgb(hex)?)),
+            }
+        }
+        Some(w) if pct(w).is_some() => {
+            let (start, end) = (pct(w)?, pct(words.next()?)?);
+            if start >= end {
+                return None;
+            }
+            FogVerb::Range(start, end)
+        }
+        w => FogVerb::Toggle(on_off(w)?),
+    };
+    words.next().is_none().then_some(out)
+}
+
+/// A fog verb applied to `style` (#363), shared by the app and the headless
+/// runner. Other verbs leave it unchanged; a bare `fog colour` only reports.
+pub fn apply_fog_style(
+    mut style: itsjustcad_render::FogStyle,
+    verb: &AppVerb,
+) -> itsjustcad_render::FogStyle {
+    match *verb {
+        AppVerb::Fog(FogVerb::Toggle(on)) => style.on = on.unwrap_or(!style.on),
+        AppVerb::Fog(FogVerb::Range(start, end)) => {
+            style.on = true;
+            style.start = start;
+            style.end = end;
+        }
+        AppVerb::Fog(FogVerb::Colour(color, rgb)) => {
+            if let Some(c) = color {
+                style.color = c;
+            }
+            if let Some(rgb) = rgb {
+                style.custom_rgb = rgb;
+            }
+        }
+        _ => {}
+    }
+    style
+}
+
 /// `edgecolor [layer|same|material|axis] [#rrggbb]`.
 fn parse_edge_color<'a>(
     mut words: impl Iterator<Item = &'a str>,
@@ -358,6 +434,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             let (on, m) = toggle_with_number(words, 0.001..=10.0)?;
             AppVerb::Extension(on, m)
         }
+        "fog" => AppVerb::Fog(parse_fog(words)?),
         "antialias" | "aa" => AppVerb::AntiAlias(match words.next() {
             None => None,
             Some(arg) => Some(parse_msaa(arg)?),
@@ -504,6 +581,54 @@ mod tests {
         assert_eq!(classify("extension on 0.2"), Some(AppVerb::Extension(Some(true), Some(0.2))));
         assert_eq!(classify("extension 0.3m"), Some(AppVerb::Extension(Some(true), Some(0.3))));
         assert_eq!(classify("extension off"), Some(AppVerb::Extension(Some(false), None)));
+    }
+
+    #[test]
+    fn classifies_fog_verbs() {
+        use itsjustcad_render::FogColor;
+        // #363: toggle, range in percent, colour.
+        let fog = |v| Some(AppVerb::Fog(v));
+        assert_eq!(classify("fog"), fog(FogVerb::Toggle(None)));
+        assert_eq!(classify("fog on"), fog(FogVerb::Toggle(Some(true))));
+        assert_eq!(classify("fog off"), fog(FogVerb::Toggle(Some(false))));
+        assert_eq!(classify("fog 20 80"), fog(FogVerb::Range(0.2, 0.8)));
+        assert_eq!(classify("fog 0% 100%"), fog(FogVerb::Range(0.0, 1.0)));
+        assert_eq!(classify("fog 80 20"), None, "start below end");
+        assert_eq!(classify("fog 20 120"), None);
+        assert_eq!(classify("fog 20"), None);
+        assert_eq!(classify("fog 20 30 40"), None);
+        assert_eq!(classify("fog thick"), None);
+        assert_eq!(classify("fog colour"), fog(FogVerb::Colour(None, None)));
+        assert_eq!(classify("fog colour bg"), fog(FogVerb::Colour(Some(FogColor::Background), None)));
+        assert_eq!(classify("fog color background"), fog(FogVerb::Colour(Some(FogColor::Background), None)));
+        assert_eq!(classify("fog colour custom"), fog(FogVerb::Colour(Some(FogColor::Custom), None)));
+        assert_eq!(
+            classify("fog color #ff8000"),
+            fog(FogVerb::Colour(Some(FogColor::Custom), Some([255, 128, 0])))
+        );
+        assert_eq!(
+            classify("fog colour custom 102030"),
+            fog(FogVerb::Colour(Some(FogColor::Custom), Some([16, 32, 48])))
+        );
+        assert_eq!(classify("fog colour plaid"), None);
+        assert_eq!(classify("fog colour bg #ffffff"), None);
+    }
+
+    #[test]
+    fn fog_verbs_apply_to_the_style() {
+        use itsjustcad_render::{FogColor, FogStyle};
+        let mut f = FogStyle::default();
+        f = apply_fog_style(f, &classify("fog 10 50").unwrap());
+        assert!(f.on && (f.start, f.end) == (0.1, 0.5), "a range turns fog on");
+        f = apply_fog_style(f, &classify("fog").unwrap());
+        assert!(!f.on);
+        f = apply_fog_style(f, &classify("fog colour #102030").unwrap());
+        assert_eq!((f.color, f.custom_rgb), (FogColor::Custom, [16, 32, 48]));
+        // Back to the background keeps the custom colour for later.
+        f = apply_fog_style(f, &classify("fog colour bg").unwrap());
+        assert_eq!((f.color, f.custom_rgb), (FogColor::Background, [16, 32, 48]));
+        assert_eq!(apply_fog_style(f, &classify("fog colour").unwrap()), f, "report only");
+        assert_eq!(apply_fog_style(f, &classify("grid off").unwrap()), f);
     }
 
     #[test]
@@ -742,6 +867,7 @@ mod tests {
         "depthcue",
         "edgecolor",
         "extension",
+        "fog",
         "ze",
         "zoomextents",
         "zs",
@@ -843,6 +969,7 @@ mod tests {
             "edgecolor",
             "edgecolour",
             "extension",
+            "fog",
             "camera",
             "save",
             "help",
@@ -906,6 +1033,9 @@ mod tests {
             "depthcue on 3",
             "edgecolor axis",
             "extension on",
+            "fog on",
+            "fog 20 100",
+            "fog colour bg",
             "ze",
             "zoomextents",
             "top",
@@ -969,6 +1099,10 @@ mod tests {
             "edgecolor material",
             "edgecolor axis",
             "extension on 0.1",
+            "fog on",
+            "fog 20 100",
+            "fog colour bg",
+            "fog colour #ffffff",
             "render glass pavilion at dusk",
             "render cancel",
             itsjustcad_deck::FEEDBACK_EXAMPLE_LINE,
@@ -987,6 +1121,8 @@ mod tests {
         assert!(h.contains("grid on|off") && h.contains("axes on|off"));
         assert!(h.contains("backedges on|off") && h.contains("depthcue on|off [px]"));
         assert!(h.contains("edgecolor layer|same|material|axis"));
+        assert!(h.contains("fog on|off") && h.contains("fog <start%> <end%>"));
+        assert!(h.contains("fog colour bg|#rrggbb"));
     }
 
     #[test]

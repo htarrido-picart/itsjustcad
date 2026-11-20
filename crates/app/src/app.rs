@@ -677,6 +677,10 @@ pub struct App {
     /// `ui.json` as one object (#362 named styles bundle it). View state,
     /// never logged.
     edge_style: itsjustcad_render::EdgeStyle,
+    /// Viewport fog (#363): on/off, start/end as fractions of the view depth,
+    /// colour. Off by default; persisted to `ui.json` as one object (#362
+    /// named styles bundle it). GPU-only view state, never logged.
+    fog_style: itsjustcad_render::FogStyle,
     /// Requested viewport anti-aliasing: MSAA sample count 1 (off), 2, 4 or 8
     /// (#356). Default 4x; set by `antialias off|2|4|8` / View menu. Persisted
     /// to `ui.json`. The count drawn is the highest supported one not above it.
@@ -1634,6 +1638,7 @@ impl App {
             show_grid: view_overlays(&load_ui_json()).0,
             show_axes: view_overlays(&load_ui_json()).1,
             edge_style: edge_style_from(&load_ui_json()),
+            fog_style: fog_style_from(&load_ui_json()),
             msaa: load_msaa().unwrap_or(itsjustcad_render::DEFAULT_MSAA),
             msaa_supported,
             plant_symbols: false,
@@ -2334,6 +2339,12 @@ impl App {
                     None => self.command_line.push_line(EDGE_USAGE),
                 }
             }
+            // Fog (#363): GPU-only view state, never logged; persisted to
+            // ui.json.
+            Some("fog") => match crate::app_verbs::classify(line) {
+                Some(verb) => self.apply_fog_verb(verb),
+                None => self.command_line.push_line(FOG_USAGE),
+            },
             Some("grid" | "axes" | "parallel" | "parallelprojection")
                 if crate::app_verbs::classify(line).is_some() =>
             {
@@ -3663,6 +3674,36 @@ impl App {
         self.edge_style = crate::app_verbs::apply_edge_style(self.edge_style, &verb);
         save_edge_style(&self.edge_style);
         self.command_line.push_line(self.edge_style.summary());
+    }
+
+    /// The flat colour behind the 3D scene: the window's clear colour, and
+    /// the fog's background colour when the gradient is off (#363).
+    fn viewport_background(&self, dark_mode: bool) -> [f32; 4] {
+        // Pencil and Sketchy force paper white regardless of the egui theme.
+        // Use the active pane's display mode to drive the clear colour.
+        let active_mode =
+            self.display_modes[self.effective_camera_index(self.active_pane)];
+        if let Some(paper) = active_mode.background_override() {
+            return paper;
+        }
+        // Dark mode wins for the 3D model space: a near-black off-grey, even
+        // under a legacy-CAD preset (whose fixed light-grey/white bg would
+        // otherwise ignore the dark theme).
+        if dark_mode {
+            return scene::Theme::Dark.background();
+        }
+        // Light mode: honour the active legacy-CAD preset background.
+        if self.cad_origin != CadOrigin::None {
+            return preset::preset_for(self.cad_origin).bg_color;
+        }
+        scene::Theme::Light.background()
+    }
+
+    /// Apply a fog verb (#363), persist the fog and report it.
+    fn apply_fog_verb(&mut self, verb: crate::app_verbs::AppVerb) {
+        self.fog_style = crate::app_verbs::apply_fog_style(self.fog_style, &verb);
+        save_fog_style(&self.fog_style);
+        self.command_line.push_line(self.fog_style.summary());
     }
 
     /// `camera <parallel|2point|persp|pano|fisheye [fov]|15|24|35|50|85|phone|phonewide>`.
@@ -5527,6 +5568,8 @@ impl App {
                         show_grid: self.show_grid,
                         show_axes: self.show_axes,
                         edge_style: self.edge_style,
+                        fog: self.fog_style,
+                        background: self.viewport_background(ui.visuals().dark_mode),
                     },
                 ));
             }
@@ -10400,6 +10443,7 @@ impl App {
             show_grid: self.show_grid,
             show_axes: self.show_axes,
             edges: self.edge_style.into(),
+            fog: self.fog_style.into(),
         }
     }
 
@@ -11710,6 +11754,25 @@ fn save_edge_style(style: &itsjustcad_render::EdgeStyle) {
     save_ui_json(&v);
 }
 
+/// ui.json key of the fog (#363).
+const FOG_STYLE_KEY: &str = "fog_style";
+
+/// Usage of the fog verb (#363).
+const FOG_USAGE: &str =
+    "usage: fog on|off · fog <start%> <end%> (start below end, % of the view depth) · fog colour bg|custom|#rrggbb";
+
+/// The fog saved in ui.json contents; defaults (off) for missing or
+/// unreadable keys.
+fn fog_style_from(ui: &serde_json::Value) -> itsjustcad_render::FogStyle {
+    serde_json::from_value(ui[FOG_STYLE_KEY].clone()).unwrap_or_default()
+}
+
+fn save_fog_style(style: &itsjustcad_render::FogStyle) {
+    let mut v = load_ui_json();
+    v[FOG_STYLE_KEY] = serde_json::to_value(style).unwrap_or_default();
+    save_ui_json(&v);
+}
+
 /// Usage line of the `camera` verb.
 const CAMERA_USAGE: &str =
     "usage: camera parallel|persp|2point|pano|fisheye [fov]|phone [lens]|<15|24|35|50|85>mm";
@@ -12431,24 +12494,7 @@ fn draw_rubber_box(
 
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        // Pencil and Sketchy force paper white regardless of the egui theme.
-        // Use the active pane's display mode to drive the clear colour.
-        let active_mode =
-            self.display_modes[self.effective_camera_index(self.active_pane)];
-        if let Some(paper) = active_mode.background_override() {
-            return paper;
-        }
-        // Dark mode wins for the 3D model space: a near-black off-grey, even
-        // under a legacy-CAD preset (whose fixed light-grey/white bg would
-        // otherwise ignore the dark theme).
-        if visuals.dark_mode {
-            return scene::Theme::Dark.background();
-        }
-        // Light mode: honour the active legacy-CAD preset background.
-        if self.cad_origin != CadOrigin::None {
-            return preset::preset_for(self.cad_origin).bg_color;
-        }
-        scene::Theme::Light.background()
+        self.viewport_background(visuals.dark_mode)
     }
 
     fn on_exit(&mut self) {
@@ -13556,6 +13602,30 @@ mod tests {
         assert!(is_destructive_verb("Delete"));
         for v in ["offset", "box", "line"] {
             assert!(!is_destructive_verb(v), "{v} should NOT be destructive");
+        }
+    }
+
+    #[test]
+    fn fog_verbs_apply_and_persist_in_ui_json() {
+        use crate::app_verbs::{apply_fog_style, classify};
+        use itsjustcad_render::{FogColor, FogStyle};
+        // #363: no key (or a broken one) is no fog.
+        assert_eq!(fog_style_from(&serde_json::json!({})), FogStyle::default());
+        assert_eq!(fog_style_from(&serde_json::json!({ FOG_STYLE_KEY: "thick" })), FogStyle::default());
+        let mut fog = FogStyle::default();
+        for line in ["fog 10 60", "fog colour #102030"] {
+            fog = apply_fog_style(fog, &classify(line).unwrap());
+        }
+        assert!(fog.on);
+        assert_eq!((fog.start, fog.end, fog.color), (0.1, 0.6, FogColor::Custom));
+        // Saved as one object under one key, read back whole; other keys
+        // (the edge style) are untouched.
+        let ui = serde_json::json!({ "zoom": 1.0, FOG_STYLE_KEY: serde_json::to_value(fog).unwrap() });
+        assert_eq!(fog_style_from(&ui), fog);
+        assert_eq!(edge_style_from(&ui), itsjustcad_render::EdgeStyle::default());
+        // Usage names every form the classifier takes.
+        for form in ["fog on|off", "fog <start%> <end%>", "fog colour bg|custom|#rrggbb"] {
+            assert!(FOG_USAGE.contains(form), "{form}");
         }
     }
 

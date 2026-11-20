@@ -220,5 +220,7 @@ fn main() {
         show_grid: true,
         show_axes: true,
         edge_style: Default::default(),
+        fog: Default::default(),
+        background: [0.0; 4],
     };
 }

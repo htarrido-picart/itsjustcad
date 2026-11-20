@@ -73,6 +73,7 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("depthcue", "Display", "depthcue [on|off] [px]"),
     ("edgecolor", "Display", "edgecolor layer|same|material|axis [#rrggbb]"),
     ("extension", "Display", "extension [on|off] [m]"),
+    ("fog", "Display", "fog [on|off] | fog <start%> <end%> | fog colour bg|#rrggbb"),
     ("parallel", "Camera", "parallel [on|off]"),
     ("edgefx", "Display", "edgefx jitter=.. extension=.."),
     // Camera / lens.
