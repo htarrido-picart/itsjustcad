@@ -62,6 +62,7 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("sketchy", "Display", "sketchy [on|off]"),
     ("profileedges", "Display", "profileedges [on|off]"),
     ("shadededges", "Display", "shadededges [on|off]"),
+    ("antialias", "Display", "antialias off|2|4|8"),
     ("edgefx", "Display", "edgefx jitter=.. extension=.."),
     // Camera / lens.
     ("camera", "Camera", "camera 2point|persp|pano|fisheye [fov]|<n>mm|phone <lens>"),

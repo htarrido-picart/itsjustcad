@@ -38,6 +38,12 @@ pub struct ViewportCallback {
     /// Pane size in egui points, for the hidden-line and sketchy strokes
     /// ([`DisplayMode::line_px`], itsjustcad-ios#174). Zero keeps hairlines.
     pub size_points: [f32; 2],
+    /// The pane rect in egui points (the paint callback's rect). Sizes the
+    /// pane's MSAA target to egui's exact viewport pixels.
+    pub rect: egui::Rect,
+    /// MSAA sample count for the scene, already clamped to what the device
+    /// supports (1 = off, draw straight into egui's pass). #356.
+    pub samples: u32,
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -46,7 +52,7 @@ impl CallbackTrait for ViewportCallback {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         screen_desc: &egui_wgpu::ScreenDescriptor,
-        _encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let renderer: &mut SceneRenderer = resources.get_mut().expect("SceneRenderer registered");
@@ -78,6 +84,23 @@ impl CallbackTrait for ViewportCallback {
             && (renderer.generation != self.generation || self.force)
         {
             renderer.set_scene(device, queue, scene, self.generation);
+        }
+        // Every pane shares one count, so only a setting change rebuilds.
+        renderer.set_sample_count(device, self.samples.max(1));
+        if renderer.sample_count() > 1 {
+            let vp = egui::epaint::ViewportInPixels::from_points(
+                &self.rect,
+                screen_desc.pixels_per_point,
+                screen_desc.size_in_pixels,
+            );
+            renderer.render_msaa_pane(
+                device,
+                encoder,
+                self.viewport,
+                [vp.width_px.max(0) as u32, vp.height_px.max(0) as u32],
+                self.mode,
+                self.edges_enabled,
+            );
         }
         Vec::new()
     }
@@ -112,6 +135,10 @@ impl CallbackTrait for ViewportCallback {
         );
 
         let renderer: &SceneRenderer = resources.get().expect("SceneRenderer registered");
-        renderer.paint(render_pass, self.viewport, self.mode, self.edges_enabled);
+        if renderer.sample_count() > 1 {
+            renderer.composite_msaa_pane(render_pass, self.viewport);
+        } else {
+            renderer.paint(render_pass, self.viewport, self.mode, self.edges_enabled);
+        }
     }
 }

@@ -44,6 +44,9 @@ pub enum AppVerb {
     /// Toggle the thin mesh feature edges drawn in Shaded mode by default
     /// (`shadededges [on|off]` / `meshedges`). `None` means bare toggle.
     ShadedEdges(Option<bool>),
+    /// Viewport anti-aliasing (`antialias off|2|4|8` / `aa`): the MSAA sample
+    /// count, 1 = off (#356). `None` reports the current setting.
+    AntiAlias(Option<u32>),
     /// Toggle 2D top-view planting symbols for planted trees
     /// (`plantsymbols [on|off]` / `plansymbols`). `None` means bare toggle.
     /// When on, each `plant:<id>` mesh also draws its plan drafting glyph flat
@@ -184,6 +187,17 @@ pub fn standard_view(name: &str) -> Option<StandardView> {
     })
 }
 
+/// Parse an `antialias` argument into an MSAA sample count (1 = off).
+pub fn parse_msaa(arg: &str) -> Option<u32> {
+    Some(match arg.to_ascii_lowercase().as_str() {
+        "off" | "none" | "0" | "1" | "1x" => 1,
+        "2" | "2x" => 2,
+        "4" | "4x" | "on" => 4,
+        "8" | "8x" => 8,
+        _ => return None,
+    })
+}
+
 /// Classify a command line as an app-level verb, or `None` if it should fall
 /// through to the substrate parser / draw tools. The single source of truth
 /// for which verbs the app owns.
@@ -206,6 +220,10 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             Some("off" | "false" | "0") => Some(false),
             None => None,
             _ => return None,
+        }),
+        "antialias" | "aa" => AppVerb::AntiAlias(match words.next() {
+            None => None,
+            Some(arg) => Some(parse_msaa(arg)?),
         }),
         "plantsymbols" | "plansymbols" => AppVerb::PlantSymbols(match words.next() {
             Some("on" | "true" | "1") => Some(true),
@@ -305,6 +323,18 @@ mod tests {
             classify("camera fisheye 120"),
             Some(AppVerb::Camera(Some("fisheye".into()), Some("120".into())))
         );
+    }
+
+    #[test]
+    fn classifies_antialias_verb() {
+        assert_eq!(classify("antialias off"), Some(AppVerb::AntiAlias(Some(1))));
+        assert_eq!(classify("aa 2"), Some(AppVerb::AntiAlias(Some(2))));
+        assert_eq!(classify("aa 4x"), Some(AppVerb::AntiAlias(Some(4))));
+        assert_eq!(classify("antialias 8"), Some(AppVerb::AntiAlias(Some(8))));
+        assert_eq!(classify("antialias"), Some(AppVerb::AntiAlias(None)));
+        // Unsupported counts are rejected (usage error), not silently clamped.
+        assert_eq!(classify("antialias 16"), None);
+        assert_eq!(classify("aa 3"), None);
     }
 
     #[test]
@@ -534,6 +564,8 @@ mod tests {
         "cutexport",     // GUI-only
         "template",     // GUI-only
         "save",         // fs write — refused on deck plane
+        "antialias",    // render-quality setting, not a drawing/view verb
+        "aa",           // alias of `antialias`
         "reducemotion",  // accessibility toggle, not a drawing/view verb the model reframes with
         "chatencryption", // privacy setting, not a drawing/view verb
         "encryptchats",   // alias of `chatencryption`
@@ -571,6 +603,8 @@ mod tests {
             "profiles",
             "shadededges",
             "meshedges",
+            "antialias",
+            "aa",
             "plantsymbols",
             "plansymbols",
             "massing",

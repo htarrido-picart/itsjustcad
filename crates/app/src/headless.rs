@@ -259,6 +259,9 @@ pub fn run_script_lines(
             Some(AppVerb::Gumball(_)) => {
                 // No gizmo in headless mode — silently accepted.
             }
+            Some(AppVerb::AntiAlias(_)) => {
+                // Headless renders stay single-sample — silently accepted.
+            }
             Some(AppVerb::ReduceMotion(_)) => {
                 // No animated UI in headless mode — silently accepted.
             }

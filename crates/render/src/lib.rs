@@ -8,6 +8,7 @@ mod contrast;
 mod control;
 mod cubemap;
 mod layout;
+mod msaa;
 mod pano;
 mod batch;
 mod renderer;
@@ -36,6 +37,10 @@ pub use sketchy::{
 pub use snapshot::{
     fade_color, object_wireframe_world, snapshot, snapshot_hiding, snapshot_in_context,
     snapshot_with_mode, ColorModeSnapshot, Theme,
+};
+pub use msaa::{
+    counts_from_flags, pick_sample_count, supported_sample_counts, MsaaTarget, DEFAULT_MSAA,
+    MSAA_CHOICES,
 };
 pub use viewport_callback::ViewportCallback;
 
