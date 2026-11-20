@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-use glam::{Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec3};
 
 use crate::pano::PanoProjection;
+
+/// Closest a cursor zoom brings the eye to the point it zooms toward, as depth
+/// along the view axis in world units: twice the near clip, so the point never
+/// clips away.
+pub const ZOOM_STANDOFF: f32 = 0.1;
+/// Camera-to-target distance range kept by `dolly` and `zoom_at`.
+const MIN_DISTANCE: f32 = 0.05;
+const MAX_DISTANCE: f32 = 1.0e5;
+/// Far clip of the pinhole projections (and half the parallel depth range).
+const FAR: f32 = 5.0e4;
 
 /// Z-up orbit camera with Rhino-style controls (RMB orbit, Shift+RMB pan, scroll dolly).
 #[derive(Clone, Copy, Debug)]
@@ -81,7 +91,87 @@ impl OrbitCamera {
     }
 
     pub fn dolly(&mut self, scroll: f32) {
-        self.distance = (self.distance * (1.0 - scroll * 0.002)).clamp(0.05, 1.0e5);
+        self.distance = (self.distance * (1.0 - scroll * 0.002)).clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+
+    /// The eye `view_proj` looks from: the levelled eye in two-point
+    /// perspective, else [`Self::eye`].
+    pub fn view_eye(&self) -> Vec3 {
+        if self.two_point && !self.ortho {
+            let (sy, cy) = self.yaw.sin_cos();
+            self.target + self.distance * Vec3::new(cy, sy, 0.0)
+        } else {
+            self.eye()
+        }
+    }
+
+    /// The 3D point under the cursor, given the pick ray `origin`/`dir` through
+    /// it (unprojected from `view_proj`) and `hit`, the ray parameter of the
+    /// nearest geometry on it (`itsjustcad_doc::pick::ray_hit`): that hit,
+    /// else the ground plane z = 0 when the ray meets it in front of the camera
+    /// and inside the far clip, else the point on the ray at the target's depth.
+    /// Cursor zoom (#365) zooms toward it; orbit about the cursor (#366) pivots
+    /// on it.
+    pub fn cursor_focus(&self, origin: DVec3, dir: DVec3, hit: Option<f64>) -> DVec3 {
+        if let Some(t) = hit.filter(|t| t.is_finite() && *t >= 0.0) {
+            return origin + dir * t;
+        }
+        let eye = self.view_eye().as_dvec3();
+        let target = self.target.as_dvec3();
+        let fwd = (target - eye).normalize_or_zero();
+        if dir.z.abs() > 1e-12 {
+            let t = -origin.z / dir.z;
+            let p = origin + dir * t;
+            if t > 0.0 && (p - eye).dot(fwd) <= f64::from(FAR) {
+                return p;
+            }
+        }
+        let t = (target - origin).dot(fwd) / dir.dot(fwd);
+        if t.is_finite() { origin + dir * t } else { target }
+    }
+
+    /// Zoom by `factor` (> 1 closer, < 1 farther) toward `focus`, which stays
+    /// on the same pixel: eye and target scale about `focus`, so the ray from
+    /// the eye to it keeps its direction (perspective and two-point), and the
+    /// parallel view height, which is `distance`, scales by the same ratio.
+    /// Speed follows the distance to `focus`: in perspective the gap between
+    /// its depth and [`ZOOM_STANDOFF`] shrinks by `factor`, so steps slow down
+    /// smoothly near it and never reach or pass it. With `focus` = `target`
+    /// only the eye moves, as in `dolly`. A panorama/fisheye cannot hold a pixel still, so it
+    /// dollies toward the target.
+    pub fn zoom_at(&mut self, focus: Vec3, factor: f32) {
+        if !factor.is_finite() || factor <= 0.0 || !focus.is_finite() || self.distance <= 0.0 {
+            return;
+        }
+        let focus = if self.pano.is_some() { self.target } else { focus };
+        let eye = self.view_eye();
+        let fwd = (self.target - eye).normalize_or_zero();
+        let depth = (focus - eye).dot(fwd);
+        let mut g = if self.ortho || depth <= ZOOM_STANDOFF {
+            // Already at the standoff: only zooming out moves.
+            if !self.ortho && factor > 1.0 {
+                return;
+            }
+            1.0 / factor
+        } else {
+            (ZOOM_STANDOFF + (depth - ZOOM_STANDOFF) / factor) / depth
+        };
+        // A plain perspective may go nearer than MIN_DISTANCE to its target
+        // (fixed below); parallel and two-point views draw with `distance`.
+        let plain = !self.ortho && !self.two_point;
+        let d = self.distance * g;
+        if !plain || d > MAX_DISTANCE {
+            g = d.clamp(MIN_DISTANCE, MAX_DISTANCE) / self.distance;
+        }
+        let new_eye = focus + (eye - focus) * g;
+        self.target = focus + (self.target - focus) * g;
+        self.distance *= g;
+        if plain && self.distance < MIN_DISTANCE {
+            // The target is only the orbit pivot here: slide it out along the
+            // view axis, which leaves the image unchanged.
+            self.distance = MIN_DISTANCE;
+            self.target = new_eye + fwd * MIN_DISTANCE;
+        }
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
@@ -512,5 +602,97 @@ mod tests {
         let c = m * Vec3::new(0.0, 0.0, 110.0).extend(1.0);
         let z = c.z / c.w;
         assert!((0.0..=1.0).contains(&z) || (-1.0..=1.0).contains(&z), "z={z}");
+    }
+
+    /// Zooms `cam` toward `p` in steps of `factor`, asserting `p` keeps its
+    /// pixel and the eye never reaches it; returns the final depth to `p`.
+    fn zoom_keeps_pixel(mut cam: OrbitCamera, p: Vec3, factor: f32, steps: usize) -> f32 {
+        let px = |c: &OrbitCamera| screen_xy(c.view_proj(1.5), p);
+        let depth = |c: &OrbitCamera| (p - c.view_eye()).dot((c.target - c.view_eye()).normalize());
+        let before = px(&cam);
+        let mut last = depth(&cam);
+        for _ in 0..steps {
+            cam.zoom_at(p, factor);
+            let now = px(&cam);
+            assert!((now - before).length() < 1e-3, "pixel moved: {before} -> {now}");
+            let d = depth(&cam);
+            if !cam.ortho {
+                assert!(d >= ZOOM_STANDOFF * 0.999, "overshot: depth {d}");
+                assert!((d < last) == (factor > 1.0) || d == last, "{last} -> {d}");
+            }
+            last = d;
+        }
+        last
+    }
+
+    #[test]
+    fn zoom_at_keeps_the_cursor_point_on_its_pixel() {
+        let p = Vec3::new(4.0, -3.0, 0.5);
+        let persp = OrbitCamera::default();
+        zoom_keeps_pixel(persp, p, 1.2, 20);
+        zoom_keeps_pixel(persp, p, 1.0 / 1.2, 20);
+        let mut ortho = OrbitCamera::default();
+        ortho.set_view(StandardView::Top);
+        let d0 = ortho.distance;
+        zoom_keeps_pixel(ortho, p, 1.2, 20);
+        ortho.zoom_at(p, 2.0);
+        assert!((ortho.distance - d0 / 2.0).abs() < 1e-3, "parallel view height halves");
+        let two_point = OrbitCamera { two_point: true, ..OrbitCamera::default() };
+        zoom_keeps_pixel(two_point, Vec3::new(4.0, -3.0, 5.0), 1.2, 20);
+    }
+
+    #[test]
+    fn zoom_at_slows_down_and_never_passes_the_point() {
+        let p = Vec3::new(1.0, 2.0, 0.0);
+        let d = zoom_keeps_pixel(OrbitCamera::default(), p, 4.0, 200);
+        assert!((d - ZOOM_STANDOFF).abs() < 1e-3, "settles at the standoff: {d}");
+        // Steps shrink with the distance to the point.
+        let mut cam = OrbitCamera::default();
+        let depth = |c: &OrbitCamera| (p - c.eye()).length();
+        let d0 = depth(&cam);
+        cam.zoom_at(p, 2.0);
+        let d1 = depth(&cam);
+        cam.zoom_at(p, 2.0);
+        let d2 = depth(&cam);
+        assert!(d1 - d2 < (d0 - d1) * 0.6, "{d0} {d1} {d2}");
+    }
+
+    #[test]
+    fn zoom_at_a_far_point_slides_a_near_target_out() {
+        // Target almost at the eye, point far away: the target cannot get any
+        // nearer, so it moves out along the view axis instead of blocking.
+        let mut cam = OrbitCamera { distance: 0.06, ..OrbitCamera::default() };
+        let p = cam.eye() + (cam.target - cam.eye()).normalize() * 100.0 + Vec3::Z;
+        zoom_keeps_pixel(cam, p, 1.5, 5);
+        cam.zoom_at(p, 1.5);
+        assert!(cam.distance >= MIN_DISTANCE);
+    }
+
+    #[test]
+    fn zoom_at_the_target_moves_only_the_eye_and_pano_ignores_the_point() {
+        let mut a = OrbitCamera::default();
+        let t0 = a.target;
+        a.zoom_at(t0, 2.0);
+        assert_eq!(a.target, t0);
+        assert!((a.distance - 15.0).abs() < ZOOM_STANDOFF, "{}", a.distance);
+        let mut pano = OrbitCamera { pano: Some(PanoProjection::Equirect), ..OrbitCamera::default() };
+        let t = pano.target;
+        pano.zoom_at(Vec3::new(9.0, 9.0, 0.0), 2.0);
+        assert_eq!(pano.target, t);
+    }
+
+    #[test]
+    fn cursor_focus_prefers_geometry_then_ground_then_target_depth() {
+        let cam = OrbitCamera::default();
+        let eye = cam.eye().as_dvec3();
+        let down = (DVec3::new(2.0, 1.0, 0.0) - eye).normalize();
+        assert_eq!(cam.cursor_focus(eye, down, Some(3.0)), eye + down * 3.0);
+        let ground = cam.cursor_focus(eye, down, None);
+        assert!(ground.z.abs() < 1e-9 && (ground - DVec3::new(2.0, 1.0, 0.0)).length() < 1e-6);
+        // Looking at the sky: the point on the ray at the target's depth.
+        let up = (cam.target.as_dvec3() + DVec3::Z * 20.0 - eye).normalize();
+        let sky = cam.cursor_focus(eye, up, None);
+        let fwd = (cam.target - cam.eye()).normalize().as_dvec3();
+        assert!(((sky - eye).dot(fwd) - f64::from(cam.distance)).abs() < 1e-3, "{sky}");
     }
 }

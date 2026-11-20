@@ -4090,6 +4090,25 @@ impl App {
         )
     }
 
+    /// The 3D point under the cursor in the pane `rect` drawn by camera
+    /// `cam_idx`: the nearest visible geometry, else the ground, else the
+    /// target's depth ([`OrbitCamera::cursor_focus`]). Cursor zoom (#365)
+    /// zooms toward it; orbit about the cursor (#366) pivots on it.
+    fn cursor_focus(&self, cam_idx: usize, rect: egui::Rect, pos: egui::Pos2) -> glam::DVec3 {
+        let cam = &self.cameras[cam_idx];
+        let view_proj = cam.view_proj(rect.width() / rect.height().max(1.0));
+        let (origin, dir) = screen_ray(view_proj, rect, pos);
+        let hit = itsjustcad_doc::pick::ray_hit(
+            &self.session.doc,
+            view_proj,
+            glam::Vec2::new(rect.width(), rect.height()),
+            glam::Vec2::new(pos.x - rect.left(), pos.y - rect.top()),
+            origin,
+            dir,
+        );
+        cam.cursor_focus(origin, dir, hit)
+    }
+
     /// The parent → child chain under the click (#199), or `None` on a miss.
     fn hit_chain(
         &self,
@@ -4957,10 +4976,17 @@ impl App {
                 // Show grab cursor while holding the button before movement.
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             }
+            // Scroll zooms toward the point under the cursor (#365).
             if response.hovered() {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll != 0.0 {
-                    self.cameras[cam_idx].dolly(scroll);
+                    match response.hover_pos() {
+                        Some(pos) => {
+                            let focus = self.cursor_focus(cam_idx, rect, pos).as_vec3();
+                            self.cameras[cam_idx].zoom_at(focus, (scroll * 0.002).exp());
+                        }
+                        None => self.cameras[cam_idx].dolly(scroll),
+                    }
                 }
             }
             let aspect = rect.width() / rect.height().max(1.0);

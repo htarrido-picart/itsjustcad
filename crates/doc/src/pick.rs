@@ -289,6 +289,68 @@ fn pick_among(
     nearest_box(&seen).map(|i| cands[i].0.id)
 }
 
+/// Ray parameter of the nearest VISIBLE geometry under the cursor at `pos`
+/// (viewport pixels, `size` the viewport) along the pick ray `origin`/`dir`,
+/// or `None` when the ray meets nothing: the "what is under the cursor" depth
+/// that cursor zoom (#365) and orbit (#366) pivot on. Unlike [`pick_object`] it
+/// answers WHERE, not WHICH: a solid counts only where the ray crosses one of
+/// its triangles (not anywhere in its bounding box), a curve where it is
+/// within [`PICK_PX`] of its drawn line, everything else (instances, text,
+/// point clouds, wire-only lattices) where the ray enters its box.
+pub fn ray_hit(
+    doc: &Document,
+    vp: Mat4,
+    size: Vec2,
+    pos: Vec2,
+    origin: DVec3,
+    dir: DVec3,
+) -> Option<f64> {
+    let cached = doc.pick_boxes.get(doc);
+    let hidden: Vec<&str> =
+        doc.layers.iter().filter(|(_, l)| !l.visible).map(|(n, _)| n.as_str()).collect();
+    let mut best: Option<f64> = None;
+    for (o, &(rank, bb)) in doc.objects_by_id().zip(cached.iter()) {
+        if rank == u32::MAX || !o.visible || hidden.contains(&o.layer.as_str()) {
+            continue;
+        }
+        let bb = match o.geometry {
+            Geometry::Instance { .. } => doc.geometry_aabb(&o.geometry),
+            _ => bb,
+        };
+        let t = match &o.geometry {
+            Geometry::Curve(c) => {
+                let far = screen_box(vp, size, bb).is_some_and(|(lo, hi)| {
+                    let (lo, hi) = (lo - Vec2::splat(PICK_PX), hi + Vec2::splat(PICK_PX));
+                    pos.x < lo.x || pos.y < lo.y || pos.x > hi.x || pos.y > hi.y
+                });
+                match curve_pick(c, None, vp, size, pos) {
+                    Ok((d, _)) if !far && d <= PICK_PX => ray_curve_t(c, origin, dir),
+                    _ => None,
+                }
+            }
+            g => match g.mesh().filter(|m| !m.faces().is_empty()) {
+                Some(m) => ray_aabb(origin, dir, bb.min, bb.max).and_then(|_| {
+                    let p = m.positions();
+                    m.faces()
+                        .iter()
+                        .filter_map(|f| {
+                            let v = |k: usize| p.get(f[k] as usize).copied();
+                            kernel_mesh::ray_triangle(origin, dir, v(0)?, v(1)?, v(2)?)
+                        })
+                        .min_by(f64::total_cmp)
+                }),
+                None => ray_aabb(origin, dir, bb.min, bb.max),
+            },
+        };
+        if let Some(t) = t.filter(|t| t.is_finite())
+            && best.is_none_or(|b| t < b)
+        {
+            best = Some(t);
+        }
+    }
+    best
+}
+
 /// Creation-order rank and world box of every object, in
 /// [`Document::objects_by_id`] order, for picking (#301). Built on first use
 /// and dropped by every object mutation (`Document` calls
@@ -455,6 +517,32 @@ mod tests {
             vec![[0, 1, 2]],
         );
         SceneObject { geometry: Geometry::Mesh(mesh), ..poly(&[], false) }
+    }
+
+    /// `ray_hit` through the top view at pixel `(x, y)`, from z = 0.5 down.
+    fn hit(doc: &Document, x: f32, y: f32) -> Option<f64> {
+        let (vp, size) = top();
+        let w = DVec3::new((x / size.x * 2.0 - 1.0) as f64, (1.0 - y / size.y * 2.0) as f64, 0.5);
+        ray_hit(doc, vp, size, Vec2::new(x, y), w, DVec3::NEG_Z)
+    }
+
+    #[test]
+    fn ray_hit_is_the_nearest_surface_not_its_box() {
+        let mut doc = Document::default();
+        // Triangle at z = 0.2 over x,y ∈ [-0.5, 0.5], lower-left half.
+        add(&mut doc, tri(-0.5, -0.5, 0.2, 1.0));
+        let t = hit(&doc, 60.0, 140.0).unwrap(); // world (-0.4, -0.4)
+        assert!((t - 0.3).abs() < 1e-9, "{t}");
+        assert_eq!(hit(&doc, 140.0, 60.0), None, "inside its box, off the triangle");
+        // A line under the cursor at z = 0 is farther than the triangle.
+        add(&mut doc, poly(&[(-0.4, -0.9), (-0.4, 0.9)], false));
+        assert!((hit(&doc, 60.0, 140.0).unwrap() - 0.3).abs() < 1e-9);
+        assert!((hit(&doc, 60.0, 20.0).unwrap() - 0.5).abs() < 1e-9, "the line alone");
+        // Hidden geometry is not under the cursor.
+        for id in doc.objects().map(|o| o.id).collect::<Vec<_>>() {
+            doc.get_mut(id).unwrap().visible = false;
+        }
+        assert_eq!(hit(&doc, 60.0, 140.0), None);
     }
 
     /// Every click of a grid over the top view through the cached pick and

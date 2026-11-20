@@ -18,7 +18,7 @@ mod viewport_callback;
 
 pub use camera::{
     fov_for_focal_mm, phone_preset, preset_focal_mm, OrbitCamera, PhonePreset, StandardView,
-    PHONE_PRESETS,
+    PHONE_PRESETS, ZOOM_STANDOFF,
 };
 pub use control::{render_control_images, ControlImagePaths};
 pub use cubemap::{render_pano_image, PanoImage};
