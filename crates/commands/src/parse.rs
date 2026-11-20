@@ -4589,9 +4589,26 @@ fn material2_body(
     match rest {
         [] => wrong("material2", "a preset, key=value list, or 'off'", args),
         ["off"] => Ok(Command::Material2Off { targets: sel }),
+        ["texture" | "tex", file @ ..] => {
+            // `texture <file> [size <w> <h>]` (#360); the file may hold spaces.
+            let (file, size) = match file {
+                [path @ .., "size", w, h] if !path.is_empty() => {
+                    let num = |v: &str| v.parse::<f32>().ok().filter(|x| *x > 0.0 && x.is_finite());
+                    let (Some(w), Some(h)) = (num(w), num(h)) else {
+                        return wrong("material2", "texture <file> [size <w> <h>] with sizes > 0 (metres)", args);
+                    };
+                    (path, [w, h])
+                }
+                path => (path, [1.0, 1.0]),
+            };
+            if file.is_empty() {
+                return wrong("material2", "texture <file.png|jpg> [size <w> <h>]", args);
+            }
+            Ok(Command::Material2Texture { targets: sel, path: file.join(" "), size })
+        }
         [one] if MaterialPreset::parse(one).is_some() => {
             let preset = MaterialPreset::parse(one).unwrap();
-            Ok(Command::Material2 { targets: sel, material: ObjectMaterial::Preset { preset } })
+            Ok(Command::Material2 { targets: sel, material: ObjectMaterial::Preset { preset }, image: None })
         }
         tokens => {
             // Custom: key=value pairs. Defaults keep a plausible matte dielectric.
@@ -4633,6 +4650,7 @@ fn material2_body(
             Ok(Command::Material2 {
                 targets: sel,
                 material: ObjectMaterial::Custom { color, roughness, metallic },
+                image: None,
             })
         }
     }
@@ -7660,6 +7678,16 @@ mod tests {
             let back: Command = serde_json::from_str(&json).unwrap();
             assert_eq!(cmd, back, "roundtrip failed for: {line}");
         }
+        // The logged texture form (#360): image id, tile size, and the bytes
+        // on the op that first stores them.
+        let image = itsjustcad_doc::StoredImage { width: 1, height: 1, bytes: std::sync::Arc::from(&b"png"[..]) };
+        let cmd = Command::Material2 {
+            targets: Selector::Last { n: 1 },
+            material: itsjustcad_doc::ObjectMaterial::Texture { image: image.id(), size: [2.0, 1.0], color: [0.5; 3], roughness: 0.6, metallic: 0.0 },
+            image: Some(image),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
     }
 
     #[test]

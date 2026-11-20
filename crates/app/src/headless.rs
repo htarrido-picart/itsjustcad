@@ -153,6 +153,8 @@ pub struct HeadlessView {
     pub show_grid: bool,
     /// World X/Y/Z axes, from `axes [on|off]` (#364). ON by default.
     pub show_axes: bool,
+    /// Material textures, from `textures [on|off]` (#360). ON by default.
+    pub show_textures: bool,
     /// Parallel projection for the view, from `camera parallel|persp` /
     /// `parallel [on|off]` (#364). `None` keeps the view's own projection.
     pub parallel: Option<bool>,
@@ -190,6 +192,7 @@ impl HeadlessView {
             sections: self.section_style,
             grid: self.show_grid,
             axes: self.show_axes,
+            textures: self.show_textures,
             gradient: self.background_gradient,
             ..Default::default()
         }
@@ -209,6 +212,7 @@ impl HeadlessView {
         self.section_style = s.sections;
         self.show_grid = s.grid;
         self.show_axes = s.axes;
+        self.show_textures = s.textures;
         self.background_gradient = s.gradient;
     }
 }
@@ -228,6 +232,7 @@ impl Default for HeadlessView {
             plant_symbols: false,
             show_grid: true,
             show_axes: true,
+            show_textures: true,
             parallel: None,
             edge_style: Default::default(),
             fog_style: Default::default(),
@@ -337,6 +342,7 @@ pub fn run_script_lines(
                 session.run(cmd).map_err(|e| (line.clone(), e.to_string()))?;
             }
             Some(AppVerb::Axes(on)) => view.show_axes = on.unwrap_or(!view.show_axes),
+            Some(AppVerb::Textures(on)) => view.show_textures = on.unwrap_or(!view.show_textures),
             Some(AppVerb::Parallel(on)) => {
                 let on = on.unwrap_or(view.parallel != Some(true));
                 apply_camera(&mut view, Some(if on { "parallel" } else { "persp" }), None)
@@ -897,6 +903,7 @@ pub fn render_headless(
     // Target size for the dash patterns (#364); no fat-stroke width.
     let cam = itsjustcad_render::CameraUniform { screen: [W as f32, H as f32, 0.0, 1.0], ..cam }
         .with_edge_style(&view.edge_style, 1.0)
+        .with_textures(view.show_textures)
         .with_fog(&view.fog_style, theme.background())
         .with_ao(&view.ao_style, mode)
         .with_shadows(&view.shadow_style, mode, sun_dir)

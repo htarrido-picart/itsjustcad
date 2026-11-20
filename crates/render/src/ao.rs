@@ -262,7 +262,8 @@ pub(crate) struct ViewportAo {
     /// 1x1 zero occlusion bound by panes without AO (wgpu zero-fills it).
     empty: wgpu::TextureView,
     /// Whole-batch index buffers of the meshes and the face meshes.
-    flat: [FlatIndices; 2],
+    /// Flat indices of the plain, per-face and textured (#360) meshes.
+    flat: [FlatIndices; 3],
 }
 
 /// A batch's indices made absolute, for one draw of the whole batch (the
@@ -308,7 +309,7 @@ impl ViewportAo {
             pipes: None,
             panes: Vec::new(),
             empty: texture(device, "ao_empty", OCCLUSION, [1, 1]),
-            flat: [FlatIndices::new("ao_flat_indices"), FlatIndices::new("ao_flat_indices")],
+            flat: std::array::from_fn(|_| FlatIndices::new("ao_flat_indices")),
         }
     }
 
@@ -379,7 +380,7 @@ impl SceneRenderer {
                 *slot = None;
                 self.rebind_camera(device, viewport);
                 if self.ao.panes.iter().all(Option::is_none) {
-                    self.ao.flat = [FlatIndices::new("ao_flat_indices"), FlatIndices::new("ao_flat_indices")];
+                    self.ao.flat = std::array::from_fn(|_| FlatIndices::new("ao_flat_indices"));
                 }
             }
             return;
@@ -392,9 +393,10 @@ impl SceneRenderer {
             self.ao.panes[viewport] = Some(AoTarget::new(device, pipes, &self.cameras[viewport].0, size_px));
             self.rebind_camera(device, viewport);
         }
-        let [flat_meshes, flat_faces] = &mut self.ao.flat;
+        let [flat_meshes, flat_faces, flat_tex] = &mut self.ao.flat;
         flat_meshes.update(device, queue, &self.meshes);
         flat_faces.update(device, queue, &self.face_meshes);
+        flat_tex.update(device, queue, &self.tex_meshes);
         let (Some(pipes), Some(Some(t))) = (&self.ao.pipes, self.ao.panes.get(viewport)) else {
             return;
         };
@@ -405,6 +407,7 @@ impl SceneRenderer {
             self.ao.flat[0].draw(&mut p, &self.meshes);
             p.set_pipeline(&pipes.prepass_face);
             self.ao.flat[1].draw(&mut p, &self.face_meshes);
+            self.ao.flat[2].draw(&mut p, &self.tex_meshes);
         }
         {
             let mut p = pass(encoder, "ao_pass", &t.raw, None);

@@ -733,8 +733,8 @@ pub fn registry() -> &'static [CommandSpec] {
             // (base color + roughness + metallic, or a preset) — a different
             // concept, so it gets its own verb rather than overloading `material`.
             name: "material2",
-            usage: "material2 <selector> <concrete|glass|metal|wood | roughness=.. metallic=.. color=r,g,b | off>",
-            summary: "Set a per-object appearance material for rendering: a preset (concrete/glass/metal/wood) or custom scalars (roughness=0..1, metallic=0..1, color=r,g,b). Presets shade visibly differently (glass smooth, concrete matte, metal specular). 'material2 last off' clears it. Distinct from 'material' (structural E+density). Example: material2 last glass · material2 walls roughness=0.9 metallic=0 color=0.6,0.6,0.6",
+            usage: "material2 <selector> <concrete|glass|metal|wood | roughness=.. metallic=.. color=r,g,b | texture <file.png|jpg> [size <w> <h>] | off>",
+            summary: "Set a per-object appearance material for rendering: a preset (concrete/glass/metal/wood), custom scalars (roughness=0..1, metallic=0..1, color=r,g,b), or an image texture tiled every w × h metres (box-mapped; saved in the file). Presets shade visibly differently (glass smooth, concrete matte, metal specular). 'material2 last off' clears it. Distinct from 'material' (structural E+density). Example: material2 last glass · material2 walls texture brick.jpg size 2 1",
             category: Category::Annotate,
         },
         CommandSpec {

@@ -21,6 +21,7 @@ mod section_style;
 mod shadow_style;
 mod sketchy;
 mod snapshot;
+mod texture;
 mod viewport_callback;
 mod view_history;
 mod view_style;
@@ -59,6 +60,7 @@ pub use msaa::{
     counts_from_flags, pick_sample_count, supported_sample_counts, MsaaTarget, DEFAULT_MSAA,
     MSAA_CHOICES,
 };
+pub use texture::{box_uv, box_uvs, TexturedMesh};
 pub use viewport_callback::ViewportCallback;
 pub use view_history::{ViewHistory, HISTORY_CAP, SETTLE_SECS};
 pub use view_style::{BuiltinStyle, ViewStyle};

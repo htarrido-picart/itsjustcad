@@ -673,6 +673,10 @@ pub struct App {
     /// World X/Y/Z axes drawn in every viewport (`axes on|off`, #364). ON by
     /// default; persisted to `ui.json`. View state, never logged.
     show_axes: bool,
+    /// Material textures drawn (`textures on|off`, #360, SketchUp's Shaded
+    /// with Textures). ON by default; persisted to `ui.json`. View state,
+    /// never logged.
+    show_textures: bool,
     /// Edge styles outside Sketchy (#361): back edges, depth cue, edge
     /// colour, extension. Defaults are the classic look; persisted to
     /// `ui.json` as one object (#362 named styles bundle it). View state,
@@ -1666,6 +1670,7 @@ impl App {
             shaded_edges: load_shaded_edges().unwrap_or(true),
             show_grid: view_overlays(&load_ui_json()).0,
             show_axes: view_overlays(&load_ui_json()).1,
+            show_textures: load_ui_json()[TEXTURES_KEY].as_bool().unwrap_or(true),
             edge_style: edge_style_from(&load_ui_json()),
             fog_style: fog_style_from(&load_ui_json()),
             ao_style: ao_style_from(&load_ui_json()),
@@ -2408,13 +2413,14 @@ impl App {
                 Some(crate::app_verbs::AppVerb::Style(verb)) => self.run_style_verb(line, verb),
                 _ => self.command_line.push_line(crate::view_styles::STYLE_USAGE),
             },
-            Some("grid" | "axes" | "parallel" | "parallelprojection")
+            Some("grid" | "axes" | "textures" | "parallel" | "parallelprojection")
                 if crate::app_verbs::classify(line).is_some() =>
             {
                 use crate::app_verbs::AppVerb;
                 match crate::app_verbs::classify(line) {
                     Some(AppVerb::Grid(on)) => self.set_show_grid(on),
                     Some(AppVerb::Axes(on)) => self.set_show_axes(on),
+                    Some(AppVerb::Textures(on)) => self.set_show_textures(on),
                     Some(AppVerb::Parallel(on)) => {
                         let on = on.unwrap_or(!self.active_camera().ortho);
                         self.set_camera(Some(if on { "parallel" } else { "persp" }), None);
@@ -3735,6 +3741,15 @@ impl App {
             .push_line(format!("grid: {}", if self.show_grid { "on" } else { "off" }));
     }
 
+    /// Show or hide material textures (`textures [on|off]`, #360); `None`
+    /// flips. Persisted to ui.json.
+    fn set_show_textures(&mut self, on: Option<bool>) {
+        self.show_textures = on.unwrap_or(!self.show_textures);
+        save_view_overlay(TEXTURES_KEY, self.show_textures);
+        self.command_line
+            .push_line(format!("textures: {}", if self.show_textures { "on" } else { "off" }));
+    }
+
     /// Show or hide the world axes (`axes [on|off]`, #364); `None` flips.
     /// Persisted to ui.json.
     fn set_show_axes(&mut self, on: Option<bool>) {
@@ -3921,6 +3936,7 @@ impl App {
             sections: self.section_style,
             grid: self.show_grid,
             axes: self.show_axes,
+            textures: self.show_textures,
             gradient: self.background_gradient,
         }
     }
@@ -3947,6 +3963,8 @@ impl App {
         save_view_overlay(GRID_KEY, s.grid);
         self.show_axes = s.axes;
         save_view_overlay(AXES_KEY, s.axes);
+        self.show_textures = s.textures;
+        save_view_overlay(TEXTURES_KEY, s.textures);
         self.edge_style = s.edges;
         save_edge_style(&s.edges);
         self.fog_style = s.fog;
@@ -5875,6 +5893,7 @@ impl App {
                         samples: self.msaa_samples(),
                         show_grid: self.show_grid,
                         show_axes: self.show_axes,
+                        show_textures: self.show_textures,
                         edge_style: self.edge_style,
                         fog: self.fog_style,
                         ao: self.ao_style,
@@ -10764,6 +10783,7 @@ impl App {
             mouse_nav: self.mouse_nav,
             show_grid: self.show_grid,
             show_axes: self.show_axes,
+            show_textures: self.show_textures,
             edges: self.edge_style.into(),
             fog: self.fog_style.into(),
             ao: self.ao_style.on,
@@ -12064,6 +12084,8 @@ fn save_msaa(samples: u32) {
 /// ui.json keys of the grid and axes toggles (#364).
 const GRID_KEY: &str = "show_grid";
 const AXES_KEY: &str = "show_axes";
+/// ui.json key of the textures toggle (#360).
+const TEXTURES_KEY: &str = "show_textures";
 
 /// `(show_grid, show_axes)` from ui.json contents; each ON when absent.
 fn view_overlays(ui: &serde_json::Value) -> (bool, bool) {

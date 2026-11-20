@@ -258,6 +258,10 @@ pub struct Document {
     /// environmental analyses (`shadowstudy`, `sunhours`). Logged via a
     /// `location` op so saved files replay it.
     pub location: Option<GeoLocation>,
+    /// Content-addressed texture images (#360), filled by the logged
+    /// `imageadd` op. Empty (and omitted) in files without textures.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub images: BTreeMap<crate::ImageId, crate::StoredImage>,
     /// Display-only name of the place the location was geocoded from
     /// (`geocode`, #215), shown in the Daylight panel. Set and cleared with
     /// `location`; analyses never read it.
@@ -417,6 +421,7 @@ impl Default for Document {
             basemap: None,
             sun: None,
             location: None,
+            images: BTreeMap::new(),
             place_name: None,
             climate: None,
             sections: BTreeMap::new(),

@@ -150,6 +150,36 @@ impl Staged {
         self.params.push(params);
     }
 
+    /// Append a textured mesh (#360): each vertex interleaves position,
+    /// normal and `[u, v, 0]` (9 floats, the per-face layout, so the depth
+    /// passes and section caps read it as they read face meshes).
+    pub fn push_textured(
+        &mut self,
+        positions: &[[f32; 3]],
+        normals: &[[f32; 3]],
+        uvs: &[[f32; 2]],
+        indices: &[u32],
+        params: ObjectParams,
+    ) {
+        if indices.is_empty() {
+            return;
+        }
+        let base_vertex = (self.vertices.len() / 9) as i32;
+        for ((p, n), [u, v]) in positions.iter().zip(normals).zip(uvs) {
+            self.vertices.extend_from_slice(p);
+            self.vertices.extend_from_slice(n);
+            self.vertices.extend_from_slice(&[*u, *v, 0.0]);
+        }
+        self.draws.push(Draw {
+            first: self.indices.len() as u32,
+            count: indices.len() as u32,
+            base_vertex,
+            slot: self.params.len() as u32,
+        });
+        self.indices.extend_from_slice(indices);
+        self.params.push(params);
+    }
+
     /// Append a run of `[x, y, z]` points drawn as one vertex range.
     pub fn push_points(&mut self, points: &[[f32; 3]], params: ObjectParams) {
         self.draws.push(Draw {
