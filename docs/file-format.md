@@ -54,7 +54,7 @@ See the `option` command for switching between branches.
 
 **Logged** (mutates model state): every geometry and annotation command — including the newer domains: landscape ops (`terrain`, `contours`, `pad`, `plant`, `plantrow`, `miyawaki`, `sitepath`), structural members (`beam`, `column`, `slab`, `wall`, `grid`, `story`, `load`, `support`), `room` tags, `codecheck` runs, and `constrain`.
 
-**Not logged** (I/O or queries): `select`, `print`, `export`, `import`, `distance`, `area`, `volume`, `bbox`, `schedule`, `report`, `plantcatalog`, `rooms`, `undo`, `redo`, `amend`, `option`. View / camera / UI verbs (display, lighting, camera, panels, basemap, `plantsymbols`) and privacy/accessibility toggles (`chatencryption`, `reducemotion`) are session/UI state and are never logged either.
+**Not logged** (I/O or queries): `select`, `print`, `export`, `import`, `distance`, `area`, `volume`, `bbox`, `schedule`, `report`, `plantcatalog`, `rooms`, `undo`, `redo`, `amend`, `option`. View / camera / UI verbs (display, lighting, camera, panels, basemap, `plantsymbols`) and privacy/accessibility/input toggles (`chatencryption`, `reducemotion`, `mouse`) are session/UI state and are never logged either.
 
 `import` is the notable exception: DXF import expands each entity into its equivalent substrate op (`line`, `polyline`, etc.) which *are* logged. The `import` command itself is not logged, so replay never re-reads the source file. The same "expand once, replay disk-free" pattern applies to `terrain`, `codecheck`, `cutfill`, and `radiation` — the resolved data (mesh, rule set + marker ids, pre-grading heights, EPW irradiance bins) is embedded in the logged op so replay never needs the original file.
 

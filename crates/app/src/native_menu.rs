@@ -221,6 +221,12 @@ impl NativeMenuBar {
                 it.set_checked(view.skin == origin);
             }
         }
+        // Mouse radios (Theme ▸ Mouse): exactly the active preset checked.
+        for (id, nav) in crate::menu::mouse_radio_items() {
+            if let Some(it) = self.check_items.get(&format!("Theme/{id}")) {
+                it.set_checked(view.mouse_nav == nav);
+            }
+        }
         // Language radios (Theme ▸ Language): exactly the active language checked.
         for (id, lang) in crate::menu::lang_radio_items() {
             if let Some(it) = self.check_items.get(&format!("Theme/{id}")) {
@@ -463,6 +469,13 @@ mod tests {
                     checks.get(&format!("Theme/{id}")),
                     Some(&MenuAction::SetSkin(origin)),
                     "skin radio {id} not routed for {style:?}"
+                );
+            }
+            for (id, nav) in crate::menu::mouse_radio_items() {
+                assert_eq!(
+                    checks.get(&format!("Theme/{id}")),
+                    Some(&MenuAction::SetMouseNav(nav)),
+                    "mouse radio {id} not routed for {style:?}"
                 );
             }
             for (id, lang) in lang_radio_items() {

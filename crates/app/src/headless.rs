@@ -265,6 +265,9 @@ pub fn run_script_lines(
             Some(AppVerb::ReduceMotion(_)) => {
                 // No animated UI in headless mode — silently accepted.
             }
+            Some(AppVerb::Mouse(_)) => {
+                // No pointer input in headless mode — silently accepted.
+            }
             Some(AppVerb::Language(lang)) => {
                 // Set the process locale (affects any subsequent printed
                 // strings). Not persisted in headless mode.

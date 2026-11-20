@@ -77,6 +77,7 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("critique", "Tools", "critique [note]"),
     ("feedback", "Help", "feedback bug|idea | title: … | <field>: …"),
     ("reducemotion", "Tools", "reducemotion [on|off]"),
+    ("mouse", "Tools", "mouse right|middle"),
 ];
 
 /// The palette summary of an app verb that opens a titled panel: its menu

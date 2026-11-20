@@ -966,6 +966,9 @@ pub struct App {
     /// egui's built-in animation (no indeterminate shimmer). Persisted to
     /// `ui.json`; honours accessibility / Reduce Motion preference.
     reduce_motion: bool,
+    /// Mouse-navigation preset (#367): which button orbits/pans. Persisted to
+    /// `ui.json`; view state, never logged.
+    mouse_nav: crate::nav::MouseNav,
     /// Whether the Help → About dialog is open.
     show_about: bool,
     /// The open feedback review sheet (`feedback` / Help ▸ Report a problem…).
@@ -1672,6 +1675,7 @@ impl App {
             dock_left: None,
             panel_visible: true,
             reduce_motion: load_reduce_motion(),
+            mouse_nav: load_mouse_nav(),
             show_about: false,
             feedback_sheet: None,
             cut_export: None,
@@ -2496,6 +2500,13 @@ impl App {
                     }
                 }
             }
+            // Mouse-navigation preset (`mouse right|middle`, #367). Applies
+            // live, persists to ui.json; view state, never logged. Never
+            // touches the active tool.
+            Some("mouse") => match words.next().and_then(crate::nav::MouseNav::from_code) {
+                Some(nav) => self.set_mouse_nav(nav),
+                None => self.command_line.push_line("usage: mouse right|middle"),
+            },
             // Toggle Reduce Motion: disables animated progress bars.
             // View/session state, never logged; persisted to ui.json.
             Some("reducemotion") => {
@@ -5028,14 +5039,18 @@ impl App {
                 }
             }
 
-            // Rhino muscle memory: RMB orbit, Shift+RMB pan, scroll dolly.
-            // Orbit pivots on the point under the cursor at drag start (#366).
-            if response.dragged_by(egui::PointerButton::Secondary)
-                || response.dragged_by(egui::PointerButton::Middle)
-            {
+            // Navigation drags per the mouse preset (#367): orbit / Shift-pan
+            // with RMB or MMB (default) or MMB only. Orbit pivots on the point
+            // under the cursor at drag start (#366). Pure camera state: the
+            // active tool, guided step, rubber band and gumball are untouched.
+            let shift = ui.input(|i| i.modifiers.shift);
+            let nav_drag = [egui::PointerButton::Middle, egui::PointerButton::Secondary]
+                .into_iter()
+                .find(|b| response.dragged_by(*b))
+                .and_then(|b| self.mouse_nav.drag(b, shift));
+            if let Some(nav_drag) = nav_drag {
                 let delta = response.drag_delta();
-                let shift = ui.input(|i| i.modifiers.shift);
-                if shift {
+                if nav_drag == crate::nav::NavDrag::Pan {
                     self.orbit_pivot = None;
                     self.cameras[cam_idx].pan(delta.x, delta.y);
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -5062,11 +5077,12 @@ impl App {
             } else if self.orbit_pivot.is_some_and(|(p, _)| p == pane) {
                 self.orbit_pivot = None;
             }
+            let nav = self.mouse_nav;
             if response.hovered()
                 && ui.input(|i| {
-                    i.pointer
-                        .button_down(egui::PointerButton::Secondary)
-                        || i.pointer.button_down(egui::PointerButton::Middle)
+                    [egui::PointerButton::Secondary, egui::PointerButton::Middle]
+                        .into_iter()
+                        .any(|b| nav.navigates(b) && i.pointer.button_down(b))
                 })
             {
                 // Show grab cursor while holding the button before movement.
@@ -9716,7 +9732,17 @@ impl App {
             antialias: self.msaa,
             skin: self.cad_origin,
             lang: crate::i18n::current_lang(),
+            mouse_nav: self.mouse_nav,
         }
+    }
+
+    /// Apply + persist the mouse-navigation preset (verb, menu and Settings
+    /// share this). View state only: the active tool is left untouched.
+    fn set_mouse_nav(&mut self, nav: crate::nav::MouseNav) {
+        self.mouse_nav = nav;
+        save_mouse_nav(nav);
+        self.command_line
+            .push_line(format!("mouse: {} ({})", crate::i18n::t(nav.label_key()), nav.code()));
     }
 
     /// Toggle the right docked panel from the View menu, mirroring the ⌘\
@@ -9822,6 +9848,8 @@ impl App {
             // Theme ▸ Language radio: apply live + persist, exactly like the
             // `language en|es` verb.
             MenuAction::SetLanguage(lang) => save_lang(lang),
+            // Theme ▸ Mouse radio: same path as the `mouse <preset>` verb.
+            MenuAction::SetMouseNav(nav) => self.set_mouse_nav(nav),
             // Quit / Close (⌘Q / ⌘W). Single-window app: both route through the
             // dirty-doc guard and, if clean (or after Discard), close the window —
             // which terminates the process. Close is Quit's twin here because
@@ -10111,6 +10139,25 @@ impl App {
                 })
                 .response
                 .on_hover_text(crate::i18n::t("settings.language.help"));
+                ui.add_space(4.0);
+
+                // Mouse navigation preset (#367); same path as `mouse <preset>`.
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(crate::i18n::t("settings.mouse.label")).strong());
+                    let mut nav = self.mouse_nav;
+                    egui::ComboBox::from_id_salt("settings_mouse_nav")
+                        .selected_text(crate::i18n::t(nav.label_key()))
+                        .show_ui(ui, |ui| {
+                            for m in crate::nav::MouseNav::ALL {
+                                ui.selectable_value(&mut nav, m, crate::i18n::t(m.label_key()));
+                            }
+                        });
+                    if nav != self.mouse_nav {
+                        self.set_mouse_nav(nav);
+                    }
+                })
+                .response
+                .on_hover_text(crate::i18n::t("settings.mouse.help"));
                 ui.separator();
 
                 // The one live download (if any), shown at the top.
@@ -11123,6 +11170,25 @@ fn load_reduce_motion() -> bool {
 fn save_reduce_motion(on: bool) {
     let mut v = load_ui_json();
     v["reduce_motion"] = serde_json::json!(on);
+    save_ui_json(&v);
+}
+
+/// Restore the mouse-navigation preset (#367); default when absent/unknown.
+fn load_mouse_nav() -> crate::nav::MouseNav {
+    mouse_nav_from_ui_json(&load_ui_json())
+}
+
+fn mouse_nav_from_ui_json(v: &serde_json::Value) -> crate::nav::MouseNav {
+    serde_json::from_value(v["mouse_nav"].clone()).unwrap_or_default()
+}
+
+fn put_mouse_nav(v: &mut serde_json::Value, nav: crate::nav::MouseNav) {
+    v["mouse_nav"] = serde_json::json!(nav.code());
+}
+
+fn save_mouse_nav(nav: crate::nav::MouseNav) {
+    let mut v = load_ui_json();
+    put_mouse_nav(&mut v, nav);
     save_ui_json(&v);
 }
 
@@ -14507,6 +14573,99 @@ mod tests {
             assert!((centre - rect.center()).length() < 1.0, "target on the centre");
             let was = project(before, rect, target.as_dvec3()).expect("in front");
             assert!((was - at).length() < 1.0, "recentred on the clicked point: {was} vs {at}");
+        });
+    }
+
+    #[test]
+    fn mouse_nav_persists_through_ui_json() {
+        use crate::nav::MouseNav;
+        for nav in MouseNav::ALL {
+            let mut v = serde_json::json!({ "zoom": 1.25 });
+            put_mouse_nav(&mut v, nav);
+            let file = serde_json::to_string_pretty(&v).unwrap();
+            let back: serde_json::Value = serde_json::from_str(&file).unwrap();
+            assert_eq!(mouse_nav_from_ui_json(&back), nav);
+            assert_eq!(back["zoom"], 1.25, "other ui.json keys kept");
+        }
+        assert_eq!(mouse_nav_from_ui_json(&serde_json::json!({})), MouseNav::Right);
+        let junk = serde_json::json!({ "mouse_nav": "wheel" });
+        assert_eq!(mouse_nav_from_ui_json(&junk), MouseNav::Right);
+    }
+
+    /// Drag `button` (with `modifiers`) from `from` by `steps` × (9, 4) px.
+    #[cfg(test)]
+    fn nav_drag(
+        h: &mut egui_kittest::Harness<'_, App>,
+        from: egui::Pos2,
+        button: egui::PointerButton,
+        modifiers: egui::Modifiers,
+    ) {
+        let ev = |pressed, pos| egui::Event::PointerButton { pos, button, pressed, modifiers };
+        h.input_mut().events.push(egui::Event::PointerMoved(from));
+        h.input_mut().events.push(ev(true, from));
+        h.run_steps(1);
+        let mut pos = from;
+        for _ in 0..6 {
+            pos += egui::vec2(9.0, 4.0);
+            h.input_mut().events.push(egui::Event::PointerMoved(pos));
+            h.run_steps(1);
+        }
+        h.input_mut().events.push(ev(false, pos));
+        h.run_steps(2);
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_navigation_mid_draw_keeps_the_tool() {
+        // #367: in both mouse presets an orbit / pan / zoom in the middle of a
+        // polyline leaves the tool armed with its points; the next click adds
+        // to the same polyline. The middle preset ignores right-drags.
+        use crate::nav::MouseNav;
+        use egui::PointerButton::{Middle, Secondary};
+        run_app_journey(|h| {
+            for nav in MouseNav::ALL {
+                h.state_mut().mouse_nav = nav;
+                for line in ["top", "ze", "polyline"] {
+                    h.state_mut().execute_line(line.to_string());
+                    h.run_steps(2);
+                }
+                assert!(h.state().draw_tool.active(), "polyline armed");
+                click_at(h, pane_point(h, 0.3, 0.3));
+                click_at(h, pane_point(h, 0.5, 0.3));
+                let last = h.state().draw_tool.last_point().expect("two points picked");
+                let shift = egui::Modifiers { shift: true, ..Default::default() };
+                let cam = |h: &egui_kittest::Harness<'_, App>| {
+                    let c = &h.state().cameras[h.state().effective_camera_index(h.state().active_pane)];
+                    (c.eye(), c.target)
+                };
+                for (button, m, navigates) in [
+                    (Middle, egui::Modifiers::default(), true),
+                    (Middle, shift, true),
+                    (Secondary, egui::Modifiers::default(), nav == MouseNav::Right),
+                    (Secondary, shift, nav == MouseNav::Right),
+                ] {
+                    let before = cam(h);
+                    nav_drag(h, pane_point(h, 0.6, 0.6), button, m);
+                    assert_eq!(cam(h) != before, navigates, "{nav:?} {button:?} {m:?} moved the view");
+                    assert!(h.state().draw_tool.active(), "{nav:?} {button:?}: tool kept");
+                    assert_eq!(h.state().draw_tool.last_point(), Some(last), "points kept");
+                }
+                let at = pane_point(h, 0.5, 0.5);
+                h.input_mut().events.push(egui::Event::PointerMoved(at));
+                h.input_mut().events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 40.0),
+                    modifiers: egui::Modifiers::default(),
+                    phase: egui::TouchPhase::Move,
+                });
+                h.run_steps(3);
+                assert_eq!(h.state().draw_tool.last_point(), Some(last), "zoom kept points");
+                click_at(h, pane_point(h, 0.5, 0.6));
+                assert!(h.state().draw_tool.active(), "still the same polyline");
+                assert_ne!(h.state().draw_tool.last_point(), Some(last), "third point added");
+                h.state_mut().draw_tool.cancel();
+                h.run_steps(1);
+            }
         });
     }
 
