@@ -2,17 +2,7 @@
 // shader, analytic anti-aliased lines at 1m and 10m, depth written so meshes
 // occlude the grid correctly.
 
-struct Camera {
-    view_proj: mat4x4<f32>,
-    inv_view_proj: mat4x4<f32>,
-    eye: vec4<f32>,
-    misc: vec4<f32>,
-    // x = lighting mode, y = background gradient flag (1 = sky/ground gradient),
-    // z = 1 hides the grid lines (`grid off`, #364), w = 1 hides the axes.
-    light: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> camera: Camera;
+// Camera, unproject() and sky_ground() come from common.wgsl.
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -33,11 +23,6 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
-fn unproject(ndc: vec2<f32>, depth: f32) -> vec3<f32> {
-    let p = camera.inv_view_proj * vec4(ndc, depth, 1.0);
-    return p.xyz / p.w;
-}
-
 struct FsOut {
     @location(0) color: vec4<f32>,
     @builtin(frag_depth) depth: f32,
@@ -52,19 +37,6 @@ fn grid_factor(coord: vec2<f32>, spacing: f32) -> f32 {
     let d = abs(fract(c - 0.5) - 0.5) / fw;
     let line = min(d.x, d.y);
     return 1.0 - min(line, 1.0);
-}
-
-// Sky/ground gradient for the SketchUp-style background. `up` is the world-ray
-// z component in [-1,1]: a light sky above the horizon fading to a warm ground
-// haze below.
-fn sky_ground(up: f32) -> vec3<f32> {
-    let sky = vec3<f32>(0.62, 0.72, 0.86);
-    let horizon = vec3<f32>(0.86, 0.88, 0.90);
-    let ground = vec3<f32>(0.52, 0.50, 0.47);
-    if (up >= 0.0) {
-        return mix(horizon, sky, clamp(up * 1.4, 0.0, 1.0));
-    }
-    return mix(horizon, ground, clamp(-up * 1.4, 0.0, 1.0));
 }
 
 @fragment
@@ -122,8 +94,9 @@ fn fs_main(in: VsOut) -> FsOut {
         // Composite the grid lines over an opaque gradient ground so the sky
         // and ground read as one continuous background (SketchUp look). The
         // ground colour comes from the down-facing gradient, lifted slightly.
-        let ground = sky_ground(-clamp(fade, 0.0, 1.0)) + vec3<f32>(0.03, 0.03, 0.03);
-        let lit = mix(ground, color, clamp(alpha, 0.0, 1.0));
+        // Fog (#363) fades the lines into the ground, or toward its colour.
+        let ground = ground_haze(dist);
+        let lit = fogged(vec4(mix(ground, color, clamp(alpha, 0.0, 1.0)), 1.0), hit).rgb;
         var out: FsOut;
         out.color = vec4(lit, 1.0); // opaque
         out.depth = depth;
@@ -135,7 +108,7 @@ fn fs_main(in: VsOut) -> FsOut {
     }
 
     var out: FsOut;
-    out.color = vec4(color * alpha, alpha); // premultiplied
+    out.color = vec4(fogged(vec4(color, 1.0), hit).rgb * alpha, alpha); // premultiplied
     out.depth = depth;
     return out;
 }

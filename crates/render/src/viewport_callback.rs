@@ -52,6 +52,11 @@ pub struct ViewportCallback {
     /// Edge style (#361); only its GPU side (back edges, depth cue) is read
     /// here, the rest shaped `scene`.
     pub edge_style: crate::EdgeStyle,
+    /// Fog (#363), GPU-only.
+    pub fog: crate::FogStyle,
+    /// The flat colour behind the scene (the clear colour: theme or paper),
+    /// the fog's background colour when the gradient is off.
+    pub background: [f32; 4],
 }
 
 impl CallbackTrait for ViewportCallback {
@@ -88,9 +93,12 @@ impl CallbackTrait for ViewportCallback {
             },
             edges: [0.0; 4],
             cue: [0.0; 4],
+            fog: [0.0; 4],
+            fog_color: [0.0; 4],
         }
         .with_overlays(self.show_grid, self.show_axes)
-        .with_edge_style(&self.edge_style, screen_desc.pixels_per_point);
+        .with_edge_style(&self.edge_style, screen_desc.pixels_per_point)
+        .with_fog(&self.fog, self.background);
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene
             && (renderer.generation != self.generation || self.force)

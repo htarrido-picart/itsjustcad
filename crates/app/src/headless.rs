@@ -159,6 +159,8 @@ pub struct HeadlessView {
     /// Edge style, from `backedges` / `depthcue` / `edgecolor` /
     /// `extension` (#361). Defaults keep the classic look.
     pub edge_style: itsjustcad_render::EdgeStyle,
+    /// Fog, from `fog` (#363). Off by default.
+    pub fog_style: itsjustcad_render::FogStyle,
 }
 
 impl Default for HeadlessView {
@@ -178,6 +180,7 @@ impl Default for HeadlessView {
             show_axes: true,
             parallel: None,
             edge_style: Default::default(),
+            fog_style: Default::default(),
         }
     }
 }
@@ -246,6 +249,9 @@ pub fn run_script_lines(
                 | AppVerb::EdgeColor(..)
                 | AppVerb::Extension(..)),
             ) => view.edge_style = crate::app_verbs::apply_edge_style(view.edge_style, &verb),
+            Some(verb @ AppVerb::Fog(_)) => {
+                view.fog_style = crate::app_verbs::apply_fog_style(view.fog_style, &verb)
+            }
             Some(AppVerb::Axes(on)) => view.show_axes = on.unwrap_or(!view.show_axes),
             Some(AppVerb::Parallel(on)) => {
                 let on = on.unwrap_or(view.parallel != Some(true));
@@ -805,7 +811,8 @@ pub fn render_headless(
     .with_overlays(view.show_grid, view.show_axes);
     // Target size for the dash patterns (#364); no fat-stroke width.
     let cam = itsjustcad_render::CameraUniform { screen: [W as f32, H as f32, 0.0, 1.0], ..cam }
-        .with_edge_style(&view.edge_style, 1.0);
+        .with_edge_style(&view.edge_style, 1.0)
+        .with_fog(&view.fog_style, theme.background());
     renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -973,6 +980,19 @@ mod tests {
         assert_eq!(view.view, Some(StandardView::Front));
         assert_eq!(view.focal_mm, Some(35.0));
         assert_eq!(view.display, DisplayMode::Pencil);
+    }
+
+    #[test]
+    fn fog_verbs_affect_view() {
+        use itsjustcad_render::{FogColor, FogStyle};
+        // #363: the fog verb runs headless and accumulates.
+        assert_eq!(HeadlessView::default().fog_style, FogStyle::default());
+        let lines: Vec<String> =
+            ["fog 25 75", "fog colour #ff0000", "fog off"].map(String::from).to_vec();
+        let (_, view) = run_script_lines(Session::default(), &lines).expect("verbs run");
+        let f = view.fog_style;
+        assert!(!f.on);
+        assert_eq!((f.start, f.end, f.color, f.custom_rgb), (0.25, 0.75, FogColor::Custom, [255, 0, 0]));
     }
 
     #[test]

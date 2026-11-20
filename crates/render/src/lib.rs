@@ -8,6 +8,7 @@ mod contrast;
 mod control;
 mod cubemap;
 mod edge_style;
+mod fog_style;
 mod layout;
 mod msaa;
 mod pano;
@@ -31,6 +32,7 @@ pub use pano::{
 pub use edge_style::{
     axis_of, parse_hex_rgb, EdgeColor, EdgeStyle, BACK_EDGE_ALPHA, DEPTH_CUE_PX, EXTENSION_M,
 };
+pub use fog_style::{FogColor, FogStyle, FOG_END, FOG_START};
 pub use layout::ViewportLayout;
 pub use renderer::{
     curve_px, hue_from_seed, linetype_dash, world_axis_lines, AxisLine, CameraUniform, ColorMode, DisplayMode, LightMode, FaceMeshEntry, LineEntry,
@@ -98,6 +100,8 @@ pub fn camera_uniform_ex(
         screen: [0.0; 4],
         edges: [0.0; 4],
         cue: [0.0; 4],
+        fog: [0.0; 4],
+        fog_color: [0.0; 4],
     }
 }
 

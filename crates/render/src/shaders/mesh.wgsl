@@ -11,18 +11,7 @@
 //
 // Pencil hidden-line mode is orthogonal: signalled by camera.misc.x < 0.
 
-struct Camera {
-    view_proj: mat4x4<f32>,
-    inv_view_proj: mat4x4<f32>,
-    eye: vec4<f32>,
-    // x  = fill alpha multiplier (display mode)
-    // yzw = sun direction (X=East,Y=North,Z=Up)
-    misc: vec4<f32>,
-    // x = lighting mode (0 working, 1 sun, 2 presentation); yzw spare.
-    light: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> camera: Camera;
+// Camera and fogged() come from common.wgsl.
 
 struct ObjectParams {
     color: vec4<f32>,
@@ -80,7 +69,7 @@ fn vs_face(in: VsFaceIn) -> VsFaceOut {
 
 @fragment
 fn fs_face(in: VsFaceOut) -> @location(0) vec4<f32> {
-    return shade_fill(in.normal, in.world, in.color);
+    return fogged(shade_fill(in.normal, in.world, in.color), in.world);
 }
 
 // Hemispheric ambient fill: sky colour when the normal faces up, ground colour
@@ -102,7 +91,7 @@ fn working_key_dir() -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return shade_fill(in.normal, in.world, object.color.rgb);
+    return fogged(shade_fill(in.normal, in.world, object.color.rgb), in.world);
 }
 
 // Lit fill of base colour `base`; alpha and material come from the object.
