@@ -700,6 +700,12 @@ pub fn classify(line: &str) -> Option<AppVerb> {
         "template" => AppVerb::GuiOnly("template"),
         "cutexport" => AppVerb::GuiOnly("cutexport"),
         "critique" => AppVerb::GuiOnly("critique"),
+        // Walkthrough tools (#369): interactive viewport tools, never run by
+        // the deck or headless.
+        "poscam" => AppVerb::GuiOnly("poscam"),
+        "positioncamera" => AppVerb::GuiOnly("positioncamera"),
+        "lookaround" => AppVerb::GuiOnly("lookaround"),
+        "walk" => AppVerb::GuiOnly("walk"),
         "feedback" => AppVerb::Feedback(itsjustcad_deck::parse_feedback_line(line)?),
         "basemap" => AppVerb::Basemap(parse_basemap_args(words)),
         other => AppVerb::View(standard_view(other)?),
@@ -1115,6 +1121,8 @@ mod tests {
         assert_eq!(classify("help box"), Some(AppVerb::Help(Some("box".into()))));
         assert_eq!(classify("template"), Some(AppVerb::GuiOnly("template")));
         assert_eq!(classify("critique looks off"), Some(AppVerb::GuiOnly("critique")));
+        assert_eq!(classify("poscam 1.7"), Some(AppVerb::GuiOnly("poscam")));
+        assert_eq!(classify("walk"), Some(AppVerb::GuiOnly("walk")));
     }
 
     #[test]
@@ -1229,6 +1237,10 @@ mod tests {
     const DECK_APP_VERB_DENYLIST: &[&str] = &[
         "critique",
         "cutexport",     // GUI-only
+        "poscam",         // walkthrough tool (#369): interactive only
+        "positioncamera", // alias of `poscam`
+        "lookaround",     // walkthrough tool (#369): interactive only
+        "walk",           // walkthrough tool (#369): interactive only
         "template",     // GUI-only
         "save",         // fs write — refused on deck plane
         "antialias",    // render-quality setting, not a drawing/view verb
@@ -1316,6 +1328,10 @@ mod tests {
             "template",
             "cutexport",
             "critique",
+            "poscam",
+            "positioncamera",
+            "lookaround",
+            "walk",
             "basemap",
             "render",
             "feedback",

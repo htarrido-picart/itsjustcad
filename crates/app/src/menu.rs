@@ -918,6 +918,16 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             ex("zw", tr("menu.view.zoom_window"), "zw"),
             ex("viewprev", tr("menu.view.prev_view"), "viewprev"),
             ex("viewnext", tr("menu.view.next_view"), "viewnext"),
+            // Walkthrough (#369): SketchUp's Position Camera / Look Around / Walk.
+            NativeItem::Submenu {
+                id: format!("{t}/walkthrough"),
+                label: tr("menu.view.walkthrough").into(),
+                items: vec![
+                    ex("poscam", tr("menu.view.position_camera"), "poscam"),
+                    ex("lookaround", tr("menu.view.look_around"), "lookaround"),
+                    ex("walk", tr("menu.view.walk"), "walk"),
+                ],
+            },
             NativeItem::Separator,
             // Object Snap… opens the modeless osnap popup (per-kind toggles).
             wired_leaf(t, "osnap", tr("menu.view.osnap"), MenuAction::ShowOsnap),

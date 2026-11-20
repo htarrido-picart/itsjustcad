@@ -8,6 +8,7 @@ mod geocode_ui;
 mod osmfetch_ui;
 mod pushpull_ui;
 mod section_ui;
+mod walk_ui;
 
 use itsjustcad_commands::Session;
 use itsjustcad_commands::lot::hierarchy::LevelKind;
@@ -702,6 +703,9 @@ pub struct App {
     section_style: itsjustcad_render::SectionStyle,
     /// The Section Plane tool (#359), armed by a bare `sectionplane`.
     section_tool: crate::section_tool::SectionPlaneTool,
+    /// The walkthrough tools (#369): Position Camera, Look Around, Walk.
+    /// View state only.
+    walkthrough: crate::walkthrough::Walkthrough,
     /// The Shadows panel's local clock (#357), in `ui.json`; releasing a
     /// slider sets the document sun from it.
     shadow_clock: crate::shadow_clock::ShadowClock,
@@ -1677,6 +1681,7 @@ impl App {
             shadow_style: shadow_style_from(&load_ui_json()),
             section_style: section_style_from(&load_ui_json()),
             section_tool: Default::default(),
+            walkthrough: Default::default(),
             shadow_clock: shadow_clock_from(&load_ui_json()),
             show_shadow_panel: false,
             shadow_preview_sun: None,
@@ -2368,6 +2373,18 @@ impl App {
                     .push_line("zoom window: drag a rectangle in a viewport (Esc cancels)");
             }
             Some("viewprev" | "previousview") => self.step_view(false),
+            // Walkthrough (#369): Position Camera, Look Around, Walk.
+            Some("poscam" | "positioncamera" | "lookaround" | "walk") => self.start_walkthrough(line),
+            // A number typed while a walkthrough tool runs is the eye height.
+            Some(word)
+                if self.walkthrough.active()
+                    && words.clone().next().is_none()
+                    && crate::walkthrough::parse_height(word).is_some() =>
+            {
+                if let Some(h) = crate::walkthrough::parse_height(word) {
+                    self.walk_set_height(h);
+                }
+            }
             Some("viewnext" | "nextview") => self.step_view(true),
             // View toggles (#364): ground grid lines, world axes, parallel
             // projection of the active view. View state, never logged; the grid
@@ -2839,6 +2856,7 @@ impl App {
             }
             _ => {
                 if self.section_tool.try_start(line) {
+                    self.walkthrough.cancel();
                     self.pushpull.cancel();
                     self.draw_tool.cancel();
                     self.guided.cancel();
@@ -2848,6 +2866,7 @@ impl App {
                     return;
                 }
                 if self.pushpull.try_start(line) {
+                    self.walkthrough.cancel();
                     self.section_tool.cancel();
                     self.draw_tool.cancel();
                     self.guided.cancel();
@@ -2857,6 +2876,7 @@ impl App {
                     return;
                 }
                 if self.draw_tool.try_start(line) {
+                    self.walkthrough.cancel();
                     self.pushpull.cancel();
                     self.section_tool.cancel();
                     if let Some(prompt) = self.draw_tool.prompt() {
@@ -2869,6 +2889,7 @@ impl App {
                 let selection = self.current_selection_selector();
                 match self.guided.try_start(line, selection.as_deref()) {
                     StartResult::Started => {
+                        self.walkthrough.cancel();
                         self.pushpull.cancel();
                         self.section_tool.cancel();
                         // Fresh guided flow → reset the trim command-panel options.
@@ -4176,6 +4197,7 @@ impl App {
             || self.guided.active()
             || self.pushpull.active()
             || self.section_tool.active()
+            || self.walkthrough.active()
             || chat_composing
             || !self.command_line.is_empty()
             || other_text_field_focused
@@ -4730,6 +4752,7 @@ impl App {
             || self.draw_tool.active()
             || self.pushpull.active()
             || self.section_tool.active()
+            || self.walkthrough.active()
         {
             return false;
         }
@@ -5464,7 +5487,8 @@ impl App {
         } else if (self.draw_tool.active()
             || self.guided.active()
             || self.pushpull.active()
-            || self.section_tool.active())
+            || self.section_tool.active()
+            || self.walkthrough.active())
             && let Some(pos) = ui.ctx().pointer_latest_pos()
             && let Some(pane) = self.layout.pane_at(full, pos)
         {
@@ -5747,6 +5771,10 @@ impl App {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                     }
                     self.section_tool_input(ui, rect, &response, view_proj);
+                }
+            } else if self.walkthrough.active() {
+                if pane == self.active_pane {
+                    self.walkthrough_input(ui, cam_idx, rect, &response, view_proj);
                 }
             } else if self.draw_tool.active() || self.guided.active() {
                 // Draw/osnap only in the active pane; one prompt, one ghost.
@@ -8795,7 +8823,8 @@ impl App {
         let flow_active = self.guided.active()
             || self.draw_tool.active()
             || self.pushpull.active()
-            || self.section_tool.active();
+            || self.section_tool.active()
+            || self.walkthrough.active();
         // Inline guided prompt → the input placeholder changes per step; the
         // TextEdit id is stable so focus is held across steps (LOCKED #5).
         let prompt = self
@@ -8803,7 +8832,8 @@ impl App {
             .prompt()
             .or_else(|| self.draw_tool.prompt())
             .or_else(|| self.pushpull.prompt())
-            .or_else(|| self.section_tool.prompt());
+            .or_else(|| self.section_tool.prompt())
+            .or_else(|| self.walkthrough.prompt());
         if let Some(line) = self.command_line.commands_segment_ui(
             ui,
             &object_names,
@@ -13721,7 +13751,8 @@ impl eframe::App for App {
                     draw_active: self.draw_tool.active()
                         || self.guided.active()
                         || self.pushpull.active()
-                        || self.section_tool.active(),
+                        || self.section_tool.active()
+                        || self.walkthrough.active(),
                     has_selection: !self.session.doc.selection.is_empty(),
                     last_command: self.last_line.as_deref(),
                 },
@@ -13832,6 +13863,7 @@ impl eframe::App for App {
             && !self.guided.active()
             && !self.pushpull.active()
             && !self.section_tool.active()
+            && !self.walkthrough.active()
             && !self.viewport_interacted
             && ctx.memory(|m| m.focused()).is_none()
         {
@@ -14061,6 +14093,79 @@ mod tests {
         for form in ["sections planes|cuts|fill [on|off]", "sections fill #rrggbb"] {
             assert!(SECTIONS_USAGE.contains(form), "{form}");
         }
+    }
+
+    /// #369: Position Camera stands the eye a typed height above the clicked
+    /// face, level and in perspective, then Look Around turns in place;
+    /// Walk moves on held keys with the floor below; a typed number sets the
+    /// eye height; Esc ends; the deck and headless never run them.
+    #[test]
+    fn walkthrough_positions_looks_and_walks() {
+        run_app_journey(|h| {
+            for line in ["box 0,0,0 4,4,1", "front", "persp", "ze"] {
+                h.state_mut().execute_line(line.into());
+                h.run_steps(2);
+            }
+            let idx = h.state().effective_camera_index(0);
+            h.state_mut().execute_line("poscam 1.7".into());
+            h.run_steps(1);
+            assert_eq!(h.state().walkthrough.mode(), Some(crate::walkthrough::WalkMode::PositionCamera));
+            assert_eq!(h.state().walkthrough.eye_height, 1.7);
+            let at = world_to_screen(h, glam::DVec3::new(2.0, 2.0, 1.0));
+            click_at(h, at);
+            h.run_steps(1);
+            let cam = h.state().cameras[idx];
+            let eye = cam.eye();
+            assert!((eye.z - 2.7).abs() < 1e-3, "{eye} {:?}", transcript(h.state()));
+            assert!((eye.x - 2.0).abs() < 0.1 && (eye.y - 2.0).abs() < 0.1, "{eye}");
+            assert!(cam.pitch.abs() < 1e-6 && !cam.ortho, "level, perspective");
+            assert_eq!(h.state().walkthrough.mode(), Some(crate::walkthrough::WalkMode::LookAround));
+            // Look Around: a drag turns the view, the eye stays.
+            let c = pane_point(h, 0.5, 0.5);
+            drag(h, c, c + egui::vec2(120.0, -40.0));
+            let turned = h.state().cameras[idx];
+            assert!((turned.eye() - eye).length() < 1e-3, "{} vs {eye}", turned.eye());
+            assert!(turned.yaw != cam.yaw && turned.forward().z > 0.0, "turned right, looked up");
+            // A typed height moves the eye above its floor (the box top).
+            h.state_mut().execute_line("1.2".into());
+            h.run_steps(1);
+            assert!((h.state().cameras[idx].eye().z - 2.2).abs() < 1e-3);
+            h.key_press(egui::Key::Escape);
+            h.run_steps(1);
+            assert!(!h.state().walkthrough.active(), "Esc ends");
+            // Walk: holding ↑ walks ahead, level.
+            h.state_mut().execute_line("walk".into());
+            h.run_steps(1);
+            let start = h.state().cameras[idx];
+            h.input_mut().events.push(egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            h.run_steps(3);
+            h.input_mut().events.push(egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            h.run_steps(1);
+            let walked = h.state().cameras[idx];
+            let (ahead, _) = start.walk_axes();
+            let moved = walked.eye() - start.eye();
+            assert!(moved.dot(ahead) > 0.1, "walked ahead: {moved}");
+            assert!((walked.yaw - start.yaw).abs() < 1e-6, "no turn");
+            h.key_press(egui::Key::Escape);
+            h.run_steps(1);
+            assert!(!h.state().walkthrough.active());
+            // Interactive only: the deck/headless classifier marks them GUI-only.
+            for v in ["poscam", "positioncamera", "lookaround", "walk"] {
+                assert!(matches!(crate::app_verbs::classify(v), Some(crate::app_verbs::AppVerb::GuiOnly(_))), "{v}");
+            }
+        });
     }
 
     #[test]
