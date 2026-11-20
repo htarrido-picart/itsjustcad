@@ -382,6 +382,7 @@ camera 2point|persp|pano|fisheye [fov]|<n>mm         projection / lens
 camera phone <lens>                                  phone-camera sim (phone-main, phone-ultrawide, phone-tele, phone-periscope)
 basemap [osm|sat] [span_m] [opacity] | basemap off   georeferenced site underlay
 reducemotion on|off                                  accessibility: stop animated progress
+mouse right|middle                                   mouse navigation preset (right = RMB/MMB orbit, middle = MMB only)
 chatencryption on|off                                encrypt chat sessions at rest (default OFF, opt-in)
 save [path] · help [verb]                            save document / inline help
 ```
