@@ -270,6 +270,10 @@ pub fn fmt_num(value: f64, decimals: usize) -> String {
 
 /// English catalog (source of truth).
 static EN: &[(&str, &str)] = &[
+    ("axis.on_red", "On Red Axis"),
+    ("axis.on_green", "On Green Axis"),
+    ("axis.on_blue", "On Blue Axis"),
+    ("axis.locked", "locked"),
     // ── Menu: top-level titles ──
     ("menu.file", "File"),
     ("menu.edit", "Edit"),
@@ -1009,6 +1013,10 @@ static EN: &[(&str, &str)] = &[
 /// cota = dimension, sólido = solid, malla = mesh, croquis / boceto = sketch,
 /// lote = lot, manzana = block, retiro = setback.
 static ES: &[(&str, &str)] = &[
+    ("axis.on_red", "En eje rojo"),
+    ("axis.on_green", "En eje verde"),
+    ("axis.on_blue", "En eje azul"),
+    ("axis.locked", "bloqueado"),
     // ── Menú: títulos ──
     ("menu.file", "Archivo"),
     ("menu.edit", "Edición"),
@@ -1756,6 +1764,10 @@ static ES: &[(&str, &str)] = &[
 /// CAD terms: camada = layer, cotação = dimension, sólido = solid, malha = mesh,
 /// esboço = sketch, lote = lot, recuo = setback.
 static PT: &[(&str, &str)] = &[
+    ("axis.on_red", "No eixo vermelho"),
+    ("axis.on_green", "No eixo verde"),
+    ("axis.on_blue", "No eixo azul"),
+    ("axis.locked", "bloqueado"),
     ("menu.file", "Ficheiro"),
     ("menu.edit", "Editar"),
     ("menu.view", "Ver"),
@@ -2466,6 +2478,10 @@ static PT: &[(&str, &str)] = &[
 /// CAD terms: calque = layer, cote = dimension, solide = solid, maillage = mesh,
 /// esquisse = sketch, parcelle = lot, retrait = setback.
 static FR: &[(&str, &str)] = &[
+    ("axis.on_red", "Sur l'axe rouge"),
+    ("axis.on_green", "Sur l'axe vert"),
+    ("axis.on_blue", "Sur l'axe bleu"),
+    ("axis.locked", "verrouillé"),
     ("menu.file", "Fichier"),
     ("menu.edit", "Édition"),
     ("menu.view", "Affichage"),
@@ -3176,6 +3192,10 @@ static FR: &[(&str, &str)] = &[
 /// CAD terms: livello = layer, quota = dimension, solido = solid, mesh = mesh,
 /// schizzo = sketch, lotto = lot, arretramento = setback.
 static IT: &[(&str, &str)] = &[
+    ("axis.on_red", "Sull'asse rosso"),
+    ("axis.on_green", "Sull'asse verde"),
+    ("axis.on_blue", "Sull'asse blu"),
+    ("axis.locked", "bloccato"),
     ("menu.file", "File"),
     ("menu.edit", "Modifica"),
     ("menu.view", "Vista"),
@@ -3886,6 +3906,10 @@ static IT: &[(&str, &str)] = &[
 /// CAD terms: strat = layer, cotă = dimension, solid = solid, plasă = mesh,
 /// schiță = sketch, lot = lot, retragere = setback.
 static RO: &[(&str, &str)] = &[
+    ("axis.on_red", "Pe axa roșie"),
+    ("axis.on_green", "Pe axa verde"),
+    ("axis.on_blue", "Pe axa albastră"),
+    ("axis.locked", "blocat"),
     ("menu.file", "Fișier"),
     ("menu.edit", "Editare"),
     ("menu.view", "Vizualizare"),
@@ -4596,6 +4620,10 @@ static RO: &[(&str, &str)] = &[
 /// CAD terms: capa = layer, cota = dimension, sòlid = solid, malla = mesh,
 /// croquis = sketch, parcel·la = lot, reculada = setback.
 static CA: &[(&str, &str)] = &[
+    ("axis.on_red", "A l'eix vermell"),
+    ("axis.on_green", "A l'eix verd"),
+    ("axis.on_blue", "A l'eix blau"),
+    ("axis.locked", "bloquejat"),
     ("menu.file", "Fitxer"),
     ("menu.edit", "Edició"),
     ("menu.view", "Visualitza"),
@@ -5306,6 +5334,10 @@ static CA: &[(&str, &str)] = &[
 /// CAD terms: capa = layer, cota = dimension, sólido = solid, malla = mesh,
 /// bosquexo = sketch, parcela = lot, recuamento = setback.
 static GL: &[(&str, &str)] = &[
+    ("axis.on_red", "No eixe vermello"),
+    ("axis.on_green", "No eixe verde"),
+    ("axis.on_blue", "No eixe azul"),
+    ("axis.locked", "bloqueado"),
     ("menu.file", "Ficheiro"),
     ("menu.edit", "Editar"),
     ("menu.view", "Ver"),
