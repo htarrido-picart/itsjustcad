@@ -899,6 +899,8 @@ pub struct App {
     /// The entered level of a hierarchical selection (#199): a double-click
     /// drills into a site plan, and later clicks pick at that depth.
     drill: itsjustcad_commands::lot::hierarchy::Drill,
+    /// Hover pre-highlight (#374): what a click would select, under the cursor.
+    hover: crate::hover::Hover,
     /// Site plan optimizer form / running search / results (#145).
     optimize: optimize_panel::OptimizePanel,
     /// Address lookup for the site location (`geocode`, #215).
@@ -1643,6 +1645,7 @@ impl App {
             subdiv_yield: None,
             focus_site_override: None,
             drill: Default::default(),
+            hover: Default::default(),
             optimize: Default::default(),
             geocode: Default::default(),
             geo_hook: std::sync::Arc::new(crate::geocode::Nominatim::desktop()),
@@ -4109,6 +4112,77 @@ impl App {
         cam.cursor_focus(origin, dir, hit)
     }
 
+    /// Hover pre-highlight (#374) at `pos` in `pane`: what a click there would
+    /// select (a select click, or a guided object step's pick), recomputed
+    /// only when the pointer, camera, document or pick rule changed. No hover
+    /// while drawing, orbiting, panning, zooming, box-selecting or dragging
+    /// (`blocked`: the gumball or a grip owns the pointer). Returns whether a
+    /// hover is live.
+    fn update_hover(
+        &mut self,
+        ui: &egui::Ui,
+        pane: usize,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        view_proj: glam::Mat4,
+        blocked: bool,
+    ) -> bool {
+        let (busy, shift, cmd) = ui.input(|i| {
+            let busy = i.pointer.any_down() || i.smooth_scroll_delta != egui::Vec2::ZERO;
+            (busy, i.modifiers.shift, i.modifiers.command)
+        });
+        if blocked || busy || self.box_drag.is_some() || self.draw_tool.active() {
+            return false;
+        }
+        let guided = self.guided.active();
+        if guided
+            && (pane != self.active_pane
+                || !(self.guided.current_wants_object() || self.guided.current_wants_objects()))
+        {
+            return false;
+        }
+        let mode = if guided {
+            4 + self.guided.step_index()
+        } else {
+            usize::from(shift) | usize::from(cmd) << 1
+        };
+        let key = crate::hover::HoverKey {
+            pane,
+            pos: [pos.x, pos.y],
+            view_proj: view_proj.to_cols_array(),
+            generation: self.session.doc.generation,
+            mode,
+        };
+        let mut hover = std::mem::take(&mut self.hover);
+        hover.update(&self.session.doc, key, || {
+            let doc = &self.session.doc;
+            let targets = if guided {
+                self.hit_object(view_proj, rect, pos)
+                    .filter(|id| self.guided_pick_matches(*id))
+                    .into_iter()
+                    .collect()
+            } else {
+                self.hit_chain(view_proj, rect, pos)
+                    .map(|c| crate::hover::click_targets(doc, &self.drill, &c, shift, !cmd))
+                    .unwrap_or_default()
+            };
+            crate::hover::hover_filter(doc, targets)
+        });
+        self.hover = hover;
+        true
+    }
+
+    /// Paint the hovered objects' outline over the scene in the hover blue.
+    fn paint_hover(&self, ui: &egui::Ui, rect: egui::Rect, view_proj: glam::Mat4) {
+        let painter = ui.painter_at(rect);
+        let stroke = egui::Stroke::new(2.5, crate::hover::color(ui.visuals().dark_mode));
+        for [a, b] in self.hover.segments() {
+            if let (Some(a), Some(b)) = (project(view_proj, rect, *a), project(view_proj, rect, *b)) {
+                painter.line_segment([a, b], stroke);
+            }
+        }
+    }
+
     /// The parent → child chain under the click (#199), or `None` on a miss.
     fn hit_chain(
         &self,
@@ -4255,31 +4329,26 @@ impl App {
     ) {
         let chain = self.hit_chain(view_proj, rect, pos);
         // Generated objects select at the drilled level (#199): the top parent
-        // first, a street off the site's edge directly.
-        let level = match &chain {
-            Some(c) if c.levels[0].kind != LevelKind::Object && additive => {
-                Some(self.drill.add_level(c))
-            }
-            Some(c) if c.levels[0].kind != LevelKind::Object => Some(self.drill.click(c)),
-            _ => {
+        // first, a street off the site's edge directly. The hover (#374)
+        // shows the same targets.
+        let targets = chain.as_ref().map(|c| {
+            crate::hover::click_targets(&self.session.doc, &self.drill, c, additive, expand)
+        });
+        match &chain {
+            Some(c) if c.levels[0].kind != LevelKind::Object => {
                 if !additive {
-                    self.drill.reset();
+                    self.drill.click(c);
                 }
-                None
             }
-        };
+            _ if !additive => self.drill.reset(),
+            _ => {}
+        }
         let doc = &mut self.session.doc;
         if !additive {
             doc.selection.clear();
         }
         let mut note = None;
-        if let Some(c) = &chain {
-            let id = c.levels[0].ids[0];
-            let ids = match level {
-                Some(l) => c.levels[l].ids.iter().copied().collect(),
-                None if expand => doc.expand_pick(id),
-                None => std::collections::BTreeSet::from([id]),
-            };
+        if let Some(ids) = targets {
             if additive && ids.iter().all(|i| doc.selection.contains(i)) {
                 for i in &ids {
                     doc.selection.remove(i);
@@ -4929,6 +4998,7 @@ impl App {
             None
         };
 
+        let mut hover_seen = false;
         let panes = self.effective_panes(full);
         for (pane, rect) in panes.iter().copied().enumerate() {
             let cam_idx = self.effective_camera_index(pane);
@@ -5006,6 +5076,7 @@ impl App {
                 }
             }
 
+            let mut hover_blocked = false;
             if self.draw_tool.active() || self.guided.active() {
                 // Draw/osnap only in the active pane; one prompt, one ghost.
                 if pane == self.active_pane {
@@ -5056,6 +5127,7 @@ impl App {
                         }
                     }
                 }
+                hover_blocked = consumed;
                 if !consumed
                     && response.clicked()
                     && let Some(pos) = response.interact_pointer_pos()
@@ -5109,6 +5181,12 @@ impl App {
                 }
             }
 
+            // Hover pre-highlight (#374) for the pane under the pointer.
+            if let Some(pos) = response.hover_pos() {
+                let blocked = hover_blocked || response.dragged();
+                hover_seen |= self.update_hover(ui, pane, rect, pos, view_proj, blocked);
+            }
+
             let sun_dir = self.session.doc.sun.map(|s| {
                 itsjustcad_solar::sun_direction(s.azimuth_deg, s.altitude_deg)
             });
@@ -5136,6 +5214,9 @@ impl App {
                         samples: self.msaa_samples(),
                     },
                 ));
+            }
+            if self.hover.pane() == Some(pane) {
+                self.paint_hover(ui, rect, view_proj);
             }
 
             // Per-pane view-name TAG (Rhino/SketchUp): the pane's name in its
@@ -5221,6 +5302,10 @@ impl App {
             // (The full per-pane border was removed — it added visual noise. The
             // active viewport is shown by its blue name tag, above; internal
             // dividers between panes are drawn once, below.)
+        }
+
+        if !hover_seen {
+            self.hover.clear();
         }
 
         // Internal viewport dividers (Rhino-style cross): a single subtle grey
@@ -14284,6 +14369,41 @@ mod tests {
                 h.state().session.doc.selection.is_empty(),
                 "empty corner click deselected (handles on)"
             );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_hover_shows_what_a_click_selects() {
+        // #374: the hover is the click's target (the whole group), it is not
+        // recomputed while the pointer rests, it drops once selected, and an
+        // orbit (secondary button down) clears it.
+        run_app_journey(|h| {
+            submit_command(h, "line 0,0,0 10,10,0");
+            submit_command(h, "line 20,0,0 30,10,0");
+            submit_command(h, "group last 2");
+            top_ortho_view(h);
+            let on_line = world_to_screen(h, glam::DVec3::new(5.0, 5.0, 0.0));
+            h.input_mut().events.push(egui::Event::PointerMoved(on_line));
+            h.run_steps(2);
+            let hovered = h.state().hover.ids().clone();
+            assert_eq!(hovered.len(), 2, "hover shows the whole group");
+            let computes = h.state().hover.computes;
+            h.run_steps(3);
+            assert_eq!(h.state().hover.computes, computes, "still pointer: no re-pick");
+            click_at(h, on_line);
+            assert_eq!(h.state().session.doc.selection, hovered, "the click selects the hover");
+            assert!(h.state().hover.ids().is_empty(), "selected: no hover");
+            h.state_mut().session.doc.selection.clear();
+            h.state_mut().session.doc.generation += 1;
+            h.input_mut().events.push(egui::Event::PointerButton {
+                pos: on_line,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            });
+            h.run_steps(2);
+            assert!(h.state().hover.pane().is_none(), "orbiting: no hover");
         });
     }
 

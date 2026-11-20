@@ -25,6 +25,7 @@ mod gumball;
 mod hardware;
 mod headless;
 mod history_rebuild;
+mod hover;
 mod i18n;
 mod icons;
 mod journal;
