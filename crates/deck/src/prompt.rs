@@ -53,6 +53,10 @@ Grid & axes:
 Feature edges:
   meshedges on|off                              show/hide the default shaded feature edges (alias:       e.g. meshedges off
                                                 shadededges)
+  backedges on|off                              hidden edges dashed and faint (not in x-ray)             e.g. backedges on
+  depthcue on|off [px]                          nearer edges thicker, farther thinner                    e.g. depthcue on 4
+  edgecolor layer|same|material|axis            edge colour; same takes #rrggbb (black default)          e.g. edgecolor axis
+  extension on|off [m]                          edges overshoot their ends (outside sketchy)             e.g. extension on 0.1
 
 Planting plan:
   plantsymbols on|off                           2D top-view plan symbols for planted trees (alias:       e.g. plantsymbols on

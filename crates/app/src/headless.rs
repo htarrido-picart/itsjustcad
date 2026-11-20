@@ -156,6 +156,9 @@ pub struct HeadlessView {
     /// Parallel projection for the view, from `camera parallel|persp` /
     /// `parallel [on|off]` (#364). `None` keeps the view's own projection.
     pub parallel: Option<bool>,
+    /// Edge style, from `backedges` / `depthcue` / `edgecolor` /
+    /// `extension` (#361). Defaults keep the classic look.
+    pub edge_style: itsjustcad_render::EdgeStyle,
 }
 
 impl Default for HeadlessView {
@@ -174,6 +177,7 @@ impl Default for HeadlessView {
             show_grid: true,
             show_axes: true,
             parallel: None,
+            edge_style: Default::default(),
         }
     }
 }
@@ -236,6 +240,12 @@ pub fn run_script_lines(
                 view.shaded_edges = on.unwrap_or(!view.shaded_edges)
             }
             Some(AppVerb::Grid(on)) => view.show_grid = on.unwrap_or(!view.show_grid),
+            Some(
+                verb @ (AppVerb::BackEdges(_)
+                | AppVerb::DepthCue(..)
+                | AppVerb::EdgeColor(..)
+                | AppVerb::Extension(..)),
+            ) => view.edge_style = crate::app_verbs::apply_edge_style(view.edge_style, &verb),
             Some(AppVerb::Axes(on)) => view.show_axes = on.unwrap_or(!view.show_axes),
             Some(AppVerb::Parallel(on)) => {
                 let on = on.unwrap_or(view.parallel != Some(true));
@@ -688,6 +698,7 @@ pub fn render_headless(
             sketchy,
             sketchy_eye,
             sketchy_radius,
+            edges: view.edge_style,
             ..Default::default()
         },
     );
@@ -793,7 +804,8 @@ pub fn render_headless(
     )
     .with_overlays(view.show_grid, view.show_axes);
     // Target size for the dash patterns (#364); no fat-stroke width.
-    let cam = itsjustcad_render::CameraUniform { screen: [W as f32, H as f32, 0.0, 1.0], ..cam };
+    let cam = itsjustcad_render::CameraUniform { screen: [W as f32, H as f32, 0.0, 1.0], ..cam }
+        .with_edge_style(&view.edge_style, 1.0);
     renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -961,6 +973,21 @@ mod tests {
         assert_eq!(view.view, Some(StandardView::Front));
         assert_eq!(view.focal_mm, Some(35.0));
         assert_eq!(view.display, DisplayMode::Pencil);
+    }
+
+    #[test]
+    fn edge_style_verbs_affect_view() {
+        use itsjustcad_render::{EdgeColor, EdgeStyle};
+        // #361: the edge-style verbs run headless and accumulate.
+        assert_eq!(HeadlessView::default().edge_style, EdgeStyle::default());
+        let lines: Vec<String> =
+            ["backedges on", "depthcue 4", "edgecolor axis", "extension on", "backedges"]
+                .map(String::from)
+                .to_vec();
+        let (_, view) = run_script_lines(Session::default(), &lines).expect("verbs run");
+        let e = view.edge_style;
+        assert!(!e.back_edges && e.depth_cue && e.extension);
+        assert_eq!((e.depth_cue_px, e.color), (4.0, EdgeColor::Axis));
     }
 
     #[test]

@@ -7,6 +7,9 @@ use itsjustcad_doc::{
     Annotation, Document, Geometry, HatchPattern, LineType, ObjectId, SceneObject,
 };
 
+use crate::edge_style::{
+    axis_class_color, extend_strip, split_soup_by_axis, split_strip_by_axis, EdgeColor, EdgeStyle,
+};
 use crate::renderer::{hue_from_seed, ColorMode, SceneData};
 use crate::sketchy::{sketchify_segments, SketchyParams};
 
@@ -28,13 +31,29 @@ pub struct ColorModeSnapshot {
     /// depth term (uniform sketchy amount).
     pub sketchy_eye: Option<glam::Vec3>,
     pub sketchy_radius: f32,
+    /// Edge style (#361). Only its colour and extension shape the snapshot;
+    /// back edges and depth cue are drawn on the GPU.
+    pub edges: EdgeStyle,
 }
 
 impl ColorModeSnapshot {
-    /// Apply the sketchy transform to a feature-edge segment soup, if active.
+    /// Apply the sketchy transform to a feature-edge segment soup, if active;
+    /// else the edge style's plain extension (#361), if on.
     fn sketchify(&self, segments: Vec<[f32; 3]>) -> Vec<[f32; 3]> {
         if self.sketchy.active() {
             sketchify_segments(&segments, self.sketchy, self.sketchy_eye, self.sketchy_radius)
+        } else if self.edges.extension_len() > 0.0 {
+            // Sketchy's overshoot without its wobble: one pass, no jitter.
+            let plain = SketchyParams {
+                enabled: true,
+                jitter: 0.0,
+                passes: 1,
+                extension: self.edges.extension_len(),
+                endpoints: false,
+                depthcue: 0.0,
+                hatching: false,
+            };
+            sketchify_segments(&segments, plain, None, 0.0)
         } else {
             segments
         }
@@ -732,6 +751,13 @@ pub fn snapshot_in_context(
                 }
             }
         }
+        // Edge style (#361): colour by same / material / axis, and the
+        // extension of straight curve segments. Selection, annotations and
+        // the subdivision cue keep their own colours and shapes.
+        if !selected && !matches!(obj.geometry, Geometry::Annotation(_)) {
+            let range = EdgeRanges { lines: before.1, edges: before.2, profile: before.3 };
+            style_edges(&mut scene, range, obj, &cms.edges);
+        }
         // Layer linetype (#364): the object's curves and mesh edges draw
         // dashed. Annotation strokes (hatch patterns, text, dimensions) and
         // points stay solid.
@@ -777,6 +803,66 @@ pub fn snapshot_in_context(
     scene
 }
 
+/// Where one object's entries start in the scene's stroke lists.
+struct EdgeRanges {
+    lines: usize,
+    edges: usize,
+    profile: usize,
+}
+
+/// Apply the edge style's colour and curve extension (#361) to the stroke
+/// entries one object just added (from `at` to the end of each list).
+fn style_edges(scene: &mut SceneData, at: EdgeRanges, obj: &SceneObject, style: &EdgeStyle) {
+    // Straight curve segments overshoot their ends (mesh edges were
+    // extended when built, see `ColorModeSnapshot::sketchify`).
+    let ext = style.extension_len();
+    if ext > 0.0 && matches!(
+        obj.geometry,
+        Geometry::Curve(kernel_curve::Curve::Line { .. } | kernel_curve::Curve::Polyline { .. })
+    ) {
+        let lines: Vec<SceneLine> = scene.lines.drain(at.lines..).collect();
+        for (pts, color, lw) in lines {
+            scene.lines.extend(extend_strip(&pts, ext).into_iter().map(|p| (p, color, lw)));
+        }
+    }
+    let recolor = match style.color {
+        EdgeColor::Layer | EdgeColor::Axis => None,
+        EdgeColor::Same => Some(style.same_rgba()),
+        // The material's colour, else the object colour, else as Layer.
+        EdgeColor::Material => obj
+            .material
+            .as_ref()
+            .map(|m| m.pbr().0)
+            .or(obj.color)
+            .map(|[r, g, b]| [r, g, b, 1.0]),
+    };
+    if let Some(c) = recolor {
+        scene.lines[at.lines..].iter_mut().for_each(|l| l.1 = c);
+        scene.edges[at.edges..].iter_mut().for_each(|l| l.1 = c);
+        scene.profile_edges[at.profile..].iter_mut().for_each(|l| l.1 = c);
+    }
+    if style.color == EdgeColor::Axis {
+        let split_soups = |list: &mut Vec<SceneLine>, from: usize| {
+            let old: Vec<SceneLine> = list.drain(from..).collect();
+            for (pts, color, w) in old {
+                for (class, part) in split_soup_by_axis(&pts).into_iter().enumerate() {
+                    if !part.is_empty() {
+                        list.push((part, axis_class_color(class, color), w));
+                    }
+                }
+            }
+        };
+        split_soups(&mut scene.edges, at.edges);
+        split_soups(&mut scene.profile_edges, at.profile);
+        let old: Vec<SceneLine> = scene.lines.drain(at.lines..).collect();
+        for (pts, color, lw) in old {
+            for (class, run) in split_strip_by_axis(&pts) {
+                scene.lines.push((run, axis_class_color(class, color), lw));
+            }
+        }
+    }
+}
+
 /// Set `types[from..to]` to `lt`, padding any gap before `from` with solid.
 fn mark(types: &mut Vec<LineType>, from: usize, to: usize, lt: LineType) {
     types.resize(from, LineType::Continuous);
@@ -793,6 +879,8 @@ pub use itsjustcad_doc::hatch::hatch_lines as hatch_segments;
 mod tests {
     use glam::DVec3;
     use itsjustcad_doc::{Document, LayerStyle, ObjectId, SceneObject};
+
+    use crate::renderer::AXIS_RGBA;
 
     use super::*;
 
@@ -844,6 +932,99 @@ mod tests {
         let id = obj.id;
         doc.insert(obj);
         id
+    }
+
+    /// An L-shaped polyline (along X, then Y) on the default layer.
+    fn insert_l(doc: &mut Document) -> ObjectId {
+        let obj = SceneObject {
+            visible: true,
+            id: ObjectId::new(),
+            name: None,
+            layer: itsjustcad_doc::DEFAULT_LAYER.into(),
+            color: None,
+            material: None,
+            lineweight_mm: None,
+            edge_tags: None,
+            street: None,
+            face_values: None,
+            geometry: Geometry::Curve(kernel_curve::Curve::Polyline {
+                points: vec![DVec3::ZERO, DVec3::X * 2.0, DVec3::new(2.0, 3.0, 0.0)],
+                closed: false,
+            }),
+        };
+        let id = obj.id;
+        doc.insert(obj);
+        id
+    }
+
+    fn with_edges(edges: EdgeStyle) -> ColorModeSnapshot {
+        ColorModeSnapshot { edges, ..Default::default() }
+    }
+
+    #[test]
+    fn edge_style_defaults_keep_todays_colours() {
+        // #361: the default style (Layer, no extension) and GPU-only
+        // settings leave the snapshot exactly as before.
+        let mut doc = Document::default();
+        insert_l(&mut doc);
+        insert_tri(&mut doc, itsjustcad_doc::DEFAULT_LAYER);
+        let today = snapshot(&doc, Theme::Light);
+        let gpu = EdgeStyle { back_edges: true, depth_cue: true, ..Default::default() };
+        let styled = snapshot_with_mode(&doc, Theme::Light, with_edges(gpu));
+        assert_eq!(styled.lines, today.lines);
+        assert_eq!(styled.edges, today.edges);
+    }
+
+    #[test]
+    fn edge_colour_same_material_and_axis() {
+        let mut doc = Document::default();
+        let l = insert_l(&mut doc);
+        let tri = insert_tri(&mut doc, itsjustcad_doc::DEFAULT_LAYER);
+        let base = EdgeStyle::default();
+
+        // All same: one colour on curves and mesh edges, selection still wins.
+        let same = EdgeStyle { color: EdgeColor::Same, same_rgb: [255, 0, 0], ..base };
+        let s = snapshot_with_mode(&doc, Theme::Dark, with_edges(same));
+        assert!(s.lines.iter().chain(&s.edges).all(|e| e.1 == [1.0, 0.0, 0.0, 1.0]));
+        doc.selection.insert(l);
+        let s = snapshot_with_mode(&doc, Theme::Dark, with_edges(same));
+        assert_eq!(s.lines[0].1, Theme::Dark.selected());
+        doc.selection.clear();
+
+        // By material: the object colour stands in when there is no material.
+        doc.get_mut(tri).unwrap().color = Some([0.0, 0.5, 1.0]);
+        let mat = EdgeStyle { color: EdgeColor::Material, ..base };
+        let s = snapshot_with_mode(&doc, Theme::Dark, with_edges(mat));
+        assert_eq!(s.edges[0].1, [0.0, 0.5, 1.0, 1.0]);
+        assert_eq!(s.lines[0].1, snapshot(&doc, Theme::Dark).lines[0].1, "no material: as Layer");
+
+        // By axis: the L splits into a red X run and a green Y run; the
+        // triangle's X and Y edges take the axis colours, its diagonal its
+        // usual ink.
+        let axis = EdgeStyle { color: EdgeColor::Axis, ..base };
+        let s = snapshot_with_mode(&doc, Theme::Dark, with_edges(axis));
+        assert_eq!(s.lines.len(), 2);
+        assert_eq!((s.lines[0].1, s.lines[1].1), (AXIS_RGBA[0], AXIS_RGBA[1]));
+        assert_eq!(s.lines[1].0, vec![[2.0, 0.0, 0.0], [2.0, 3.0, 0.0]]);
+        let colours: Vec<[f32; 4]> = s.edges.iter().map(|e| e.1).collect();
+        assert_eq!(colours, [AXIS_RGBA[0], AXIS_RGBA[1], Theme::Dark.curve()]);
+        assert!(s.edges.iter().all(|e| e.0.len() == 2), "one segment each");
+    }
+
+    #[test]
+    fn edge_extension_outside_sketchy() {
+        // #361: every straight segment overshoots both ends; mesh edges too.
+        let mut doc = Document::default();
+        insert_l(&mut doc);
+        insert_tri(&mut doc, itsjustcad_doc::DEFAULT_LAYER);
+        let ext = EdgeStyle { extension: true, extension_m: 0.5, ..Default::default() };
+        let s = snapshot_with_mode(&doc, Theme::Dark, with_edges(ext));
+        assert_eq!(s.lines.len(), 2, "one strip per segment");
+        assert_eq!(s.lines[0].0, vec![[-0.5, 0.0, 0.0], [2.5, 0.0, 0.0]]);
+        let plain = snapshot(&doc, Theme::Dark);
+        assert_eq!(s.edges[0].0.len(), plain.edges[0].0.len(), "same segment count");
+        let len = |p: &[[f32; 3]]| glam::Vec3::from(p[1]).distance(glam::Vec3::from(p[0]));
+        assert!((len(&s.edges[0].0) - len(&plain.edges[0].0) - 1.0).abs() < 1e-5);
     }
 
     #[test]

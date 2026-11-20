@@ -2936,6 +2936,8 @@ dependencies = [
  "libc",
  "naga",
  "pollster",
+ "serde",
+ "serde_json",
  "wgpu",
 ]
 

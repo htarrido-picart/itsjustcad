@@ -11,6 +11,12 @@ struct Camera {
     // x,y = target size (device px), z = stroke width (device px); see vs_fat.
     // w = device px per logical px, scaling the dash patterns (0 reads as 1).
     screen: vec4<f32>,
+    // Edge styles (#361): x = depth-cue width of the nearest strokes (device
+    // px, 0 = off), y = 1 draws back edges, z = device px per logical px.
+    edges: vec4<f32>,
+    // Depth-cue ramp: dot(p, xyz) + w is 0 at the nearest scene point, 1 at
+    // the farthest.
+    cue: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -75,6 +81,8 @@ struct FatOut {
     // and the segment's screen length, for the round caps and AA ramp.
     @location(0) @interpolate(linear) local: vec2<f32>,
     @location(1) @interpolate(flat) len_px: f32,
+    // Stroke width in device px (the depth cue varies it per segment).
+    @location(2) @interpolate(flat) width: f32,
 };
 
 // Fraction of the eye distance a stroke is pulled toward the camera so it wins
@@ -102,11 +110,25 @@ fn vs_fat(
     @location(0) a: vec3<f32>,
     @location(1) b: vec3<f32>,
 ) -> FatOut {
-    return fat_quad(vi, a, b);
+    return fat_quad(vi, a, b, stroke_width(a, b));
 }
 
-fn fat_quad(vi: u32, a: vec3<f32>, b: vec3<f32>) -> FatOut {
+// Stroke width of a segment in device px: the mode's width, or with the depth
+// cue on (#361) a ramp from the cue width at the nearest scene point down to
+// the mode's width at the farthest, taken at the segment's midpoint.
+fn stroke_width(a: vec3<f32>, b: vec3<f32>) -> f32 {
+    let base = camera.screen.z;
+    let near = camera.edges.x;
+    if (near <= base) {
+        return base;
+    }
+    let t = clamp(dot((a + b) * 0.5, camera.cue.xyz) + camera.cue.w, 0.0, 1.0);
+    return mix(near, base, t);
+}
+
+fn fat_quad(vi: u32, a: vec3<f32>, b: vec3<f32>, width: f32) -> FatOut {
     var out: FatOut;
+    out.width = width;
     var ca = pulled_clip(a);
     var cb = pulled_clip(b);
     // Clip to just in front of the eye so a segment crossing it does not flip.
@@ -137,7 +159,7 @@ fn fat_quad(vi: u32, a: vec3<f32>, b: vec3<f32>) -> FatOut {
         vec2(0.0, 1.0), vec2(1.0, -1.0), vec2(1.0, 1.0),
     );
     let c = corners[vi];
-    let half_w = camera.screen.z * 0.5 + 1.0; // +1 px for the AA ramp
+    let half_w = width * 0.5 + 1.0; // +1 px for the AA ramp
     var clip = ca;
     var along = -1.0;
     if (c.x > 0.5) {
@@ -154,15 +176,15 @@ fn fat_quad(vi: u32, a: vec3<f32>, b: vec3<f32>) -> FatOut {
 
 @fragment
 fn fs_fat(in: FatOut) -> @location(0) vec4<f32> {
-    return fat_ink(in.local, in.len_px);
+    return fat_ink(in.local, in.len_px, in.width);
 }
 
-fn fat_ink(local: vec2<f32>, len_px: f32) -> vec4<f32> {
+fn fat_ink(local: vec2<f32>, len_px: f32, width: f32) -> vec4<f32> {
     let c = ink();
     // Distance to the segment (not just across it): round caps.
     let past = max(-local.y, local.y - len_px);
     let dist = length(vec2(local.x, max(past, 0.0)));
-    let cover = clamp(camera.screen.z * 0.5 + 0.5 - dist, 0.0, 1.0);
+    let cover = clamp(width * 0.5 + 0.5 - dist, 0.0, 1.0);
     if (cover <= 0.0) {
         discard; // keep the cap corners out of the depth buffer
     }
@@ -229,6 +251,7 @@ struct FatDashOut {
     @location(1) @interpolate(flat) len_px: f32,
     @location(2) s: f32,
     @location(3) w: f32,
+    @location(4) @interpolate(flat) width: f32,
 };
 
 @vertex
@@ -237,9 +260,10 @@ fn vs_fat_dash(
     @location(0) a: vec4<f32>,
     @location(1) b: vec4<f32>,
 ) -> FatDashOut {
-    let q = fat_quad(vi, a.xyz, b.xyz);
+    let q = fat_quad(vi, a.xyz, b.xyz, stroke_width(a.xyz, b.xyz));
     var out: FatDashOut;
     out.pos = q.pos;
+    out.width = q.width;
     out.local = q.local;
     out.len_px = q.len_px;
     // Corners 1, 4 and 5 sit at the segment's end (see `corners` above).
@@ -253,5 +277,40 @@ fn fs_fat_dash(in: FatDashOut) -> @location(0) vec4<f32> {
     if (!dash_on(in.s, in.w)) {
         discard;
     }
-    return fat_ink(in.local, in.len_px);
+    return fat_ink(in.local, in.len_px, in.width);
+}
+
+// Back edges (#361, SketchUp): the edges hidden behind faces, drawn after the
+// scene in a second pass whose depth test is reversed (GREATER, no depth
+// writes), as faint dashes of the stroke's own colour. One fat quad per
+// segment of the edge / curve LineList buffers, so no extra geometry: the
+// dashes run in screen px along each segment (`local.y`). The segment is
+// pulled toward the eye like every fat stroke, plus a little more in
+// parallel views, so a visible edge (at its face's depth) fails the test.
+@vertex
+fn vs_back(
+    @builtin(vertex_index) vi: u32,
+    @location(0) a: vec3<f32>,
+    @location(1) b: vec3<f32>,
+) -> FatOut {
+    var q = fat_quad(vi, a, b, max(camera.screen.z, 1.0));
+    let eye_clip = camera.view_proj * vec4(camera.eye.xyz, 1.0);
+    if (abs(eye_clip.w) >= 0.5) {
+        q.pos.z -= 1e-4 * q.pos.w;
+    }
+    return q;
+}
+
+// Back-edge dash in logical px (on, off) and opacity (`BACK_EDGE_ALPHA`).
+const BACK_DASH: vec2<f32> = vec2(4.0, 3.0);
+const BACK_ALPHA: f32 = 0.4;
+
+@fragment
+fn fs_back(in: FatOut) -> @location(0) vec4<f32> {
+    let pat = BACK_DASH * max(camera.edges.z, 1.0);
+    if (fract(max(in.local.y, 0.0) / (pat.x + pat.y)) * (pat.x + pat.y) >= pat.x) {
+        discard;
+    }
+    let c = fat_ink(in.local, in.len_px, in.width);
+    return vec4(c.rgb, c.a * BACK_ALPHA);
 }

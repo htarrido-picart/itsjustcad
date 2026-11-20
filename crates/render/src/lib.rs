@@ -7,6 +7,7 @@ mod camera;
 mod contrast;
 mod control;
 mod cubemap;
+mod edge_style;
 mod layout;
 mod msaa;
 mod pano;
@@ -26,6 +27,9 @@ pub use cubemap::{render_pano_image, PanoImage};
 pub use pano::{
     equirect_dir_to_ndc, equirect_ndc_to_dir, fisheye_ndc_to_dir, fisheye_radius, pixel_to_ndc,
     CubeFace, Ndc, PanoProjection,
+};
+pub use edge_style::{
+    axis_of, parse_hex_rgb, EdgeColor, EdgeStyle, BACK_EDGE_ALPHA, DEPTH_CUE_PX, EXTENSION_M,
 };
 pub use layout::ViewportLayout;
 pub use renderer::{
@@ -92,6 +96,8 @@ pub fn camera_uniform_ex(
         misc: [mode.fill_alpha(), sx, sy, sz],
         light: [light.shader_flag(), if background_gradient { 1.0 } else { 0.0 }, 0.0, 0.0],
         screen: [0.0; 4],
+        edges: [0.0; 4],
+        cue: [0.0; 4],
     }
 }
 
