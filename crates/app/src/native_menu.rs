@@ -209,6 +209,12 @@ impl NativeMenuBar {
                 it.set_checked(view.camera == Some(tag));
             }
         }
+        // Anti-aliasing radios: exactly the requested sample count checked.
+        for (id, n) in [("View/aa_off", 1), ("View/aa_2x", 2), ("View/aa_4x", 4), ("View/aa_8x", 8)] {
+            if let Some(it) = self.check_items.get(id) {
+                it.set_checked(view.antialias.max(1) == n);
+            }
+        }
         // Skin radios (Theme ▸ Skin): exactly the active skin checked.
         for (id, origin) in crate::menu::skin_radio_items() {
             if let Some(it) = self.check_items.get(&format!("Theme/{id}")) {

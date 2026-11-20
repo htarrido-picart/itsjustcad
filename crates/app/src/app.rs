@@ -663,6 +663,12 @@ pub struct App {
     /// edges" default). ON by default; toggled by `shadededges [on|off]`.
     /// Persisted to `ui.json`. View state, never logged.
     shaded_edges: bool,
+    /// Requested viewport anti-aliasing: MSAA sample count 1 (off), 2, 4 or 8
+    /// (#356). Default 4x; set by `antialias off|2|4|8` / View menu. Persisted
+    /// to `ui.json`. The count drawn is the highest supported one not above it.
+    msaa: u32,
+    /// MSAA sample counts this GPU supports for the viewport (always has 1).
+    msaa_supported: Vec<u32>,
     /// 2D top-view planting symbols overlay for `plant:<id>` meshes. OFF by
     /// default; toggled by `plantsymbols [on|off]`. View state, never logged.
     plant_symbols: bool,
@@ -1455,6 +1461,12 @@ impl App {
             .write()
             .callback_resources
             .insert(SceneRenderer::new(&rs.device, rs.target_format));
+        // MSAA counts this GPU can render + resolve for the viewport (#356).
+        let msaa_supported = itsjustcad_render::supported_sample_counts(
+            &rs.adapter,
+            rs.device.features(),
+            rs.target_format,
+        );
 
         // Accessibility: readable default text size, persisted across runs.
         // Cmd+= / Cmd+- / Cmd+0 also work (egui built-in zoom).
@@ -1550,6 +1562,8 @@ impl App {
             light_mode: itsjustcad_render::LightMode::default(),
             profile_edges: false,
             shaded_edges: load_shaded_edges().unwrap_or(true),
+            msaa: load_msaa().unwrap_or(itsjustcad_render::DEFAULT_MSAA),
+            msaa_supported,
             plant_symbols: false,
             show_gumball: load_gumball_visible().unwrap_or(false),
             sketchy: itsjustcad_render::SketchyParams::default(),
@@ -2261,6 +2275,23 @@ impl App {
                 self.command_line
                     .push_line(format!("shaded edges: {}", if on { "on" } else { "off" }));
             }
+            // Viewport anti-aliasing (MSAA, #356). View state, never logged;
+            // persisted to ui.json. Bare `antialias` reports the setting.
+            Some("antialias" | "aa") => match words.next() {
+                None => {
+                    let line = self.msaa_status();
+                    self.command_line.push_line(line);
+                }
+                Some(arg) => match crate::app_verbs::parse_msaa(arg) {
+                    Some(n) => {
+                        self.msaa = n;
+                        save_msaa(n);
+                        let line = self.msaa_status();
+                        self.command_line.push_line(line);
+                    }
+                    None => self.command_line.push_line("usage: antialias off|2|4|8"),
+                },
+            },
             // Toggle 2D top-view planting symbols. When on, each `plant:<id>`
             // mesh also draws its plan drafting glyph flat on the ground so the
             // model reads as a planting plan in the top view. View state, never
@@ -5075,6 +5106,8 @@ impl App {
                         edges_enabled: self.shaded_edges,
                         force: force_upload,
                         size_points: [rect.width(), rect.height()],
+                        rect,
+                        samples: self.msaa_samples(),
                     },
                 ));
             }
@@ -9468,6 +9501,29 @@ impl App {
     /// visibility) so the View menu's radio + flip items read as stateful. Maps
     /// the render enums onto the menu-local tags [`crate::menu`] uses so `menu.rs`
     /// stays render-dep-free.
+    /// The MSAA sample count the viewport draws with: the requested one, or
+    /// the highest supported count below it (#356).
+    fn msaa_samples(&self) -> u32 {
+        itsjustcad_render::pick_sample_count(self.msaa, &self.msaa_supported)
+    }
+
+    /// `antialias: 4x`, noting the fallback when the GPU caps the request.
+    fn msaa_status(&self) -> String {
+        let label = |n: u32| if n <= 1 { "off".to_string() } else { format!("{n}x") };
+        let used = self.msaa_samples();
+        if used == self.msaa {
+            format!("antialias: {}", label(used))
+        } else {
+            let max = self.msaa_supported.iter().copied().max().unwrap_or(1);
+            format!(
+                "antialias: {} (GPU max {}, using {})",
+                label(self.msaa),
+                label(max),
+                label(used)
+            )
+        }
+    }
+
     fn view_state(&self) -> crate::menu::ViewState {
         use crate::menu::{CameraTag, DisplayModeTag, LightModeTag};
         use itsjustcad_render::{DisplayMode, LightMode, PanoProjection};
@@ -9505,6 +9561,7 @@ impl App {
             lighting,
             camera,
             panel_visible: self.panel_visible,
+            antialias: self.msaa,
             skin: self.cad_origin,
             lang: crate::i18n::current_lang(),
         }
@@ -10736,6 +10793,21 @@ fn load_deck_visible() -> Option<bool> {
 fn save_deck_visible(visible: bool) {
     let mut v = load_ui_json();
     v["deck_visible"] = serde_json::json!(visible);
+    save_ui_json(&v);
+}
+
+/// Restore the persisted viewport MSAA sample count (#356); `None` when absent
+/// or not one of the offered choices.
+fn load_msaa() -> Option<u32> {
+    load_ui_json()["antialias"]
+        .as_u64()
+        .map(|n| n as u32)
+        .filter(|n| itsjustcad_render::MSAA_CHOICES.contains(n))
+}
+
+fn save_msaa(samples: u32) {
+    let mut v = load_ui_json();
+    v["antialias"] = serde_json::json!(samples);
     save_ui_json(&v);
 }
 
