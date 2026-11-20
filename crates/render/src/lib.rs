@@ -3,6 +3,8 @@
 
 //! Viewport rendering: wgpu pipelines inside egui paint callbacks.
 
+mod ao;
+mod ao_style;
 mod camera;
 mod contrast;
 mod control;
@@ -33,6 +35,8 @@ pub use pano::{
 pub use edge_style::{
     axis_of, parse_hex_rgb, EdgeColor, EdgeStyle, BACK_EDGE_ALPHA, DEPTH_CUE_PX, EXTENSION_M,
 };
+pub use ao::{ao_resolution, AoTarget};
+pub use ao_style::{AoStyle, AoUnits, AO_DISTANCE, AO_INTENSITY};
 pub use fog_style::{FogColor, FogStyle, FOG_END, FOG_START};
 pub use layout::ViewportLayout;
 pub use renderer::{
@@ -104,6 +108,8 @@ pub fn camera_uniform_ex(
         cue: [0.0; 4],
         fog: [0.0; 4],
         fog_color: [0.0; 4],
+        ao: [0.0; 4],
+        ao_color: [0.0; 4],
     }
 }
 

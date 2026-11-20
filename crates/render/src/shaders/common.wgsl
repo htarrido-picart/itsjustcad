@@ -1,6 +1,7 @@
-// Shared by the scene shaders (mesh, curve, grid, underlay): prepended to each
-// when its module is built (see `scene_shader` in renderer.rs). Holds the
-// camera uniform, the background gradient and the fog (#363).
+// Shared by the scene shaders (mesh, curve, grid, underlay, ao): prepended to
+// each when its module is built (see `scene_shader` in renderer.rs). Holds the
+// camera uniform, the background gradient, the fog (#363) and the ambient
+// occlusion lookup (#358).
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -27,9 +28,16 @@ struct Camera {
     fog: vec4<f32>,
     // Fog colour: the custom colour, or the flat background colour.
     fog_color: vec4<f32>,
+    // Ambient occlusion (#358): x = 1 on, y = intensity, z = requested
+    // distance, w = sampling radius in world units.
+    ao: vec4<f32>,
+    // Colour occluded faces darken toward.
+    ao_color: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
+// The pane's blurred occlusion (0 = open, 1 = fully occluded), see ao.rs.
+@group(0) @binding(1) var ao_tex: texture_2d<f32>;
 
 fn unproject(ndc: vec2<f32>, depth: f32) -> vec3<f32> {
     let p = camera.inv_view_proj * vec4(ndc, depth, 1.0);
@@ -100,4 +108,20 @@ fn fogged(c: vec4<f32>, p: vec3<f32>) -> vec4<f32> {
         return c;
     }
     return vec4(mix(c.rgb, fog_colour(p), f), c.a);
+}
+
+// Fill colour `c` of world point `p` darkened by the pane's ambient occlusion
+// (#358) toward the AO colour. The texel is found by projecting `p`, so the
+// lookup is the same in the MSAA target and in egui's pass. With AO off the
+// colour is returned untouched.
+fn occluded(c: vec4<f32>, p: vec3<f32>) -> vec4<f32> {
+    if (camera.ao.x < 0.5) {
+        return c;
+    }
+    let clip = camera.view_proj * vec4(p, 1.0);
+    let ndc = clip.xy / clip.w;
+    let dims = vec2<f32>(textureDimensions(ao_tex));
+    let px = clamp(vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * dims, vec2(0.0), dims - 1.0);
+    let occ = textureLoad(ao_tex, vec2<i32>(px), 0).r;
+    return vec4(mix(c.rgb, camera.ao_color.rgb, occ * camera.ao.y), c.a);
 }

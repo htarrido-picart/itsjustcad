@@ -51,6 +51,13 @@ pub struct CameraUniform {
     pub fog: [f32; 4],
     /// Fog colour RGBA: the custom colour, or the flat background colour.
     pub fog_color: [f32; 4],
+    /// Ambient occlusion (#358): x = 1 on, y = intensity (0..1), z = the
+    /// requested distance (world units, or minus a fraction of the scene
+    /// diagonal), w = the sampling radius in world units, resolved by
+    /// [`SceneRenderer::write_camera`]. See [`CameraUniform::with_ao`].
+    pub ao: [f32; 4],
+    /// The colour occluded faces darken toward (RGBA).
+    pub ao_color: [f32; 4],
 }
 
 impl CameraUniform {
@@ -114,6 +121,36 @@ impl CameraUniform {
     /// Whether the pane draws fog.
     pub fn has_fog(&self) -> bool {
         self.fog[2] > 0.5
+    }
+
+    /// The same camera with the pane's ambient occlusion (#358), on only
+    /// when `style` is on and `mode` has an opaque fill
+    /// ([`DisplayMode::takes_ao`]). Off leaves the camera as it was.
+    pub fn with_ao(mut self, style: &crate::AoStyle, mode: DisplayMode) -> Self {
+        if !style.on || !mode.takes_ao() {
+            self.ao = [0.0; 4];
+            self.ao_color = [0.0; 4];
+            return self;
+        }
+        let (request, radius) = match style.units {
+            crate::AoUnits::World => (style.radius(1.0), style.radius(1.0)),
+            // Resolved against the scene bounds in `write_camera`.
+            crate::AoUnits::Scene => (-style.radius(1.0), 0.0),
+        };
+        self.ao = [1.0, style.strength(), request, radius];
+        self.ao_color = style.rgba();
+        self
+    }
+
+    /// Whether the pane draws ambient occlusion.
+    pub fn has_ao(&self) -> bool {
+        self.ao[0] > 0.5
+    }
+
+    /// Whether the camera depends on the scene bounds: the depth ramp, or an
+    /// AO distance relative to the scene.
+    fn uses_bounds(&self) -> bool {
+        self.uses_ramp() || (self.has_ao() && self.ao[2] < 0.0)
     }
 
     /// Whether the depth ramp (`cue`) is in use: depth cue or fog.
@@ -259,6 +296,13 @@ impl DisplayMode {
 
     pub fn draws_fill(self) -> bool {
         self != DisplayMode::Wireframe
+    }
+
+    /// Whether ambient occlusion (#358) darkens this mode's fill: the opaque
+    /// fills (Shaded, Pencil, Sketchy). Wireframe has none, X-ray and
+    /// Ghosted see through, and Hidden Line shows the background.
+    pub fn takes_ao(self) -> bool {
+        matches!(self, DisplayMode::Shaded | DisplayMode::Pencil | DisplayMode::Sketchy)
     }
 
     /// Whether this mode draws mesh feature edges. Shaded now draws them too:
@@ -1146,6 +1190,8 @@ pub struct SceneRenderer {
     sample_count: u32,
     /// Per-pane multisampled targets for the viewport MSAA path (#356).
     pub(crate) msaa: crate::msaa::ViewportMsaa,
+    /// Per-pane ambient-occlusion targets and passes (#358).
+    pub(crate) ao: crate::ao::ViewportAo,
     /// LineList copies of `lines` (strips) for the fat-stroke pass.
     curve_segments: Batch,
     /// Per pane: whether its last camera asked for fat strokes.
@@ -1154,15 +1200,15 @@ pub struct SceneRenderer {
     axes_hidden: Vec<bool>,
     /// Per pane: its last camera, re-sent with a fresh depth-cue ramp when
     /// the scene bounds change (#361).
-    last_cameras: Vec<CameraUniform>,
+    pub(crate) last_cameras: Vec<CameraUniform>,
     /// World bounds `(min, max)` of the uploaded scene's strokes and meshes,
     /// for the depth-cue ramp (#361).
     scene_bounds: Option<(glam::Vec3, glam::Vec3)>,
-    camera_layout: wgpu::BindGroupLayout,
+    pub(crate) camera_layout: wgpu::BindGroupLayout,
     /// One camera UBO + bind group per viewport pane. egui-wgpu runs every
     /// callback's `prepare` before any `paint`, so panes must not share a
     /// single camera buffer — the last write would win for all of them.
-    cameras: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    pub(crate) cameras: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     object_layout: wgpu::BindGroupLayout,
     /// Per-object color/material for every scene batch, one bind group.
     scene_params: ParamBuffer,
@@ -1172,9 +1218,9 @@ pub struct SceneRenderer {
     axis_params: ParamBuffer,
     /// Underlay bind layout: (texture, sampler, opacity).
     underlay_layout: wgpu::BindGroupLayout,
-    meshes: Batch,
+    pub(crate) meshes: Batch,
     /// Per-face-coloured meshes, 9 floats per vertex (#327).
-    face_meshes: Batch,
+    pub(crate) face_meshes: Batch,
     lines: Batch,
     edges: Batch,
     /// Profile / silhouette edges tessellated into fat-line ribbon meshes so
@@ -1218,16 +1264,20 @@ impl SceneRenderer {
     ) -> Self {
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // The pane's ambient occlusion (#358), read by the fills.
+                crate::ao::occlusion_entry(1),
+            ],
         });
         let object_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("object_layout"),
@@ -1304,6 +1354,7 @@ impl SceneRenderer {
             target_format,
             sample_count: samples,
             msaa: Default::default(),
+            ao: crate::ao::ViewportAo::new(device),
             curve_segments: Batch::new("curve_segments"),
             fat_lines: Vec::new(),
             axes_hidden: Vec::new(),
@@ -1377,17 +1428,15 @@ impl SceneRenderer {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("camera_bind_group"),
-                layout: &self.camera_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buf.as_entire_binding(),
-                }],
-            });
+            let bind_group = self.camera_bind_group(device, &buf, self.cameras.len());
             self.cameras.push((buf, bind_group));
         }
-        let cam = &CameraUniform { cue: depth_cue_ramp(cam, self.scene_bounds), ..*cam };
+        let mut ao = cam.ao;
+        if cam.has_ao() && ao[2] < 0.0 {
+            let diagonal = self.scene_bounds.map_or(1.0, |(lo, hi)| (hi - lo).length());
+            ao[3] = -ao[2] * diagonal.max(1e-3);
+        }
+        let cam = &CameraUniform { cue: depth_cue_ramp(cam, self.scene_bounds), ao, ..*cam };
         queue.write_buffer(&self.cameras[viewport].0, 0, bytemuck::bytes_of(cam));
         if self.fat_lines.len() <= viewport {
             self.fat_lines.resize(viewport + 1, false);
@@ -1398,6 +1447,27 @@ impl SceneRenderer {
         self.fat_lines[viewport] =
             cam.screen[0] > 0.0 && cam.screen[1] > 0.0 && cam.screen[2] > 0.0;
         self.axes_hidden[viewport] = !cam.shows_axes();
+    }
+
+    /// Pane `viewport`'s camera bind group over `buf`: the camera and the
+    /// pane's occlusion (its AO target, else the empty one).
+    pub(crate) fn camera_bind_group(
+        &self,
+        device: &wgpu::Device,
+        buf: &wgpu::Buffer,
+        viewport: usize,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera_bind_group"),
+            layout: &self.camera_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(self.ao.occlusion_view(viewport)),
+                },
+            ],
+        })
     }
 
     /// Replace the mesh fill only, leaving the other scene batches as they
@@ -1504,7 +1574,7 @@ impl SceneRenderer {
             self.scene_bounds = bounds;
             for i in 0..self.last_cameras.len() {
                 let cam = self.last_cameras[i];
-                if cam.uses_ramp() {
+                if cam.uses_bounds() {
                     self.write_camera(device, queue, i, &cam);
                 }
             }

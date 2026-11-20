@@ -54,6 +54,9 @@ pub struct ViewportCallback {
     pub edge_style: crate::EdgeStyle,
     /// Fog (#363), GPU-only.
     pub fog: crate::FogStyle,
+    /// Ambient occlusion (#358), GPU-only; applied when `mode` has an opaque
+    /// fill.
+    pub ao: crate::AoStyle,
     /// The flat colour behind the scene (the clear colour: theme or paper),
     /// the fog's background colour when the gradient is off.
     pub background: [f32; 4],
@@ -95,10 +98,13 @@ impl CallbackTrait for ViewportCallback {
             cue: [0.0; 4],
             fog: [0.0; 4],
             fog_color: [0.0; 4],
+            ao: [0.0; 4],
+            ao_color: [0.0; 4],
         }
         .with_overlays(self.show_grid, self.show_axes)
         .with_edge_style(&self.edge_style, screen_desc.pixels_per_point)
-        .with_fog(&self.fog, self.background);
+        .with_fog(&self.fog, self.background)
+        .with_ao(&self.ao, self.mode);
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene
             && (renderer.generation != self.generation || self.force)
@@ -107,17 +113,20 @@ impl CallbackTrait for ViewportCallback {
         }
         // Every pane shares one count, so only a setting change rebuilds.
         renderer.set_sample_count(device, self.samples.max(1));
+        let vp = egui::epaint::ViewportInPixels::from_points(
+            &self.rect,
+            screen_desc.pixels_per_point,
+            screen_desc.size_in_pixels,
+        );
+        let size_px = [vp.width_px.max(0) as u32, vp.height_px.max(0) as u32];
+        // Ambient occlusion (#358) first, for either path: the fills read it.
+        renderer.render_ao(device, queue, encoder, self.viewport, size_px);
         if renderer.sample_count() > 1 {
-            let vp = egui::epaint::ViewportInPixels::from_points(
-                &self.rect,
-                screen_desc.pixels_per_point,
-                screen_desc.size_in_pixels,
-            );
             renderer.render_msaa_pane(
                 device,
                 encoder,
                 self.viewport,
-                [vp.width_px.max(0) as u32, vp.height_px.max(0) as u32],
+                size_px,
                 self.mode,
                 self.edges_enabled,
             );

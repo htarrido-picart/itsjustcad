@@ -10,8 +10,8 @@
 
 use glam::{Mat4, Vec3};
 use itsjustcad_render::{
-    camera_uniform, pick_sample_count, supported_sample_counts, DisplayMode, EdgeStyle, FogColor,
-    FogStyle, SceneData,
+    camera_uniform, pick_sample_count, supported_sample_counts, AoStyle, AoUnits, DisplayMode,
+    EdgeStyle, FogColor, FogStyle, SceneData,
     SceneRenderer, UnderlayData, DEPTH_FORMAT,
 };
 use itsjustcad_doc::LineType;
@@ -579,4 +579,131 @@ fn fog_fades_far_geometry_and_leaves_near_untouched_at_every_sample_count() {
             }
         }
     }
+}
+
+/// A box-corner scene for ambient occlusion (#358): a floor (z = 0) meeting
+/// a wall (y = 4) that faces the camera, plus the camera looking down at the
+/// inside corner from the front.
+fn corner_scene() -> (SceneData, Mat4, Vec3) {
+    let quad = |c: [[f32; 3]; 4], n: [f32; 3]| RenderMesh {
+        positions: c.to_vec(),
+        normals: vec![n; 4],
+        // Both windings, so back-face culling never hides it.
+        indices: vec![0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2],
+    };
+    let floor = quad([[-4.0, -2.0, 0.0], [4.0, -2.0, 0.0], [4.0, 4.0, 0.0], [-4.0, 4.0, 0.0]], [0.0, 0.0, 1.0]);
+    let wall = quad([[-4.0, 4.0, 0.0], [4.0, 4.0, 0.0], [4.0, 4.0, 4.0], [-4.0, 4.0, 4.0]], [0.0, -1.0, 0.0]);
+    let grey = [0.8, 0.8, 0.8, 1.0];
+    let scene = SceneData {
+        meshes: vec![(floor, grey, [0.5, 0.0]), (wall, grey, [0.5, 0.0])],
+        face_meshes: vec![],
+        lines: vec![],
+        edges: vec![],
+        line_types: vec![],
+        edge_types: vec![],
+        profile_edges: vec![],
+        points: vec![],
+        underlay: None,
+        basemap: None,
+        show_lineweights: false,
+    };
+    let eye = Vec3::new(0.0, -5.0, 5.0);
+    let view = Mat4::look_at_rh(eye, Vec3::new(0.0, 3.0, 1.0), Vec3::Z);
+    let proj = Mat4::perspective_rh(50f32.to_radians(), W as f32 / H as f32, 0.05, 1000.0);
+    (scene, proj * view, eye)
+}
+
+/// Render the corner scene at `n` samples in `mode` with `ao`; validation
+/// errors fail the test.
+fn draw_ao(g: &Gpu, n: u32, mode: DisplayMode, ao: &AoStyle) -> Vec<u8> {
+    let (scene, vp, eye) = corner_scene();
+    let scope = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut r = SceneRenderer::with_samples(&g.device, FORMAT, n);
+    r.set_scene(&g.device, &g.queue, &scene, 1);
+    let mut cam = camera_uniform(vp, eye).with_overlays(false, false);
+    cam.screen = [W as f32, H as f32, 0.0, 1.0];
+    r.write_camera(&g.device, &g.queue, 0, &cam.with_ao(ao, mode));
+    let mut enc = g.device.create_command_encoder(&Default::default());
+    r.render_ao(&g.device, &g.queue, &mut enc, 0, [W, H]);
+    assert_eq!(r.ao_target(0).is_some(), ao.on && mode.takes_ao(), "{n}x {mode:?}: target only with AO");
+    let rgba = if n > 1 {
+        r.render_msaa_pane(&g.device, &mut enc, 0, [W, H], mode, false);
+        g.queue.submit([enc.finish()]);
+        read_rgba(g, r.msaa_target(0).expect("target").resolve_texture())
+    } else {
+        g.queue.submit([enc.finish()]);
+        window_pass(g, wgpu::Color::TRANSPARENT, |pass| r.paint(pass, 0, mode, false))
+    };
+    let err = pollster::block_on(scope.pop());
+    assert!(err.is_none(), "{n}x {mode:?} ao: {err:?}");
+    rgba
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn ao_darkens_the_concave_corner_not_open_faces_at_every_sample_count() {
+    // #358: with AO on, the floor/wall crease darkens clearly while the open
+    // middle of the floor and the top of the wall keep their shade, at every
+    // sample count. AO off (or a mode without AO) is today's image exactly.
+    let g = gpu();
+    let (_, vp, _) = corner_scene();
+    let pixel = |p: Vec3| {
+        let ndc = vp.project_point3(p);
+        let x = ((ndc.x * 0.5 + 0.5) * W as f32) as usize;
+        let y = ((0.5 - ndc.y * 0.5) * H as f32) as usize;
+        (y * W as usize + x) * 4
+    };
+    let luma = |rgba: &[u8], p: Vec3| {
+        let i = pixel(p);
+        rgba[i] as i32 + rgba[i + 1] as i32 + rgba[i + 2] as i32
+    };
+    let on = AoStyle { on: true, distance: 1.0, units: AoUnits::World, intensity: 1.0, ..Default::default() };
+    let corner = [Vec3::new(-1.0, 3.95, 0.08), Vec3::new(1.0, 3.9, 0.05), Vec3::new(0.0, 3.97, 0.25)];
+    let open = [Vec3::new(0.0, 0.5, 0.0), Vec3::new(-1.5, 1.0, 0.0), Vec3::new(0.5, 4.0, 3.0)];
+    for &n in &g.counts {
+        for mode in [DisplayMode::Shaded, DisplayMode::Pencil] {
+            let plain = draw_ao(&g, n, mode, &AoStyle::default());
+            let ao = draw_ao(&g, n, mode, &on);
+            for p in corner {
+                let (a, b) = (luma(&plain, p), luma(&ao, p));
+                assert!(b * 10 < a * 8, "{n}x {mode:?}: corner {p} darkens ({a} -> {b})");
+            }
+            for p in open {
+                let (a, b) = (luma(&plain, p), luma(&ao, p));
+                assert!(a.abs_diff(b) <= 6, "{n}x {mode:?}: open face {p} untouched ({a} -> {b})");
+            }
+            // Off with other settings changed is the default image.
+            assert_eq!(draw_ao(&g, n, mode, &AoStyle { on: false, ..on }), plain, "{n}x {mode:?}: off");
+        }
+        for mode in [DisplayMode::XRay, DisplayMode::HiddenLine, DisplayMode::Wireframe, DisplayMode::Ghosted] {
+            let plain = draw_ao(&g, n, mode, &AoStyle::default());
+            assert_eq!(draw_ao(&g, n, mode, &on), plain, "{n}x {mode:?}: skipped");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn ao_targets_rebuild_only_on_resize_and_free_when_off() {
+    let g = gpu();
+    let (scene, vp, eye) = corner_scene();
+    let mut r = SceneRenderer::new(&g.device, FORMAT);
+    r.set_scene(&g.device, &g.queue, &scene, 1);
+    let on = AoStyle { on: true, ..Default::default() };
+    let cam = camera_uniform(vp, eye);
+    r.write_camera(&g.device, &g.queue, 0, &cam.with_ao(&on, DisplayMode::Shaded));
+    let mut enc = g.device.create_command_encoder(&Default::default());
+    r.render_ao(&g.device, &g.queue, &mut enc, 0, [W, H]);
+    let before = r.ao_target(0).expect("target") as *const _;
+    // A setting change only rewrites the camera.
+    let stronger = AoStyle { intensity: 1.0, ..on };
+    r.write_camera(&g.device, &g.queue, 0, &cam.with_ao(&stronger, DisplayMode::Shaded));
+    r.render_ao(&g.device, &g.queue, &mut enc, 0, [W, H]);
+    assert!(std::ptr::eq(before, r.ao_target(0).unwrap()), "kept across frames and settings");
+    r.render_ao(&g.device, &g.queue, &mut enc, 0, [W / 2, H]);
+    assert_eq!(r.ao_target(0).unwrap().size(), [W / 2, H], "rebuilt on resize");
+    r.write_camera(&g.device, &g.queue, 0, &cam);
+    r.render_ao(&g.device, &g.queue, &mut enc, 0, [W / 2, H]);
+    assert!(r.ao_target(0).is_none(), "freed when off");
+    g.queue.submit([enc.finish()]);
 }

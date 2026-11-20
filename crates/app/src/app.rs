@@ -681,6 +681,10 @@ pub struct App {
     /// colour. Off by default; persisted to `ui.json` as one object (#362
     /// named styles bundle it). GPU-only view state, never logged.
     fog_style: itsjustcad_render::FogStyle,
+    /// Viewport ambient occlusion (#358): on/off, distance, intensity,
+    /// colour. Off by default; persisted to `ui.json` as one object (named
+    /// styles bundle it). GPU-only view state, never logged.
+    ao_style: itsjustcad_render::AoStyle,
     /// Sky/ground gradient behind the scene, set by a named style (#362).
     /// `None` (the default) follows `profile_edges`, the coupling the
     /// `massing` preset has always had. View state, never logged.
@@ -1643,6 +1647,7 @@ impl App {
             show_axes: view_overlays(&load_ui_json()).1,
             edge_style: edge_style_from(&load_ui_json()),
             fog_style: fog_style_from(&load_ui_json()),
+            ao_style: ao_style_from(&load_ui_json()),
             background_gradient: None,
             msaa: load_msaa().unwrap_or(itsjustcad_render::DEFAULT_MSAA),
             msaa_supported,
@@ -2349,6 +2354,12 @@ impl App {
             Some("fog") => match crate::app_verbs::classify(line) {
                 Some(verb) => self.apply_fog_verb(verb),
                 None => self.command_line.push_line(FOG_USAGE),
+            },
+            // Ambient occlusion (#358): GPU-only view state, never logged;
+            // persisted to ui.json.
+            Some("ao" | "ambientocclusion") => match crate::app_verbs::classify(line) {
+                Some(verb) => self.apply_ao_verb(verb),
+                None => self.command_line.push_line(AO_USAGE),
             },
             Some("style") => match crate::app_verbs::classify(line) {
                 Some(crate::app_verbs::AppVerb::Style(verb)) => self.run_style_verb(line, verb),
@@ -3715,6 +3726,13 @@ impl App {
         self.command_line.push_line(self.fog_style.summary());
     }
 
+    /// Apply an `ao` verb (#358), persist the setting and report it.
+    fn apply_ao_verb(&mut self, verb: crate::app_verbs::AppVerb) {
+        self.ao_style = crate::app_verbs::apply_ao_style(self.ao_style, &verb);
+        save_ao_style(&self.ao_style);
+        self.command_line.push_line(self.ao_style.summary());
+    }
+
     /// The display settings of the active pane as a named style (#362).
     fn current_view_style(&self) -> itsjustcad_render::ViewStyle {
         let slot = self.effective_camera_index(self.active_pane);
@@ -3727,6 +3745,7 @@ impl App {
             sketchy: self.sketchy,
             edges: self.edge_style,
             fog: self.fog_style,
+            ao: self.ao_style,
             grid: self.show_grid,
             axes: self.show_axes,
             gradient: self.background_gradient,
@@ -3759,6 +3778,8 @@ impl App {
         save_edge_style(&s.edges);
         self.fog_style = s.fog;
         save_fog_style(&s.fog);
+        self.ao_style = s.ao;
+        save_ao_style(&s.ao);
     }
 
     /// The name of the style the active pane's settings match (#362).
@@ -5662,6 +5683,7 @@ impl App {
                         show_axes: self.show_axes,
                         edge_style: self.edge_style,
                         fog: self.fog_style,
+                        ao: self.ao_style,
                         background: self.viewport_background(ui.visuals().dark_mode),
                     },
                 ));
@@ -10539,6 +10561,7 @@ impl App {
             show_axes: self.show_axes,
             edges: self.edge_style.into(),
             fog: self.fog_style.into(),
+            ao: self.ao_style.on,
             style: self
                 .active_style_name()
                 .and_then(|n| itsjustcad_render::BuiltinStyle::parse(&n)),
@@ -11876,6 +11899,25 @@ fn fog_style_from(ui: &serde_json::Value) -> itsjustcad_render::FogStyle {
 fn save_fog_style(style: &itsjustcad_render::FogStyle) {
     let mut v = load_ui_json();
     v[FOG_STYLE_KEY] = serde_json::to_value(style).unwrap_or_default();
+    save_ui_json(&v);
+}
+
+/// ui.json key of the ambient occlusion (#358).
+const AO_STYLE_KEY: &str = "ao_style";
+
+/// Usage of the ao verb (#358).
+const AO_USAGE: &str =
+    "usage: ao on|off · ao distance <n%> (of the scene) | <n>[m] · ao intensity <0..1> · ao colour #rrggbb|black";
+
+/// The ambient occlusion saved in ui.json contents; defaults (off) for
+/// missing or unreadable keys.
+fn ao_style_from(ui: &serde_json::Value) -> itsjustcad_render::AoStyle {
+    serde_json::from_value(ui[AO_STYLE_KEY].clone()).unwrap_or_default()
+}
+
+fn save_ao_style(style: &itsjustcad_render::AoStyle) {
+    let mut v = load_ui_json();
+    v[AO_STYLE_KEY] = serde_json::to_value(style).unwrap_or_default();
     save_ui_json(&v);
 }
 
@@ -13710,6 +13752,28 @@ mod tests {
         assert!(is_destructive_verb("Delete"));
         for v in ["offset", "box", "line"] {
             assert!(!is_destructive_verb(v), "{v} should NOT be destructive");
+        }
+    }
+
+    #[test]
+    fn ao_verbs_apply_and_persist_in_ui_json() {
+        use crate::app_verbs::{apply_ao_style, classify};
+        use itsjustcad_render::{AoStyle, AoUnits};
+        // #358: no key (or a broken one) is no AO.
+        assert_eq!(ao_style_from(&serde_json::json!({})), AoStyle::default());
+        assert_eq!(ao_style_from(&serde_json::json!({ AO_STYLE_KEY: [1] })), AoStyle::default());
+        let mut ao = AoStyle::default();
+        for line in ["ao distance 4%", "ao intensity 0.7", "ao colour #102030"] {
+            ao = apply_ao_style(ao, &classify(line).unwrap());
+        }
+        assert!(ao.on);
+        assert_eq!((ao.distance, ao.units, ao.intensity), (0.04, AoUnits::Scene, 0.7));
+        // One object under one key, read back whole; the fog is untouched.
+        let ui = serde_json::json!({ "zoom": 1.0, AO_STYLE_KEY: serde_json::to_value(ao).unwrap() });
+        assert_eq!(ao_style_from(&ui), ao);
+        assert_eq!(fog_style_from(&ui), itsjustcad_render::FogStyle::default());
+        for form in ["ao on|off", "ao distance <n%>", "ao intensity <0..1>", "ao colour #rrggbb"] {
+            assert!(AO_USAGE.contains(form), "{form}");
         }
     }
 

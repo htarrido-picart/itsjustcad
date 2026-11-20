@@ -11,7 +11,8 @@
 //
 // Pencil hidden-line mode is orthogonal: signalled by camera.misc.x < 0.
 
-// Camera and fogged() come from common.wgsl.
+// Camera, occluded() (#358) and fogged() come from common.wgsl. Ambient
+// occlusion darkens the fill first; the fog then covers it.
 
 struct ObjectParams {
     color: vec4<f32>,
@@ -69,7 +70,7 @@ fn vs_face(in: VsFaceIn) -> VsFaceOut {
 
 @fragment
 fn fs_face(in: VsFaceOut) -> @location(0) vec4<f32> {
-    return fogged(shade_fill(in.normal, in.world, in.color), in.world);
+    return fogged(occluded(shade_fill(in.normal, in.world, in.color), in.world), in.world);
 }
 
 // Hemispheric ambient fill: sky colour when the normal faces up, ground colour
@@ -91,7 +92,7 @@ fn working_key_dir() -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return fogged(shade_fill(in.normal, in.world, object.color.rgb), in.world);
+    return fogged(occluded(shade_fill(in.normal, in.world, object.color.rgb), in.world), in.world);
 }
 
 // Lit fill of base colour `base`; alpha and material come from the object.
