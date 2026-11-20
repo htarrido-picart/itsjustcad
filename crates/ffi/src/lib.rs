@@ -1188,6 +1188,7 @@ fn apply_pending(app: &mut AppHandle) {
             PendingOp::Camera(k) => apply_camera(app, k),
         }
     }
+    cameras::observe_view(app);
 }
 
 /// Apply one camera op to the handle's camera.

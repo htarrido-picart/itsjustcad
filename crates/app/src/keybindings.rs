@@ -224,6 +224,13 @@ pub fn target_is_valid(line: &str) -> bool {
         "hotkeys",
         "keybindings",
         "ortho",
+        // Zoom window and previous / next view (#368).
+        "zw",
+        "zoomwindow",
+        "viewprev",
+        "previousview",
+        "viewnext",
+        "nextview",
     ];
     if EXECUTE_LINE_VERBS.contains(&verb) {
         return true;

@@ -756,6 +756,9 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             ex("v_persp", tr("menu.view.persp"), "persp"),
             NativeItem::Separator,
             ex("ze", tr("menu.view.zoom_extents"), "ze"),
+            ex("zw", tr("menu.view.zoom_window"), "zw"),
+            ex("viewprev", tr("menu.view.prev_view"), "viewprev"),
+            ex("viewnext", tr("menu.view.next_view"), "viewnext"),
             NativeItem::Separator,
             // Object Snap… opens the modeless osnap popup (per-kind toggles).
             wired_leaf(t, "osnap", tr("menu.view.osnap"), MenuAction::ShowOsnap),

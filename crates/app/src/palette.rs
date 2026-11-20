@@ -44,6 +44,10 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     // Zoom / framing.
     ("ze", "View", ""),
     ("zoomextents", "View", ""),
+    ("zw", "View", ""),
+    ("zoomwindow", "View", ""),
+    ("viewprev", "View", ""),
+    ("viewnext", "View", ""),
     // Standard views.
     ("top", "View", ""),
     ("bottom", "View", ""),

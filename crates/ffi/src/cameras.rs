@@ -33,7 +33,7 @@ use std::ptr::NonNull;
 
 use itsjustcad_commands::{ApplyOutcome, Command, ExecError};
 use itsjustcad_doc::{NamedView, PanoView};
-use itsjustcad_render::{OrbitCamera, PanoProjection};
+use itsjustcad_render::{OrbitCamera, PanoProjection, ViewHistory};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
 
 use super::{
@@ -59,9 +59,17 @@ pub(crate) struct Cameras {
     store: BTreeMap<u32, Slot>,
     /// Last id handed out by [`ijc_camera_new`].
     last_id: u32,
+    /// Previous / next view (#368) per camera id. View state, never logged.
+    histories: BTreeMap<u32, ViewHistory>,
+    /// Start of the history clock.
+    epoch: Option<std::time::Instant>,
 }
 
 impl Cameras {
+    /// Seconds on the view-history clock.
+    fn now(&mut self) -> f64 {
+        self.epoch.get_or_insert_with(std::time::Instant::now).elapsed().as_secs_f64()
+    }
     /// The active camera's pane size, if it has one.
     pub(crate) fn active_viewport(&self) -> Option<(f32, f32)> {
         self.active_viewport
@@ -120,6 +128,63 @@ fn activate(app: &mut AppHandle, id: u32) -> bool {
     app.cams.active_viewport = next.viewport;
     app.cams.active = id;
     true
+}
+
+/// Let the active camera's view history see the camera after a batch of
+/// camera ops (#368): a view is recorded once it has held still.
+pub(crate) fn observe_view(app: &mut AppHandle) {
+    let now = app.cams.now();
+    let id = app.cams.active;
+    app.cams.histories.entry(id).or_default().observe(&app.camera, now, false);
+}
+
+/// Step the active camera back (or forward) through its view history.
+fn step_view(app: &mut AppHandle, forward: bool) -> bool {
+    apply_pending(app);
+    let now = app.cams.now();
+    let history = app.cams.histories.entry(app.cams.active).or_default();
+    let step = if forward {
+        history.forward(&app.camera, now)
+    } else {
+        history.back(&app.camera, now)
+    };
+    step.map(|cam| app.camera = cam).is_some()
+}
+
+/// Previous view (#368): restore the active camera's view before the current
+/// one. A view is recorded once the camera holds still for a moment after a
+/// gesture, `ijc_camera_zoom_extents`, a standard or named view, so a
+/// gesture's many small steps make one entry; the view the camera is in now
+/// is recorded first. Each camera has its own history; it is view state, not
+/// logged and not saved. Queued ops are applied first. True when the camera
+/// moved; false at the oldest view or on a null/invalid/busy handle.
+///
+/// # Safety
+/// `h` must be null or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_view_prev(h: *mut AppHandle) -> bool {
+    guard_ffi(false, || {
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        step_view(&mut guard, false)
+    })
+}
+
+/// Next view (#368): undo an [`ijc_camera_view_prev`]. New navigation after
+/// stepping back drops the views ahead. True when the camera moved; false at
+/// the newest view or on a null/invalid/busy handle.
+///
+/// # Safety
+/// `h` must be null or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_camera_view_next(h: *mut AppHandle) -> bool {
+    guard_ffi(false, || {
+        let Some(mut guard) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        step_view(&mut guard, true)
+    })
 }
 
 /// Mutable camera `id`.
@@ -305,6 +370,7 @@ pub unsafe extern "C" fn ijc_camera_free(h: *mut AppHandle, cam: u32) -> bool {
         if app.cams.active == cam && !activate(app, 0) {
             return false;
         }
+        app.cams.histories.remove(&cam);
         app.cams.store.remove(&cam).is_some()
     })
 }
@@ -607,6 +673,36 @@ mod tests {
                 r(ijc_views_json(std::ptr::null_mut())),
                 serde_json::json!([])
             );
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn view_prev_and_next_walk_the_active_camera_history() {
+        // #368: back to the view before an orbit and forward again; another
+        // camera keeps its own history.
+        let h = ijc_init_headless();
+        unsafe {
+            ok(h, "box 0,0,0 4,4,4");
+            assert!(ijc_flush(h));
+            let start = r(ijc_camera_state_json(h));
+            assert!(!ijc_camera_view_prev(h), "nothing behind yet");
+            ijc_camera_orbit(h, 120.0, 40.0);
+            assert!(ijc_flush(h));
+            let orbited = r(ijc_camera_state_json(h));
+            assert!(ijc_camera_view_prev(h));
+            assert_eq!(r(ijc_camera_state_json(h)), start);
+            assert!(ijc_camera_view_next(h));
+            assert_eq!(r(ijc_camera_state_json(h)), orbited);
+            assert!(!ijc_camera_view_next(h), "newest view");
+
+            let cam = ijc_camera_new(h);
+            assert!(ijc_camera_activate(h, cam));
+            assert!(!ijc_camera_view_prev(h), "a new camera starts with no history");
+            assert!(ijc_camera_activate(h, 0));
+            assert!(ijc_camera_view_prev(h), "camera 0 kept its history");
+            assert_eq!(r(ijc_camera_state_json(h)), start);
+            assert!(!ijc_camera_view_prev(std::ptr::null_mut()));
             ijc_free(h);
         }
     }
