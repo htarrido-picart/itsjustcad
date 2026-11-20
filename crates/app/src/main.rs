@@ -17,6 +17,7 @@ mod doc_paths;
 mod download;
 mod feedback_sheet;
 mod draw_tool;
+mod edge_infer;
 mod face_draw;
 mod dyntabs;
 mod filewatch;

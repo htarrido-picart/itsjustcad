@@ -840,6 +840,20 @@ pub struct App {
     face_cue: Option<crate::face_draw::FaceCue>,
     /// Axis the rubber band ran along last frame (colour + Shift hold).
     axis_shown: Option<char>,
+    /// Straight edges of the objects near the cursor, per document
+    /// generation (On Edge, #373).
+    edge_cache: crate::osnap::EdgeCache,
+    /// The edge the cursor is resting on, and since when (#373).
+    edge_dwell: crate::edge_infer::Dwell,
+    /// The last edge the cursor dwelt on: the reference for parallel /
+    /// perpendicular, Extend Edge and the ↓ lock (#373). Session state.
+    edge_ref: Option<inference::Edge>,
+    /// ↓ lock: parallel / perpendicular to `edge_ref` (#373).
+    edge_lock: inference::EdgeLock,
+    /// The edge relation the band showed last frame (what ↓ locks).
+    edge_shown: Option<(inference::EdgeRel, glam::DVec3)>,
+    /// The screen tip shown at the cursor last frame (#373).
+    tip_shown: Option<crate::edge_infer::Tip>,
     /// Persistent SmartTrack toggle: when on, dwelling on an osnap point
     /// acquires it and projects H/V construction guides the cursor snaps to.
     /// Persisted to ui.json. UI/session state, never part of the op-log.
@@ -1665,6 +1679,12 @@ impl App {
             face_shown: None,
             face_cue: None,
             axis_shown: None,
+            edge_cache: Default::default(),
+            edge_dwell: None,
+            edge_ref: None,
+            edge_lock: Default::default(),
+            edge_shown: None,
+            tip_shown: None,
             smarttrack: load_smarttrack(),
             st_acquired: crate::smarttrack::Acquired::new(),
             st_dwell: None,
@@ -5283,6 +5303,11 @@ impl App {
                     self.st_dwell = None;
                     self.st_active_guides.clear();
                 }
+                // The reference edge (#373) is per-draw too.
+                self.edge_ref = None;
+                self.edge_dwell = None;
+                self.edge_lock.clear();
+                self.edge_shown = None;
                 // Gumball on the selection (active pane only). A completed
                 // drag emits ONE substrate command through Session::run so
                 // the op-log stays the single source of truth.
@@ -6947,11 +6972,36 @@ impl App {
                 }
             } else if let Some(anchor) = axis_anchor {
                 let now = self.axis_lock.toggle(a, anchor);
+                if now.is_some() {
+                    self.edge_lock.clear();
+                }
                 self.command_line.push_line(match now {
                     Some(a) => format!("axis lock: {}", axis_label(a)),
                     None => "axis lock: off".to_string(),
                 });
             }
+        }
+        // ↓ (#373): lock the band parallel / perpendicular to the reference
+        // edge — the relation it shows, else parallel; ↓ again unlocks.
+        if ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
+            && !(guided_active && self.guided.supports_axis_lock())
+            && let Some(anchor) = axis_anchor
+        {
+            let parallel = self.edge_ref.and_then(|e| {
+                let d = e.rel_dir(inference::EdgeRel::Parallel, glam::DVec3::Z)?;
+                Some((inference::EdgeRel::Parallel, d))
+            });
+            let was = self.edge_lock.get(Some(anchor)).is_some();
+            let now = self.edge_lock.toggle(self.edge_shown.or(parallel), anchor);
+            if now.is_some() {
+                self.axis_lock.clear();
+            }
+            self.command_line.push_line(match now {
+                Some((inference::EdgeRel::Parallel, _)) => "edge lock: parallel",
+                Some((inference::EdgeRel::Perpendicular, _)) => "edge lock: perpendicular",
+                None if was => "edge lock: off",
+                None => "edge lock: hover an edge first",
+            });
         }
         // Shift pressed while the band runs along an axis holds that axis for
         // as long as Shift stays down (SketchUp); pressed off-axis it is the
@@ -6979,6 +7029,7 @@ impl App {
             .axis_lock
             .get(axis_anchor)
             .or_else(|| self.shift_hold.get(axis_anchor));
+        let locked_edge = self.edge_lock.get(axis_anchor).filter(|_| locked_axis.is_none());
         // A guided flow that armed *this* frame set `guided_suppress_enter`: the
         // Enter that submitted the bare verb in the command line is still down,
         // and would otherwise auto-commit the first typed step at its default.
@@ -7028,6 +7079,9 @@ impl App {
             self.trim_apparent = true;
             self.st_acquired.clear();
             self.st_dwell = None;
+            self.edge_ref = None;
+            self.edge_dwell = None;
+            self.edge_lock.clear();
             self.command_line.push_line("drawing cancelled");
             return;
         }
@@ -7132,17 +7186,55 @@ impl App {
         let ground = cursor_px
             .and_then(|pos| ground_point(view_proj, rect, pos))
             .map(|p| if grid_on { crate::osnap::grid_snap(p) } else { p });
+        // On Edge (#373): off any snap point, a point on the edge or curve
+        // under the cursor. Its edge is also what a dwell makes the
+        // reference edge.
+        let edge_hit = cursor_px.filter(|_| picks_faces).and_then(|pos| {
+            let edges: Vec<inference::Edge> = self
+                .edge_cache
+                .edges(&self.session.doc, |bb| match projected_rect(view_proj, rect, bb.min, bb.max) {
+                    Some(r) => r.expand(crate::osnap::SNAP_RADIUS_PX).contains(pos),
+                    None => true,
+                })
+                .into_iter()
+                .map(|(_, a, b)| inference::Edge { a, b })
+                .collect();
+            let (i, p) = inference::on_edge(
+                &edges,
+                glam::Vec2::new(pos.x, pos.y),
+                crate::osnap::SNAP_RADIUS_PX,
+                |w| project(view_proj, rect, w).map(|p| glam::Vec2::new(p.x, p.y)),
+                cursor_ray,
+                face_hit.map(|f| f.t),
+            )?;
+            Some((edges[i], p))
+        });
+        let dwell_tol = 1e-9 * (1.0 + edge_hit.map_or(0.0, |(e, _)| e.a.abs().max_element()));
+        if let Some(e) = crate::edge_infer::dwell(
+            &mut self.edge_dwell,
+            edge_hit.map(|(e, _)| e),
+            std::time::Instant::now(),
+            dwell_tol,
+        ) {
+            self.edge_ref = Some(e);
+        } else if self.edge_dwell.is_some() {
+            // Wake up when the dwell is due, even with the mouse at rest.
+            ui.ctx().request_repaint_after(crate::edge_infer::EDGE_DWELL);
+        }
+        let on_edge = edge_hit.map(|(_, p)| p).filter(|_| snap_hit.is_none());
+        // A point the cursor sticks to: a snap point, else a point on an edge.
+        let point_snap = snap_hit.map(|(p, _)| p).or(on_edge);
         // The grid applies on a level plane (a top face) as on the ground.
         let grid_on_plane = |pl: itsjustcad_doc::pick::FacePlane, p: glam::DVec3| {
-            if grid_on && snap_hit.is_none() && pl.is_horizontal() {
+            if grid_on && point_snap.is_none() && pl.is_horizontal() {
                 pl.project(crate::osnap::grid_snap(p))
             } else {
                 p
             }
         };
         let mut cursor_world =
-            crate::face_draw::base_cursor(snap_hit.map(|(p, _)| p), face_hit.as_ref(), ground);
-        if let Some(f) = face_hit.filter(|_| snap_hit.is_none()) {
+            crate::face_draw::base_cursor(point_snap, face_hit.as_ref(), ground);
+        if let Some(f) = face_hit.filter(|_| point_snap.is_none()) {
             cursor_world = cursor_world.map(|p| grid_on_plane(f.plane(), p));
         }
         // The plane the cursor keeps to: a rect/circle/polygon's own, else
@@ -7153,7 +7245,7 @@ impl App {
             .or(self.plane_hold);
         if let Some(pl) = draw_plane {
             cursor_world =
-                crate::face_draw::on_plane(pl, snap_hit.map(|(p, _)| p), cursor_ray, cursor_world)
+                crate::face_draw::on_plane(pl, point_snap, cursor_ray, cursor_world)
                     .map(|p| grid_on_plane(pl, p));
         }
         // World-space tolerance = SNAP_RADIUS_PX converted through the current
@@ -7208,18 +7300,27 @@ impl App {
             self.st_dwell = None;
         }
 
-        // Cursor resolution precedence:
+        // Cursor resolution precedence (see `edge_infer`):
         //   (1) a DIRECT osnap hit wins — never overridden by a guide;
-        //   (2) else SmartTrack guide snap (records active guides to draw);
-        //   (3) else axis inference: a band within a few degrees of red/green/
-        //       blue on screen snaps onto that axis (#372);
-        //   (4) else ortho lock (persistent toggle OR momentary Shift);
-        //   (5) else the plain ground/grid point resolved above.
-        // An axis lock (arrow key or Shift hold) overrides all of these: the
-        // point stays on the axis line, an osnap only setting its distance.
-        // Ortho squares to world X/Y, so not on a held upright plane.
+        //   (2) else On Edge: a point on the edge under the cursor (#373);
+        //   (3) else, from the face / ground point resolved above:
+        //       SmartTrack guide snap (From Point; records guides to draw);
+        //   (4) else Extend Edge along the reference edge's line (#373);
+        //   (5) else direction inference: a band within a few degrees of
+        //       red/green/blue (#372) or of parallel / perpendicular to the
+        //       reference edge (#373) on screen snaps onto that line;
+        //   (6) else ortho lock (persistent toggle OR momentary Shift);
+        //   (7) else the plain face/ground/grid point.
+        // A lock (arrow key, ↓ edge lock or Shift hold) overrides all of
+        // these: the point stays on the locked line, an osnap only setting
+        // its distance. Ortho squares to world X/Y, so not on a held upright
+        // plane.
         let apply_ortho = (self.ortho || (shift && self.plane_hold.is_none()))
             && draw_plane.is_none_or(|p| p.is_horizontal());
+        // What placed the point, for the tip (#373).
+        let mut from_point: Option<char> = None;
+        let mut extend_hit: Option<glam::DVec3> = None;
+        let mut edge_shown = locked_edge;
         let along_grid = |anchor: glam::DVec3, a: char, p: glam::DVec3| {
             if !grid_on {
                 return p;
@@ -7243,7 +7344,10 @@ impl App {
             } else {
                 along_grid(anchor, a, p)
             });
-        } else if snap_hit.is_none() {
+        } else if let (Some((_, d)), Some(anchor)) = (locked_edge, axis_anchor) {
+            cursor_world =
+                Some(inference::constrain_to_line(anchor, d, snap_hit.map(|(p, _)| p), cursor_ray));
+        } else if point_snap.is_none() {
             let mut handled = false;
             if self.smarttrack
                 && let (Some(c), Some(tol)) = (cursor_world, st_tol)
@@ -7259,30 +7363,61 @@ impl App {
                     crate::smarttrack::snap(&self.st_acquired, c, last_point, tol, &extra)
                 {
                     cursor_world = Some(s.snapped);
+                    // From Point (#373): an axis guide through an acquired
+                    // point names the tip.
+                    from_point = s
+                        .active
+                        .iter()
+                        .filter(|g| self.st_acquired.points().iter().any(|p| p.distance(g.origin) < 1e-9))
+                        .find_map(|g| crate::edge_infer::guide_axis(g.dir()));
                     self.st_active_guides = s.active;
                     handled = true;
                 }
+            }
+            if !handled
+                && let (Some(e), Some(pos), Some(ray)) = (self.edge_ref, cursor_px, cursor_ray)
+                && let Some(p) = inference::extend_edge(
+                    e,
+                    glam::Vec2::new(pos.x, pos.y),
+                    crate::osnap::SNAP_RADIUS_PX,
+                    |w| project(view_proj, rect, w).map(|p| glam::Vec2::new(p.x, p.y)),
+                    ray,
+                )
+                && draw_plane.is_none_or(|pl| crate::face_draw::lies_on(pl, p))
+            {
+                cursor_world = Some(p);
+                extend_hit = Some(p);
+                handled = true;
             }
             if !handled
                 && let (Some(anchor), Some(pos), Some((ro, rd))) =
                     (axis_anchor, cursor_px, cursor_ray)
                 && let Some(anchor_px) = project(view_proj, rect, anchor)
             {
-                // Each axis's on-screen direction at the anchor: project a
-                // step of ~100 px worth of world along it.
+                // Each candidate direction's on-screen run at the anchor:
+                // project a step of ~100 px worth of world along it.
                 let step = world_per_px.unwrap_or(0.01) * 100.0;
-                let axis_px = |a: char| {
-                    let u = itsjustcad_guided::axis_vector(a)?;
+                let dir_px = |u: glam::DVec3| {
                     let q = project(view_proj, rect, anchor + u * step)?;
                     Some(glam::Vec2::new(q.x - anchor_px.x, q.y - anchor_px.y))
                 };
                 let band = glam::Vec2::new(pos.x - anchor_px.x, pos.y - anchor_px.y);
-                if let Some(a) = inference::infer_axis(band, axis_px, inference::INFER_TOL_DEG)
-                    && let Some(u) = itsjustcad_guided::axis_vector(a)
+                // Perpendicular runs in the drawing plane (the ground's +Z).
+                let plane_n = draw_plane.map_or(glam::DVec3::Z, |pl| pl.normal);
+                let edge = self.edge_ref.map(|e| (e, plane_n));
+                if let Some(inf) =
+                    inference::infer_direction(band, dir_px, edge, inference::INFER_TOL_DEG)
+                    && let Some(u) = inf.dir()
                     && draw_plane.is_none_or(|pl| u.dot(pl.normal).abs() < 1e-9)
                     && let Some(p) = inference::closest_on_line_to_ray(anchor, u, ro, rd)
                 {
-                    cursor_world = Some(along_grid(anchor, a, p));
+                    cursor_world = Some(match inf {
+                        inference::Inferred::Axis(a) => along_grid(anchor, a, p),
+                        inference::Inferred::Edge(rel, d) => {
+                            edge_shown = Some((rel, d));
+                            p
+                        }
+                    });
                     handled = true;
                 }
             }
@@ -7297,6 +7432,7 @@ impl App {
         // the held plane.
         if let Some(pl) = draw_plane
             && locked_axis.is_none()
+            && locked_edge.is_none()
         {
             cursor_world = cursor_world.map(|c| pl.project(c));
         }
@@ -7316,12 +7452,27 @@ impl App {
             .zip(cursor_world)
             .and_then(|(a, c)| inference::axis_of(a, c));
         self.axis_shown = band_axis;
+        self.edge_shown = edge_shown.filter(|_| axis_anchor.is_some());
         // A typed bare distance runs toward the cursor — along the locked
-        // axis even when the cursor sits on the anchor.
+        // axis (or edge line) even when the cursor sits on the anchor.
+        let locked_dir = locked_axis
+            .and_then(itsjustcad_guided::axis_vector)
+            .or(locked_edge.map(|(_, d)| d));
         let typed_cursor = match axis_anchor {
-            Some(a) => inference::typed_direction_cursor(a, locked_axis, cursor_world),
+            Some(a) => inference::typed_direction_along(a, locked_dir, cursor_world),
             None => cursor_world,
         };
+        // The one screen tip at the cursor (#373), most specific first.
+        let at = |p: glam::DVec3| cursor_world.is_some_and(|c| c.distance(p) <= 1e-9 * (1.0 + p.abs().max_element()));
+        let tip = crate::edge_infer::choose_tip(crate::edge_infer::Placed {
+            on_edge: on_edge.is_some_and(at),
+            extend_edge: extend_hit.is_some_and(at),
+            edge_rel: self.edge_shown.map(|(r, _)| (r, locked_edge.is_some())),
+            axis: band_axis.map(|a| (a, locked_axis == Some(a))),
+            from_point,
+            on_face: (snap_hit.is_none() && click_face.is_some()).then_some(self.plane_hold.is_some()),
+        });
+        self.tip_shown = tip;
 
         if enter {
             if guided_active {
@@ -7585,8 +7736,13 @@ impl App {
                     project(view_proj, rect, g.origin - d),
                     project(view_proj, rect, g.origin + d),
                 ) {
-                    // Dashed: egui's dashed_line into the painter.
-                    let dashed = egui::Shape::dashed_line(&[a, b], guide_stroke, 6.0, 4.0);
+                    // Dashed: egui's dashed_line into the painter. An axis
+                    // guide takes its axis colour (From Point, #373).
+                    let stroke = match crate::edge_infer::guide_axis(g.dir()) {
+                        Some(a) => egui::Stroke::new(1.2, axis_color(a)),
+                        None => guide_stroke,
+                    };
+                    let dashed = egui::Shape::dashed_line(&[a, b], stroke, 6.0, 4.0);
                     painter.extend(dashed);
                 }
             }
@@ -7648,11 +7804,41 @@ impl App {
             },
         );
         // The rubber band (anchor → cursor) on an axis takes that axis colour.
-        let band = axis_anchor.zip(cursor_world).zip(band_axis);
-        let band_stroke = band.map(|(_, a)| egui::Stroke::new(2.0, axis_color(a)));
+        // Parallel / perpendicular to an edge takes magenta (#373).
+        let edge_rgb = crate::edge_infer::EDGE_RGB;
+        let edge_color = egui::Color32::from_rgb(edge_rgb[0], edge_rgb[1], edge_rgb[2]);
+        let band_color = if self.edge_shown.is_some() {
+            Some(edge_color)
+        } else {
+            band_axis.map(axis_color)
+        };
+        let band = axis_anchor.zip(cursor_world).zip(band_color);
+        let band_stroke = band.map(|(_, c)| egui::Stroke::new(2.0, c));
         let is_band = |p: glam::DVec3, q: glam::DVec3| {
             band.is_some_and(|((a, c), _)| (p == a && q == c) || (p == c && q == a))
         };
+        // The edge an edge inference uses, highlighted: the one under the
+        // cursor (On Edge), else the reference edge (parallel, perpendicular,
+        // extension — with a dotted run from its nearer end to the point).
+        let lit_edge = match tip {
+            Some(crate::edge_infer::Tip::OnEdge) => edge_hit.map(|(e, _)| e),
+            Some(crate::edge_infer::Tip::ExtendEdge | crate::edge_infer::Tip::Edge { .. }) => {
+                self.edge_ref
+            }
+            _ => None,
+        };
+        if let Some(e) = lit_edge
+            && let (Some(a), Some(b)) = (project(view_proj, rect, e.a), project(view_proj, rect, e.b))
+        {
+            painter.line_segment([a, b], egui::Stroke::new(3.0, edge_color));
+            if tip == Some(crate::edge_infer::Tip::ExtendEdge)
+                && let Some(c) = cursor_world
+                && let Some(cs) = project(view_proj, rect, c)
+            {
+                let end = if c.distance(e.a) < c.distance(e.b) { a } else { b };
+                painter.extend(egui::Shape::dotted_line(&[end, cs], edge_color, 6.0, 1.5));
+            }
+        }
         let preview = if guided_active {
             self.guided.preview(cursor_world)
         } else {
@@ -7672,35 +7858,24 @@ impl App {
                 }
             }
         }
-        // "On Red Axis" tip below-right of the cursor (SketchUp), clear of the
-        // osnap label that sits above-right of the snap marker.
-        if let (Some(((_, c), a)), Some(pos)) = (band, cursor_px)
-            && project(view_proj, rect, c).is_some()
+        // The screen tip ("On Red Axis", "On Edge", "Parallel to Edge", …)
+        // below-right of the cursor (SketchUp), clear of the osnap label
+        // that sits above-right of the snap marker; one style for all.
+        if let (Some(t), Some(pos)) = (tip, cursor_px)
+            && cursor_world.is_some_and(|c| project(view_proj, rect, c).is_some())
         {
-            painter.text(
-                pos + egui::vec2(14.0, 14.0),
-                egui::Align2::LEFT_TOP,
-                axis_tip(a, locked_axis == Some(a)),
-                egui::TextStyle::Small.resolve(ui.style()),
-                axis_color(a),
-            );
-        } else if snap_hit.is_none()
-            && click_face.is_some()
-            && let Some(pos) = cursor_px
-        {
-            // "On Face" (#371), "· locked" while Shift holds the plane.
-            let on = crate::i18n::t("face.on");
-            let tip = if self.plane_hold.is_some() {
-                format!("{on} · {}", crate::i18n::t("axis.locked"))
-            } else {
-                on.to_string()
+            use crate::edge_infer::Tip;
+            let color = match t {
+                Tip::Axis { axis, .. } | Tip::FromPoint(axis) => axis_color(axis),
+                Tip::OnFace { .. } => egui::Color32::from_rgb(90, 160, 255),
+                Tip::OnEdge | Tip::ExtendEdge | Tip::Edge { .. } => edge_color,
             };
             painter.text(
                 pos + egui::vec2(14.0, 14.0),
                 egui::Align2::LEFT_TOP,
-                tip,
+                crate::edge_infer::tip_text(t),
                 egui::TextStyle::Small.resolve(ui.style()),
-                egui::Color32::from_rgb(90, 160, 255),
+                color,
             );
         }
 
@@ -11904,7 +12079,7 @@ fn empty_deletable_layers(doc: &itsjustcad_doc::Document) -> Vec<String> {
 }
 
 /// Arrow key → axis it locks (SketchUp: → red X, ← green Y, ↑ blue Z). ↓
-/// (parallel/perpendicular to an edge) is not mapped yet (#373).
+/// locks parallel / perpendicular to the reference edge instead (#373).
 const ARROW_AXES: [(egui::Key, char); 3] = [
     (egui::Key::ArrowRight, 'x'),
     (egui::Key::ArrowLeft, 'y'),
@@ -11917,21 +12092,6 @@ fn axis_color(a: char) -> egui::Color32 {
         'x' => egui::Color32::from_rgb(225, 85, 85),
         'y' => egui::Color32::from_rgb(110, 200, 110),
         _ => egui::Color32::from_rgb(95, 145, 255),
-    }
-}
-
-/// Screen tip for a band on axis `a` ("On Red Axis"), with the localized
-/// "locked" suffix under an arrow/Shift lock.
-fn axis_tip(a: char, locked: bool) -> String {
-    let on = crate::i18n::t(match a {
-        'x' => "axis.on_red",
-        'y' => "axis.on_green",
-        _ => "axis.on_blue",
-    });
-    if locked {
-        format!("{on} · {}", crate::i18n::t("axis.locked"))
-    } else {
-        on.to_string()
     }
 }
 
@@ -14565,6 +14725,66 @@ mod tests {
             let (p, q) = ends(h);
             assert!(p.distance(a) < 1e-6 && q.distance(a + glam::DVec3::Z * 3.0) < 1e-6, "{p} {q}");
             assert!(!h.state().draw_tool.active());
+        });
+    }
+
+    /// #373: hovering an edge puts the point on it ("On Edge"); after a
+    /// dwell it is the reference edge, so a band parallel to it snaps
+    /// ("Parallel to Edge"), ↓ locks that and a typed distance follows it.
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_on_edge_parallel_inference_and_down_arrow_lock() {
+        use crate::edge_infer::Tip;
+        use inference::EdgeRel;
+        run_app_journey(|h| {
+            for line in ["line 0,0 8,4", "top", "ze"] {
+                h.state_mut().execute_line(line.into());
+                h.run_steps(2);
+            }
+            h.state_mut().smarttrack = false;
+            h.state_mut().ortho = false;
+            h.state_mut().execute_line("line".into());
+            h.run_steps(1);
+            let dir = glam::DVec3::new(2.0, 1.0, 0.0).normalize();
+            // Off any snap point, 3 px off the edge: On Edge.
+            let on = world_to_screen(h, glam::DVec3::new(6.0, 3.0, 0.0)) + egui::vec2(0.0, 3.0);
+            h.input_mut().events.push(egui::Event::PointerMoved(on));
+            h.run_steps(1);
+            assert_eq!(h.state().tip_shown, Some(Tip::OnEdge));
+            assert_eq!(h.state().edge_ref, None, "not before the dwell");
+            std::thread::sleep(crate::edge_infer::EDGE_DWELL + std::time::Duration::from_millis(50));
+            h.run_steps(1);
+            assert!(h.state().edge_ref.is_some(), "dwelt: the reference edge");
+
+            click_at(h, world_to_screen(h, glam::DVec3::new(2.0, 3.0, 0.0)));
+            let a = h.state().draw_tool.last_point().expect("first point");
+            let along = world_to_screen(h, a + dir * 3.0) + egui::vec2(1.0, -1.0);
+            h.input_mut().events.push(egui::Event::PointerMoved(along));
+            h.run_steps(1);
+            assert_eq!(h.state().tip_shown, Some(Tip::Edge { rel: EdgeRel::Parallel, locked: false }));
+            let perp = glam::DVec3::new(-1.0, 2.0, 0.0).normalize();
+            let square = world_to_screen(h, a + perp * 1.5) + egui::vec2(1.0, 1.0);
+            h.input_mut().events.push(egui::Event::PointerMoved(square));
+            h.run_steps(1);
+            assert_eq!(h.state().tip_shown, Some(Tip::Edge { rel: EdgeRel::Perpendicular, locked: false }));
+
+            h.input_mut().events.push(egui::Event::PointerMoved(along));
+            h.run_steps(1);
+            h.key_press(egui::Key::ArrowDown);
+            h.run_steps(1);
+            assert!(transcript(h.state()).iter().any(|l| l == "edge lock: parallel"));
+            h.input_mut().events.push(egui::Event::Text("2".into()));
+            h.run_steps(1);
+            h.key_press(egui::Key::Enter);
+            h.run_steps(2);
+            let doc = &h.state().session.doc;
+            let itsjustcad_doc::Geometry::Curve(c) = &doc.objects().last().unwrap().geometry else {
+                panic!("a line");
+            };
+            let pts = c.tessellate(0.05);
+            let q = *pts.last().unwrap();
+            // The command line carries millimetres.
+            assert!(q.distance(a + dir * 2.0) < 1e-3, "{q:?} vs {:?}", a + dir * 2.0);
         });
     }
 

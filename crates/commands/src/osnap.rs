@@ -327,6 +327,73 @@ pub fn candidates_tagged(
     tagged
 }
 
+/// Solids with more triangles than this give no edges to the On Edge
+/// inference (#373): extracting their feature edges per hover is too slow.
+pub const EDGE_TRI_CAP: usize = 20_000;
+
+/// Chord tolerance curves are cut into straight edges with (#373).
+pub const EDGE_TOL: f64 = 0.01;
+
+/// The straight edges of one object the On Edge / parallel / perpendicular
+/// inferences use (#373): a curve cut into chords, a solid's feature edges
+/// (its visible outline, not every triangle seam). Empty for other kinds.
+pub fn object_edges(geometry: &Geometry) -> Vec<(DVec3, DVec3)> {
+    match geometry {
+        Geometry::Curve(c) => {
+            let mut pts = c.tessellate(EDGE_TOL);
+            if c.is_closed()
+                && let Some(first) = pts.first().copied()
+            {
+                pts.push(first);
+            }
+            pts.windows(2).map(|w| (w[0], w[1])).collect()
+        }
+        Geometry::Mesh(m)
+        | Geometry::Frame { mesh: m, .. }
+        | Geometry::Area { mesh: m, .. }
+        | Geometry::Parametric { mesh: m, .. }
+            if m.faces().len() <= EDGE_TRI_CAP =>
+        {
+            kernel_mesh::feature_edges(m)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Edges of every visible object whose bounds pass `keep`, through a cache
+/// keyed by the document generation (an object's edges are only extracted
+/// once per edit).
+#[derive(Debug, Default)]
+pub struct EdgeCache {
+    generation: Option<u64>,
+    per_object: std::collections::HashMap<ObjectId, Vec<(DVec3, DVec3)>>,
+}
+
+impl EdgeCache {
+    pub fn edges(
+        &mut self,
+        doc: &Document,
+        keep: impl Fn(kernel_mesh::Aabb) -> bool,
+    ) -> Vec<(ObjectId, DVec3, DVec3)> {
+        if self.generation != Some(doc.generation) {
+            self.per_object.clear();
+            self.generation = Some(doc.generation);
+        }
+        let mut out = Vec::new();
+        for obj in doc.objects() {
+            if !obj.visible || !doc.layer_visible(&obj.layer) || !keep(doc.geometry_aabb(&obj.geometry)) {
+                continue;
+            }
+            let edges = self
+                .per_object
+                .entry(obj.id)
+                .or_insert_with(|| object_edges(&obj.geometry));
+            out.extend(edges.iter().map(|&(a, b)| (obj.id, a, b)));
+        }
+        out
+    }
+}
+
 /// Per-curve significant points (end/mid/center/quadrant/perp/tan/nearest).
 fn curve_candidates(
     c: &Curve,
@@ -1206,5 +1273,21 @@ mod tests {
         assert!(pick_ms < 50.0, "pick too slow: {pick_ms} ms/ray");
         assert!(osnap_ms < 1000.0, "osnap cull too slow: {osnap_ms} ms");
         assert!(cands.len() < n, "cull should drop most objects, got {}", cands.len());
+    }
+
+    #[test]
+    fn edges_are_curve_chords_and_solid_outlines() {
+        let line = Geometry::Curve(Curve::Line { a: DVec3::ZERO, b: DVec3::X });
+        assert_eq!(object_edges(&line), vec![(DVec3::ZERO, DVec3::X)]);
+        let sq = Geometry::Curve(Curve::Polyline {
+            points: vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0)],
+            closed: true,
+        });
+        assert_eq!(object_edges(&sq).len(), 3, "closed: back to the start");
+        let mut s = crate::Session::default();
+        s.run(crate::parse("box 0,0,0 1,1,1").unwrap()).unwrap();
+        let mut cache = EdgeCache::default();
+        assert_eq!(cache.edges(&s.doc, |_| true).len(), 12, "a box's 12 edges");
+        assert!(cache.edges(&s.doc, |_| false).is_empty());
     }
 }
