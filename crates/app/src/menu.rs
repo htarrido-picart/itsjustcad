@@ -408,6 +408,9 @@ pub struct ViewState {
     /// Whether the right docked panel is currently shown; flips the Panel item's
     /// label between "Hide Panel" and "Show Panel".
     pub panel_visible: bool,
+    /// Requested viewport anti-aliasing sample count (1 = off, 2/4/8) —
+    /// drives the check on the View ▸ Anti-aliasing radio group (#356).
+    pub antialias: u32,
     /// Active legacy-CAD skin — drives the check on the Theme ▸ Skin radio group.
     /// Matched against each `SetSkin(origin)` item's origin.
     pub skin: CadOrigin,
@@ -722,6 +725,12 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             radio("cam_2point", tr("menu.view.cam_2point"), "camera 2point", view.camera == Some(CameraTag::TwoPoint)),
             radio("cam_pano", tr("menu.view.cam_pano"), "camera pano", view.camera == Some(CameraTag::Panorama)),
             radio("cam_fisheye", tr("menu.view.cam_fisheye"), "camera fisheye", view.camera == Some(CameraTag::Fisheye)),
+            NativeItem::Separator,
+            // Anti-aliasing (MSAA, #356) — radio: the requested count is checked.
+            radio("aa_off", tr("menu.view.aa_off"), "antialias off", view.antialias <= 1),
+            radio("aa_2x", tr("menu.view.aa_2x"), "antialias 2", view.antialias == 2),
+            radio("aa_4x", tr("menu.view.aa_4x"), "antialias 4", view.antialias == 4),
+            radio("aa_8x", tr("menu.view.aa_8x"), "antialias 8", view.antialias == 8),
             NativeItem::Separator,
             // Viewport layout.
             ex("vp1", tr("menu.view.vp1"), "viewports 1"),
@@ -1166,6 +1175,7 @@ pub fn demo_open(
         lighting: Some(LightModeTag::Working),
         camera: Some(CameraTag::Perspective),
         panel_visible: true,
+        antialias: 4,
         skin: CadOrigin::None,
         lang: Lang::En,
     };
@@ -1692,6 +1702,25 @@ mod tests {
         assert_eq!(view_check(v, "View/disp_shaded"), Some(false));
         assert_eq!(view_check(v, "View/disp_xray"), Some(false));
         assert_eq!(view_check(v, "View/disp_pencil"), Some(false));
+    }
+
+    #[test]
+    fn view_antialias_is_radio_checked_and_fires_verb() {
+        let v = ViewState { antialias: 8, ..Default::default() };
+        assert_eq!(view_check(v, "View/aa_8x"), Some(true));
+        assert_eq!(view_check(v, "View/aa_4x"), Some(false));
+        assert_eq!(view_check(v, "View/aa_2x"), Some(false));
+        assert_eq!(view_check(v, "View/aa_off"), Some(false));
+        let off = ViewState { antialias: 1, ..Default::default() };
+        assert_eq!(view_check(off, "View/aa_off"), Some(true));
+        let action = native_model(MenuStyle::Modeler, true, v)
+            .into_iter()
+            .flat_map(|m| m.items)
+            .find_map(|it| match it {
+                NativeItem::Check { id, action, .. } if id == "View/aa_2x" => Some(action),
+                _ => None,
+            });
+        assert_eq!(action, Some(MenuAction::Execute("antialias 2".into())));
     }
 
     #[test]

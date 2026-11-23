@@ -213,5 +213,7 @@ fn main() {
         edges_enabled: true,
         force: false,
         size_points: [0.0; 2],
+        rect: egui::Rect::NOTHING,
+        samples: 1,
     };
 }

@@ -437,8 +437,10 @@ pub struct SceneData {
     pub show_lineweights: bool,
 }
 
-/// Owns all wgpu resources; lives in egui-wgpu's `CallbackResources` type map.
-pub struct SceneRenderer {
+/// The scene's render pipelines. All share one colour format and one MSAA
+/// sample count, so every viewport pass (mesh, edges, grid, overlays) agrees
+/// with the target it draws into (#356).
+struct Pipelines {
     grid_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
     /// Mesh fill without depth writes, for the transparent display modes.
@@ -453,10 +455,6 @@ pub struct SceneRenderer {
     /// Screen-space quad strokes for edges and curves when the camera carries
     /// a stroke width (itsjustcad-ios#174).
     fat_pipeline: wgpu::RenderPipeline,
-    /// LineList copies of `lines` (strips) for the fat-stroke pass.
-    curve_segments: Batch,
-    /// Per pane: whether its last camera asked for fat strokes.
-    fat_lines: Vec<bool>,
     /// World-axis variant of the edge pipeline: LineList using the `vs_axis`
     /// shader entry, which nudges depth slightly toward the camera so the
     /// coplanar grid plane (which writes an ANALYTIC frag_depth that quantizes
@@ -464,74 +462,20 @@ pub struct SceneRenderer {
     axis_pipeline: wgpu::RenderPipeline,
     /// PointList pipeline for point-cloud geometry.
     point_pipeline: wgpu::RenderPipeline,
-    camera_layout: wgpu::BindGroupLayout,
-    /// One camera UBO + bind group per viewport pane. egui-wgpu runs every
-    /// callback's `prepare` before any `paint`, so panes must not share a
-    /// single camera buffer — the last write would win for all of them.
-    cameras: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
-    object_layout: wgpu::BindGroupLayout,
-    /// Per-object color/material for every scene batch, one bind group.
-    scene_params: ParamBuffer,
-    /// Parameters of the ghost and axis batches, kept apart so a drag frame
-    /// or the constant axes never rewrite the scene's buffer.
-    ghost_params: ParamBuffer,
-    axis_params: ParamBuffer,
-    /// Textured-quad pipeline + its (texture, sampler, opacity) bind layout.
+    /// Textured-quad pipeline (underlay and basemap).
     underlay_pipeline: wgpu::RenderPipeline,
-    underlay_layout: wgpu::BindGroupLayout,
-    meshes: Batch,
-    /// Per-face-coloured meshes, 9 floats per vertex (#327).
-    face_meshes: Batch,
-    lines: Batch,
-    edges: Batch,
-    /// Profile / silhouette edges tessellated into fat-line ribbon meshes so
-    /// they render visibly thicker than the 1-pixel interior edge lines.
-    profile_ribbons: Batch,
-    point_clouds: Batch,
-    /// Transient ghost preview lines (the iOS gumball live wireframe). Rebuilt
-    /// every drag frame via [`SceneRenderer::set_ghost_lines`] and cleared on
-    /// commit/cancel. Drawn as hairline segments over the scene, under the grid.
-    /// Independent of the scene `generation` so it updates between doc changes.
-    ghost_lines: Batch,
-    /// Persistent world X/Y axis segments (see [`world_axis_lines`]). Built
-    /// once in [`SceneRenderer::new`]; drawn every frame wherever the grid is
-    /// drawn, independent of document content.
-    axis_lines: Batch,
-    underlay: Option<GpuUnderlay>,
-    basemap: Option<GpuUnderlay>,
-    /// Document generation the GPU buffers were built from.
-    pub generation: u64,
 }
 
-impl SceneRenderer {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let object_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("object_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: Some(ParamBuffer::binding_size()),
-                },
-                count: None,
-            }],
-        });
-
+impl Pipelines {
+    fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        samples: u32,
+        camera_layout: &wgpu::BindGroupLayout,
+        object_layout: &wgpu::BindGroupLayout,
+        underlay_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
+        let ms = wgpu::MultisampleState { count: samples, ..Default::default() };
         let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("grid_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/grid.wgsl").into()),
@@ -543,7 +487,7 @@ impl SceneRenderer {
 
         let grid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("grid_pl"),
-            bind_group_layouts: &[Some(&camera_layout)],
+            bind_group_layouts: &[Some(camera_layout)],
             immediate_size: 0,
         });
         let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -574,14 +518,14 @@ impl SceneRenderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: ms,
             multiview_mask: None,
             cache: None,
         });
 
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh_pl"),
-            bind_group_layouts: &[Some(&camera_layout), Some(&object_layout)],
+            bind_group_layouts: &[Some(camera_layout), Some(object_layout)],
             immediate_size: 0,
         });
         // Mesh fills. The xray variant has no depth writes and no culling:
@@ -626,7 +570,7 @@ impl SceneRenderer {
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: ms,
                 multiview_mask: None,
                 cache: None,
             })
@@ -674,7 +618,7 @@ impl SceneRenderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: ms,
             multiview_mask: None,
             cache: None,
         });
@@ -715,7 +659,7 @@ impl SceneRenderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: ms,
             multiview_mask: None,
             cache: None,
         });
@@ -756,7 +700,7 @@ impl SceneRenderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: ms,
             multiview_mask: None,
             cache: None,
         });
@@ -804,7 +748,7 @@ impl SceneRenderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: ms,
             multiview_mask: None,
             cache: None,
         });
@@ -844,50 +788,19 @@ impl SceneRenderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: ms,
             multiview_mask: None,
             cache: None,
         });
 
         // Underlay: a textured quad. Bind group 1 = texture + sampler + opacity.
-        let underlay_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("underlay_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
         let underlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("underlay_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/underlay.wgsl").into()),
         });
         let underlay_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("underlay_pl"),
-            bind_group_layouts: &[Some(&camera_layout), Some(&underlay_layout)],
+            bind_group_layouts: &[Some(camera_layout), Some(underlay_layout)],
             immediate_size: 0,
         });
         let underlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -931,10 +844,156 @@ impl SceneRenderer {
                     clamp: 0.0,
                 },
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: ms,
             multiview_mask: None,
             cache: None,
         });
+        Self {
+            grid_pipeline,
+            mesh_pipeline,
+            mesh_xray_pipeline,
+            face_pipeline,
+            face_xray_pipeline,
+            curve_pipeline,
+            edge_pipeline,
+            fat_pipeline,
+            axis_pipeline,
+            point_pipeline,
+            underlay_pipeline,
+        }
+    }
+}
+
+/// Owns all wgpu resources; lives in egui-wgpu's `CallbackResources` type map.
+pub struct SceneRenderer {
+    /// Every scene pipeline, built for one colour format and MSAA sample
+    /// count. Rebuilt as a set by [`SceneRenderer::set_sample_count`].
+    pipes: Pipelines,
+    target_format: wgpu::TextureFormat,
+    /// Sample count every pipeline in `pipes` was built for (1 = no MSAA).
+    sample_count: u32,
+    /// Per-pane multisampled targets for the viewport MSAA path (#356).
+    pub(crate) msaa: crate::msaa::ViewportMsaa,
+    /// LineList copies of `lines` (strips) for the fat-stroke pass.
+    curve_segments: Batch,
+    /// Per pane: whether its last camera asked for fat strokes.
+    fat_lines: Vec<bool>,
+    camera_layout: wgpu::BindGroupLayout,
+    /// One camera UBO + bind group per viewport pane. egui-wgpu runs every
+    /// callback's `prepare` before any `paint`, so panes must not share a
+    /// single camera buffer — the last write would win for all of them.
+    cameras: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    object_layout: wgpu::BindGroupLayout,
+    /// Per-object color/material for every scene batch, one bind group.
+    scene_params: ParamBuffer,
+    /// Parameters of the ghost and axis batches, kept apart so a drag frame
+    /// or the constant axes never rewrite the scene's buffer.
+    ghost_params: ParamBuffer,
+    axis_params: ParamBuffer,
+    /// Underlay bind layout: (texture, sampler, opacity).
+    underlay_layout: wgpu::BindGroupLayout,
+    meshes: Batch,
+    /// Per-face-coloured meshes, 9 floats per vertex (#327).
+    face_meshes: Batch,
+    lines: Batch,
+    edges: Batch,
+    /// Profile / silhouette edges tessellated into fat-line ribbon meshes so
+    /// they render visibly thicker than the 1-pixel interior edge lines.
+    profile_ribbons: Batch,
+    point_clouds: Batch,
+    /// Transient ghost preview lines (the iOS gumball live wireframe). Rebuilt
+    /// every drag frame via [`SceneRenderer::set_ghost_lines`] and cleared on
+    /// commit/cancel. Drawn as hairline segments over the scene, under the grid.
+    /// Independent of the scene `generation` so it updates between doc changes.
+    ghost_lines: Batch,
+    /// Persistent world X/Y axis segments (see [`world_axis_lines`]). Built
+    /// once in [`SceneRenderer::new`]; drawn every frame wherever the grid is
+    /// drawn, independent of document content.
+    axis_lines: Batch,
+    underlay: Option<GpuUnderlay>,
+    basemap: Option<GpuUnderlay>,
+    /// Document generation the GPU buffers were built from.
+    pub generation: u64,
+}
+
+impl SceneRenderer {
+    /// Single-sample renderer (no MSAA) for `target_format`.
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        Self::with_samples(device, target_format, 1)
+    }
+
+    /// Renderer whose pipelines draw into `samples`-sample targets (#356). The
+    /// caller must have checked the count with [`crate::supported_sample_counts`].
+    pub fn with_samples(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        samples: u32,
+    ) -> Self {
+        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let object_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("object_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: Some(ParamBuffer::binding_size()),
+                },
+                count: None,
+            }],
+        });
+        let underlay_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("underlay_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipes = Pipelines::new(
+            device,
+            target_format,
+            samples,
+            &camera_layout,
+            &object_layout,
+            &underlay_layout,
+        );
 
         let mut axis_lines = Batch::new("axis");
         let mut axis = Staged::default();
@@ -946,25 +1005,18 @@ impl SceneRenderer {
         axis_lines.init(device, axis);
 
         Self {
-            grid_pipeline,
-            mesh_pipeline,
-            mesh_xray_pipeline,
-            face_pipeline,
-            face_xray_pipeline,
-            curve_pipeline,
-            edge_pipeline,
-            fat_pipeline,
+            pipes,
+            target_format,
+            sample_count: samples,
+            msaa: Default::default(),
             curve_segments: Batch::new("curve_segments"),
             fat_lines: Vec::new(),
-            axis_pipeline,
-            point_pipeline,
             camera_layout,
             cameras: Vec::new(),
             scene_params: ParamBuffer::new(device),
             ghost_params: ParamBuffer::new(device),
             axis_params,
             object_layout,
-            underlay_pipeline,
             underlay_layout,
             meshes: Batch::new("meshes"),
             face_meshes: Batch::new("face_meshes"),
@@ -978,6 +1030,35 @@ impl SceneRenderer {
             basemap: None,
             generation: u64::MAX,
         }
+    }
+
+    /// MSAA sample count the pipelines were built for (1 = off).
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
+    /// Colour format the pipelines target.
+    pub fn target_format(&self) -> wgpu::TextureFormat {
+        self.target_format
+    }
+
+    /// Rebuild every pipeline for a new MSAA sample count, keeping the
+    /// uploaded scene. No-op when the count is unchanged, so a per-frame call
+    /// costs nothing; pane targets of the old count are dropped.
+    pub fn set_sample_count(&mut self, device: &wgpu::Device, samples: u32) {
+        if samples == self.sample_count {
+            return;
+        }
+        self.pipes = Pipelines::new(
+            device,
+            self.target_format,
+            samples,
+            &self.camera_layout,
+            &self.object_layout,
+            &self.underlay_layout,
+        );
+        self.sample_count = samples;
+        self.msaa.clear();
     }
 
     /// Upload the camera for one viewport pane, growing the slot list on demand.
@@ -1264,7 +1345,7 @@ impl SceneRenderer {
         // Basemap first (bottom of the ground-plane stack): satellite/OSM tiles
         // under any tracing underlay. Same textured-quad pipeline.
         if let Some(b) = &self.basemap {
-            render_pass.set_pipeline(&self.underlay_pipeline);
+            render_pass.set_pipeline(&self.pipes.underlay_pipeline);
             render_pass.set_bind_group(1, &b.bind_group, &[]);
             render_pass.set_vertex_buffer(0, b.vertex_buf.slice(..));
             render_pass.set_index_buffer(b.index_buf.slice(..), wgpu::IndexFormat::Uint16);
@@ -1274,7 +1355,7 @@ impl SceneRenderer {
         // Underlay next: on the ground plane, depth-written so meshes occlude
         // it and the grid blends over it.
         if let Some(u) = &self.underlay {
-            render_pass.set_pipeline(&self.underlay_pipeline);
+            render_pass.set_pipeline(&self.pipes.underlay_pipeline);
             render_pass.set_bind_group(1, &u.bind_group, &[]);
             render_pass.set_vertex_buffer(0, u.vertex_buf.slice(..));
             render_pass.set_index_buffer(u.index_buf.slice(..), wgpu::IndexFormat::Uint16);
@@ -1284,16 +1365,16 @@ impl SceneRenderer {
         let scene = &self.scene_params;
         if mode.draws_fill() {
             render_pass.set_pipeline(if mode.depth_writes() {
-                &self.mesh_pipeline
+                &self.pipes.mesh_pipeline
             } else {
-                &self.mesh_xray_pipeline
+                &self.pipes.mesh_xray_pipeline
             });
             draw_indexed(render_pass, &self.meshes, scene);
             if !self.face_meshes.draws.is_empty() {
                 render_pass.set_pipeline(if mode.depth_writes() {
-                    &self.face_pipeline
+                    &self.pipes.face_pipeline
                 } else {
-                    &self.face_xray_pipeline
+                    &self.pipes.face_xray_pipeline
                 });
                 draw_indexed(render_pass, &self.face_meshes, scene);
             }
@@ -1306,10 +1387,10 @@ impl SceneRenderer {
             && (edges_enabled || mode == DisplayMode::Wireframe);
         let fat = self.fat_lines.get(viewport).copied().unwrap_or(false);
         if draw_edges && fat {
-            render_pass.set_pipeline(&self.fat_pipeline);
+            render_pass.set_pipeline(&self.pipes.fat_pipeline);
             draw_fat(render_pass, &self.edges, scene);
         } else if draw_edges {
-            render_pass.set_pipeline(&self.edge_pipeline);
+            render_pass.set_pipeline(&self.pipes.edge_pipeline);
             draw_ranges(render_pass, &self.edges, scene);
         }
 
@@ -1317,7 +1398,7 @@ impl SceneRenderer {
         // solid mesh pipeline (depth-writing) so they read as fat ink edges on
         // top of the fill. Present only when the snapshot populated them.
         if !self.profile_ribbons.draws.is_empty() {
-            render_pass.set_pipeline(&self.mesh_pipeline);
+            render_pass.set_pipeline(&self.pipes.mesh_pipeline);
             draw_indexed(render_pass, &self.profile_ribbons, scene);
         }
 
@@ -1325,16 +1406,16 @@ impl SceneRenderer {
         // Rhino wire (constant on-screen width, selection shown by colour).
         // Fat-stroke modes widen them like the edges above.
         if fat {
-            render_pass.set_pipeline(&self.fat_pipeline);
+            render_pass.set_pipeline(&self.pipes.fat_pipeline);
             draw_fat(render_pass, &self.curve_segments, scene);
         } else {
-            render_pass.set_pipeline(&self.curve_pipeline);
+            render_pass.set_pipeline(&self.pipes.curve_pipeline);
             draw_ranges(render_pass, &self.lines, scene);
         }
 
         // Point clouds: rendered as PointList after lines so they appear on top
         // of surfaces but below the grid.
-        render_pass.set_pipeline(&self.point_pipeline);
+        render_pass.set_pipeline(&self.pipes.point_pipeline);
         draw_ranges(render_pass, &self.point_clouds, scene);
 
         // Ghost preview lines (iOS gumball live wireframe): hairline segments
@@ -1342,12 +1423,12 @@ impl SceneRenderer {
         // soup, not a strip). Over the scene, under the grid. Present only while
         // a gumball drag is active; empty otherwise.
         if !self.ghost_lines.draws.is_empty() {
-            render_pass.set_pipeline(&self.edge_pipeline);
+            render_pass.set_pipeline(&self.pipes.edge_pipeline);
             draw_ranges(render_pass, &self.ghost_lines, &self.ghost_params);
         }
 
         // Grid last: blends over background, depth-tested against meshes.
-        render_pass.set_pipeline(&self.grid_pipeline);
+        render_pass.set_pipeline(&self.pipes.grid_pipeline);
         render_pass.draw(0..3, 0..1);
 
         // World X/Y axes: the z=0 datum lines (incl. the horizontal datum in
@@ -1357,7 +1438,7 @@ impl SceneRenderer {
         // not stipple over them; still depth-tested, so meshes occlude them.
         // They share the grid's visibility: any view that paints the grid
         // paints the axes.
-        render_pass.set_pipeline(&self.axis_pipeline);
+        render_pass.set_pipeline(&self.pipes.axis_pipeline);
         draw_ranges(render_pass, &self.axis_lines, &self.axis_params);
     }
 }

@@ -409,6 +409,7 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         depth_buffer: 24,
         viewport,
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
 
@@ -417,6 +418,24 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, handle)))),
     )
+}
+
+/// eframe's default wgpu setup, plus `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`
+/// when the adapter has it: without it the device only allows the WebGPU
+/// baseline sample counts (1 and 4), so 2x/8x viewport MSAA (#356) would be
+/// unusable even on GPUs that support them.
+fn wgpu_options() -> egui_wgpu::WgpuConfiguration {
+    let mut config = egui_wgpu::WgpuConfiguration::default();
+    if let egui_wgpu::WgpuSetup::CreateNew(create) = &mut config.wgpu_setup {
+        let base = create.device_descriptor.clone();
+        create.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut desc = base(adapter);
+            desc.required_features |=
+                adapter.features() & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+            desc
+        });
+    }
+    config
 }
 
 #[cfg(test)]
