@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright © 2026 Hector Tarrido-Picart
 
-use glam::{DVec3, Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec2, Vec3};
 
 use crate::pano::PanoProjection;
 
@@ -16,7 +16,7 @@ const MAX_DISTANCE: f32 = 1.0e5;
 const FAR: f32 = 5.0e4;
 
 /// Z-up orbit camera with Rhino-style controls (RMB orbit, Shift+RMB pan, scroll dolly).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OrbitCamera {
     pub target: Vec3,
     pub distance: f32,
@@ -251,6 +251,62 @@ impl OrbitCamera {
         }
     }
 
+    /// Zoom window (#368): fit the screen rectangle with corners `a` and `b`,
+    /// in the normalized device coordinates of a viewport of `aspect`, to that
+    /// viewport. `focus` is the 3D point under the rectangle's centre (as
+    /// [`Self::cursor_focus`] finds it); only its depth is used. The camera
+    /// scales about the point at that depth under the centre, which keeps its
+    /// pixel while everything around it grows by the window's size ratio, then
+    /// pans it onto the view centre (the centre column in two-point, whose
+    /// pitch shift remains). The window's aspect is kept: the axis it fills
+    /// more of reaches the viewport edges and the other stays inside.
+    /// Orientation and projection are kept, in perspective, two-point and
+    /// parallel views alike; the target moves to the point's depth. False,
+    /// with the camera untouched, for a panorama/fisheye, a degenerate window
+    /// or a point behind the camera.
+    pub fn zoom_window(&mut self, a: Vec2, b: Vec2, focus: Vec3, aspect: f32) -> bool {
+        let half = (b - a).abs() * 0.5;
+        let mut s = half.x.max(half.y);
+        if self.pano.is_some() || !focus.is_finite() || !s.is_finite() || s < 1e-4 {
+            return false;
+        }
+        let ndc_of = |cam: &Self, p: DVec3| {
+            let clip = cam.view_proj(aspect).as_dmat4() * p.extend(1.0);
+            (clip.w > 1e-9).then(|| clip.truncate() / clip.w)
+        };
+        let unproject = |cam: &Self, ndc: DVec3| {
+            cam.view_proj(aspect).as_dmat4().inverse().project_point3(ndc)
+        };
+        let Some(f) = ndc_of(self, focus.as_dvec3()) else {
+            return false;
+        };
+        let goal = ndc_of(self, self.target.as_dvec3()).unwrap_or(DVec3::ZERO);
+        let centre = (a + b).as_dvec2() * 0.5;
+        let p = unproject(self, DVec3::new(centre.x, centre.y, f.z));
+        if !p.is_finite() {
+            return false;
+        }
+        let p = p.as_vec3();
+        // Never closer than the zoom standoff (perspective) nor outside the
+        // distance range.
+        if !self.ortho {
+            let eye = self.view_eye();
+            let depth = (p - eye).dot((self.target - eye).normalize_or_zero());
+            s = s.max(ZOOM_STANDOFF / depth.max(ZOOM_STANDOFF));
+        }
+        s = s.clamp(MIN_DISTANCE / self.distance, MAX_DISTANCE / self.distance);
+        self.target = p + (self.target - p) * s;
+        self.distance *= s;
+        if let Some(n) = ndc_of(self, p.as_dvec3()) {
+            let q = unproject(self, DVec3::new(goal.x, goal.y, n.z)).as_vec3();
+            if q.is_finite() {
+                self.target += p - q;
+            }
+        }
+        self.retarget(p);
+        true
+    }
+
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let aspect = aspect.max(1e-3);
         if self.ortho {
@@ -467,6 +523,74 @@ mod tests {
             let s = screen_xy(m, p);
             s.x.abs() <= 1.0 && s.y.abs() <= 1.0
         })
+    }
+
+    /// The four window corners, as world points at `focus`'s depth.
+    fn window_corners(cam: &OrbitCamera, a: Vec2, b: Vec2, focus: Vec3, aspect: f32) -> [Vec3; 4] {
+        let m = cam.view_proj(aspect);
+        let c = m * focus.extend(1.0);
+        let z = c.z / c.w;
+        [(a.x, a.y), (b.x, a.y), (b.x, b.y), (a.x, b.y)]
+            .map(|(x, y)| m.inverse().project_point3(Vec3::new(x, y, z)))
+    }
+
+    #[test]
+    fn zoom_window_fits_the_rectangle_in_every_projection() {
+        // #368: after the zoom the window's corners land on the viewport edges
+        // along the axis the window fills more of, inside along the other, with
+        // the window's aspect kept and its centre on the view centre.
+        let aspect = 1.6;
+        let mut two_point = OrbitCamera { two_point: true, pitch: 0.3, ..OrbitCamera::default() };
+        two_point.target = Vec3::new(2.0, 1.0, 1.0);
+        let mut top = OrbitCamera::default();
+        top.set_view(StandardView::Top);
+        top.ortho = true;
+        let mut front = OrbitCamera { ortho: true, ..OrbitCamera::default() };
+        front.set_view(StandardView::Front);
+        let cams = [OrbitCamera::default(), two_point, top, front];
+        // Wide, tall and off-centre windows, dragged either way.
+        let windows = [
+            (Vec2::new(-0.2, -0.1), Vec2::new(0.4, 0.1)),
+            (Vec2::new(0.5, 0.6), Vec2::new(0.3, -0.2)),
+            (Vec2::new(-0.9, -0.8), Vec2::new(-0.5, -0.6)),
+        ];
+        for (i, cam0) in cams.iter().enumerate() {
+            for &(a, b) in &windows {
+                let mut cam = *cam0;
+                let centre = (a + b) * 0.5;
+                let (origin, dir) = {
+                    let inv = cam.view_proj(aspect).inverse();
+                    let o = inv.project_point3(centre.extend(-1.0));
+                    let f = inv.project_point3(centre.extend(1.0));
+                    (o.as_dvec3(), (f - o).normalize().as_dvec3())
+                };
+                let focus = cam.cursor_focus(origin, dir, None).as_vec3();
+                let corners = window_corners(&cam, a, b, focus, aspect);
+                let goal = screen_xy(cam.view_proj(aspect), cam.target);
+                assert!(cam.zoom_window(a, b, focus, aspect), "cam {i}");
+                let m = cam.view_proj(aspect);
+                let s: Vec<Vec2> = corners.iter().map(|&p| screen_xy(m, p) - goal).collect();
+                let w = (s[1].x - s[0].x).abs();
+                let h = (s[2].y - s[1].y).abs();
+                assert!((w.max(h) - 2.0).abs() < 1e-2, "cam {i} {a} {b}: fills {w} x {h}");
+                let (w0, h0) = ((b.x - a.x).abs(), (b.y - a.y).abs());
+                assert!((w / h - w0 / h0).abs() < 1e-2 * (w0 / h0), "cam {i}: aspect kept");
+                let mid = (s[0] + s[2]) * 0.5;
+                assert!(mid.length() < 1e-2, "cam {i} {a} {b}: centred, off by {mid}");
+                assert!((cam.yaw, cam.pitch, cam.ortho) == (cam0.yaw, cam0.pitch, cam0.ortho));
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_window_ignores_a_degenerate_window_and_a_panorama() {
+        let mut cam = OrbitCamera::default();
+        let before = cam;
+        let p = Vec2::new(0.1, 0.1);
+        assert!(!cam.zoom_window(p, p, cam.target, 1.0));
+        assert_eq!(cam, before);
+        cam.pano = Some(crate::pano::PanoProjection::Equirect);
+        assert!(!cam.zoom_window(Vec2::ZERO, Vec2::ONE, cam.target, 1.0));
     }
 
     #[test]

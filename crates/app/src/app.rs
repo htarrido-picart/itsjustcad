@@ -905,6 +905,16 @@ pub struct App {
     /// the point that was under the cursor when the orbit drag started. Kept
     /// for the whole drag; dropped by a pan step or when the drag ends.
     orbit_pivot: Option<(usize, glam::Vec3)>,
+    /// Zoom window (#368, `zw`): `Some(None)` while armed, waiting for a
+    /// drag; `Some(Some((pane, start)))` while a rectangle is being dragged
+    /// in `pane` from `start`. View state, never logged.
+    zoom_window: Option<Option<(usize, egui::Pos2)>>,
+    /// Previous / next view (#368), one history per camera slot. View state:
+    /// never logged, never saved.
+    view_history: [itsjustcad_render::ViewHistory; 4],
+    /// egui's clock (seconds) at the start of this frame, for the view
+    /// history's settle timing.
+    now: f64,
     /// Site plan optimizer form / running search / results (#145).
     optimize: optimize_panel::OptimizePanel,
     /// Address lookup for the site location (`geocode`, #215).
@@ -1654,6 +1664,9 @@ impl App {
             drill: Default::default(),
             hover: Default::default(),
             orbit_pivot: None,
+            zoom_window: None,
+            view_history: Default::default(),
+            now: 0.0,
             optimize: Default::default(),
             geocode: Default::default(),
             geo_hook: std::sync::Arc::new(crate::geocode::Nominatim::desktop()),
@@ -2235,6 +2248,13 @@ impl App {
             Some("recover") => self.recover(),
             Some("ze" | "zoomextents") => self.zoom_extents(),
             Some("zs" | "zoomselected") => self.zoom_selected(),
+            Some("zw" | "zoomwindow") => {
+                self.zoom_window = Some(None);
+                self.command_line
+                    .push_line("zoom window: drag a rectangle in a viewport (Esc cancels)");
+            }
+            Some("viewprev" | "previousview") => self.step_view(false),
+            Some("viewnext" | "nextview") => self.step_view(true),
             // Display mode of the active viewport. View state, never logged.
             // Verb/mode mapping is shared with the headless runner via app_verbs.
             Some("display") => match words.next().and_then(DisplayMode::parse) {
@@ -2845,6 +2865,24 @@ impl App {
     fn active_camera(&mut self) -> &mut OrbitCamera {
         let idx = self.effective_camera_index(self.active_pane);
         &mut self.cameras[idx]
+    }
+
+    /// Previous / next view (#368) of the active pane: restore the view
+    /// before (or after) the current one in that pane's history. View state,
+    /// never logged.
+    fn step_view(&mut self, forward: bool) {
+        let idx = self.effective_camera_index(self.active_pane);
+        let (cam, now) = (self.cameras[idx], self.now);
+        let history = &mut self.view_history[idx];
+        let step = if forward { history.forward(&cam, now) } else { history.back(&cam, now) };
+        match step {
+            Some(view) => self.cameras[idx] = view,
+            None => self.command_line.push_line(if forward {
+                "next view: none (this is the newest view)"
+            } else {
+                "previous view: none (this is the oldest view)"
+            }),
+        }
     }
 
     fn set_view(&mut self, name: &str) {
@@ -3615,6 +3653,16 @@ impl App {
     /// no modal open, and no draw tool active. Runs BEFORE any widget so matched
     /// key events can be consumed. Everything NOT in this whitelist types normally.
     fn early_hotkeys(&mut self, ctx: &egui::Context) {
+        // Esc cancels an armed or dragging zoom window (#368) and nothing else:
+        // a draw tool or selection underneath is kept.
+        if self.zoom_window.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.zoom_window = None;
+            self.command_line.push_line("zoom window: cancelled");
+            ctx.input_mut(|i| {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: egui::Key::Escape, .. }))
+            });
+            return;
+        }
         let modal = self.show_palette
             || self.show_about
             || self.feedback_sheet.is_some()
@@ -4113,6 +4161,56 @@ impl App {
     /// `cam_idx`: the nearest visible geometry, else the ground, else the
     /// target's depth ([`OrbitCamera::cursor_focus`]). Cursor zoom (#365)
     /// zooms toward it; orbit about the cursor (#366) pivots on it.
+    /// Zoom window (#368) input for `pane`: a left drag that starts in it
+    /// draws a rectangle, and the release fits that pane's view to it.
+    fn zoom_window_input(
+        &mut self,
+        ui: &egui::Ui,
+        pane: usize,
+        cam_idx: usize,
+        rect: egui::Rect,
+        response: &egui::Response,
+    ) {
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
+        }
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos())
+        {
+            self.zoom_window = Some(Some((pane, pos)));
+        }
+        let Some(Some((p, start))) = self.zoom_window else {
+            return;
+        };
+        if p != pane {
+            return;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return;
+        };
+        let drag = egui::Rect::from_two_pos(start, pos).intersect(rect);
+        draw_rubber_box(&ui.painter_at(rect), drag, crate::boxsel::BoxMode::Window, ui.visuals());
+        ui.ctx().request_repaint();
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
+            self.zoom_window = None;
+            let ndc = |q: egui::Pos2| {
+                glam::Vec2::new(
+                    (q.x - rect.left()) / rect.width().max(1.0) * 2.0 - 1.0,
+                    1.0 - (q.y - rect.top()) / rect.height().max(1.0) * 2.0,
+                )
+            };
+            let focus = self.cursor_focus(cam_idx, rect, drag.center()).as_vec3();
+            let aspect = rect.width() / rect.height().max(1.0);
+            let fitted =
+                self.cameras[cam_idx].zoom_window(ndc(drag.min), ndc(drag.max), focus, aspect);
+            self.command_line.push_line(if fitted {
+                "zoom window"
+            } else {
+                "zoom window: nothing to fit (drag a larger rectangle)"
+            });
+        }
+    }
+
     fn cursor_focus(&self, cam_idx: usize, rect: egui::Rect, pos: egui::Pos2) -> glam::DVec3 {
         let cam = &self.cameras[cam_idx];
         let view_proj = cam.view_proj(rect.width() / rect.height().max(1.0));
@@ -5111,6 +5209,17 @@ impl App {
                 let focus = self.cursor_focus(cam_idx, rect, pos).as_vec3();
                 self.cameras[cam_idx].recentre(focus);
             }
+            if self.zoom_window.is_some() {
+                self.zoom_window_input(ui, pane, cam_idx, rect, &response);
+            }
+            // Previous / next view (#368): record this pane's view once it
+            // settles after any change (drag, scroll burst, verb, named view).
+            let busy = ui.input(|i| i.pointer.any_down());
+            if self.view_history[cam_idx].observe(&self.cameras[cam_idx], self.now, busy) {
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(
+                    itsjustcad_render::SETTLE_SECS,
+                ));
+            }
             let aspect = rect.width() / rect.height().max(1.0);
             let view_proj = self.cameras[cam_idx].view_proj(aspect);
 
@@ -5129,7 +5238,10 @@ impl App {
             }
 
             let mut hover_blocked = false;
-            if self.draw_tool.active() || self.guided.active() {
+            if self.zoom_window.is_some() {
+                // Zoom window owns the left button: no pick, box select or
+                // draw step underneath (the tool stays armed).
+            } else if self.draw_tool.active() || self.guided.active() {
                 // Draw/osnap only in the active pane; one prompt, one ghost.
                 if pane == self.active_pane {
                     if response.hovered() {
@@ -5401,6 +5513,9 @@ impl App {
         // another pane) must not leave a stale rubber box behind.
         if self.box_drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
             self.box_drag = None;
+        }
+        if matches!(self.zoom_window, Some(Some(_))) && !ui.input(|i| i.pointer.any_down()) {
+            self.zoom_window = Some(None);
         }
 
         // Empty-document next-actions: instead of a bare viewport, offer the
@@ -11748,6 +11863,7 @@ impl eframe::App for App {
         // Modeless-hotkey exceptions run BEFORE any widget so their key/text
         // events can be consumed (the command line is focused-by-default, so the
         // input would otherwise eat the letter).
+        self.now = ui.input(|i| i.time);
         self.early_hotkeys(&ui.ctx().clone());
         // OS drag-and-drop: dropping model files onto the window imports them
         // (the literal "drop in a DWG" ask). Dispatch by extension via the same
@@ -14573,6 +14689,92 @@ mod tests {
             assert!((centre - rect.center()).length() < 1.0, "target on the centre");
             let was = project(before, rect, target.as_dvec3()).expect("in front");
             assert!((was - at).length() < 1.0, "recentred on the clicked point: {was} vs {at}");
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run explicitly (journey tests)"]
+    fn journey_zoom_window_then_previous_and_next_view_per_pane() {
+        // #368: `zw` + a left drag fits the dragged window to the pane; Esc
+        // cancels an armed zoom window; `viewprev` / `viewnext` walk each
+        // pane's own settled views.
+        run_app_journey(|h| {
+            let run = |h: &mut egui_kittest::Harness<'_, App>, line: &str| {
+                h.state_mut().execute_line(line.to_string());
+                h.run_steps(3); // kittest steps 0.25 s: the view settles
+            };
+            let cam = |h: &egui_kittest::Harness<'_, App>, pane: usize| {
+                h.state().cameras[h.state().effective_camera_index(pane)]
+            };
+            for line in ["box -5,-5,0 10,10,10", "persp", "ze"] {
+                run(h, line);
+            }
+            let before = cam(h, 0);
+
+            run(h, "zw");
+            h.key_press(egui::Key::Escape);
+            h.run_steps(1);
+            assert!(h.state().zoom_window.is_none(), "Esc cancels");
+            assert_eq!(cam(h, 0), before);
+
+            run(h, "zw");
+            let (rect, vp0) = active_viewport(h);
+            let (a, b) = (pane_point(h, 0.35, 0.40), pane_point(h, 0.55, 0.50));
+            let focus = h.state().cursor_focus(h.state().effective_camera_index(0), rect, a.lerp(b, 0.5));
+            // The points under the corners at the focus's depth.
+            let eye = before.eye().as_dvec3();
+            let fwd = (before.target.as_dvec3() - eye).normalize();
+            let world = |q: egui::Pos2| {
+                let (o, d) = screen_ray(vp0, rect, q);
+                o + d * ((focus - o).dot(fwd) / d.dot(fwd))
+            };
+            let (wa, wb) = (world(a), world(b));
+            let m = egui::Modifiers::default();
+            let button = |pressed, pos| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: m,
+            };
+            h.input_mut().events.push(egui::Event::PointerMoved(a));
+            h.input_mut().events.push(button(true, a));
+            h.run_steps(1);
+            for i in 1..=6 {
+                let p = a.lerp(b, i as f32 / 6.0);
+                h.input_mut().events.push(egui::Event::PointerMoved(p));
+                h.run_steps(1);
+            }
+            assert!(matches!(h.state().zoom_window, Some(Some((0, _)))), "dragging");
+            h.input_mut().events.push(button(false, b));
+            h.run_steps(3);
+            assert!(h.state().zoom_window.is_none(), "one zoom per `zw`");
+            assert!(h.state().session.doc.selection.is_empty(), "no box selection");
+            let (rect, vp1) = active_viewport(h);
+            let (pa, pb) = (project(vp1, rect, wa).unwrap(), project(vp1, rect, wb).unwrap());
+            // The window is wider than the pane's aspect: its width fills it.
+            assert!((pa.x - rect.left()).abs() < 2.0 && (pb.x - rect.right()).abs() < 2.0, "{pa} {pb} {rect:?}");
+            assert!((pa.lerp(pb, 0.5) - rect.center()).length() < 2.0, "centred");
+            let zoomed = cam(h, 0);
+
+            run(h, "viewprev");
+            assert_eq!(cam(h, 0), before, "previous view");
+            run(h, "viewnext");
+            assert_eq!(cam(h, 0), zoomed, "next view");
+
+            // Each pane walks its own history.
+            run(h, "viewports 4");
+            h.state_mut().active_pane = 1;
+            let top = cam(h, 1);
+            run(h, "ze");
+            let top_ze = cam(h, 1);
+            assert_ne!(top, top_ze);
+            h.state_mut().active_pane = 0;
+            run(h, "viewprev");
+            assert_eq!(cam(h, 0), before);
+            assert_eq!(cam(h, 1), top_ze, "the other pane is untouched");
+            h.state_mut().active_pane = 1;
+            run(h, "viewprev");
+            assert_eq!(cam(h, 1), top);
         });
     }
 
