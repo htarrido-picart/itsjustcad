@@ -27,6 +27,15 @@ pub struct CameraUniform {
     /// dash pattern scale, #364; 0 reads as 1). Zero x,y,z (the default) keeps
     /// the 1-device-px hardware hairline; see [`DisplayMode::line_pt`].
     pub screen: [f32; 4],
+    /// Edge styles (#361): x = depth-cue width of the nearest strokes in
+    /// device px (0 = no depth cue), y = 1 draws the dashed back edges, z =
+    /// device px per logical px of the back-edge dashes, w spare. See
+    /// [`CameraUniform::with_edge_style`].
+    pub edges: [f32; 4],
+    /// Depth-cue ramp, filled by [`SceneRenderer::write_camera`] from the
+    /// scene bounds: `dot(p, xyz) + w` runs 0 at the nearest scene point to 1
+    /// at the farthest. Zero when depth cue is off.
+    pub cue: [f32; 4],
 }
 
 impl CameraUniform {
@@ -46,6 +55,33 @@ impl CameraUniform {
     /// Whether the world axes are shown (see [`Self::with_overlays`]).
     pub fn shows_axes(&self) -> bool {
         self.light[3] <= 0.5
+    }
+
+    /// The same camera with the pane's GPU-side edge style (#361): the
+    /// depth cue widens the nearest strokes to `style.depth_cue_px` logical
+    /// px (`ppp` device px each), tapering to the mode's own width (at least
+    /// one device px) at the far end of the scene; back edges flag the
+    /// dashed occluded-edge pass. Call after `screen` is set: depth cue turns
+    /// a hairline mode's strokes into 1-device-px fat strokes so they can
+    /// widen. The default style leaves the camera as it was.
+    pub fn with_edge_style(mut self, style: &crate::EdgeStyle, ppp: f32) -> Self {
+        let ppp = ppp.max(1.0);
+        self.edges = [0.0, 0.0, ppp, 0.0];
+        if style.depth_cue {
+            if self.screen[2] <= 0.0 {
+                self.screen[2] = 1.0;
+            }
+            self.edges[0] = (style.depth_cue_px * ppp).max(self.screen[2]);
+        }
+        if style.back_edges {
+            self.edges[1] = 1.0;
+        }
+        self
+    }
+
+    /// Whether the pane asks for the dashed back-edge pass.
+    pub fn draws_back_edges(&self) -> bool {
+        self.edges[1] > 0.5
     }
 }
 
@@ -551,6 +587,10 @@ struct Pipelines {
     dash_pipeline: wgpu::RenderPipeline,
     /// Fat-stroke variant of `dash_pipeline` (one instance per segment).
     fat_dash_pipeline: wgpu::RenderPipeline,
+    /// Dashed back edges (#361): fat quads over the edge / curve LineList
+    /// buffers with the depth test reversed (GREATER, no depth writes), so
+    /// only the occluded parts draw.
+    back_pipeline: wgpu::RenderPipeline,
     /// PointList pipeline for point-cloud geometry.
     point_pipeline: wgpu::RenderPipeline,
     /// Textured-quad pipeline (underlay and basemap).
@@ -899,6 +939,44 @@ impl Pipelines {
         let dash_pipeline = dash("dash_pipeline", false);
         let fat_dash_pipeline = dash("fat_dash_pipeline", true);
 
+        // Back edges (#361): the fat-stroke layout over the plain LineList
+        // buffers, depth-tested GREATER without writes.
+        let back_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("back_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: wgpu::VertexState {
+                module: &curve_shader,
+                entry_point: Some("vs_back"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 24,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &curve_shader,
+                entry_point: Some("fs_back"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: ms,
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Point cloud: same shader as curves, PointList topology.
         let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("point_pipeline"),
@@ -1006,6 +1084,7 @@ impl Pipelines {
             axis_pipeline,
             dash_pipeline,
             fat_dash_pipeline,
+            back_pipeline,
             point_pipeline,
             underlay_pipeline,
         }
@@ -1028,6 +1107,12 @@ pub struct SceneRenderer {
     fat_lines: Vec<bool>,
     /// Per pane: whether its last camera hid the world axes (#364).
     axes_hidden: Vec<bool>,
+    /// Per pane: its last camera, re-sent with a fresh depth-cue ramp when
+    /// the scene bounds change (#361).
+    last_cameras: Vec<CameraUniform>,
+    /// World bounds `(min, max)` of the uploaded scene's strokes and meshes,
+    /// for the depth-cue ramp (#361).
+    scene_bounds: Option<(glam::Vec3, glam::Vec3)>,
     camera_layout: wgpu::BindGroupLayout,
     /// One camera UBO + bind group per viewport pane. egui-wgpu runs every
     /// callback's `prepare` before any `paint`, so panes must not share a
@@ -1177,6 +1262,8 @@ impl SceneRenderer {
             curve_segments: Batch::new("curve_segments"),
             fat_lines: Vec::new(),
             axes_hidden: Vec::new(),
+            last_cameras: Vec::new(),
+            scene_bounds: None,
             camera_layout,
             cameras: Vec::new(),
             scene_params: ParamBuffer::new(device),
@@ -1255,11 +1342,14 @@ impl SceneRenderer {
             });
             self.cameras.push((buf, bind_group));
         }
+        let cam = &CameraUniform { cue: depth_cue_ramp(cam, self.scene_bounds), ..*cam };
         queue.write_buffer(&self.cameras[viewport].0, 0, bytemuck::bytes_of(cam));
         if self.fat_lines.len() <= viewport {
             self.fat_lines.resize(viewport + 1, false);
             self.axes_hidden.resize(viewport + 1, false);
+            self.last_cameras.resize(viewport + 1, *cam);
         }
+        self.last_cameras[viewport] = *cam;
         self.fat_lines[viewport] =
             cam.screen[0] > 0.0 && cam.screen[1] > 0.0 && cam.screen[2] > 0.0;
         self.axes_hidden[viewport] = !cam.shows_axes();
@@ -1361,6 +1451,18 @@ impl SceneRenderer {
 
         self.write_scene_params(device, queue);
         self.generation = generation;
+
+        // Depth cue (#361): new bounds re-send the panes that use the ramp.
+        let bounds = scene_bounds(scene);
+        if bounds != self.scene_bounds {
+            self.scene_bounds = bounds;
+            for i in 0..self.last_cameras.len() {
+                let cam = self.last_cameras[i];
+                if cam.edges[0] > 0.0 {
+                    self.write_camera(device, queue, i, &cam);
+                }
+            }
+        }
 
         self.underlay = scene
             .underlay
@@ -1633,6 +1735,20 @@ impl SceneRenderer {
             draw_ranges(render_pass, &self.ghost_lines, &self.ghost_params);
         }
 
+        // Back edges (#361): after every occluder, before the grid, only in
+        // the opaque modes (never X-ray, Ghosted or Wireframe, whose faces
+        // write no depth) and only for the panes that ask.
+        let back = draw_edges
+            && mode.depth_writes()
+            && self.last_cameras.get(viewport).is_some_and(|c| {
+                c.draws_back_edges() && c.screen[0] > 0.0 && c.screen[1] > 0.0
+            });
+        if back {
+            render_pass.set_pipeline(&self.pipes.back_pipeline);
+            draw_fat(render_pass, &self.edges, scene);
+            draw_fat(render_pass, &self.curve_segments, scene);
+        }
+
         // Grid last: blends over background, depth-tested against meshes.
         // A hidden grid (`grid off`, camera `light.z`) is dropped in the
         // shader, which still paints the gradient background (#364).
@@ -1668,6 +1784,53 @@ impl SceneRenderer {
             draw_ranges(pass, batch, &self.scene_params);
         }
     }
+}
+
+/// World bounds of a scene's meshes and strokes, `None` when empty.
+fn scene_bounds(scene: &SceneData) -> Option<(glam::Vec3, glam::Vec3)> {
+    let points = scene
+        .meshes
+        .iter()
+        .flat_map(|m| m.0.positions.iter())
+        .chain(scene.face_meshes.iter().flat_map(|m| m.0.positions.iter()))
+        .chain(scene.edges.iter().flat_map(|e| e.0.iter()))
+        .chain(scene.lines.iter().flat_map(|l| l.0.iter()))
+        .map(|p| glam::Vec3::from(*p));
+    points.fold(None, |acc, p| match acc {
+        None => Some((p, p)),
+        Some((lo, hi)) => Some((lo.min(p), hi.max(p))),
+    })
+}
+
+/// The depth-cue ramp of a camera over the scene bounds (#361): a plane
+/// whose `dot(p, xyz) + w` is 0 at the bounds' nearest corner (or the eye,
+/// if nearer) and 1 at the farthest, measured along the view direction so
+/// parallel views ramp too. Zero when the camera has no depth cue.
+fn depth_cue_ramp(cam: &CameraUniform, bounds: Option<(glam::Vec3, glam::Vec3)>) -> [f32; 4] {
+    let Some((lo, hi)) = bounds.filter(|_| cam.edges[0] > 0.0) else {
+        return [0.0; 4];
+    };
+    // View direction from two unprojected points on the screen centre.
+    let inv = glam::Mat4::from_cols_array_2d(&cam.inv_view_proj);
+    let fwd = (inv.project_point3(glam::Vec3::new(0.0, 0.0, 0.5))
+        - inv.project_point3(glam::Vec3::ZERO))
+    .normalize_or_zero();
+    if fwd == glam::Vec3::ZERO || !fwd.is_finite() {
+        return [0.0; 4];
+    }
+    let corners = (0..8).map(|i| {
+        glam::Vec3::new(
+            if i & 1 == 0 { lo.x } else { hi.x },
+            if i & 2 == 0 { lo.y } else { hi.y },
+            if i & 4 == 0 { lo.z } else { hi.z },
+        )
+        .dot(fwd)
+    });
+    let (near, far) = corners.fold((f32::MAX, f32::MIN), |(a, b), d| (a.min(d), b.max(d)));
+    let eye = glam::Vec3::new(cam.eye[0], cam.eye[1], cam.eye[2]).dot(fwd);
+    let near = near.max(eye.min(far));
+    let range = (far - near).max(1e-3);
+    [fwd.x / range, fwd.y / range, fwd.z / range, -near / range]
 }
 
 /// Pack scene meshes into one indexed batch.

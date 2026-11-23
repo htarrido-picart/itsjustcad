@@ -369,6 +369,10 @@ pub enum NativeItem {
     },
     /// A visual divider between item groups.
     Separator,
+    /// A nested menu (View ▸ Edges, #361): one level deep, holding leaves,
+    /// checks and separators. `id` names it for tests; the items keep their
+    /// own ids, so their routes and check syncing are as at the top level.
+    Submenu { id: String, label: String, items: Vec<NativeItem> },
 }
 
 /// A macOS-standard predefined menu item the OS implements directly (no
@@ -428,6 +432,28 @@ pub struct ViewState {
     pub show_grid: bool,
     /// World axes shown — the check on View ▸ Show Axes (#364).
     pub show_axes: bool,
+    /// Edge styles — the checks in View ▸ Edges (#361).
+    pub edges: ViewEdges,
+}
+
+/// The View ▸ Edges checks (#361): the edge style's toggles and colour mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewEdges {
+    pub back_edges: bool,
+    pub depth_cue: bool,
+    pub extension: bool,
+    pub color: itsjustcad_render::EdgeColor,
+}
+
+impl From<itsjustcad_render::EdgeStyle> for ViewEdges {
+    fn from(s: itsjustcad_render::EdgeStyle) -> Self {
+        ViewEdges {
+            back_edges: s.back_edges,
+            depth_cue: s.depth_cue,
+            extension: s.extension,
+            color: s.color,
+        }
+    }
 }
 
 /// The display-mode radio choices the View menu offers, in menu order. A copy of
@@ -756,6 +782,29 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
 
             radio("grid", tr("menu.view.grid"), "grid", view.show_grid),
             radio("axes", tr("menu.view.axes"), "axes", view.show_axes),
+            // Edge styles (#361): the bare verbs flip the toggles; the colour
+            // modes are a radio group.
+            NativeItem::Submenu {
+                id: format!("{t}/edges"),
+                label: tr("menu.view.edges").into(),
+                items: {
+                    use itsjustcad_render::EdgeColor;
+                    let e = view.edges;
+                    let colour = |id: &str, key: &str, c: EdgeColor| {
+                        radio(id, tr(key), &format!("edgecolor {}", c.label()), e.color == c)
+                    };
+                    vec![
+                        radio("back_edges", tr("menu.view.back_edges"), "backedges", e.back_edges),
+                        radio("depth_cue", tr("menu.view.depth_cue"), "depthcue", e.depth_cue),
+                        radio("edge_extension", tr("menu.view.edge_extension"), "extension", e.extension),
+                        NativeItem::Separator,
+                        colour("edgecolor_layer", "menu.view.edgecolor_layer", EdgeColor::Layer),
+                        colour("edgecolor_same", "menu.view.edgecolor_same", EdgeColor::Same),
+                        colour("edgecolor_material", "menu.view.edgecolor_material", EdgeColor::Material),
+                        colour("edgecolor_axis", "menu.view.edgecolor_axis", EdgeColor::Axis),
+                    ]
+                },
+            },
             NativeItem::Separator,
             // Viewport layout.
             ex("vp1", tr("menu.view.vp1"), "viewports 1"),
@@ -1078,61 +1127,79 @@ pub fn ui(
         for menu in &model {
             ui.menu_button(&menu.title, |ui| {
                 for it in &menu.items {
-                    match it {
-                        NativeItem::Separator => {
-                            ui.separator();
-                        }
-                        NativeItem::Predefined(kind) => {
-                            let label = match kind {
-                                PredefinedKind::Minimize => tr("menu.window.minimize"),
-                                PredefinedKind::Zoom => tr("menu.window.zoom"),
-                                PredefinedKind::BringAllToFront => tr("menu.window.bring_all_to_front"),
-                                PredefinedKind::Fullscreen => tr("menu.window.fullscreen"),
-                                PredefinedKind::Quit => tr("menu.file.quit"),
-                            };
-                            let _ = ui.button(label);
-                        }
-                        NativeItem::Leaf { id, label, action: a, shortcut, enabled } => {
-                            if icons
-                                .menu_item_ex(ui, leaf_icon(id, label), label, shortcut.as_deref(), *enabled)
-                                .clicked()
-                            {
-                                action = Some(a.clone());
-                                ui.close();
-                            }
-                        }
-                        NativeItem::Check { label, action: a, checked: model_checked, enabled, .. } => {
-                            // LLM toggles read their live state from `toggles`; all
-                            // other checks (View display/lighting radios) render the
-                            // model's `checked`, which the caller already resolved
-                            // from the live ViewState.
-                            let (checked, live_enabled) = match a {
-                                MenuAction::ToggleLocalOnly
-                                | MenuAction::ToggleWebSearch
-                                | MenuAction::ToggleTerse => {
-                                    toggles.for_action(a, *enabled)
-                                }
-                                _ => (*model_checked, *enabled),
-                            };
-                            let mark = if checked { "☑ " } else { "☐ " };
-                            if ui
-                                .add_enabled(
-                                    live_enabled,
-                                    egui::Button::new(format!("{mark}{label}")),
-                                )
-                                .clicked()
-                            {
-                                action = Some(a.clone());
-                                ui.close();
-                            }
-                        }
-                    }
+                    item_ui(ui, icons, toggles, it, &mut action);
                 }
             });
         }
         appearance_controls(ui, icons);
     });
     action
+}
+
+/// One in-window menu item ([`ui`]); a submenu draws its items nested.
+fn item_ui(
+    ui: &mut egui::Ui,
+    icons: &Icons,
+    toggles: MenuToggles,
+    it: &NativeItem,
+    action: &mut Option<MenuAction>,
+) {
+    match it {
+        NativeItem::Submenu { label, items, .. } => {
+            ui.menu_button(label, |ui| {
+                for sub in items {
+                    item_ui(ui, icons, toggles, sub, action);
+                }
+            });
+        }
+        NativeItem::Separator => {
+            ui.separator();
+        }
+        NativeItem::Predefined(kind) => {
+            let label = match kind {
+                PredefinedKind::Minimize => tr("menu.window.minimize"),
+                PredefinedKind::Zoom => tr("menu.window.zoom"),
+                PredefinedKind::BringAllToFront => tr("menu.window.bring_all_to_front"),
+                PredefinedKind::Fullscreen => tr("menu.window.fullscreen"),
+                PredefinedKind::Quit => tr("menu.file.quit"),
+            };
+            let _ = ui.button(label);
+        }
+        NativeItem::Leaf { id, label, action: a, shortcut, enabled } => {
+            if icons
+                .menu_item_ex(ui, leaf_icon(id, label), label, shortcut.as_deref(), *enabled)
+                .clicked()
+            {
+                *action = Some(a.clone());
+                ui.close();
+            }
+        }
+        NativeItem::Check { label, action: a, checked: model_checked, enabled, .. } => {
+            // LLM toggles read their live state from `toggles`; all
+            // other checks (View display/lighting radios) render the
+            // model's `checked`, which the caller already resolved
+            // from the live ViewState.
+            let (checked, live_enabled) = match a {
+                MenuAction::ToggleLocalOnly
+                | MenuAction::ToggleWebSearch
+                | MenuAction::ToggleTerse => {
+                    toggles.for_action(a, *enabled)
+                }
+                _ => (*model_checked, *enabled),
+            };
+            let mark = if checked { "☑ " } else { "☐ " };
+            if ui
+                .add_enabled(
+                    live_enabled,
+                    egui::Button::new(format!("{mark}{label}")),
+                )
+                .clicked()
+            {
+                *action = Some(a.clone());
+                ui.close();
+            }
+        }
+    }
 }
 
 /// Live state for the checkable LLM-menu toggles, passed into [`ui`] so the
@@ -1220,6 +1287,7 @@ pub fn demo_open(
         mouse_nav: MouseNav::Right,
         show_grid: true,
         show_axes: true,
+        edges: ViewEdges::default(),
     };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
         return;
@@ -1237,6 +1305,9 @@ pub fn demo_open(
                             ui.separator();
                         }
                         NativeItem::Predefined(_) => {}
+                        NativeItem::Submenu { label, .. } => {
+                            let _ = ui.button(format!("{label}  ▸"));
+                        }
                         NativeItem::Leaf { id, label, shortcut, enabled, .. } => {
                             let _ = icons.menu_item_ex(
                                 ui,
@@ -1265,17 +1336,30 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// Every item of a menu, submenu contents inlined after their submenu.
+    fn flat(items: &[NativeItem]) -> Vec<&NativeItem> {
+        items
+            .iter()
+            .flat_map(|it| match it {
+                NativeItem::Submenu { items, .. } => {
+                    std::iter::once(it).chain(flat(items)).collect::<Vec<_>>()
+                }
+                _ => vec![it],
+            })
+            .collect()
+    }
+
     /// Collect all leaf (id, label, action) triples from a native model.
     fn leaves(menus: &[NativeMenu]) -> Vec<(String, String, MenuAction)> {
         menus
             .iter()
-            .flat_map(|m| &m.items)
+            .flat_map(|m| flat(&m.items))
             .filter_map(|it| match it {
                 NativeItem::Leaf { id, label, action, .. }
                 | NativeItem::Check { id, label, action, .. } => {
                     Some((id.clone(), label.clone(), action.clone()))
                 }
-                NativeItem::Separator | NativeItem::Predefined(_) => None,
+                NativeItem::Separator | NativeItem::Predefined(_) | NativeItem::Submenu { .. } => None,
             })
             .collect()
     }
@@ -1725,11 +1809,10 @@ mod tests {
 
     /// Helper: the `checked` flag of a View check leaf by id.
     fn view_check(view: ViewState, id: &str) -> Option<bool> {
-        native_model(MenuStyle::Modeler, true, view)
+        let menus = native_model(MenuStyle::Modeler, true, view);
+        let items = &menus.into_iter().find(|m| m.title == tr("menu.view"))?.items;
+        flat(items)
             .into_iter()
-            .find(|m| m.title == tr("menu.view"))?
-            .items
-            .iter()
             .find_map(|it| match it {
                 NativeItem::Check { id: i, checked, .. } if i == id => Some(*checked),
                 _ => None,
@@ -1795,6 +1878,64 @@ mod tests {
         assert_eq!(view_check(par, "View/cam_parallel"), Some(true));
         assert_eq!(view_check(par, "View/cam_persp"), Some(false));
         assert_eq!(action(par, "View/cam_parallel"), Some(MenuAction::Execute("camera parallel".into())));
+    }
+
+    #[test]
+    fn view_edges_submenu_checks_and_fires_verbs() {
+        use itsjustcad_render::EdgeColor;
+        // #361: View ▸ Edges holds the three toggles and the colour radio
+        // group; each fires the verb the command line uses.
+        let menus = native_model(MenuStyle::Modeler, true, ViewState::default());
+        let view = menus.iter().find(|m| m.title == tr("menu.view")).expect("View menu");
+        let sub = view
+            .items
+            .iter()
+            .find_map(|it| match it {
+                NativeItem::Submenu { id, label, items } if id == "View/edges" => Some((label, items)),
+                _ => None,
+            })
+            .expect("View ▸ Edges");
+        assert_eq!(sub.0, tr("menu.view.edges"));
+        let actions: Vec<(String, MenuAction)> = sub
+            .1
+            .iter()
+            .filter_map(|it| match it {
+                NativeItem::Check { id, action, .. } => Some((id.clone(), action.clone())),
+                _ => None,
+            })
+            .collect();
+        let want = [
+            ("View/back_edges", "backedges"),
+            ("View/depth_cue", "depthcue"),
+            ("View/edge_extension", "extension"),
+            ("View/edgecolor_layer", "edgecolor layer"),
+            ("View/edgecolor_same", "edgecolor same"),
+            ("View/edgecolor_material", "edgecolor material"),
+            ("View/edgecolor_axis", "edgecolor axis"),
+        ];
+        assert_eq!(actions.len(), want.len());
+        for ((id, action), (want_id, line)) in actions.iter().zip(want) {
+            assert_eq!(id, want_id);
+            assert_eq!(*action, MenuAction::Execute(line.into()));
+            assert!(crate::app_verbs::classify(line).is_some(), "{line} classifies");
+        }
+        // Defaults: nothing on, By Layer checked.
+        let d = ViewState::default();
+        assert_eq!(view_check(d, "View/back_edges"), Some(false));
+        assert_eq!(view_check(d, "View/edgecolor_layer"), Some(true));
+        assert_eq!(view_check(d, "View/edgecolor_axis"), Some(false));
+        let on = ViewState {
+            edges: ViewEdges { back_edges: true, depth_cue: true, extension: true, color: EdgeColor::Axis },
+            ..Default::default()
+        };
+        for id in ["View/back_edges", "View/depth_cue", "View/edge_extension", "View/edgecolor_axis"] {
+            assert_eq!(view_check(on, id), Some(true), "{id}");
+        }
+        assert_eq!(view_check(on, "View/edgecolor_layer"), Some(false));
+        // The style's own fields feed the checks.
+        let style = itsjustcad_render::EdgeStyle { back_edges: true, color: EdgeColor::Same, ..Default::default() };
+        let e = ViewEdges::from(style);
+        assert!(e.back_edges && !e.depth_cue && e.color == EdgeColor::Same);
     }
 
     #[test]

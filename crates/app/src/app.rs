@@ -672,6 +672,11 @@ pub struct App {
     /// World X/Y/Z axes drawn in every viewport (`axes on|off`, #364). ON by
     /// default; persisted to `ui.json`. View state, never logged.
     show_axes: bool,
+    /// Edge styles outside Sketchy (#361): back edges, depth cue, edge
+    /// colour, extension. Defaults are the classic look; persisted to
+    /// `ui.json` as one object (#362 named styles bundle it). View state,
+    /// never logged.
+    edge_style: itsjustcad_render::EdgeStyle,
     /// Requested viewport anti-aliasing: MSAA sample count 1 (off), 2, 4 or 8
     /// (#356). Default 4x; set by `antialias off|2|4|8` / View menu. Persisted
     /// to `ui.json`. The count drawn is the highest supported one not above it.
@@ -710,6 +715,8 @@ pub struct App {
     uploaded_plant_symbols: Option<bool>,
     /// Sketchy params of the last GPU upload; changes force a re-upload.
     uploaded_sketchy: Option<itsjustcad_render::SketchyParams>,
+    /// The snapshot-shaping part of the edge style last uploaded (#361).
+    uploaded_edge_key: Option<(itsjustcad_render::EdgeColor, [u8; 3], bool, u32)>,
     /// Marked-removal count of the last upload during a trim preview (`None`
     /// when not in trim's parts-to-remove phase); changes force a re-upload so
     /// clicked pieces disappear even though doc.generation hasn't moved.
@@ -1626,6 +1633,7 @@ impl App {
             shaded_edges: load_shaded_edges().unwrap_or(true),
             show_grid: view_overlays(&load_ui_json()).0,
             show_axes: view_overlays(&load_ui_json()).1,
+            edge_style: edge_style_from(&load_ui_json()),
             msaa: load_msaa().unwrap_or(itsjustcad_render::DEFAULT_MSAA),
             msaa_supported,
             plant_symbols: false,
@@ -1645,6 +1653,7 @@ impl App {
             uploaded_profile_edges: None,
             uploaded_plant_symbols: None,
             uploaded_sketchy: None,
+            uploaded_edge_key: None,
             uploaded_trim_marks: None,
             trim_extend: false,
             trim_apparent: true,
@@ -2317,6 +2326,14 @@ impl App {
             // projection of the active view. View state, never logged; the grid
             // and axes persist to ui.json. A structural `grid <name> x …` is
             // not a toggle and falls through to the substrate.
+            // Edge styles (#361): back edges, depth cue, edge colour and
+            // extension. View state, never logged; persisted to ui.json.
+            Some("backedges" | "depthcue" | "edgecolor" | "edgecolour" | "extension") => {
+                match crate::app_verbs::classify(line) {
+                    Some(verb) => self.apply_edge_verb(verb),
+                    None => self.command_line.push_line(EDGE_USAGE),
+                }
+            }
             Some("grid" | "axes" | "parallel" | "parallelprojection")
                 if crate::app_verbs::classify(line).is_some() =>
             {
@@ -3639,6 +3656,13 @@ impl App {
         save_view_overlay(AXES_KEY, self.show_axes);
         self.command_line
             .push_line(format!("axes: {}", if self.show_axes { "on" } else { "off" }));
+    }
+
+    /// Apply an edge-style verb (#361), persist the style and report it.
+    fn apply_edge_verb(&mut self, verb: crate::app_verbs::AppVerb) {
+        self.edge_style = crate::app_verbs::apply_edge_style(self.edge_style, &verb);
+        save_edge_style(&self.edge_style);
+        self.command_line.push_line(self.edge_style.summary());
     }
 
     /// `camera <parallel|2point|persp|pano|fisheye [fov]|15|24|35|50|85|phone|phonewide>`.
@@ -5131,6 +5155,7 @@ impl App {
             || self.uploaded_profile_edges != Some(self.profile_edges)
             || self.uploaded_plant_symbols != Some(self.plant_symbols)
             || self.uploaded_sketchy != Some(sketchy)
+            || self.uploaded_edge_key != Some(self.edge_style.snapshot_key())
             || trim_mark_change;
         // Scene is uploaded once (renderer shared); only the first pane's
         // callback carries the snapshot, the rest just set their camera.
@@ -5141,6 +5166,7 @@ impl App {
             self.uploaded_profile_edges = Some(self.profile_edges);
             self.uploaded_plant_symbols = Some(self.plant_symbols);
             self.uploaded_sketchy = Some(sketchy);
+            self.uploaded_edge_key = Some(self.edge_style.snapshot_key());
             self.uploaded_trim_marks = trim_marks;
             // Sketchy depth cue: bias by the active pane's eye + scene radius.
             let (sketchy_eye, sketchy_radius) = if sketchy.active() {
@@ -5161,6 +5187,7 @@ impl App {
                 sketchy,
                 sketchy_eye,
                 sketchy_radius,
+                edges: self.edge_style,
             };
             // Trim removal preview: hide the target curves that have ≥1 piece
             // queued for removal and draw their SURVIVING pieces in place, so the
@@ -5499,6 +5526,7 @@ impl App {
                         samples: self.msaa_samples(),
                         show_grid: self.show_grid,
                         show_axes: self.show_axes,
+                        edge_style: self.edge_style,
                     },
                 ));
             }
@@ -10371,6 +10399,7 @@ impl App {
             mouse_nav: self.mouse_nav,
             show_grid: self.show_grid,
             show_axes: self.show_axes,
+            edges: self.edge_style.into(),
         }
     }
 
@@ -11660,6 +11689,24 @@ fn view_overlays(ui: &serde_json::Value) -> (bool, bool) {
 fn save_view_overlay(key: &str, on: bool) {
     let mut v = load_ui_json();
     v[key] = serde_json::json!(on);
+    save_ui_json(&v);
+}
+
+/// ui.json key of the edge style (#361).
+const EDGE_STYLE_KEY: &str = "edge_style";
+
+/// Usage of the edge-style verbs (#361).
+const EDGE_USAGE: &str = "usage: backedges on|off · depthcue on|off [px] · edgecolor layer|same|material|axis [#rrggbb] · extension on|off [m]";
+
+/// The edge style saved in ui.json contents; defaults (today's look) for
+/// missing or unreadable keys.
+fn edge_style_from(ui: &serde_json::Value) -> itsjustcad_render::EdgeStyle {
+    serde_json::from_value(ui[EDGE_STYLE_KEY].clone()).unwrap_or_default()
+}
+
+fn save_edge_style(style: &itsjustcad_render::EdgeStyle) {
+    let mut v = load_ui_json();
+    v[EDGE_STYLE_KEY] = serde_json::to_value(style).unwrap_or_default();
     save_ui_json(&v);
 }
 
@@ -13510,6 +13557,29 @@ mod tests {
         for v in ["offset", "box", "line"] {
             assert!(!is_destructive_verb(v), "{v} should NOT be destructive");
         }
+    }
+
+    #[test]
+    fn edge_style_verbs_apply_and_persist_in_ui_json() {
+        use crate::app_verbs::{apply_edge_style, classify};
+        use itsjustcad_render::{EdgeColor, EdgeStyle};
+        // #361: no key (or a broken one) is today's look.
+        assert_eq!(edge_style_from(&serde_json::json!({})), EdgeStyle::default());
+        assert_eq!(edge_style_from(&serde_json::json!({ EDGE_STYLE_KEY: 3 })), EdgeStyle::default());
+        let mut style = EdgeStyle::default();
+        for line in ["backedges", "depthcue on 5", "edgecolor same #102030", "extension 0.2"] {
+            style = apply_edge_style(style, &classify(line).unwrap());
+        }
+        assert!(style.back_edges && style.depth_cue && style.extension);
+        assert_eq!((style.depth_cue_px, style.extension_m), (5.0, 0.2));
+        assert_eq!((style.color, style.same_rgb), (EdgeColor::Same, [16, 32, 48]));
+        // A bare report changes nothing; toggles flip back.
+        assert_eq!(apply_edge_style(style, &classify("edgecolor").unwrap()), style);
+        let off = apply_edge_style(style, &classify("backedges").unwrap());
+        assert!(!off.back_edges);
+        // Saved as one object under one key, read back whole.
+        let ui = serde_json::json!({ "zoom": 1.0, EDGE_STYLE_KEY: serde_json::to_value(style).unwrap() });
+        assert_eq!(edge_style_from(&ui), style);
     }
 
     #[test]

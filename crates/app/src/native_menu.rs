@@ -215,8 +215,20 @@ impl NativeMenuBar {
                 it.set_checked(view.antialias.max(1) == n);
             }
         }
-        // Show Grid / Show Axes checks (#364).
-        for (id, on) in [("View/grid", view.show_grid), ("View/axes", view.show_axes)] {
+        // Show Grid / Show Axes checks (#364) and View ▸ Edges (#361).
+        use itsjustcad_render::EdgeColor;
+        let e = view.edges;
+        for (id, on) in [
+            ("View/grid", view.show_grid),
+            ("View/axes", view.show_axes),
+            ("View/back_edges", e.back_edges),
+            ("View/depth_cue", e.depth_cue),
+            ("View/edge_extension", e.extension),
+            ("View/edgecolor_layer", e.color == EdgeColor::Layer),
+            ("View/edgecolor_same", e.color == EdgeColor::Same),
+            ("View/edgecolor_material", e.color == EdgeColor::Material),
+            ("View/edgecolor_axis", e.color == EdgeColor::Axis),
+        ] {
             if let Some(it) = self.check_items.get(id) {
                 it.set_checked(on);
             }
@@ -349,6 +361,32 @@ fn build_menu(
                     submenu.append(&ci).ok()?;
                     routes.insert(id.clone(), action.clone());
                     check_items.insert(id.clone(), ci);
+                }
+                // One level deep (View ▸ Edges, #361): leaves, checks and
+                // separators, routed and synced by their own ids.
+                NativeItem::Submenu { label, items, .. } => {
+                    let nested = Submenu::new(label, true);
+                    for sub in items {
+                        match sub {
+                            NativeItem::Separator => {
+                                nested.append(&PredefinedMenuItem::separator()).ok()?;
+                            }
+                            NativeItem::Leaf { id, label, action, enabled, .. } => {
+                                let mi = MenuItem::with_id(id.as_str(), label, *enabled, None);
+                                nested.append(&mi).ok()?;
+                                routes.insert(id.clone(), action.clone());
+                            }
+                            NativeItem::Check { id, label, action, checked, enabled } => {
+                                let ci =
+                                    CheckMenuItem::with_id(id.as_str(), label, *enabled, *checked, None);
+                                nested.append(&ci).ok()?;
+                                routes.insert(id.clone(), action.clone());
+                                check_items.insert(id.clone(), ci);
+                            }
+                            NativeItem::Predefined(_) | NativeItem::Submenu { .. } => {}
+                        }
+                    }
+                    submenu.append(&nested).ok()?;
                 }
             }
         }

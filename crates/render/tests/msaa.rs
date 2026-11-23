@@ -10,7 +10,7 @@
 
 use glam::{Mat4, Vec3};
 use itsjustcad_render::{
-    camera_uniform, pick_sample_count, supported_sample_counts, DisplayMode, SceneData,
+    camera_uniform, pick_sample_count, supported_sample_counts, DisplayMode, EdgeStyle, SceneData,
     SceneRenderer, UnderlayData, DEPTH_FORMAT,
 };
 use itsjustcad_doc::LineType;
@@ -362,5 +362,103 @@ fn dashed_lines_draw_gaps_at_every_sample_count() {
                 "{n}x {mode:?}: dashed {dashed} px vs solid {solid} px"
             );
         }
+    }
+}
+
+/// Render `scene` once with `style` at `n` samples in `mode`, the camera
+/// sized like a real pane; validation errors fail the test.
+fn draw_styled(g: &Gpu, scene: &SceneData, n: u32, mode: DisplayMode, style: &EdgeStyle) -> Vec<u8> {
+    let scope = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut r = renderer(g, scene, n);
+    let (vp, eye) = view_proj();
+    let mut cam = camera_uniform(vp, eye).with_overlays(false, false);
+    cam.screen = [W as f32, H as f32, mode.line_px(1.0), 1.0];
+    r.write_camera(&g.device, &g.queue, 0, &cam.with_edge_style(style, 1.0));
+    let rgba = if n > 1 {
+        let mut enc = g.device.create_command_encoder(&Default::default());
+        r.render_msaa_pane(&g.device, &mut enc, 0, [W, H], mode, true);
+        g.queue.submit([enc.finish()]);
+        read_rgba(g, r.msaa_target(0).expect("target").resolve_texture())
+    } else {
+        window_pass(g, wgpu::Color::TRANSPARENT, |pass| r.paint(pass, 0, mode, true))
+    };
+    let err = pollster::block_on(scope.pop());
+    assert!(err.is_none(), "{n}x {mode:?}: {err:?}");
+    rgba
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn back_edges_draw_hidden_edges_dashed_at_every_sample_count() {
+    // #361: a red edge behind a grey face shows only with back edges on, and
+    // then dashed and faint; never in X-ray. The back pipeline validates
+    // against every sample count.
+    let g = gpu();
+    let face = || quad_mesh([[-6.0, 5.0, 6.0], [6.0, 5.0, 6.0], [0.0, 5.0, 20.0]]);
+    let scene = SceneData {
+        meshes: vec![(face(), [0.5, 0.5, 0.5, 1.0], [0.5, 0.0])],
+        face_meshes: vec![],
+        lines: vec![],
+        // Red behind the face; blue in front of it, on its own plane.
+        edges: vec![
+            (vec![[-3.0, 9.0, 12.0], [3.0, 9.0, 12.0]], [1.0, 0.0, 0.0, 1.0], 0.25),
+            (vec![[-3.0, 4.0, 10.0], [3.0, 4.0, 10.0]], [0.0, 0.0, 1.0, 1.0], 0.25),
+        ],
+        line_types: vec![],
+        edge_types: vec![],
+        profile_edges: vec![],
+        points: vec![],
+        underlay: None,
+        basemap: None,
+        show_lineweights: false,
+    };
+    let blue = |rgba: &[u8]| -> Vec<Vec<u8>> {
+        rgba.chunks(4).filter(|p| p[2] as i32 > p[0] as i32 + 20).map(<[u8]>::to_vec).collect()
+    };
+    let red = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[0] as i32 > p[1] as i32 + 20).count();
+    let on = EdgeStyle { back_edges: true, ..Default::default() };
+    for &n in &g.counts {
+        for mode in [DisplayMode::Shaded, DisplayMode::HiddenLine] {
+            let off = red(&draw_styled(&g, &scene, n, mode, &EdgeStyle::default()));
+            let back = draw_styled(&g, &scene, n, mode, &on);
+            assert_eq!(off, 0, "{n}x {mode:?}: hidden edge occluded by default");
+            let plain = draw_styled(&g, &scene, n, mode, &EdgeStyle::default());
+            assert_eq!(blue(&back), blue(&plain), "{n}x {mode:?}: visible edge untouched");
+            assert!(red(&back) > 20, "{n}x {mode:?}: back edge drawn ({} px)", red(&back));
+            // Faint: no fully red pixel over the grey face.
+            assert!(back.chunks(4).all(|p| p[0] < 250 || p[1] > 100), "{n}x {mode:?}: faint");
+        }
+        // X-ray already shows every edge; the back pass stays off there.
+        let xr = draw_styled(&g, &scene, n, DisplayMode::XRay, &on);
+        assert_eq!(xr, draw_styled(&g, &scene, n, DisplayMode::XRay, &EdgeStyle::default()));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn depth_cue_widens_near_edges_at_every_sample_count() {
+    // #361: an edge running from near to far covers more pixels with the
+    // depth cue on, mostly at its near end.
+    let g = gpu();
+    let scene = SceneData {
+        meshes: vec![],
+        face_meshes: vec![],
+        lines: vec![],
+        edges: vec![(vec![[-1.0, 2.0, 11.0], [-1.0, 60.0, 30.0]], [1.0, 0.0, 0.0, 1.0], 0.25)],
+        line_types: vec![],
+        edge_types: vec![],
+        profile_edges: vec![],
+        points: vec![],
+        underlay: None,
+        basemap: None,
+        show_lineweights: false,
+    };
+    let drawn = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[3] > 8).count();
+    let cue = EdgeStyle { depth_cue: true, depth_cue_px: 6.0, ..Default::default() };
+    for &n in &g.counts {
+        let plain = drawn(&draw_styled(&g, &scene, n, DisplayMode::Shaded, &EdgeStyle::default()));
+        let wide = drawn(&draw_styled(&g, &scene, n, DisplayMode::Shaded, &cue));
+        assert!(plain > 10, "{n}x: edge in frame ({plain} px)");
+        assert!(wide > plain * 2, "{n}x: depth cue {wide} px vs {plain} px");
     }
 }
