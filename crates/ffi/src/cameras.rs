@@ -7,8 +7,8 @@
 //! # Cameras
 //! Camera 0 always exists; [`ijc_camera_new`] adds more. Exactly one camera
 //! is ACTIVE (camera 0 until [`ijc_camera_activate`]): the existing camera
-//! calls ([`super::ijc_camera_orbit`], `pan`, `zoom`, `zoom_extents`, typed
-//! view verbs, `view save`/`view <name>`), picks, [`super::ijc_project_point`],
+//! calls ([`super::ijc_camera_orbit`], `orbit_at`, `recentre_at`, `pan`,
+//! `zoom`, `zoom_extents`, typed view verbs, `view save`/`view <name>`), picks, [`super::ijc_project_point`],
 //! [`super::ijc_screen_to_world`] and [`super::ijc_camera_state_json`] all
 //! use the active camera and its pane size. A host with panes activates the
 //! pane under the pointer before forwarding its gestures.
