@@ -63,6 +63,11 @@ Fog:
   fog <start%> <end%>                           fade from start to end, % of the view depth              e.g. fog 20 100
   fog colour bg|#rrggbb                         fog colour: background (default) or custom               e.g. fog colour #ffffff
 
+Styles (one-step bundles of the display settings above):
+  style <name> [all]                            modelling|presentation|sketch|hiddenline|xray|massing    e.g. style presentation
+                                                or a saved one; active pane (all: every pane)
+  style save|update|delete <name>               save the current settings into the file                  e.g. style save review
+
 Planting plan:
   plantsymbols on|off                           2D top-view plan symbols for planted trees (alias:       e.g. plantsymbols on
                                                 plansymbols)

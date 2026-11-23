@@ -74,6 +74,7 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("edgecolor", "Display", "edgecolor layer|same|material|axis [#rrggbb]"),
     ("extension", "Display", "extension [on|off] [m]"),
     ("fog", "Display", "fog [on|off] | fog <start%> <end%> | fog colour bg|#rrggbb"),
+    ("style", "Display", "style <name> [all] | style save|update|delete <name> | style list"),
     ("parallel", "Camera", "parallel [on|off]"),
     ("edgefx", "Display", "edgefx jitter=.. extension=.."),
     // Camera / lens.
@@ -128,6 +129,20 @@ pub fn entries() -> Vec<PaletteEntry> {
         }
     }
     out
+}
+
+/// One-step palette rows for the named styles (#362): `style <name>` runs
+/// directly (no placeholder in the usage).
+pub fn style_entries(names: &[String]) -> Vec<PaletteEntry> {
+    names
+        .iter()
+        .map(|n| PaletteEntry {
+            name: format!("style {n}"),
+            category: "Style".to_string(),
+            usage: String::new(),
+            summary: crate::i18n::t("menu.view.styles").to_string(),
+        })
+        .collect()
 }
 
 /// Score `query` against a single haystack string using a case-insensitive

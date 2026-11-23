@@ -1766,6 +1766,20 @@ pub enum Command {
     ViewDelete {
         name: String,
     },
+    // -- named styles (#362) --
+    /// Save (or overwrite) a named viewport style. `style` is the serialized
+    /// `itsjustcad_render::ViewStyle`; `None` when typed outside the app,
+    /// which fills it from the live viewport before apply. Written back into
+    /// the logged op, so replay restores identical styles offline.
+    StyleSave {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<serde_json::Value>,
+    },
+    /// Delete a saved style. Logged; undo restores it.
+    StyleDelete {
+        name: String,
+    },
     Select {
         targets: Selector,
     },

@@ -161,6 +161,43 @@ pub struct HeadlessView {
     pub edge_style: itsjustcad_render::EdgeStyle,
     /// Fog, from `fog` (#363). Off by default.
     pub fog_style: itsjustcad_render::FogStyle,
+    /// Sky/ground gradient from a named style (#362); `None` follows
+    /// `profile_edges`.
+    pub background_gradient: Option<bool>,
+}
+
+impl HeadlessView {
+    /// The view's display settings as a named style (#362). Headless has no
+    /// colour mode, so it stays the default.
+    pub fn view_style(&self) -> itsjustcad_render::ViewStyle {
+        itsjustcad_render::ViewStyle {
+            display: self.display,
+            light: self.light,
+            profiles: self.profile_edges,
+            mesh_edges: self.shaded_edges,
+            sketchy: self.sketchy,
+            edges: self.edge_style,
+            fog: self.fog_style,
+            grid: self.show_grid,
+            axes: self.show_axes,
+            gradient: self.background_gradient,
+            ..Default::default()
+        }
+    }
+
+    /// Apply a named style (#362); the colour mode has no headless meaning.
+    pub fn apply_style(&mut self, s: &itsjustcad_render::ViewStyle) {
+        self.display = s.display;
+        self.light = s.light;
+        self.profile_edges = s.profiles;
+        self.shaded_edges = s.mesh_edges;
+        self.sketchy = s.sketchy;
+        self.edge_style = s.edges;
+        self.fog_style = s.fog;
+        self.show_grid = s.grid;
+        self.show_axes = s.axes;
+        self.background_gradient = s.gradient;
+    }
 }
 
 impl Default for HeadlessView {
@@ -181,6 +218,7 @@ impl Default for HeadlessView {
             parallel: None,
             edge_style: Default::default(),
             fog_style: Default::default(),
+            background_gradient: None,
         }
     }
 }
@@ -251,6 +289,26 @@ pub fn run_script_lines(
             ) => view.edge_style = crate::app_verbs::apply_edge_style(view.edge_style, &verb),
             Some(verb @ AppVerb::Fog(_)) => {
                 view.fog_style = crate::app_verbs::apply_fog_style(view.fog_style, &verb)
+            }
+            Some(AppVerb::Style(verb)) => {
+                use crate::view_styles::{self as vs, StyleVerb};
+                let cmd = match verb {
+                    StyleVerb::List => {
+                        println!("{}", vs::list_line(&session.doc, vs::active_name(&session.doc, &view.view_style()).as_deref()));
+                        continue;
+                    }
+                    StyleVerb::Apply { name, .. } => {
+                        // One view headless, so `all` is the same view.
+                        let s = vs::resolve(&session.doc, &name).map_err(|e| (line.clone(), e))?;
+                        view.apply_style(&s);
+                        continue;
+                    }
+                    StyleVerb::Save(name) => vs::save_command(&session.doc, &name, false, &view.view_style()),
+                    StyleVerb::Update(name) => vs::save_command(&session.doc, &name, true, &view.view_style()),
+                    StyleVerb::Delete(name) => vs::delete_command(&session.doc, &name),
+                };
+                let cmd = cmd.map_err(|e| (line.clone(), e))?;
+                session.run(cmd).map_err(|e| (line.clone(), e.to_string()))?;
             }
             Some(AppVerb::Axes(on)) => view.show_axes = on.unwrap_or(!view.show_axes),
             Some(AppVerb::Parallel(on)) => {
@@ -806,7 +864,8 @@ pub fn render_headless(
         mode,
         view.light,
         sun_dir,
-        view.profile_edges, // SketchUp preset → gradient background
+        // SketchUp preset → gradient background, unless a style says otherwise.
+        view.background_gradient.unwrap_or(view.profile_edges),
     )
     .with_overlays(view.show_grid, view.show_axes);
     // Target size for the dash patterns (#364); no fat-stroke width.
@@ -980,6 +1039,32 @@ mod tests {
         assert_eq!(view.view, Some(StandardView::Front));
         assert_eq!(view.focal_mm, Some(35.0));
         assert_eq!(view.display, DisplayMode::Pencil);
+    }
+
+    #[test]
+    fn style_verbs_apply_and_save_into_the_document() {
+        use itsjustcad_render::{BuiltinStyle, DisplayMode, LightMode};
+        // #362: a built-in sets every field it carries.
+        let lines: Vec<String> = ["style presentation"].map(String::from).to_vec();
+        let (_, view) = run_script_lines(Session::default(), &lines).expect("verbs run");
+        let p = BuiltinStyle::Presentation.style();
+        assert_eq!(view.view_style(), p);
+        assert_eq!(view.light, LightMode::Sun);
+        assert!(view.profile_edges && view.fog_style.on && view.edge_style.depth_cue);
+        // Save the current settings, switch away, switch back.
+        let lines: Vec<String> =
+            ["display xray", "grid off", "style save mine", "style modelling", "style mine"]
+                .map(String::from)
+                .to_vec();
+        let (session, view) = run_script_lines(Session::default(), &lines).expect("verbs run");
+        assert_eq!(view.display, DisplayMode::XRay);
+        assert!(!view.show_grid);
+        assert!(session.doc.named_styles.contains_key("mine"));
+        // Unknown and read-only names fail like any bad command.
+        let bad: Vec<String> = ["style nope"].map(String::from).to_vec();
+        assert!(run_script_lines(Session::default(), &bad).err().expect("fails").1.contains("no style"));
+        let bad: Vec<String> = ["style save sketch"].map(String::from).to_vec();
+        assert!(run_script_lines(Session::default(), &bad).err().expect("fails").1.contains("read-only"));
     }
 
     #[test]

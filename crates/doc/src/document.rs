@@ -209,6 +209,14 @@ pub struct Document {
     /// Named viewport cameras, saved via the logged `view save` command so
     /// replayed files keep them. Mutators bump `generation` (exec does).
     pub named_views: BTreeMap<String, NamedView>,
+    /// Named viewport styles (#362), saved via the logged `style save`
+    /// command so a file carries its styles through replay. Each value is a
+    /// serialized `itsjustcad_render::ViewStyle`, kept opaque here so the
+    /// document stays renderer-free (and keys a newer build adds survive a
+    /// round trip). Absent in files written before #362. Mutators bump
+    /// `generation` (exec does).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub named_styles: BTreeMap<String, serde_json::Value>,
     /// Named id-sets created by the logged `group` command. Members may be
     /// stale (deleted objects keep their entry so group undo stays symmetric);
     /// readers filter through `get`. Mutators bump `generation` (exec does).
@@ -386,6 +394,7 @@ impl Default for Document {
             sheet_sets: Vec::new(),
             units: Units::default(),
             named_views: BTreeMap::new(),
+            named_styles: BTreeMap::new(),
             groups: BTreeMap::new(),
             blocks: BTreeMap::new(),
             param_blocks: BTreeMap::new(),

@@ -72,6 +72,9 @@ pub enum AppVerb {
     /// Fog (#363): `fog [on|off]`, `fog <start%> <end%>`, `fog colour
     /// bg|custom [#rrggbb]|#rrggbb` (`color` too).
     Fog(FogVerb),
+    /// Named viewport styles (#362): `style <name> [all]`, `style
+    /// save|update|delete <name>`, `style [list]`.
+    Style(crate::view_styles::StyleVerb),
     /// Viewport anti-aliasing (`antialias off|2|4|8` / `aa`): the MSAA sample
     /// count, 1 = off (#356). `None` reports the current setting.
     AntiAlias(Option<u32>),
@@ -435,6 +438,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             AppVerb::Extension(on, m)
         }
         "fog" => AppVerb::Fog(parse_fog(words)?),
+        "style" => AppVerb::Style(crate::view_styles::parse(words)?),
         "antialias" | "aa" => AppVerb::AntiAlias(match words.next() {
             None => None,
             Some(arg) => Some(parse_msaa(arg)?),
@@ -612,6 +616,22 @@ mod tests {
         );
         assert_eq!(classify("fog colour plaid"), None);
         assert_eq!(classify("fog colour bg #ffffff"), None);
+    }
+
+    #[test]
+    fn classifies_style_verbs() {
+        use crate::view_styles::StyleVerb;
+        // #362: apply, all panes, save/update/delete, list.
+        let st = |v| Some(AppVerb::Style(v));
+        assert_eq!(classify("style"), st(StyleVerb::List));
+        assert_eq!(classify("style list"), st(StyleVerb::List));
+        assert_eq!(classify("style sketch"), st(StyleVerb::Apply { name: "sketch".into(), all: false }));
+        assert_eq!(classify("style sketch all"), st(StyleVerb::Apply { name: "sketch".into(), all: true }));
+        assert_eq!(classify("style save a"), st(StyleVerb::Save("a".into())));
+        assert_eq!(classify("style update a"), st(StyleVerb::Update("a".into())));
+        assert_eq!(classify("style delete a"), st(StyleVerb::Delete("a".into())));
+        assert_eq!(classify("style save"), None);
+        assert_eq!(classify("style a b"), None);
     }
 
     #[test]
@@ -868,6 +888,7 @@ mod tests {
         "edgecolor",
         "extension",
         "fog",
+        "style",
         "ze",
         "zoomextents",
         "zs",
@@ -970,6 +991,7 @@ mod tests {
             "edgecolour",
             "extension",
             "fog",
+            "style",
             "camera",
             "save",
             "help",
@@ -1036,6 +1058,8 @@ mod tests {
             "fog on",
             "fog 20 100",
             "fog colour bg",
+            "style presentation",
+            "style save review",
             "ze",
             "zoomextents",
             "top",
@@ -1103,6 +1127,11 @@ mod tests {
             "fog 20 100",
             "fog colour bg",
             "fog colour #ffffff",
+            "style presentation",
+            "style sketch all",
+            "style save review",
+            "style update review",
+            "style delete review",
             "render glass pavilion at dusk",
             "render cancel",
             itsjustcad_deck::FEEDBACK_EXAMPLE_LINE,
@@ -1123,6 +1152,10 @@ mod tests {
         assert!(h.contains("edgecolor layer|same|material|axis"));
         assert!(h.contains("fog on|off") && h.contains("fog <start%> <end%>"));
         assert!(h.contains("fog colour bg|#rrggbb"));
+        assert!(h.contains("style <name> [all]") && h.contains("style save|update|delete <name>"));
+        for b in itsjustcad_render::BuiltinStyle::ALL {
+            assert!(h.contains(b.name()), "{}", b.name());
+        }
     }
 
     #[test]
