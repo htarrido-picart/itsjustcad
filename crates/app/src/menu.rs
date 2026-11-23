@@ -434,6 +434,22 @@ pub struct ViewState {
     pub show_axes: bool,
     /// Edge styles — the checks in View ▸ Edges (#361).
     pub edges: ViewEdges,
+    /// Fog — the checks in View ▸ Fog (#363).
+    pub fog: ViewFog,
+}
+
+/// The View ▸ Fog checks (#363).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewFog {
+    pub on: bool,
+    /// The fog takes the background colour (else the custom one).
+    pub background: bool,
+}
+
+impl From<itsjustcad_render::FogStyle> for ViewFog {
+    fn from(s: itsjustcad_render::FogStyle) -> Self {
+        ViewFog { on: s.on, background: s.color == itsjustcad_render::FogColor::Background }
+    }
 }
 
 /// The View ▸ Edges checks (#361): the edge style's toggles and colour mode.
@@ -804,6 +820,18 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                         colour("edgecolor_axis", "menu.view.edgecolor_axis", EdgeColor::Axis),
                     ]
                 },
+            },
+            // Fog (#363): the toggle and the colour source. Distances and the
+            // custom colour are typed (`fog 20 80`, `fog colour #rrggbb`).
+            NativeItem::Submenu {
+                id: format!("{t}/fog"),
+                label: tr("menu.view.fog").into(),
+                items: vec![
+                    radio("fog_show", tr("menu.view.fog_show"), "fog", view.fog.on),
+                    NativeItem::Separator,
+                    radio("fog_bg", tr("menu.view.fog_bg"), "fog colour bg", view.fog.background),
+                    radio("fog_custom", tr("menu.view.fog_custom"), "fog colour custom", !view.fog.background),
+                ],
             },
             NativeItem::Separator,
             // Viewport layout.
@@ -1288,6 +1316,7 @@ pub fn demo_open(
         show_grid: true,
         show_axes: true,
         edges: ViewEdges::default(),
+        fog: ViewFog::default(),
     };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
         return;
@@ -1936,6 +1965,55 @@ mod tests {
         let style = itsjustcad_render::EdgeStyle { back_edges: true, color: EdgeColor::Same, ..Default::default() };
         let e = ViewEdges::from(style);
         assert!(e.back_edges && !e.depth_cue && e.color == EdgeColor::Same);
+    }
+
+    #[test]
+    fn view_fog_submenu_checks_and_fires_verbs() {
+        // #363: View ▸ Fog holds the toggle and the colour radio pair; each
+        // fires the verb the command line uses.
+        let menus = native_model(MenuStyle::Modeler, true, ViewState::default());
+        let view = menus.iter().find(|m| m.title == tr("menu.view")).expect("View menu");
+        let (label, items) = view
+            .items
+            .iter()
+            .find_map(|it| match it {
+                NativeItem::Submenu { id, label, items } if id == "View/fog" => Some((label, items)),
+                _ => None,
+            })
+            .expect("View ▸ Fog");
+        assert_eq!(label, tr("menu.view.fog"));
+        let actions: Vec<(String, MenuAction)> = items
+            .iter()
+            .filter_map(|it| match it {
+                NativeItem::Check { id, action, .. } => Some((id.clone(), action.clone())),
+                _ => None,
+            })
+            .collect();
+        let want = [
+            ("View/fog_show", "fog"),
+            ("View/fog_bg", "fog colour bg"),
+            ("View/fog_custom", "fog colour custom"),
+        ];
+        assert_eq!(actions.len(), want.len());
+        for ((id, action), (want_id, line)) in actions.iter().zip(want) {
+            assert_eq!(id, want_id);
+            assert_eq!(*action, MenuAction::Execute(line.into()));
+            assert!(crate::app_verbs::classify(line).is_some(), "{line} classifies");
+        }
+        // Defaults (from the default style): off, background colour.
+        let d = ViewState { fog: itsjustcad_render::FogStyle::default().into(), ..Default::default() };
+        assert_eq!(view_check(d, "View/fog_show"), Some(false));
+        assert_eq!(view_check(d, "View/fog_bg"), Some(true));
+        assert_eq!(view_check(d, "View/fog_custom"), Some(false));
+        let custom = itsjustcad_render::FogStyle {
+            on: true,
+            color: itsjustcad_render::FogColor::Custom,
+            ..Default::default()
+        };
+        let on = ViewState { fog: custom.into(), ..Default::default() };
+        assert_eq!(view_check(on, "View/fog_show"), Some(true));
+        assert_eq!(view_check(on, "View/fog_bg"), Some(false));
+        assert_eq!(view_check(on, "View/fog_custom"), Some(true));
     }
 
     #[test]

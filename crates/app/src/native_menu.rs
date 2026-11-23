@@ -215,7 +215,8 @@ impl NativeMenuBar {
                 it.set_checked(view.antialias.max(1) == n);
             }
         }
-        // Show Grid / Show Axes checks (#364) and View ▸ Edges (#361).
+        // Show Grid / Show Axes checks (#364), View ▸ Edges (#361) and View ▸
+        // Fog (#363).
         use itsjustcad_render::EdgeColor;
         let e = view.edges;
         for (id, on) in [
@@ -228,6 +229,9 @@ impl NativeMenuBar {
             ("View/edgecolor_same", e.color == EdgeColor::Same),
             ("View/edgecolor_material", e.color == EdgeColor::Material),
             ("View/edgecolor_axis", e.color == EdgeColor::Axis),
+            ("View/fog_show", view.fog.on),
+            ("View/fog_bg", view.fog.background),
+            ("View/fog_custom", !view.fog.background),
         ] {
             if let Some(it) = self.check_items.get(id) {
                 it.set_checked(on);

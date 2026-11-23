@@ -10,7 +10,8 @@
 
 use glam::{Mat4, Vec3};
 use itsjustcad_render::{
-    camera_uniform, pick_sample_count, supported_sample_counts, DisplayMode, EdgeStyle, SceneData,
+    camera_uniform, pick_sample_count, supported_sample_counts, DisplayMode, EdgeStyle, FogColor,
+    FogStyle, SceneData,
     SceneRenderer, UnderlayData, DEPTH_FORMAT,
 };
 use itsjustcad_doc::LineType;
@@ -460,5 +461,122 @@ fn depth_cue_widens_near_edges_at_every_sample_count() {
         let wide = drawn(&draw_styled(&g, &scene, n, DisplayMode::Shaded, &cue));
         assert!(plain > 10, "{n}x: edge in frame ({plain} px)");
         assert!(wide > plain * 2, "{n}x: depth cue {wide} px vs {plain} px");
+    }
+}
+
+/// Render `scene` shaded at `n` samples with `fog` (flat background `bg`,
+/// or the sky/ground gradient with `gradient`); `fat` draws the strokes as
+/// 3 px quads instead of hairlines.
+fn draw_fogged(
+    g: &Gpu,
+    scene: &SceneData,
+    n: u32,
+    fog: &FogStyle,
+    bg: [f32; 4],
+    fat: bool,
+    gradient: bool,
+) -> Vec<u8> {
+    let scope = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut r = renderer(g, scene, n);
+    let (vp, eye) = view_proj();
+    let mut cam = camera_uniform(vp, eye).with_overlays(false, false);
+    cam.screen = [W as f32, H as f32, if fat { 3.0 } else { 0.0 }, 1.0];
+    cam.light[1] = if gradient { 1.0 } else { 0.0 };
+    r.write_camera(&g.device, &g.queue, 0, &cam.with_fog(fog, bg));
+    let mode = DisplayMode::Shaded;
+    let rgba = if n > 1 {
+        let mut enc = g.device.create_command_encoder(&Default::default());
+        r.render_msaa_pane(&g.device, &mut enc, 0, [W, H], mode, true);
+        g.queue.submit([enc.finish()]);
+        read_rgba(g, r.msaa_target(0).expect("target").resolve_texture())
+    } else {
+        window_pass(g, wgpu::Color::TRANSPARENT, |pass| r.paint(pass, 0, mode, true))
+    };
+    let err = pollster::block_on(scope.pop());
+    assert!(err.is_none(), "{n}x fog: {err:?}");
+    rgba
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn fog_fades_far_geometry_and_leaves_near_untouched_at_every_sample_count() {
+    // #363: a green face near the eye and a blue face plus a red edge far
+    // away. With fog from 30% to 60% of the view depth, the far ones turn
+    // the fog colour and the near face keeps every pixel, at every sample
+    // count, hairline or fat strokes.
+    let g = gpu();
+    let wall = |x0: f32, x1: f32, y: f32, z0: f32, z1: f32| RenderMesh {
+        positions: vec![[x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1]],
+        normals: vec![[0.0, -1.0, 0.0]; 4],
+        indices: vec![0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2],
+    };
+    let scene = SceneData {
+        meshes: vec![
+            (wall(-1.5, -0.2, 4.0, 10.5, 12.5), [0.1, 0.8, 0.1, 1.0], [0.5, 0.0]),
+            (wall(2.0, 20.0, 60.0, 25.0, 45.0), [0.1, 0.1, 0.8, 1.0], [0.5, 0.0]),
+        ],
+        face_meshes: vec![],
+        lines: vec![],
+        edges: vec![(vec![[-20.0, 60.0, 55.0], [-5.0, 60.0, 55.0]], [1.0, 0.0, 0.0, 1.0], 0.25)],
+        line_types: vec![],
+        edge_types: vec![],
+        profile_edges: vec![],
+        points: vec![],
+        underlay: None,
+        basemap: None,
+        show_lineweights: false,
+    };
+    let green = |p: &[u8]| p[1] as i32 > p[0] as i32 + 40 && p[1] as i32 > p[2] as i32 + 40;
+    let blue = |p: &[u8]| p[2] as i32 > p[0] as i32 + 40 && p[2] as i32 > p[1] as i32 + 40;
+    let red = |p: &[u8]| p[0] as i32 > p[1] as i32 + 40 && p[0] as i32 > p[2] as i32 + 40;
+    let count = |rgba: &[u8], f: &dyn Fn(&[u8]) -> bool| rgba.chunks(4).filter(|p| f(p)).count();
+    let custom = FogStyle {
+        on: true,
+        start: 0.3,
+        end: 0.6,
+        color: FogColor::Custom,
+        custom_rgb: [255, 255, 0],
+    };
+    let bg = [0.2, 0.2, 0.2, 1.0];
+    for &n in &g.counts {
+        for fat in [false, true] {
+            let plain = draw_fogged(&g, &scene, n, &FogStyle::default(), bg, fat, false);
+            let tag = format!("{n}x fat={fat}");
+            assert!(count(&plain, &green) > 50, "{tag}: near face in frame");
+            assert!(count(&plain, &blue) > 50, "{tag}: far face in frame");
+            assert!(count(&plain, &red) > 5, "{tag}: far edge in frame");
+            // Fog off is the default camera: identical to no fog at all.
+            let off = FogStyle { on: false, ..custom };
+            assert_eq!(draw_fogged(&g, &scene, n, &off, bg, fat, false), plain, "{tag}: off");
+
+            let fogged = draw_fogged(&g, &scene, n, &custom, bg, fat, false);
+            for (a, b) in plain.chunks(4).zip(fogged.chunks(4)) {
+                if green(a) {
+                    assert_eq!(a, b, "{tag}: near face untouched");
+                }
+                if blue(a) && a[3] == 255 {
+                    assert!(b[0] > 240 && b[1] > 240 && b[2] < 15, "{tag}: far face is fog {b:?}");
+                }
+            }
+            assert_eq!(count(&fogged, &blue), 0, "{tag}: no blue left");
+            assert_eq!(count(&fogged, &red), 0, "{tag}: far edge fogged");
+
+            // Background colour (gradient off): the flat background.
+            let bg_fog = FogStyle { color: FogColor::Background, ..custom };
+            let into_bg = draw_fogged(&g, &scene, n, &bg_fog, bg, fat, false);
+            for (a, b) in plain.chunks(4).zip(into_bg.chunks(4)) {
+                if blue(a) && a[3] == 255 {
+                    assert!(b[..3].iter().all(|&c| (50..=53).contains(&c)), "{tag}: far face is bg {b:?}");
+                }
+            }
+            // Background colour over the gradient: the sky behind the face
+            // (light, bluish), not the flat colour.
+            let sky = draw_fogged(&g, &scene, n, &bg_fog, bg, fat, true);
+            for (a, b) in plain.chunks(4).zip(sky.chunks(4)) {
+                if blue(a) && a[3] == 255 {
+                    assert!(b[0] > 150 && b[2] > b[0] && b[2] > 200, "{tag}: far face is sky {b:?}");
+                }
+            }
+        }
     }
 }

@@ -15,13 +15,21 @@ fn validate(name: &str, source: &str) {
         .unwrap_or_else(|e| panic!("{name}: WGSL validation error: {e:?}"));
 }
 
+/// A scene shader as the renderer builds it: the shared prelude
+/// (`common.wgsl`: camera, background, fog) first.
+macro_rules! scene {
+    ($file:literal) => {
+        concat!(include_str!("../src/shaders/common.wgsl"), include_str!(concat!("../src/shaders/", $file)))
+    };
+}
+
 #[test]
 fn all_shaders_parse_and_validate() {
     for (name, source) in [
-        ("grid.wgsl", include_str!("../src/shaders/grid.wgsl")),
-        ("mesh.wgsl", include_str!("../src/shaders/mesh.wgsl")),
-        ("curve.wgsl", include_str!("../src/shaders/curve.wgsl")),
-        ("underlay.wgsl", include_str!("../src/shaders/underlay.wgsl")),
+        ("grid.wgsl", scene!("grid.wgsl")),
+        ("mesh.wgsl", scene!("mesh.wgsl")),
+        ("curve.wgsl", scene!("curve.wgsl")),
+        ("underlay.wgsl", scene!("underlay.wgsl")),
         ("control.wgsl", include_str!("../src/shaders/control.wgsl")),
         ("pano.wgsl", include_str!("../src/shaders/pano.wgsl")),
     ] {

@@ -58,6 +58,11 @@ Feature edges:
   edgecolor layer|same|material|axis            edge colour; same takes #rrggbb (black default)          e.g. edgecolor axis
   extension on|off [m]                          edges overshoot their ends (outside sketchy)             e.g. extension on 0.1
 
+Fog:
+  fog on|off                                    far geometry fades into the background                   e.g. fog on
+  fog <start%> <end%>                           fade from start to end, % of the view depth              e.g. fog 20 100
+  fog colour bg|#rrggbb                         fog colour: background (default) or custom               e.g. fog colour #ffffff
+
 Planting plan:
   plantsymbols on|off                           2D top-view plan symbols for planted trees (alias:       e.g. plantsymbols on
                                                 plansymbols)

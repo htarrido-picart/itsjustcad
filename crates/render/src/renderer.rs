@@ -8,6 +8,14 @@ use kernel_mesh::RenderMesh;
 use crate::batch::{Batch, ObjectParams, ParamBuffer, Staged};
 use crate::DEPTH_FORMAT;
 
+/// A scene shader's WGSL with the shared prelude (`shaders/common.wgsl`: the
+/// camera uniform, background gradient and fog, #363) in front.
+macro_rules! scene_shader {
+    ($file:literal) => {
+        concat!(include_str!("shaders/common.wgsl"), include_str!(concat!("shaders/", $file)))
+    };
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct CameraUniform {
@@ -32,10 +40,17 @@ pub struct CameraUniform {
     /// device px per logical px of the back-edge dashes, w spare. See
     /// [`CameraUniform::with_edge_style`].
     pub edges: [f32; 4],
-    /// Depth-cue ramp, filled by [`SceneRenderer::write_camera`] from the
-    /// scene bounds: `dot(p, xyz) + w` runs 0 at the nearest scene point to 1
-    /// at the farthest. Zero when depth cue is off.
+    /// Depth ramp of the depth cue and the fog, filled by
+    /// [`SceneRenderer::write_camera`] from the scene bounds: `dot(p, xyz) +
+    /// w` runs 0 at the nearest scene point to 1 at the farthest. Zero when
+    /// both are off.
     pub cue: [f32; 4],
+    /// Fog (#363): x = start, y = end (fractions of the `cue` ramp), z = 1
+    /// on, w = 1 takes the colour from the background behind each pixel
+    /// (the gradient when it is on). See [`CameraUniform::with_fog`].
+    pub fog: [f32; 4],
+    /// Fog colour RGBA: the custom colour, or the flat background colour.
+    pub fog_color: [f32; 4],
 }
 
 impl CameraUniform {
@@ -77,6 +92,33 @@ impl CameraUniform {
             self.edges[1] = 1.0;
         }
         self
+    }
+
+    /// The same camera with the pane's fog (#363). `background` is the flat
+    /// colour behind the scene (theme or paper, the clear colour): the fog
+    /// colour in [`crate::FogColor::Background`] unless the sky/ground
+    /// gradient is on, in which case each pixel takes the gradient behind
+    /// it. Fog off leaves the camera as it was.
+    pub fn with_fog(mut self, style: &crate::FogStyle, background: [f32; 4]) -> Self {
+        if !style.on {
+            self.fog = [0.0; 4];
+            return self;
+        }
+        let (start, end) = style.range();
+        let from_bg = style.color == crate::FogColor::Background;
+        self.fog = [start, end, 1.0, if from_bg { 1.0 } else { 0.0 }];
+        self.fog_color = if from_bg { background } else { style.custom_rgba() };
+        self
+    }
+
+    /// Whether the pane draws fog.
+    pub fn has_fog(&self) -> bool {
+        self.fog[2] > 0.5
+    }
+
+    /// Whether the depth ramp (`cue`) is in use: depth cue or fog.
+    fn uses_ramp(&self) -> bool {
+        self.edges[0] > 0.0 || self.has_fog()
     }
 
     /// Whether the pane asks for the dashed back-edge pass.
@@ -609,11 +651,11 @@ impl Pipelines {
         let ms = wgpu::MultisampleState { count: samples, ..Default::default() };
         let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("grid_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/grid.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(scene_shader!("grid.wgsl").into()),
         });
         let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mesh_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mesh.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(scene_shader!("mesh.wgsl").into()),
         });
 
         let grid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -713,7 +755,7 @@ impl Pipelines {
 
         let curve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("curve_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/curve.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(scene_shader!("curve.wgsl").into()),
         });
         let curve_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("curve_pipeline"),
@@ -1020,7 +1062,7 @@ impl Pipelines {
         // Underlay: a textured quad. Bind group 1 = texture + sampler + opacity.
         let underlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("underlay_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/underlay.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(scene_shader!("underlay.wgsl").into()),
         });
         let underlay_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("underlay_pl"),
@@ -1452,13 +1494,14 @@ impl SceneRenderer {
         self.write_scene_params(device, queue);
         self.generation = generation;
 
-        // Depth cue (#361): new bounds re-send the panes that use the ramp.
+        // Depth cue (#361) and fog (#363): new bounds re-send the panes that
+        // use the ramp.
         let bounds = scene_bounds(scene);
         if bounds != self.scene_bounds {
             self.scene_bounds = bounds;
             for i in 0..self.last_cameras.len() {
                 let cam = self.last_cameras[i];
-                if cam.edges[0] > 0.0 {
+                if cam.uses_ramp() {
                     self.write_camera(device, queue, i, &cam);
                 }
             }
@@ -1786,7 +1829,7 @@ impl SceneRenderer {
     }
 }
 
-/// World bounds of a scene's meshes and strokes, `None` when empty.
+/// World bounds of a scene's meshes, strokes and points, `None` when empty.
 fn scene_bounds(scene: &SceneData) -> Option<(glam::Vec3, glam::Vec3)> {
     let points = scene
         .meshes
@@ -1795,6 +1838,7 @@ fn scene_bounds(scene: &SceneData) -> Option<(glam::Vec3, glam::Vec3)> {
         .chain(scene.face_meshes.iter().flat_map(|m| m.0.positions.iter()))
         .chain(scene.edges.iter().flat_map(|e| e.0.iter()))
         .chain(scene.lines.iter().flat_map(|l| l.0.iter()))
+        .chain(scene.points.iter().flat_map(|p| p.0.iter()))
         .map(|p| glam::Vec3::from(*p));
     points.fold(None, |acc, p| match acc {
         None => Some((p, p)),
@@ -1802,12 +1846,13 @@ fn scene_bounds(scene: &SceneData) -> Option<(glam::Vec3, glam::Vec3)> {
     })
 }
 
-/// The depth-cue ramp of a camera over the scene bounds (#361): a plane
+/// The depth ramp of a camera over the scene bounds (depth cue #361, fog
+/// #363): a plane
 /// whose `dot(p, xyz) + w` is 0 at the bounds' nearest corner (or the eye,
 /// if nearer) and 1 at the farthest, measured along the view direction so
-/// parallel views ramp too. Zero when the camera has no depth cue.
+/// parallel views ramp too. Zero when the camera has neither.
 fn depth_cue_ramp(cam: &CameraUniform, bounds: Option<(glam::Vec3, glam::Vec3)>) -> [f32; 4] {
-    let Some((lo, hi)) = bounds.filter(|_| cam.edges[0] > 0.0) else {
+    let Some((lo, hi)) = bounds.filter(|_| cam.uses_ramp()) else {
         return [0.0; 4];
     };
     // View direction from two unprojected points on the screen centre.
