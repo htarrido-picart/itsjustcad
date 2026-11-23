@@ -1,7 +1,8 @@
 // Shared by the scene shaders (mesh, curve, grid, underlay, ao): prepended to
 // each when its module is built (see `scene_shader` in renderer.rs). Holds the
 // camera uniform, the background gradient, the fog (#363), the ambient
-// occlusion lookup (#358) and the sun shadow lookup (#357).
+// occlusion lookup (#358), the sun shadow lookup (#357) and the live
+// section cut (#359).
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -38,6 +39,11 @@ struct Camera {
     shadow: vec4<f32>,
     // Unit direction toward the sun (xyz): the shadows' and the key light's.
     shadow_dir: vec4<f32>,
+    // Live section cut (#359): xyz = unit normal toward the removed side,
+    // w = minus the offset. All zero = no cut.
+    clip: vec4<f32>,
+    // Section fill colour (rgb), w = 1 caps the cut solids.
+    clip_fill: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -200,4 +206,14 @@ fn ground_shadow(p: vec3<f32>) -> f32 {
         return 0.0;
     }
     return (1.0 - sun_visibility(p, vec3(0.0, 0.0, 1.0))) * direct / total;
+}
+
+// Whether the live section cut (#359) removes world point `p`: on the side
+// the plane's normal points at, past a hair of tolerance so a face the plane
+// was placed on stays. Always false without a cut (all-zero plane). The
+// scene shaders discard such fragments; the grid, the world axes and the
+// sun's shadow map are not cut (cut-away geometry still casts shadows).
+fn cut_away(p: vec3<f32>) -> bool {
+    let d = dot(p, camera.clip.xyz) + camera.clip.w;
+    return d > 1e-4 * (1.0 + abs(camera.clip.w));
 }

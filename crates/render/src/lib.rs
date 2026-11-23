@@ -17,6 +17,7 @@ mod pano;
 mod batch;
 mod renderer;
 mod shadow;
+mod section_style;
 mod shadow_style;
 mod sketchy;
 mod snapshot;
@@ -39,6 +40,7 @@ pub use edge_style::{
 };
 pub use ao::{ao_resolution, AoTarget};
 pub use ao_style::{AoStyle, AoUnits, AO_DISTANCE, AO_INTENSITY};
+pub use section_style::{SectionStyle, SECTION_FILL_RGB};
 pub use shadow_style::{ShadowStyle, DEFAULT_SUN_DIR, SHADOW_DARK, SHADOW_LIGHT};
 pub use fog_style::{FogColor, FogStyle, FOG_END, FOG_START};
 pub use layout::ViewportLayout;
@@ -115,6 +117,8 @@ pub fn camera_uniform_ex(
         ao_color: [0.0; 4],
         shadow: [0.0; 4],
         shadow_dir: [0.0; 4],
+        clip: [0.0; 4],
+        clip_fill: [0.0; 4],
     }
 }
 

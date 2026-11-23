@@ -65,6 +65,13 @@ pub struct CameraUniform {
     /// Unit direction toward the sun the shadows fall from (xyz), which is
     /// also the key light while they are on.
     pub shadow_dir: [f32; 4],
+    /// Live section cut (#359): the active plane as `xyz` = unit normal
+    /// (pointing at the removed side), `w` = minus its offset, so a world
+    /// point `p` is cut away where `dot(p, xyz) + w` is positive. All zero
+    /// = no cut. See [`CameraUniform::with_section`].
+    pub clip: [f32; 4],
+    /// Section fill colour RGB, `w` = 1 caps the cut solids.
+    pub clip_fill: [f32; 4],
 }
 
 impl CameraUniform {
@@ -174,6 +181,32 @@ impl CameraUniform {
     /// Whether the pane draws sun shadows.
     pub fn has_shadows(&self) -> bool {
         self.shadow[0] > 0.5
+    }
+
+    /// The same camera cut by the section `plane` (#359): `[point, normal]`,
+    /// the normal pointing at the removed side. Off (no plane, `cuts off`,
+    /// or a zero normal) leaves the camera as it was.
+    pub fn with_section(mut self, plane: Option<[[f32; 3]; 2]>, style: &crate::SectionStyle) -> Self {
+        let n = plane.map(|[_, n]| glam::Vec3::from(n).normalize_or_zero()).unwrap_or_default();
+        let Some([p, _]) = plane.filter(|_| style.cuts && n != glam::Vec3::ZERO) else {
+            self.clip = [0.0; 4];
+            self.clip_fill = [0.0; 4];
+            return self;
+        };
+        self.clip = [n.x, n.y, n.z, -n.dot(glam::Vec3::from(p))];
+        let [r, g, b, _] = style.fill_rgba();
+        self.clip_fill = [r, g, b, if style.fill { 1.0 } else { 0.0 }];
+        self
+    }
+
+    /// Whether the pane is cut by a section plane.
+    pub fn has_clip(&self) -> bool {
+        self.clip[..3] != [0.0; 3]
+    }
+
+    /// Whether the pane caps the cut solids in the section fill.
+    pub fn draws_section_fill(&self) -> bool {
+        self.has_clip() && self.clip_fill[3] > 0.5
     }
 
     /// Whether the camera depends on the scene bounds: the depth ramp, or an
@@ -713,6 +746,11 @@ struct Pipelines {
     point_pipeline: wgpu::RenderPipeline,
     /// Textured-quad pipeline (underlay and basemap).
     underlay_pipeline: wgpu::RenderPipeline,
+    /// Section fill (#359): the back faces seen through the live cut, flat
+    /// in the fill colour (`vs_cap`/`fs_cap`), for the plain and the
+    /// per-face-coloured meshes (whose colour attribute it ignores).
+    cap_pipeline: wgpu::RenderPipeline,
+    cap_face_pipeline: wgpu::RenderPipeline,
 }
 
 impl Pipelines {
@@ -828,6 +866,49 @@ impl Pipelines {
         let mesh_xray_pipeline = mesh_fill("mesh_xray_pipeline", true, false);
         let face_pipeline = mesh_fill("face_pipeline", false, true);
         let face_xray_pipeline = mesh_fill("face_xray_pipeline", true, true);
+        // Section fill (#359): front faces culled, depth-written so the cap
+        // hides what lies behind it.
+        let cap_fill = |label: &str, face: bool| {
+            let plain = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+            let colored = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&mesh_layout),
+                vertex: wgpu::VertexState {
+                    module: &mesh_shader,
+                    entry_point: Some("vs_cap"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: if face { 36 } else { 24 },
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: if face { &colored } else { &plain },
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &mesh_shader,
+                    entry_point: Some("fs_cap"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Front), ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: ms,
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let cap_pipeline = cap_fill("cap_pipeline", false);
+        let cap_face_pipeline = cap_fill("cap_face_pipeline", true);
 
         let curve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("curve_shader"),
@@ -1205,6 +1286,8 @@ impl Pipelines {
             back_pipeline,
             point_pipeline,
             underlay_pipeline,
+            cap_pipeline,
+            cap_face_pipeline,
         }
     }
 }
@@ -1375,11 +1458,16 @@ impl SceneRenderer {
         let mut axis_dots = Batch::new("axis_dots");
         let mut axis = Staged::default();
         let mut dots = Staged::default();
+        // material.w = 1: the section cut (#359) never removes the axes.
+        let uncut = |mut p: ObjectParams| {
+            p.material[3] = 1.0;
+            p
+        };
         for a in world_axis_lines() {
             if a.dotted {
-                dots.push_dashed(&dashed_strip(&a.points), ObjectParams::dashed(a.color, AXIS_DOTS));
+                dots.push_dashed(&dashed_strip(&a.points), uncut(ObjectParams::dashed(a.color, AXIS_DOTS)));
             } else {
-                axis.push_segments(&a.points, ObjectParams::stroke(a.color));
+                axis.push_segments(&a.points, uncut(ObjectParams::stroke(a.color)));
             }
         }
         let mut axis_params = ParamBuffer::new(device);
@@ -1904,6 +1992,21 @@ impl SceneRenderer {
         if !self.ghost_lines.draws.is_empty() {
             render_pass.set_pipeline(&self.pipes.edge_pipeline);
             draw_ranges(render_pass, &self.ghost_lines, &self.ghost_params);
+        }
+
+        // Section fill (#359): after every stroke, which the caps (pulled
+        // toward the eye past them) cover where the cut opens a solid. Only
+        // the opaque modes, whose faces write depth.
+        let caps = mode.draws_fill()
+            && mode.depth_writes()
+            && self.last_cameras.get(viewport).is_some_and(CameraUniform::draws_section_fill);
+        if caps {
+            render_pass.set_pipeline(&self.pipes.cap_pipeline);
+            draw_indexed(render_pass, &self.meshes, scene);
+            if !self.face_meshes.draws.is_empty() {
+                render_pass.set_pipeline(&self.pipes.cap_face_pipeline);
+                draw_indexed(render_pass, &self.face_meshes, scene);
+            }
         }
 
         // Back edges (#361): after every occluder, before the grid, only in

@@ -397,6 +397,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Boolean,
         },
         CommandSpec {
+            name: "sectionplane",
+            usage: "sectionplane <point x,y,z> <normal x,y,z> [name] | activate <name> | deactivate | reverse [name] | delete [name] | slice [name] | list",
+            summary: "Live section plane (SketchUp): place a named plane that cuts the viewport (the normal points at the removed side; placing makes it the active cut), switch or clear the active cut, flip it, delete it, or slice the model along it into section curves. One active cut per document. Example: sectionplane 0,0,1.5 0,0,1",
+            category: Category::Dimension,
+        },
+        CommandSpec {
             name: "section",
             usage: "section <selector> <plane point x,y,z> <normal x,y,z>  |  section <name> rect <w> <h> | circle <d> | iwf <d> <bf> <tf> <tw> | pipe <d> <t> | tee <d> <bf> <tf> <tw> | channel <d> <bf> <tf> <tw> | angle <a> <b> <t> | hss <w> <h> <t>",
             summary: "Two uses. (1) Plane cut: cut meshes, parametric objects and block instances with a plane; each cut becomes a heavy polyline on layer 'sections' (closed loop for a solid, open polyline for an open surface such as a vault). Example: section all 0,0,1.2 0,0,1. (2) Structural section: define a named cross-section (profile) for beam/column members, chosen by a shape keyword in second position — rect (solid rectangle), circle, iwf (I / wide-flange: depth, flange width, flange thickness, web thickness), pipe (hollow round), tee (T), channel (C/U), angle (L: leg a, leg b, thickness), hss (hollow square/rect tube). Example: section W12 iwf 0.31 0.2 0.013 0.008 · section col rect 0.4 0.4 · section T1 tee 0.2 0.15 0.012 0.008",

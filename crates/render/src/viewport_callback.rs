@@ -61,6 +61,11 @@ pub struct ViewportCallback {
     /// Sun shadows (#357), GPU-only; cast from `sun_dir` (else the default
     /// sun) when `mode` has an opaque fill.
     pub shadows: crate::ShadowStyle,
+    /// The active section plane `[point, normal]` (#359; the normal points
+    /// at the cut side), `None` for no cut.
+    pub section: Option<[[f32; 3]; 2]>,
+    /// Section display: cuts and fill on or off, fill colour.
+    pub sections: crate::SectionStyle,
     /// The flat colour behind the scene (the clear colour: theme or paper),
     /// the fog's background colour when the gradient is off.
     pub background: [f32; 4],
@@ -106,12 +111,15 @@ impl CallbackTrait for ViewportCallback {
             ao_color: [0.0; 4],
             shadow: [0.0; 4],
             shadow_dir: [0.0; 4],
+            clip: [0.0; 4],
+            clip_fill: [0.0; 4],
         }
         .with_overlays(self.show_grid, self.show_axes)
         .with_edge_style(&self.edge_style, screen_desc.pixels_per_point)
         .with_fog(&self.fog, self.background)
         .with_ao(&self.ao, self.mode)
-        .with_shadows(&self.shadows, self.mode, self.sun_dir);
+        .with_shadows(&self.shadows, self.mode, self.sun_dir)
+        .with_section(self.section, &self.sections);
         renderer.write_camera(device, queue, self.viewport, &cam);
         if let Some(scene) = &self.scene
             && (renderer.generation != self.generation || self.force)

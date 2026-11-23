@@ -54,7 +54,7 @@ pub mod workdir;
 
 pub use command::{
     BoolKind, CPlaneOp, Command, CompassDir, ConstrainKind, DimAnchorSpec, GridshellSurfaceSpec,
-    LotEdit, LotField, MirrorPlane, OptionOp, PlotStyleOp, RegionMode, Selector, SheetSetOp, SheetViewSet, SimilarBy,
+    LotEdit, LotField, MirrorPlane, OptionOp, PlotStyleOp, RegionMode, SectionPlaneOp, Selector, SheetSetOp, SheetViewSet, SimilarBy,
 };
 pub use error::{ExecError, ParseError};
 pub use exec::{

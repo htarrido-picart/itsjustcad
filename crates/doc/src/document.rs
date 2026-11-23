@@ -367,6 +367,19 @@ pub struct Document {
     /// cleared by `plotstyle none`. `serde(default)` keeps old files loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_plot_style: Option<String>,
+    /// Named section planes (#359), in placement order. Set by the logged
+    /// `sectionplane` ops; skipped when empty so files without planes save
+    /// byte-for-byte as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub section_planes: Vec<crate::SectionPlane>,
+    /// The name of the plane cutting the model (#359), at most one per
+    /// document. Logged (`sectionplane activate|deactivate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_section: Option<String>,
+    /// View state: the app's `sections cuts off` (#359). Hidden cuts draw
+    /// and pick the whole model. Never saved or logged.
+    #[serde(skip)]
+    pub section_cuts_hidden: bool,
     /// Custom hatch patterns imported from AutoCAD `.pat` files via `hatchpat`
     /// (name → line families). A `hatch … pattern <name>` reference copies the
     /// families into the created hatch (self-contained), so this registry is a
@@ -425,6 +438,9 @@ impl Default for Document {
             named_cplanes: BTreeMap::new(),
             plot_styles: BTreeMap::new(),
             active_plot_style: None,
+            section_planes: Vec::new(),
+            active_section: None,
+            section_cuts_hidden: false,
             hatch_patterns: BTreeMap::new(),
             generation: 0,
             pick_boxes: Default::default(),
@@ -433,6 +449,22 @@ impl Default for Document {
 }
 
 impl Document {
+    /// The section plane named `name` (#359).
+    pub fn section_plane(&self, name: &str) -> Option<&crate::SectionPlane> {
+        self.section_planes.iter().find(|p| p.name == name)
+    }
+
+    /// The active section plane (#359), whether or not its cut is shown.
+    pub fn active_section_plane(&self) -> Option<&crate::SectionPlane> {
+        self.section_plane(self.active_section.as_deref()?)
+    }
+
+    /// The plane cutting the view and the picks (#359): the active one,
+    /// unless the cuts are hidden.
+    pub fn section_cut(&self) -> Option<&crate::SectionPlane> {
+        if self.section_cuts_hidden { None } else { self.active_section_plane() }
+    }
+
     /// The associative subdivision link keyed by its `source` block, if any.
     pub fn subdiv_link(&self, source: ObjectId) -> Option<&SubdivLink> {
         self.subdivision_links.get(&source)
@@ -948,6 +980,16 @@ pub fn expand_to_group(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn section_planes_default_and_stay_out_of_old_files() {
+        // #359: a file from before section planes loads with none, and a
+        // document without planes saves no new keys.
+        let json = serde_json::to_string(&Document::default()).unwrap();
+        assert!(!json.contains("section_planes") && !json.contains("active_section"), "{json}");
+        let doc: Document = serde_json::from_str(&json).unwrap();
+        assert!(doc.section_planes.is_empty() && doc.active_section.is_none() && doc.section_cut().is_none());
+    }
+
     use glam::DVec3;
     use kernel_mesh::Mesh;
 

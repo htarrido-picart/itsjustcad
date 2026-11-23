@@ -11,6 +11,7 @@ struct PreIn {
 struct PreOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
+    @location(1) world: vec3<f32>,
 };
 
 @vertex
@@ -18,11 +19,16 @@ fn vs_prepass(in: PreIn) -> PreOut {
     var out: PreOut;
     out.clip = camera.view_proj * vec4(in.position, 1.0);
     out.normal = in.normal;
+    out.world = in.position;
     return out;
 }
 
 @fragment
 fn fs_prepass(in: PreOut) -> @location(0) vec4<f32> {
+    // What the section cut removes (#359) occludes nothing.
+    if (cut_away(in.world)) {
+        discard;
+    }
     return vec4(normalize(in.normal) * 0.5 + 0.5, 1.0);
 }
 

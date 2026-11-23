@@ -73,6 +73,9 @@ fn vs_face(in: VsFaceIn) -> VsFaceOut {
 
 @fragment
 fn fs_face(in: VsFaceOut) -> @location(0) vec4<f32> {
+    if (cut_away(in.world)) {
+        discard;
+    }
     return fogged(occluded(shade_fill(in.normal, in.world, in.color), in.world), in.world);
 }
 
@@ -95,6 +98,9 @@ fn working_key_dir() -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if (cut_away(in.world)) {
+        discard;
+    }
     return fogged(occluded(shade_fill(in.normal, in.world, object.color.rgb), in.world), in.world);
 }
 
@@ -158,4 +164,39 @@ fn shade_fill(normal: vec3<f32>, world: vec3<f32>, base: vec3<f32>) -> vec4<f32>
     }
 
     return vec4(lit, object.color.a * camera.misc.x);
+}
+
+// Section fill (#359): the back faces of the solids seen through the live
+// cut, flat in the fill colour, read as the cut face (the capping trick:
+// exact for closed solids). Drawn after the strokes with the back faces
+// pulled toward the eye, more than any stroke is, so the far side's edges
+// behind the cap do not show through it, while every nearer kept face still
+// hides it. Only fragments on the kept side whose view ray starts on the
+// cut side (at the near plane): the ray then crosses the plane in front of
+// them, where the cap is. From the kept side no cap can show.
+const CAP_PULL: f32 = 4e-3;
+
+@vertex
+fn vs_cap(in: VsIn) -> VsOut {
+    var out: VsOut;
+    let eye_clip = camera.view_proj * vec4(camera.eye.xyz, 1.0);
+    if (abs(eye_clip.w) < 0.5) {
+        out.clip = camera.view_proj * vec4(mix(in.position, camera.eye.xyz, CAP_PULL), 1.0);
+    } else {
+        // Parallel views: depth is linear, a fixed nudge past the strokes'.
+        out.clip = camera.view_proj * vec4(in.position, 1.0);
+        out.clip.z -= 4e-5 * out.clip.w;
+    }
+    out.normal = in.normal;
+    out.world = in.position;
+    return out;
+}
+
+@fragment
+fn fs_cap(in: VsOut) -> @location(0) vec4<f32> {
+    let c = camera.view_proj * vec4(in.world, 1.0);
+    if (cut_away(in.world) || !cut_away(unproject(c.xy / c.w, 0.0))) {
+        discard;
+    }
+    return fogged(vec4(camera.clip_fill.rgb, 1.0), in.world);
 }
