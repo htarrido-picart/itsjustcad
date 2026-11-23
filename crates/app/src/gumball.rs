@@ -2,8 +2,9 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 //! Gumball transform gizmo: shown at the selection's combined AABB center.
-//! Arrows drag-move along X/Y/Z, the ring rotates about Z, the center square
-//! scales uniformly. Drags preview as a ghost wireframe; on release ONE
+//! Arrows drag-move along X/Y/Z, three rings (X red, Y green, Z blue, the
+//! SketchUp axis colours) rotate about their axis through the gizmo centre,
+//! the center square scales uniformly. Drags preview as a ghost wireframe; on release ONE
 //! substrate command (move/rotate/scale with explicit center) is emitted so
 //! the op-log stays the single source of truth and undo works.
 
@@ -23,9 +24,17 @@ pub enum Handle {
     MoveX,
     MoveY,
     MoveZ,
+    RotX,
+    RotY,
     RotZ,
     ScaleUniform,
 }
+
+const RINGS: [(Handle, DVec3); 3] = [
+    (Handle::RotX, DVec3::X),
+    (Handle::RotY, DVec3::Y),
+    (Handle::RotZ, DVec3::Z),
+];
 
 impl Handle {
     fn axis(self) -> Option<DVec3> {
@@ -34,6 +43,25 @@ impl Handle {
             Handle::MoveY => Some(DVec3::Y),
             Handle::MoveZ => Some(DVec3::Z),
             _ => None,
+        }
+    }
+
+    fn rot_axis(self) -> Option<DVec3> {
+        match self {
+            Handle::RotX => Some(DVec3::X),
+            Handle::RotY => Some(DVec3::Y),
+            Handle::RotZ => Some(DVec3::Z),
+            _ => None,
+        }
+    }
+
+    /// SketchUp axis colour (red X, green Y, blue Z); grey for scale.
+    fn color(self) -> egui::Color32 {
+        match self {
+            Handle::MoveX | Handle::RotX => egui::Color32::from_rgb(225, 85, 85),
+            Handle::MoveY | Handle::RotY => egui::Color32::from_rgb(110, 200, 110),
+            Handle::MoveZ | Handle::RotZ => egui::Color32::from_rgb(95, 145, 255),
+            Handle::ScaleUniform => egui::Color32::from_rgb(200, 200, 200),
         }
     }
 }
@@ -106,7 +134,13 @@ impl Gumball {
         .into_iter()
         .filter_map(|(h, a)| Some((h, a, axis_len(a)?)))
         .collect();
-        let ring_radius = axis_len(DVec3::X).map(|l| l * (RING_PX / AXIS_PX) as f64);
+        // Rings share one world radius: the least-foreshortened axis gives the
+        // true px scale, so the rings stay ~RING_PX from any view angle.
+        let ring_radius = [DVec3::X, DVec3::Y, DVec3::Z]
+            .into_iter()
+            .filter_map(axis_len)
+            .reduce(f64::min)
+            .map(|l| l * (RING_PX / AXIS_PX) as f64);
 
         let pointer = response
             .hover_pos()
@@ -130,19 +164,24 @@ impl Gumball {
             {
                 return Some(Handle::ScaleUniform);
             }
-            if let Some(r) = ring_radius {
-                let pts = ring_points(center, r, RING_SEGMENTS);
-                let mut prev: Option<egui::Pos2> = None;
-                for p in pts.iter().filter_map(|w| project(*w)) {
-                    if let Some(q) = prev
-                        && dist_point_segment(pos, q, p) <= HIT_PX
-                    {
-                        return Some(Handle::RotZ);
-                    }
-                    prev = Some(p);
-                }
-            }
-            None
+            // Nearest ring wins where rings cross (screen-space, so an
+            // edge-on ring, a line through the centre, still hits).
+            let r = ring_radius?;
+            RINGS
+                .iter()
+                .filter_map(|&(handle, axis)| {
+                    let pts: Vec<egui::Pos2> = ring_points(center, axis, r, RING_SEGMENTS)
+                        .iter()
+                        .filter_map(|w| project(*w))
+                        .collect();
+                    let d = pts
+                        .windows(2)
+                        .map(|w| dist_point_segment(pos, w[0], w[1]))
+                        .fold(f32::INFINITY, f32::min);
+                    (d <= HIT_PX).then_some((handle, d))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(h, _)| h)
         });
 
         // -- drag lifecycle --
@@ -191,33 +230,32 @@ impl Gumball {
             }
         };
         for (handle, axis, len) in &axes {
-            let color = colw(
-                *handle,
-                match handle {
-                    Handle::MoveX => egui::Color32::from_rgb(225, 85, 85),
-                    Handle::MoveY => egui::Color32::from_rgb(110, 200, 110),
-                    _ => egui::Color32::from_rgb(95, 145, 255),
-                },
-            );
+            let color = colw(*handle, handle.color());
             if let (Some(a), Some(b)) = (project(center), project(center + *axis * *len)) {
                 painter.line_segment([a, b], egui::Stroke::new(2.0, color));
                 painter.circle_filled(b, 4.0, color);
             }
         }
         if let Some(r) = ring_radius {
-            let color = colw(Handle::RotZ, egui::Color32::from_rgb(95, 145, 255));
-            let pts: Vec<egui::Pos2> = ring_points(center, r, RING_SEGMENTS)
-                .iter()
-                .filter_map(|w| project(*w))
-                .collect();
-            for pair in pts.windows(2) {
-                painter.line_segment([pair[0], pair[1]], egui::Stroke::new(1.5, color));
+            for (handle, axis) in RINGS {
+                // While dragging, only the active ring (the protractor) shows.
+                if self.drag.as_ref().is_some_and(|d| d.handle != handle) {
+                    continue;
+                }
+                let color = colw(handle, handle.color());
+                let pts: Vec<egui::Pos2> = ring_points(center, axis, r, RING_SEGMENTS)
+                    .iter()
+                    .filter_map(|w| project(*w))
+                    .collect();
+                for pair in pts.windows(2) {
+                    painter.line_segment([pair[0], pair[1]], egui::Stroke::new(1.5, color));
+                }
             }
         }
         painter.rect_filled(
             egui::Rect::from_center_size(center_px, egui::Vec2::splat(CENTER_PX * 2.0)),
             1.0,
-            colw(Handle::ScaleUniform, egui::Color32::from_rgb(200, 200, 200)),
+            colw(Handle::ScaleUniform, Handle::ScaleUniform.color()),
         );
 
         // -- ghost preview + readout while dragging --
@@ -287,10 +325,11 @@ fn drag_param(
             let (ro, rd) = crate::app::screen_ray(view_proj, rect, pos);
             closest_axis_t(center, handle.axis().expect("move handle"), ro, rd)
         }
-        Handle::RotZ => {
+        Handle::RotX | Handle::RotY | Handle::RotZ => {
+            let axis = handle.rot_axis().expect("ring handle");
             let (ro, rd) = crate::app::screen_ray(view_proj, rect, pos);
-            let p = ray_plane_z(center.z, ro, rd)?;
-            Some(plane_angle(center, p))
+            let p = ray_plane(center, axis, ro, rd)?;
+            Some(plane_angle(center, axis, p))
         }
         Handle::ScaleUniform => Some((pos - center_px).length() as f64),
     }
@@ -303,12 +342,12 @@ fn commit_command(drag: &DragState) -> Option<Command> {
             let delta = drag.handle.axis().expect("move handle") * (drag.current - drag.start);
             (delta.length() > 1e-9).then_some(Command::Move { targets, delta })
         }
-        Handle::RotZ => {
+        Handle::RotX | Handle::RotY | Handle::RotZ => {
             let angle_deg = wrap_angle_deg((drag.current - drag.start).to_degrees());
             (angle_deg.abs() > 1e-6).then_some(Command::Rotate {
                 targets,
                 angle_deg,
-                axis: DVec3::Z,
+                axis: drag.handle.rot_axis().expect("ring handle"),
                 center: Some(drag.center),
             })
         }
@@ -329,9 +368,12 @@ fn pending_matrix(drag: &DragState) -> DMat4 {
         Handle::MoveX | Handle::MoveY | Handle::MoveZ => DMat4::from_translation(
             drag.handle.axis().expect("move handle") * (drag.current - drag.start),
         ),
-        Handle::RotZ => {
+        Handle::RotX | Handle::RotY | Handle::RotZ => {
             DMat4::from_translation(c)
-                * DMat4::from_rotation_z(drag.current - drag.start)
+                * DMat4::from_axis_angle(
+                    drag.handle.rot_axis().expect("ring handle"),
+                    drag.current - drag.start,
+                )
                 * DMat4::from_translation(-c)
         }
         Handle::ScaleUniform => {
@@ -349,8 +391,13 @@ fn drag_readout(drag: &DragState, units: itsjustcad_doc::Units) -> String {
         Handle::MoveX => format!("dx {}", d()),
         Handle::MoveY => format!("dy {}", d()),
         Handle::MoveZ => format!("dz {}", d()),
-        Handle::RotZ => format!(
-            "{:.1}°",
+        Handle::RotX | Handle::RotY | Handle::RotZ => format!(
+            "{} {:.1}°",
+            match drag.handle {
+                Handle::RotX => "X",
+                Handle::RotY => "Y",
+                _ => "Z",
+            },
             wrap_angle_deg((drag.current - drag.start).to_degrees())
         ),
         Handle::ScaleUniform => {
@@ -390,12 +437,14 @@ fn draw_ghost_box(
     }
 }
 
-/// Points on the Z ring (world space, plane z = center.z), closed.
-fn ring_points(center: DVec3, radius: f64, segments: usize) -> Vec<DVec3> {
+/// Points on the ring about `axis` (world space, plane through `center`
+/// normal to `axis`), closed.
+fn ring_points(center: DVec3, axis: DVec3, radius: f64, segments: usize) -> Vec<DVec3> {
+    let (u, v) = itsjustcad_guided::rotation_basis(axis);
     (0..=segments)
         .map(|i| {
             let a = i as f64 / segments as f64 * std::f64::consts::TAU;
-            center + DVec3::new(a.cos() * radius, a.sin() * radius, 0.0)
+            center + (u * a.cos() + v * a.sin()) * radius
         })
         .collect()
 }
@@ -418,18 +467,24 @@ pub fn closest_axis_t(axis_o: DVec3, axis_d: DVec3, ray_o: DVec3, ray_d: DVec3) 
     Some((b * e - c * d) / denom)
 }
 
-/// Ray vs the horizontal plane at height `z` (any hit direction, t > 0).
-pub fn ray_plane_z(z: f64, ray_o: DVec3, ray_d: DVec3) -> Option<DVec3> {
-    if ray_d.z.abs() < 1e-12 {
+/// Ray vs the plane through `origin` with normal `n` (t > 0). `None` when
+/// the ray runs parallel to the plane or points away from it.
+pub fn ray_plane(origin: DVec3, n: DVec3, ray_o: DVec3, ray_d: DVec3) -> Option<DVec3> {
+    let denom = ray_d.dot(n);
+    if denom.abs() < 1e-12 {
         return None;
     }
-    let t = (z - ray_o.z) / ray_d.z;
+    let t = (origin - ray_o).dot(n) / denom;
     (t > 0.0).then(|| ray_o + ray_d * t)
 }
 
-/// Angle of `p` about `center` in the XY plane (radians, atan2 convention).
-pub fn plane_angle(center: DVec3, p: DVec3) -> f64 {
-    (p.y - center.y).atan2(p.x - center.x)
+/// Right-hand angle of `p` about `axis` through `center` (radians, atan2 in
+/// the [`itsjustcad_guided::rotation_basis`] of `axis`), so a positive delta
+/// matches `Command::Rotate`'s positive angle.
+pub fn plane_angle(center: DVec3, axis: DVec3, p: DVec3) -> f64 {
+    let (u, v) = itsjustcad_guided::rotation_basis(axis);
+    let d = p - center;
+    d.dot(v).atan2(d.dot(u))
 }
 
 /// Wrap to (-180, 180] so a rotate drag never logs a >half-turn detour.
@@ -501,21 +556,53 @@ mod tests {
 
     #[test]
     fn plane_hit_and_angle() {
-        let p = ray_plane_z(
-            1.0,
+        let p = ray_plane(
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::Z,
             DVec3::new(2.0, 2.0, 11.0),
             DVec3::new(0.0, 0.0, -1.0),
         )
         .unwrap();
         assert!((p - DVec3::new(2.0, 2.0, 1.0)).length() < 1e-12);
-        let a = plane_angle(DVec3::new(1.0, 1.0, 1.0), p);
+        let a = plane_angle(DVec3::new(1.0, 1.0, 1.0), DVec3::Z, p);
         assert!((a - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+        // Side view onto the X ring: the ray hits the plane x = 3.
+        let p = ray_plane(
+            DVec3::new(3.0, 0.0, 0.0),
+            DVec3::X,
+            DVec3::new(10.0, 1.0, 1.0),
+            -DVec3::X,
+        )
+        .unwrap();
+        assert!((p - DVec3::new(3.0, 1.0, 1.0)).length() < 1e-12);
     }
 
     #[test]
     fn plane_parallel_or_behind_is_none() {
-        assert!(ray_plane_z(0.0, DVec3::new(0.0, 0.0, 1.0), DVec3::X).is_none());
-        assert!(ray_plane_z(5.0, DVec3::ZERO, DVec3::new(0.0, 0.0, -1.0)).is_none());
+        assert!(ray_plane(DVec3::ZERO, DVec3::Z, DVec3::new(0.0, 0.0, 1.0), DVec3::X).is_none());
+        assert!(ray_plane(DVec3::new(0.0, 0.0, 5.0), DVec3::Z, DVec3::ZERO, -DVec3::Z).is_none());
+        assert!(ray_plane(DVec3::ZERO, DVec3::Y, DVec3::new(0.0, 1.0, 0.0), DVec3::X).is_none());
+    }
+
+    #[test]
+    fn ring_angle_matches_rotate_direction_on_every_axis() {
+        // Dragging the pointer from angle 0 to angle θ on a ring must preview
+        // and commit the same turn `rotate … <θ> <axis>` applies.
+        let c = DVec3::new(1.0, 2.0, 3.0);
+        for (_, axis) in RINGS {
+            let (u, _) = itsjustcad_guided::rotation_basis(axis);
+            let theta = 0.6_f64;
+            let moved = DMat4::from_axis_angle(axis, theta).transform_point3(u * 2.0) + c;
+            assert!((plane_angle(c, axis, c + u * 2.0)).abs() < 1e-12);
+            assert!(
+                (plane_angle(c, axis, moved) - theta).abs() < 1e-12,
+                "{axis}"
+            );
+            for p in ring_points(c, axis, 2.0, 12) {
+                assert!((p - c).dot(axis).abs() < 1e-12, "ring lies in its plane");
+                assert!(((p - c).length() - 2.0).abs() < 1e-12);
+            }
+        }
     }
 
     #[test]
@@ -573,6 +660,75 @@ mod tests {
             }
             other => panic!("expected rotate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn commit_rotate_x_and_y_rings_use_their_axis() {
+        for (handle, axis) in [(Handle::RotX, DVec3::X), (Handle::RotY, DVec3::Y)] {
+            let d = drag(handle, 0.0, -std::f64::consts::FRAC_PI_6);
+            match commit_command(&d).unwrap() {
+                Command::Rotate {
+                    angle_deg,
+                    axis: a,
+                    center,
+                    ..
+                } => {
+                    assert!((angle_deg + 30.0).abs() < 1e-9);
+                    assert_eq!(a, axis);
+                    assert_eq!(center, Some(DVec3::new(1.0, 2.0, 0.0)));
+                }
+                other => panic!("expected rotate, got {other:?}"),
+            }
+            // The ghost turns the same way the command will.
+            let m = pending_matrix(&d);
+            let want = DMat4::from_translation(d.center)
+                * DMat4::from_axis_angle(axis, -std::f64::consts::FRAC_PI_6)
+                * DMat4::from_translation(-d.center);
+            assert!(m.abs_diff_eq(want, 1e-12));
+            assert!(
+                drag_readout(&d, itsjustcad_doc::Units::default())
+                    .starts_with(if handle == Handle::RotX { "X " } else { "Y " })
+            );
+        }
+    }
+
+    #[test]
+    fn commit_rotate_x_logs_and_replays_as_rotate_x_line() {
+        // The gumball's X-ring command and the typed `rotate … x about …` line
+        // land the selection in the same place, in one undo step.
+        let session = || {
+            let mut s = itsjustcad_commands::Session::default();
+            s.run(itsjustcad_commands::parse("box 0,0,0 2,1,3").unwrap())
+                .unwrap();
+            s
+        };
+        let (mut a, mut b) = (session(), session());
+        let ids: Vec<ObjectId> = a.doc.objects().map(|o| o.id).collect();
+        let undo_before = a.undo_len();
+        let d = DragState {
+            handle: Handle::RotX,
+            center: DVec3::new(1.0, 0.5, 1.5),
+            ids,
+            start: 0.0,
+            current: std::f64::consts::FRAC_PI_2,
+        };
+        a.run(commit_command(&d).unwrap()).unwrap();
+        b.run(itsjustcad_commands::parse("rotate all 90 x about 1,0.5,1.5").unwrap())
+            .unwrap();
+        let bb = |s: &itsjustcad_commands::Session| {
+            s.doc
+                .geometry_aabb(&s.doc.objects().next().unwrap().geometry)
+        };
+        let (ba, bbx) = (bb(&a), bb(&b));
+        // 90° about X swaps the 1 (y) by 3 (z) cross-section.
+        assert!(((ba.max - ba.min) - DVec3::new(2.0, 3.0, 1.0)).length() < 1e-9);
+        assert!(ba.min.abs_diff_eq(bbx.min, 1e-9) && ba.max.abs_diff_eq(bbx.max, 1e-9));
+        assert_eq!(a.undo_len(), undo_before + 1, "one undo step");
+        a.run(itsjustcad_commands::Command::Undo).unwrap();
+        assert!(
+            bb(&a).min.abs_diff_eq(DVec3::ZERO, 1e-9),
+            "one undo step restores it"
+        );
     }
 
     #[test]
