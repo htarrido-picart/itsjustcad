@@ -64,6 +64,7 @@ mod ui_plane;
 mod update;
 mod usage_spec;
 mod view_styles;
+mod walkthrough;
 mod widgets;
 
 /// The user's config dir: [`home_config_dir`] of the home directory.

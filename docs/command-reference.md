@@ -389,6 +389,15 @@ chatencryption on|off                                encrypt chat sessions at re
 save [path] · help [verb]                            save document / inline help
 ```
 
+Walkthrough tools (#369; interactive only, so the deck and `--run` scripts ignore them; view state, not logged or saved):
+
+```
+poscam [h] (positioncamera)                          click where to stand, eye h m above it (default 1.68 m), or drag to where to look; Look Around follows
+lookaround [h]                                       drag turns the view about the eye; a typed number sets the eye height above the floor
+walk [h]                                             drag from the cross or ↑ ↓ W S walk, ← → turn, A D step aside; Shift up/down, Ctrl/Cmd run ×3, Alt through walls
+```
+The eye keeps its height above the floor below (stairs, ramps, ledges), stops 0.3 m before a face ahead and refuses a rise above 0.6 m. Scroll still zooms; Esc ends the tool.
+
 ### Object snap
 
 Precision object snapping while drawing. A clickable **osnap chip** in the status bar opens a toggle popup; the same set is under **View ▸ Object Snap…**. The `osnap` verb toggles the master switch or any individual snap.

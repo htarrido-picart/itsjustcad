@@ -22,6 +22,7 @@ mod structure;
 mod underlay;
 mod units;
 mod view;
+pub mod walk;
 
 pub use constraint::{PointRef, SketchConstraint};
 pub use cplane::CPlane;
