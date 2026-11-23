@@ -18,6 +18,7 @@ use itsjustcad_commands::{Category, registry};
 use crate::i18n::Lang;
 use crate::i18n::t as tr;
 use crate::icons::{Icon, Icons};
+use crate::nav::MouseNav;
 use crate::preset::{CadOrigin, MenuStyle};
 
 /// What happens when a menu item is chosen. The rule (documented on each
@@ -135,6 +136,9 @@ pub enum MenuAction {
     /// same apply+persist path the `language en|es` verb uses. UI/session state,
     /// not op-log.
     SetLanguage(Lang),
+    /// Switch the mouse-navigation preset (#367). Radio in the Theme menu's
+    /// Mouse group; same apply+persist path as the `mouse <preset>` verb.
+    SetMouseNav(MouseNav),
     /// Quit the application (⌘Q). Routes through the dirty-doc guard, then closes
     /// the (single) window — which terminates the app. Present in the File menu on
     /// every platform so ⌘Q is always reachable from the menu bar; the macOS app
@@ -417,6 +421,8 @@ pub struct ViewState {
     /// Active UI language — drives the check on the Theme ▸ Language radio group.
     /// Matched against each `SetLanguage(lang)` item's lang.
     pub lang: Lang,
+    /// Active mouse-navigation preset — drives the check on Theme ▸ Mouse.
+    pub mouse_nav: MouseNav,
 }
 
 /// The display-mode radio choices the View menu offers, in menu order. A copy of
@@ -496,6 +502,12 @@ pub fn skin_radio_items() -> [(&'static str, CadOrigin); 4] {
         ("skin_nurbs", CadOrigin::Nurbs),
         ("skin_bim", CadOrigin::Bim),
     ]
+}
+
+/// The Theme ▸ Mouse radio group (#367): `(id_suffix, MouseNav)`. Each becomes
+/// a `Check` firing `SetMouseNav(nav)`; labels localize via `label_key`.
+pub fn mouse_radio_items() -> [(&'static str, MouseNav); 2] {
+    [("mouse_right", MouseNav::Right), ("mouse_middle", MouseNav::Middle)]
 }
 
 /// The Theme ▸ Language radio group: `(id_suffix, Lang)`, one per shipped
@@ -779,6 +791,17 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                 label: tr(origin.label_key()).into(),
                 action: MenuAction::SetSkin(origin),
                 checked: view.skin == origin,
+                enabled: true,
+            });
+        }
+        // ── Mouse-navigation radio group (MouseNav, #367) ────────────────────
+        items.push(NativeItem::Separator);
+        for (id, nav) in mouse_radio_items() {
+            items.push(NativeItem::Check {
+                id: format!("{t}/{id}"),
+                label: tr(nav.label_key()).into(),
+                action: MenuAction::SetMouseNav(nav),
+                checked: view.mouse_nav == nav,
                 enabled: true,
             });
         }
@@ -1178,6 +1201,7 @@ pub fn demo_open(
         antialias: 4,
         skin: CadOrigin::None,
         lang: Lang::En,
+        mouse_nav: MouseNav::Right,
     };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
         return;

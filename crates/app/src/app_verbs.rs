@@ -67,6 +67,9 @@ pub enum AppVerb {
     /// Toggle Reduce Motion for animated progress bars (`reducemotion [on|off]`).
     /// `None` means bare toggle.
     ReduceMotion(Option<bool>),
+    /// Mouse-navigation preset (`mouse right|middle`, #367). Persisted to
+    /// ui.json; view state, never logged. Unknown/missing preset → `None`.
+    Mouse(crate::nav::MouseNav),
     /// Toggle at-rest encryption of chat-session files (`chatencryption [on|off]`
     /// / `encryptchats`). `None` means bare toggle. Persisted to ui.json; a
     /// disabled setting writes new saves in plaintext (existing encrypted stores
@@ -251,6 +254,7 @@ pub fn classify(line: &str) -> Option<AppVerb> {
             None => None,
             _ => return None,
         }),
+        "mouse" => AppVerb::Mouse(crate::nav::MouseNav::from_code(words.next()?)?),
         "chatencryption" | "encryptchats" => AppVerb::ChatEncryption(match words.next() {
             Some("on" | "true" | "1") => Some(true),
             Some("off" | "false" | "0") => Some(false),
@@ -424,6 +428,16 @@ mod tests {
     }
 
     #[test]
+    fn classifies_mouse() {
+        use crate::nav::MouseNav;
+        assert_eq!(classify("mouse right"), Some(AppVerb::Mouse(MouseNav::Right)));
+        assert_eq!(classify("mouse middle"), Some(AppVerb::Mouse(MouseNav::Middle)));
+        assert_eq!(classify("mouse sketchup"), Some(AppVerb::Mouse(MouseNav::Middle)));
+        assert_eq!(classify("mouse"), None);
+        assert_eq!(classify("mouse wheel"), None);
+    }
+
+    #[test]
     fn classifies_reduce_motion() {
         assert_eq!(classify("reducemotion on"), Some(AppVerb::ReduceMotion(Some(true))));
         assert_eq!(classify("reducemotion off"), Some(AppVerb::ReduceMotion(Some(false))));
@@ -567,6 +581,7 @@ mod tests {
         "antialias",    // render-quality setting, not a drawing/view verb
         "aa",           // alias of `antialias`
         "reducemotion",  // accessibility toggle, not a drawing/view verb the model reframes with
+        "mouse",        // input preference, not a drawing/view verb
         "chatencryption", // privacy setting, not a drawing/view verb
         "encryptchats",   // alias of `chatencryption`
         "lightmode",    // alias of `light`
@@ -614,6 +629,7 @@ mod tests {
             "gumball",
             "gizmo",
             "reducemotion",
+            "mouse",
             "chatencryption",
             "encryptchats",
             "skin",

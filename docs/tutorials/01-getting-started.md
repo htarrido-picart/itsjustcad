@@ -72,9 +72,23 @@ Now use the mouse in the viewport:
 | Mouse | Does |
 |---|---|
 | **Right-drag** or **middle-drag** | Orbit about the point under the cursor; verticals stay vertical |
-| **Shift + right-drag** | Pan |
+| **Shift + right-drag** or **Shift + middle-drag** | Pan |
 | **Scroll wheel** | Zoom toward the point under the cursor |
 | **Middle double-click** | Recentre the view on the point under the cursor |
+
+Prefer middle-drag only? Type `mouse middle` (or pick **Middle-drag orbits** in
+the Theme menu or Settings): middle-drag orbits, **Shift + middle-drag** pans,
+and the right button no longer navigates. `mouse right` switches back.
+
+| Mouse (`mouse middle`) | Does |
+|---|---|
+| **Middle-drag** | Orbit about the point under the cursor |
+| **Shift + middle-drag** | Pan |
+| **Scroll wheel** | Zoom toward the point under the cursor |
+| **Middle double-click** | Recentre the view on the point under the cursor |
+
+Orbit, pan and zoom never cancel the tool you are in: start a polyline, orbit
+mid-way, and the next click carries on the same polyline.
 
 ---
 

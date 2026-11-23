@@ -888,7 +888,9 @@ and a scene digest; it never touches raw geometry.
 
 | | |
 |---|---|
-| RMB drag / Shift+RMB / scroll | orbit / pan / zoom toward the cursor |
+| RMB or MMB drag / Shift+drag / scroll | orbit / pan / zoom toward the cursor |
+| MMB double-click | recentre on the point under the cursor |
+| `mouse middle` (or Theme ▸ Middle-drag orbits) | MMB-only preset: MMB orbits, Shift+MMB pans, RMB never navigates; `mouse right` restores the default |
 | `l` `r` `c` `p` | line / rect / circle / polyline tools |
 | Delete · Cmd+Z / Cmd+Shift+Z · Cmd+A · Cmd+C/V · Cmd+S | the usual |
 | Tab | accept autosuggest |
