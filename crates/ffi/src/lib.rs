@@ -2594,6 +2594,57 @@ pub unsafe extern "C" fn ijc_move_selected(h: *mut AppHandle, dx: f64, dy: f64, 
     })
 }
 
+/// Push/Pull (#370): move the flat face of solid `object` (short id or uuid)
+/// through `(px,py,pz)` facing `(nx,ny,nz)` by `distance` along that normal
+/// (positive pulls out, negative pushes in; through = a hole), as ONE
+/// undoable, op-logged `pushpull`. On a closed flat curve it makes the region
+/// a solid (or cuts the solid face it lies on). `keep` keeps the old face's
+/// edges (SketchUp's Ctrl). The point and normal are what [`snap::ijc_osnap`]
+/// reports for a `face` hit. A zero normal names the face by the point
+/// alone. Returns `false` on a null/invalid handle, an unknown object,
+/// non-finite input, or when the command fails (no face there, nothing left).
+///
+/// # Safety
+/// `h` must be null or a live handle from [`ijc_init`]; `object` must be null
+/// or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ijc_pushpull(
+    h: *mut AppHandle,
+    object: *const c_char,
+    px: f64,
+    py: f64,
+    pz: f64,
+    nx: f64,
+    ny: f64,
+    nz: f64,
+    distance: f64,
+    keep: bool,
+) -> bool {
+    guard_ffi(false, || {
+        let (point, normal) = (glam::DVec3::new(px, py, pz), glam::DVec3::new(nx, ny, nz));
+        if !point.is_finite() || !normal.is_finite() || !distance.is_finite() {
+            return false;
+        }
+        let Some(mut app) = (unsafe { handle_mut(h) }) else {
+            return false;
+        };
+        let Some(id) = (unsafe { c_str(object) }).and_then(|s| object_by_id(&app.session.doc, s))
+        else {
+            return false;
+        };
+        let cmd = Command::PushPull {
+            id: None,
+            target: Selector::Ids { ids: vec![id] },
+            point,
+            normal: (normal != glam::DVec3::ZERO).then_some(normal),
+            distance,
+            keep,
+        };
+        app.session.run(cmd).is_ok()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Gumball (full on-screen transform gizmo): live ghost preview + commit
 // ---------------------------------------------------------------------------
@@ -7883,6 +7934,29 @@ mod headless_tests {
             assert!(ijc_open_json(h, json.as_ptr(), json.len()));
             assert_eq!(count(h), 1);
 
+            ijc_free(h);
+        }
+    }
+
+    #[test]
+    fn pushpull_pulls_a_box_top_as_one_undo_step() {
+        let h = ijc_init_headless();
+        unsafe {
+            let r = take(ijc_run_command_result(h, c("box 0,0,0 2,2,3").as_ptr()));
+            let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+            let id = c(v["created"][0].as_str().unwrap());
+            let top = |h| {
+                let app = handle_ref(h).unwrap();
+                let o = app.session.doc.objects().next().unwrap();
+                o.geometry.mesh().unwrap().aabb().max.z
+            };
+            assert!(ijc_pushpull(h, id.as_ptr(), 1.0, 1.0, 3.0, 0.0, 0.0, 1.0, 2.0, false));
+            assert_eq!(top(h), 5.0);
+            assert!(!ijc_pushpull(h, id.as_ptr(), 9.0, 9.0, 9.0, 0.0, 0.0, 1.0, 2.0, false), "no face");
+            assert!(!ijc_pushpull(h, id.as_ptr(), 1.0, 1.0, 5.0, 0.0, 0.0, 1.0, f64::NAN, false));
+            assert!(!ijc_pushpull(std::ptr::null_mut(), id.as_ptr(), 1.0, 1.0, 5.0, 0.0, 0.0, 1.0, 1.0, false));
+            take(ijc_run_command_result(h, c("undo").as_ptr()));
+            assert_eq!(top(h), 3.0);
             ijc_free(h);
         }
     }

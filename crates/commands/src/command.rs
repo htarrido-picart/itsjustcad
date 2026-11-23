@@ -250,6 +250,24 @@ pub enum Command {
         profile: Selector,
         height: f64,
     },
+    /// Push/Pull a flat face along its normal (#370, SketchUp). `target` is
+    /// a solid, whose face is the one through `point` (facing `normal`), or a
+    /// closed flat curve, a region that becomes a solid (or, pushed into the
+    /// solid face it lies on, cuts it). Positive pulls out, negative pushes
+    /// in. `keep` keeps the old face's outline (SketchUp's Ctrl). `normal`
+    /// is filled at apply time and `id` names a solid made from a region,
+    /// so replay finds the same face and ids.
+    PushPull {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<ObjectId>,
+        target: Selector,
+        point: DVec3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        normal: Option<DVec3>,
+        distance: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep: bool,
+    },
     /// Revolve a closed profile curve about an axis (default: z axis through
     /// the origin, full circle). Partial angles are capped.
     Revolve {

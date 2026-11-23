@@ -151,9 +151,10 @@ pub enum MenuAction {
     Close,
 }
 
-/// Draw-tool verbs (mirror `draw_tool::try_start`). A menu pick of one of these
-/// starts the interactive picker rather than typing text.
-const DRAW_VERBS: [&str; 4] = ["line", "polyline", "rect", "circle"];
+/// Draw-tool verbs (mirror `draw_tool::try_start`, plus the Push/Pull tool,
+/// #370). A menu pick of one of these starts the interactive picker rather
+/// than typing text.
+const DRAW_VERBS: [&str; 5] = ["line", "polyline", "rect", "circle", "pushpull"];
 
 /// The keyboard shortcut shown next to a menu item, if it has one. This is the
 /// SINGLE source of truth for menu accelerators — both the in-window bar and the
@@ -1648,7 +1649,7 @@ mod tests {
 
     #[test]
     fn draw_verbs_start_the_draw_tool() {
-        for v in ["line", "polyline", "rect", "circle"] {
+        for v in ["line", "polyline", "rect", "circle", "pushpull"] {
             assert_eq!(menu_action(v), MenuAction::StartDraw(v.to_string()));
         }
     }

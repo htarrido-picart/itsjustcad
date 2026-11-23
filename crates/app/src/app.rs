@@ -6,6 +6,7 @@ mod cut_export;
 mod optimize_panel;
 mod geocode_ui;
 mod osmfetch_ui;
+mod pushpull_ui;
 
 use itsjustcad_commands::Session;
 use itsjustcad_commands::lot::hierarchy::LevelKind;
@@ -635,6 +636,8 @@ pub struct App {
     command_line: CommandLine,
     deck_pane: DeckPane,
     draw_tool: DrawTool,
+    /// The Push/Pull tool (#370), armed by a bare `pushpull`.
+    pushpull: crate::pushpull::PushPullTool,
     /// Rhino-style guided command engine (bare-verb step machine); shares the
     /// snap/ortho/smarttrack path with `draw_tool` and is mutually exclusive
     /// with it. See [`crate::guided`].
@@ -1597,6 +1600,7 @@ impl App {
             command_line,
             deck_pane: DeckPane::default(),
             draw_tool: DrawTool::default(),
+            pushpull: Default::default(),
             guided: GuidedTool::default(),
             guided_suppress_enter: false,
             gumball: Gumball::default(),
@@ -2711,7 +2715,16 @@ impl App {
                 self.pending_critique = Some(question);
             }
             _ => {
+                if self.pushpull.try_start(line) {
+                    self.draw_tool.cancel();
+                    self.guided.cancel();
+                    if let Some(prompt) = self.pushpull.prompt() {
+                        self.command_line.push_line(prompt);
+                    }
+                    return;
+                }
                 if self.draw_tool.try_start(line) {
+                    self.pushpull.cancel();
                     if let Some(prompt) = self.draw_tool.prompt() {
                         self.command_line.push_line(prompt);
                     }
@@ -2722,6 +2735,7 @@ impl App {
                 let selection = self.current_selection_selector();
                 match self.guided.try_start(line, selection.as_deref()) {
                     StartResult::Started => {
+                        self.pushpull.cancel();
                         // Fresh guided flow → reset the trim command-panel options.
                         self.trim_extend = false;
                         self.trim_apparent = true;
@@ -3743,6 +3757,7 @@ impl App {
         if modal
             || self.draw_tool.active()
             || self.guided.active()
+            || self.pushpull.active()
             || chat_composing
             || !self.command_line.is_empty()
             || other_text_field_focused
@@ -4291,7 +4306,12 @@ impl App {
             let busy = i.pointer.any_down() || i.smooth_scroll_delta != egui::Vec2::ZERO;
             (busy, i.modifiers.shift, i.modifiers.command)
         });
-        if blocked || busy || self.box_drag.is_some() || self.draw_tool.active() {
+        if blocked
+            || busy
+            || self.box_drag.is_some()
+            || self.draw_tool.active()
+            || self.pushpull.active()
+        {
             return false;
         }
         let guided = self.guided.active();
@@ -5022,7 +5042,7 @@ impl App {
         if self.maximized.is_some() {
             // Only one pane exists while maximized; everything targets it.
             self.active_pane = 0;
-        } else if (self.draw_tool.active() || self.guided.active())
+        } else if (self.draw_tool.active() || self.guided.active() || self.pushpull.active())
             && let Some(pos) = ui.ctx().pointer_latest_pos()
             && let Some(pane) = self.layout.pane_at(full, pos)
         {
@@ -5287,6 +5307,13 @@ impl App {
             if self.zoom_window.is_some() {
                 // Zoom window owns the left button: no pick, box select or
                 // draw step underneath (the tool stays armed).
+            } else if self.pushpull.active() {
+                if pane == self.active_pane {
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    }
+                    self.pushpull_input(ui, rect, &response, view_proj);
+                }
             } else if self.draw_tool.active() || self.guided.active() {
                 // Draw/osnap only in the active pane; one prompt, one ghost.
                 if pane == self.active_pane {
@@ -8293,10 +8320,15 @@ impl App {
         // While a guided flow OR a draw tool is running, the command line must NOT
         // hijack a bare Space/Enter to re-run the last verb — those keys belong to
         // the active flow (the viewport handler finishes the step/tool).
-        let flow_active = self.guided.active() || self.draw_tool.active();
+        let flow_active =
+            self.guided.active() || self.draw_tool.active() || self.pushpull.active();
         // Inline guided prompt → the input placeholder changes per step; the
         // TextEdit id is stable so focus is held across steps (LOCKED #5).
-        let prompt = self.guided.prompt().or_else(|| self.draw_tool.prompt());
+        let prompt = self
+            .guided
+            .prompt()
+            .or_else(|| self.draw_tool.prompt())
+            .or_else(|| self.pushpull.prompt());
         if let Some(line) = self.command_line.commands_segment_ui(
             ui,
             &object_names,
@@ -13067,7 +13099,9 @@ impl eframe::App for App {
                 mods,
                 keymap::KeyContext {
                     typing,
-                    draw_active: self.draw_tool.active() || self.guided.active(),
+                    draw_active: self.draw_tool.active()
+                        || self.guided.active()
+                        || self.pushpull.active(),
                     has_selection: !self.session.doc.selection.is_empty(),
                     last_command: self.last_line.as_deref(),
                 },
@@ -13176,6 +13210,7 @@ impl eframe::App for App {
         if !modal_open
             && !self.draw_tool.active()
             && !self.guided.active()
+            && !self.pushpull.active()
             && !self.viewport_interacted
             && ctx.memory(|m| m.focused()).is_none()
         {
@@ -14113,6 +14148,59 @@ mod tests {
             .filter(|l| l.as_str() != PLAINTEXT_CHAT_WARNING)
             .cloned()
             .collect()
+    }
+
+    /// Push/Pull (#370) end to end: arm, click a box top, type 2 + Enter,
+    /// then double-click it to repeat; each is one undo step.
+    #[test]
+    fn pushpull_tool_pulls_types_and_repeats() {
+        run_app_journey(|h| {
+            for line in ["box 0,0,0 4,4,3", "top", "ze"] {
+                h.state_mut().execute_line(line.into());
+                h.run_steps(2);
+            }
+            let top = |h: &egui_kittest::Harness<'_, App>| {
+                let o = h.state().session.doc.objects().next().unwrap();
+                o.geometry.mesh().unwrap().aabb().max.z
+            };
+            h.state_mut().execute_line("pushpull".into());
+            h.run_steps(1);
+            assert!(h.state().pushpull.active(), "bare `pushpull` armed the tool");
+            let at = world_to_screen(h, glam::DVec3::new(2.0, 2.0, 3.0));
+            click_at(h, at);
+            assert!(h.state().pushpull.drag().is_some(), "the click grabbed the top");
+            h.input_mut().events.push(egui::Event::Text("2".into()));
+            h.run_steps(1);
+            h.key_press(egui::Key::Enter);
+            h.run_steps(2);
+            assert!((top(h) - 5.0).abs() < 1e-9, "{}", top(h));
+            // Double-click: the last distance again.
+            // (One click per frame: a harness frame is a quarter second, and
+            // egui's double-click window is 0.3 s.)
+            h.input_mut().events.push(egui::Event::PointerMoved(at));
+            for _ in 0..2 {
+                for pressed in [true, false] {
+                    h.input_mut().events.push(egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+                h.run_steps(1);
+            }
+            h.run_steps(1);
+            assert!((top(h) - 7.0).abs() < 1e-9, "{} {:?}", top(h), transcript(h.state()));
+            assert!(h.state().pushpull.active(), "the tool stays armed");
+            h.state_mut().execute_line("undo".into());
+            h.run_steps(1);
+            assert!((top(h) - 5.0).abs() < 1e-9, "one undo step");
+            h.key_press(egui::Key::Escape);
+            h.run_steps(1);
+            h.key_press(egui::Key::Escape);
+            h.run_steps(1);
+            assert!(!h.state().pushpull.active(), "Esc disarms");
+        });
     }
 
     const MOUNTAIN_VIEW: &[u8] = br#"[{"lat":"37.4224857","lon":"-122.0855846","display_name":"Google Building 41, 1600, Amphitheatre Parkway, Mountain View, California, United States"}]"#;

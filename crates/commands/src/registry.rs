@@ -67,6 +67,12 @@ pub fn registry() -> &'static [CommandSpec] {
             category: Category::Solid,
         },
         CommandSpec {
+            name: "pushpull",
+            usage: "pushpull <selector> <point x,y,z> [normal x,y,z] <distance> [keep]",
+            summary: "Push/Pull the flat face of a solid through a point (facing normal) along its normal: positive pulls out, negative pushes in (through = hole). On a closed flat curve, makes it a solid (or cuts the solid face it lies on). keep keeps the old face's edges. Example: pushpull last 1,1,3 0,0,1 2",
+            category: Category::Solid,
+        },
+        CommandSpec {
             name: "revolve",
             usage: "revolve <selector> [axis point x,y,z] [axis dir x,y,z] [angle deg]",
             summary: "Revolve one closed profile curve into a solid (default: full circle about the z axis through the origin; partial angles are capped). Draw the profile beside the axis, e.g. in the xz plane with x,0,z points. Example: revolve last · revolve vase 0,0,0 0,0,1 270",

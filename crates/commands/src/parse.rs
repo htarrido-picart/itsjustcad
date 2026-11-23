@@ -59,6 +59,27 @@ fn parse_verbatim(input: &str) -> Result<Command, ParseError> {
                 height: number(height)?,
             })
         }
+        "pushpull" => {
+            // pushpull <selector> <point> [<normal>] <distance> [keep]
+            let usage = "a selector, a point on the face, an optional face normal, a distance and an optional `keep`";
+            let (keep, args) = match args.split_last() {
+                Some((&"keep", rest)) => (true, rest),
+                _ => (false, &args[..]),
+            };
+            let (sel, point_s, normal_s, dist) = match args {
+                [sel, p, d] => (*sel, *p, None, *d),
+                [sel, p, n, d] => (*sel, *p, Some(*n), *d),
+                _ => return wrong("pushpull", usage, args),
+            };
+            Ok(Command::PushPull {
+                id: None,
+                target: selector_one(sel)?,
+                point: point(point_s)?,
+                normal: normal_s.map(point).transpose()?,
+                distance: number(dist)?,
+                keep,
+            })
+        }
         "revolve" => {
             // Exactly one profile, so 'last' never takes a count: a bare
             // number after it is the angle, not an object count.
