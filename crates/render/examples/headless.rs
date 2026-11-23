@@ -85,6 +85,7 @@ fn main() {
             underlay: None,
             basemap: None,
             show_lineweights: false,
+            textured: Vec::new(),
         };
         renderer.set_scene(&device, &queue, &scene, 0);
         camera.target = glam::Vec3::new(0.5, 0.0, 2.5);
@@ -219,6 +220,7 @@ fn main() {
         samples: 1,
         show_grid: true,
         show_axes: true,
+        show_textures: true,
         edge_style: Default::default(),
         fog: Default::default(),
         ao: Default::default(),

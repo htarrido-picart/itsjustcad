@@ -102,7 +102,8 @@ impl CameraUniform {
     /// widen. The default style leaves the camera as it was.
     pub fn with_edge_style(mut self, style: &crate::EdgeStyle, ppp: f32) -> Self {
         let ppp = ppp.max(1.0);
-        self.edges = [0.0, 0.0, ppp, 0.0];
+        // edges.w is the textures flag (#360), set apart by `with_textures`.
+        self.edges = [0.0, 0.0, ppp, self.edges[3]];
         if style.depth_cue {
             if self.screen[2] <= 0.0 {
                 self.screen[2] = 1.0;
@@ -113,6 +114,18 @@ impl CameraUniform {
             self.edges[1] = 1.0;
         }
         self
+    }
+
+    /// The same camera with material textures shown or hidden (#360,
+    /// SketchUp's Shaded with Textures): off draws textured faces in their
+    /// image's average colour. Shown by default (`edges.w` = 0).
+    pub fn with_textures(mut self, on: bool) -> Self {
+        self.edges[3] = if on { 0.0 } else { 1.0 };
+        self
+    }
+
+    pub fn shows_textures(&self) -> bool {
+        self.edges[3] < 0.5
     }
 
     /// The same camera with the pane's fog (#363). `background` is the flat
@@ -706,6 +719,8 @@ pub struct SceneData {
     /// When true the renderer draws fat-line quads for lines with
     /// non-hairline weights; when false all strokes are 1-pixel hairlines.
     pub show_lineweights: bool,
+    /// Meshes with an image texture (#360), box-mapped.
+    pub textured: Vec<crate::TexturedMesh>,
 }
 
 /// The scene's render pipelines. All share one colour format and one MSAA
@@ -751,6 +766,10 @@ struct Pipelines {
     /// per-face-coloured meshes (whose colour attribute it ignores).
     cap_pipeline: wgpu::RenderPipeline,
     cap_face_pipeline: wgpu::RenderPipeline,
+    /// The two mesh fills for textured meshes (#360): the vertex carries its
+    /// uv, `@group(2)` the image.
+    tex_pipeline: wgpu::RenderPipeline,
+    tex_xray_pipeline: wgpu::RenderPipeline,
 }
 
 impl Pipelines {
@@ -761,6 +780,7 @@ impl Pipelines {
         camera_layout: &wgpu::BindGroupLayout,
         object_layout: &wgpu::BindGroupLayout,
         underlay_layout: &wgpu::BindGroupLayout,
+        texture_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let ms = wgpu::MultisampleState { count: samples, ..Default::default() };
         let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -815,53 +835,23 @@ impl Pipelines {
             bind_group_layouts: &[Some(camera_layout), Some(object_layout)],
             immediate_size: 0,
         });
+        let tex_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tex_pl"),
+            bind_group_layouts: &[Some(camera_layout), Some(object_layout), Some(texture_layout)],
+            immediate_size: 0,
+        });
         // Mesh fills. The xray variant has no depth writes and no culling:
         // transparent modes must not occlude, and back faces keep x-ray solids
-        // readable. The face variant reads a per-vertex face colour (#327).
-        let mesh_fill = |label: &str, xray: bool, face: bool| {
-            let plain = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-            let colored = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&mesh_layout),
-                vertex: wgpu::VertexState {
-                    module: &mesh_shader,
-                    entry_point: Some(if face { "vs_face" } else { "vs_main" }),
-                    compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        // 3 f32 position + 3 f32 normal (+ 3 f32 face rgb)
-                        array_stride: if face { 36 } else { 24 },
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: if face { &colored } else { &plain },
-                    }],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &mesh_shader,
-                    entry_point: Some(if face { "fs_face" } else { "fs_main" }),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: if xray {
-                    wgpu::PrimitiveState::default()
-                } else {
-                    wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() }
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(!xray),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: ms,
-                multiview_mask: None,
-                cache: None,
-            })
+        // readable. The face variant reads a per-vertex face colour (#327),
+        // the textured one (#360) a per-vertex uv in the same slot.
+        let fill = |layout, label: &str, xray: bool, entry: &str| {
+            Self::fill(device, layout, &mesh_shader, target_format, ms, label, xray, entry)
         };
+        let mesh_fill = |label: &str, xray: bool, face: bool| {
+            fill(&mesh_layout, label, xray, if face { "face" } else { "main" })
+        };
+        let tex_pipeline = fill(&tex_layout, "tex_pipeline", false, "tex");
+        let tex_xray_pipeline = fill(&tex_layout, "tex_xray_pipeline", true, "tex");
         let mesh_pipeline = mesh_fill("mesh_pipeline", false, false);
         let mesh_xray_pipeline = mesh_fill("mesh_xray_pipeline", true, false);
         let face_pipeline = mesh_fill("face_pipeline", false, true);
@@ -1288,7 +1278,69 @@ impl Pipelines {
             underlay_pipeline,
             cap_pipeline,
             cap_face_pipeline,
+            tex_pipeline,
+            tex_xray_pipeline,
         }
+    }
+
+    /// One mesh fill pipeline over `vs_<entry>` / `fs_<entry>`: `main` reads
+    /// position + normal, `face` and `tex` a third vec3 per vertex.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        target_format: wgpu::TextureFormat,
+        ms: wgpu::MultisampleState,
+        label: &str,
+        xray: bool,
+        entry: &str,
+    ) -> wgpu::RenderPipeline {
+        let plain = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+        let extra = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
+        let wide = entry != "main";
+        let vs = format!("vs_{entry}");
+        let fs = format!("fs_{entry}");
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some(&vs),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    // 3 f32 position + 3 f32 normal (+ 3 f32 face rgb or uv)
+                    array_stride: if wide { 36 } else { 24 },
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: if wide { &extra } else { &plain },
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(&fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: if xray {
+                wgpu::PrimitiveState::default()
+            } else {
+                wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() }
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(!xray),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: ms,
+            multiview_mask: None,
+            cache: None,
+        })
     }
 }
 
@@ -1338,6 +1390,12 @@ pub struct SceneRenderer {
     pub(crate) meshes: Batch,
     /// Per-face-coloured meshes, 9 floats per vertex (#327).
     pub(crate) face_meshes: Batch,
+    /// Textured meshes, 9 floats per vertex (#360), and the image of each
+    /// draw.
+    pub(crate) tex_meshes: Batch,
+    tex_images: Vec<itsjustcad_doc::ImageId>,
+    /// One GPU texture per image the scene uses (#360).
+    textures: crate::texture::TextureCache,
     lines: Batch,
     edges: Batch,
     /// Profile / silhouette edges tessellated into fat-line ribbon meshes so
@@ -1445,6 +1503,7 @@ impl SceneRenderer {
                 },
             ],
         });
+        let textures = crate::texture::TextureCache::new(device);
         let pipes = Pipelines::new(
             device,
             target_format,
@@ -1452,6 +1511,7 @@ impl SceneRenderer {
             &camera_layout,
             &object_layout,
             &underlay_layout,
+            textures.layout(),
         );
 
         let mut axis_lines = Batch::new("axis");
@@ -1498,6 +1558,9 @@ impl SceneRenderer {
             underlay_layout,
             meshes: Batch::new("meshes"),
             face_meshes: Batch::new("face_meshes"),
+            tex_meshes: Batch::new("tex_meshes"),
+            tex_images: Vec::new(),
+            textures,
             lines: Batch::new("curves"),
             edges: Batch::new("edges"),
             profile_ribbons: Batch::new("profile_ribbons"),
@@ -1537,6 +1600,7 @@ impl SceneRenderer {
             &self.camera_layout,
             &self.object_layout,
             &self.underlay_layout,
+            self.textures.layout(),
         );
         self.sample_count = samples;
         self.msaa.clear();
@@ -1631,13 +1695,30 @@ impl SceneRenderer {
         scene: &SceneData,
         generation: u64,
     ) {
-        self.meshes.set(device, queue, stage_meshes(&scene.meshes));
+        let mut flat = stage_meshes(&scene.meshes);
         let mut faces = Staged::default();
         for (mesh, rgb, color, rm) in &scene.face_meshes {
             let params = ObjectParams::surface(*color, [rm[0], rm[1], 0.0, 0.0]);
             faces.push_face_mesh(&mesh.positions, &mesh.normals, rgb, &mesh.indices, params);
         }
         self.face_meshes.set(device, queue, faces);
+        // Textured meshes (#360): one GPU texture per image; a mesh whose
+        // image failed to decode draws flat in its average colour.
+        self.textures.sync(device, queue, &scene.textured);
+        let mut tex = Staged::default();
+        self.tex_images.clear();
+        for t in &scene.textured {
+            let params = ObjectParams::surface(t.color, [t.material[0], t.material[1], 0.0, 0.0]);
+            let m = &t.mesh;
+            if self.textures.get(&t.image).is_some() {
+                tex.push_textured(&m.positions, &m.normals, &t.uvs, &m.indices, params);
+                self.tex_images.push(t.image);
+            } else {
+                flat.push_mesh(&m.positions, &m.normals, &m.indices, params);
+            }
+        }
+        self.meshes.set(device, queue, flat);
+        self.tex_meshes.set(device, queue, tex);
 
         // Curves: strips for the hairline pass, plus LineList copies of the
         // same strips for the fat-stroke pass.
@@ -1710,7 +1791,8 @@ impl SceneRenderer {
                 .meshes
                 .iter()
                 .flat_map(|m| m.0.positions.iter())
-                .chain(scene.face_meshes.iter().flat_map(|m| m.0.positions.iter())),
+                .chain(scene.face_meshes.iter().flat_map(|m| m.0.positions.iter()))
+                .chain(scene.textured.iter().flat_map(|m| m.mesh.positions.iter())),
         );
         let bounds = scene_bounds(scene);
         if bounds != self.scene_bounds {
@@ -1744,6 +1826,7 @@ impl SceneRenderer {
         let Self {
             meshes,
             face_meshes,
+            tex_meshes,
             edges,
             profile_ribbons,
             curve_segments,
@@ -1765,13 +1848,14 @@ impl SceneRenderer {
             &*face_meshes,
             &*dash_lines,
             &*dash_edges,
+            &*tex_meshes,
         ]
         .into_iter()
             .flat_map(|b| b.params.iter());
         scene_params.write(device, queue, object_layout, params);
     }
 
-    fn scene_batches_mut(&mut self) -> [&mut Batch; 9] {
+    fn scene_batches_mut(&mut self) -> [&mut Batch; 10] {
         [
             &mut self.meshes,
             &mut self.edges,
@@ -1782,6 +1866,7 @@ impl SceneRenderer {
             &mut self.face_meshes,
             &mut self.dash_lines,
             &mut self.dash_edges,
+            &mut self.tex_meshes,
         ]
     }
 
@@ -1941,6 +2026,14 @@ impl SceneRenderer {
                 });
                 draw_indexed(render_pass, &self.face_meshes, scene);
             }
+            if !self.tex_meshes.draws.is_empty() {
+                render_pass.set_pipeline(if mode.depth_writes() {
+                    &self.pipes.tex_pipeline
+                } else {
+                    &self.pipes.tex_xray_pipeline
+                });
+                self.draw_textured(render_pass);
+            }
         }
 
         // Shaded draws edges by default but can be turned off; other modes
@@ -2007,6 +2100,11 @@ impl SceneRenderer {
                 render_pass.set_pipeline(&self.pipes.cap_face_pipeline);
                 draw_indexed(render_pass, &self.face_meshes, scene);
             }
+            // Textured meshes share the face layout; the cap ignores the uv.
+            if !self.tex_meshes.draws.is_empty() {
+                render_pass.set_pipeline(&self.pipes.cap_face_pipeline);
+                draw_indexed(render_pass, &self.tex_meshes, scene);
+            }
         }
 
         // Back edges (#361): after every occluder, before the grid, only in
@@ -2044,6 +2142,31 @@ impl SceneRenderer {
         }
     }
 
+    /// Draw the textured meshes, each with its image at `@group(2)` (#360).
+    fn draw_textured(&self, pass: &mut wgpu::RenderPass<'static>) {
+        let batch = &self.tex_meshes;
+        let params = &self.scene_params;
+        let (Some(vb), Some(ib), Some(bg)) = (batch.vertex_slice(), batch.index_slice(), params.bind_group())
+        else {
+            return;
+        };
+        pass.set_vertex_buffer(0, vb);
+        pass.set_index_buffer(ib, wgpu::IndexFormat::Uint32);
+        for (d, image) in batch.draws.iter().zip(&self.tex_images) {
+            let Some(tex) = self.textures.get(image) else {
+                continue;
+            };
+            pass.set_bind_group(1, bg, &[params.offset(batch.slot_base + d.slot)]);
+            pass.set_bind_group(2, tex, &[]);
+            pass.draw_indexed(d.range(), d.base_vertex, 0..1);
+        }
+    }
+
+    /// GPU textures currently held (#360): one per image the scene uses.
+    pub fn texture_count(&self) -> usize {
+        self.textures.len()
+    }
+
     /// Draw a dashed batch as hairlines, or as fat strokes when the pane's
     /// camera asks for them (#364).
     fn draw_dashed(&self, pass: &mut wgpu::RenderPass<'static>, batch: &Batch, fat: bool) {
@@ -2068,6 +2191,7 @@ fn scene_bounds(scene: &SceneData) -> Option<(glam::Vec3, glam::Vec3)> {
             .iter()
             .flat_map(|m| m.0.positions.iter())
             .chain(scene.face_meshes.iter().flat_map(|m| m.0.positions.iter()))
+            .chain(scene.textured.iter().flat_map(|m| m.mesh.positions.iter()))
             .chain(scene.edges.iter().flat_map(|e| e.0.iter()))
             .chain(scene.lines.iter().flat_map(|l| l.0.iter()))
             .chain(scene.points.iter().flat_map(|p| p.0.iter())),

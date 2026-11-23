@@ -50,6 +50,9 @@ pub struct ViewportCallback {
     pub show_grid: bool,
     /// World X/Y/Z axes shown (`axes on|off`, #364).
     pub show_axes: bool,
+    /// Material textures shown (`textures on|off`, #360); off draws
+    /// textured faces in their image's average colour.
+    pub show_textures: bool,
     /// Edge style (#361); only its GPU side (back edges, depth cue) is read
     /// here, the rest shaped `scene`.
     pub edge_style: crate::EdgeStyle,
@@ -116,6 +119,7 @@ impl CallbackTrait for ViewportCallback {
         }
         .with_overlays(self.show_grid, self.show_axes)
         .with_edge_style(&self.edge_style, screen_desc.pixels_per_point)
+        .with_textures(self.show_textures)
         .with_fog(&self.fog, self.background)
         .with_ao(&self.ao, self.mode)
         .with_shadows(&self.shadows, self.mode, self.sun_dir)

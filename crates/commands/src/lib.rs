@@ -49,6 +49,7 @@ pub mod subdiv_params;
 pub mod svg;
 mod segments;
 pub mod textoutline;
+pub mod texture;
 pub mod trace;
 pub mod workdir;
 

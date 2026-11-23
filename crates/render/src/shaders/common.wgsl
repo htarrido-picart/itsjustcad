@@ -19,7 +19,8 @@ struct Camera {
     // w = device px per logical px, scaling the dash patterns (0 reads as 1).
     screen: vec4<f32>,
     // Edge styles (#361): x = depth-cue width of the nearest strokes (device
-    // px, 0 = off), y = 1 draws back edges, z = device px per logical px.
+    // px, 0 = off), y = 1 draws back edges, z = device px per logical px,
+    // w = 1 hides material textures (`textures off`, #360).
     edges: vec4<f32>,
     // Depth ramp (depth cue and fog): dot(p, xyz) + w is 0 at the nearest
     // scene point, 1 at the farthest.

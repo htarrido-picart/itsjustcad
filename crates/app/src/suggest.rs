@@ -57,6 +57,7 @@ pub const APP_VERBS: &[&str] = &[
     "parallel",
     "grid",
     "axes",
+    "textures",
     "backedges",
     "depthcue",
     "edgecolor",

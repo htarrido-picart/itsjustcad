@@ -389,6 +389,7 @@ pub fn snapshot_in_context(
         // its already-decoded pixels to the scene, same as the underlay.
         basemap: None,
         show_lineweights: doc.show_lineweights,
+        textured: Vec::new(),
     };
     // Subdivision source outlines are collected here and appended to
     // `scene.lines` AFTER the main loop, so the live/frozen cue draws on TOP of
@@ -430,6 +431,7 @@ pub fn snapshot_in_context(
             scene.points.len(),
             deferred_source_lines.len(),
             scene.face_meshes.len(),
+            scene.textured.len(),
         );
         match &obj.geometry {
             // Strut-lattice parametric generators (spaceframe/geodesic/
@@ -470,9 +472,28 @@ pub fn snapshot_in_context(
                 // a by-type/random colour mode asks for one colour per object.
                 let per_face = !selected
                     && matches!(mode, ColorMode::ByLayer | ColorMode::ByObject);
-                match obj.face_colors().filter(|_| per_face) {
-                    Some(rgb) => scene.face_meshes.push((mesh.to_render(), rgb, color, rm)),
-                    None => scene.meshes.push((mesh.to_render(), color, rm)),
+                // An image texture (#360) the same way; a missing image draws
+                // flat in the material's average colour.
+                let texture = obj
+                    .material
+                    .and_then(|m| m.texture())
+                    .filter(|_| per_face)
+                    .and_then(|(id, size)| doc.images.get(&id).map(|img| (id, size, img)));
+                match (obj.face_colors().filter(|_| per_face), texture) {
+                    (Some(rgb), _) => scene.face_meshes.push((mesh.to_render(), rgb, color, rm)),
+                    (None, Some((image, size, pixels))) => {
+                        let mesh = mesh.to_render();
+                        let uvs = crate::texture::box_uvs(&mesh, size);
+                        scene.textured.push(crate::TexturedMesh {
+                            mesh,
+                            uvs,
+                            color,
+                            material: rm,
+                            image,
+                            pixels: pixels.clone(),
+                        });
+                    }
+                    (None, None) => scene.meshes.push((mesh.to_render(), color, rm)),
                 }
                 // Feature edges for the wireframe/x-ray/ghosted display modes.
                 let edge_color = if selected { theme.selected() } else { theme.curve() };
@@ -768,6 +789,9 @@ pub fn snapshot_in_context(
             mark(&mut deferred_types, before.5, deferred_source_lines.len(), lt);
         }
         if fade {
+            // Context fade draws a textured mesh flat, in its faded colour.
+            let flat: Vec<_> = scene.textured.drain(before.7..).collect();
+            scene.meshes.extend(flat.into_iter().map(|t| (t.mesh, t.color, t.material)));
             let f = |c: &mut [f32; 4]| *c = fade_color(*c, theme);
             scene.meshes[before.0..]
                 .iter_mut()
@@ -932,6 +956,41 @@ mod tests {
         let id = obj.id;
         doc.insert(obj);
         id
+    }
+
+    #[test]
+    fn textured_material_goes_to_the_textured_list_with_box_uvs() {
+        // #360: a stored texture draws textured; selection, a by-type colour
+        // mode, the context fade and a missing image draw it flat.
+        let mut doc = Document::default();
+        let id = insert_tri(&mut doc, itsjustcad_doc::DEFAULT_LAYER);
+        let img = itsjustcad_doc::StoredImage { width: 1, height: 1, bytes: std::sync::Arc::from(&b"px"[..]) };
+        let material = itsjustcad_doc::ObjectMaterial::Texture {
+            image: img.id(),
+            size: [0.5, 0.5],
+            color: [0.2, 0.3, 0.4],
+            roughness: 0.6,
+            metallic: 0.0,
+        };
+        doc.get_mut(id).unwrap().material = Some(material);
+        let flat = snapshot(&doc, Theme::Dark);
+        assert!(flat.textured.is_empty(), "image not stored: flat");
+        assert_eq!(flat.meshes[0].1, [0.2, 0.3, 0.4, 1.0]);
+
+        doc.images.insert(img.id(), img.clone());
+        let s = snapshot(&doc, Theme::Dark);
+        assert!(s.meshes.is_empty());
+        let t = &s.textured[0];
+        assert_eq!((t.image, t.color, t.material), (img.id(), [0.2, 0.3, 0.4, 1.0], [0.6, 0.0]));
+        assert_eq!(t.uvs, vec![[0.0, 0.0], [2.0, 0.0], [0.0, -2.0]]);
+
+        let by_type = ColorModeSnapshot { color_mode: ColorMode::ByType, ..Default::default() };
+        assert!(snapshot_with_mode(&doc, Theme::Dark, by_type).textured.is_empty());
+        let none = std::collections::HashSet::new();
+        let faded = snapshot_in_context(&doc, Theme::Dark, ColorModeSnapshot::default(), &none, Some(&none));
+        assert!(faded.textured.is_empty() && faded.meshes.len() == 1, "faded: flat");
+        doc.selection.insert(id);
+        assert!(snapshot(&doc, Theme::Dark).textured.is_empty(), "selected: flat");
     }
 
     /// An L-shaped polyline (along X, then Y) on the default layer.

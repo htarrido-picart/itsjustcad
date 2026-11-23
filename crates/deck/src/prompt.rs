@@ -46,9 +46,10 @@ Display mode (how solids are drawn):
 Lighting:
   light working|sun|presentation                lighting model (alias: lightmode)                        e.g. light sun
 
-Grid & axes:
+Grid, axes & textures:
   grid on|off                                   show/hide the ground grid lines (not the grid snap)      e.g. grid off
   axes on|off                                   show/hide the red/green/blue world axes                  e.g. axes off
+  textures on|off                               show material textures or their flat colour              e.g. textures off
 
 Feature edges:
   meshedges on|off                              show/hide the default shaded feature edges (alias:       e.g. meshedges off

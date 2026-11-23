@@ -234,6 +234,7 @@ impl NativeMenuBar {
         for (id, on) in [
             ("View/grid", view.show_grid),
             ("View/axes", view.show_axes),
+            ("View/textures", view.show_textures),
             ("View/back_edges", e.back_edges),
             ("View/depth_cue", e.depth_cue),
             ("View/edge_extension", e.extension),

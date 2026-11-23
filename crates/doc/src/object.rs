@@ -1020,6 +1020,11 @@ impl MaterialPreset {
 pub enum ObjectMaterial {
     Preset { preset: MaterialPreset },
     Custom { color: [f32; 3], roughness: f32, metallic: f32 },
+    /// An image texture (#360) from `Document::images`, tiled every `size`
+    /// metres (u, v) by box mapping. `color` is the image's average colour:
+    /// the flat fill when textures are off and the ray tracer's base colour.
+    /// Room for PBR maps later: add optional fields with serde defaults.
+    Texture { image: crate::ImageId, size: [f32; 2], color: [f32; 3], roughness: f32, metallic: f32 },
 }
 
 impl ObjectMaterial {
@@ -1027,7 +1032,16 @@ impl ObjectMaterial {
     pub fn pbr(&self) -> ([f32; 3], f32, f32) {
         match self {
             ObjectMaterial::Preset { preset } => preset.pbr(),
-            ObjectMaterial::Custom { color, roughness, metallic } => (*color, *roughness, *metallic),
+            ObjectMaterial::Custom { color, roughness, metallic }
+            | ObjectMaterial::Texture { color, roughness, metallic, .. } => (*color, *roughness, *metallic),
+        }
+    }
+
+    /// The texture image and tile size (metres), when this is a texture.
+    pub fn texture(&self) -> Option<(crate::ImageId, [f32; 2])> {
+        match self {
+            ObjectMaterial::Texture { image, size, .. } => Some((*image, *size)),
+            _ => None,
         }
     }
 

@@ -213,6 +213,12 @@ enum Inverse {
     ObjectColor(Vec<(ObjectId, Option<[f32; 3]>)>),
     /// `material2`/`material2off`: restore each object's previous material.
     ObjectMaterial(Vec<(ObjectId, Option<itsjustcad_doc::ObjectMaterial>)>),
+    /// `material2` (#360): restore each object's previous material and drop
+    /// the image the op added to the store, if any.
+    TextureMaterial {
+        prev: Vec<(ObjectId, Option<itsjustcad_doc::ObjectMaterial>)>,
+        added: Option<itsjustcad_doc::ImageId>,
+    },
     /// `units`: restore the previous display unit.
     Units { prev: Units },
     /// `underlay`/`underlayopacity`/`underlayoff`: restore the previous underlay.
@@ -953,6 +959,7 @@ impl Session {
             Command::Amend { step, with } => self.amend(step, *with),
             Command::Option(op) => self.option(op),
             Command::Import { path } => self.import(path),
+            Command::Material2Texture { targets, path, size } => self.material2_texture(targets, path, size),
             Command::Geocode { query, pick } => self.geocode(&query, pick),
             Command::Trace { target, tol, layer } => self.trace(target, tol, layer),
             Command::Terrain { path } => self.terrain(path),
@@ -1386,6 +1393,17 @@ impl Session {
                     if let Some(obj) = self.doc.get_mut(id) {
                         obj.material = material;
                     }
+                }
+                self.doc.generation += 1;
+            }
+            Inverse::TextureMaterial { prev, added } => {
+                for (id, material) in prev.clone() {
+                    if let Some(obj) = self.doc.get_mut(id) {
+                        obj.material = material;
+                    }
+                }
+                if let Some(id) = added {
+                    self.doc.images.remove(id);
                 }
                 self.doc.generation += 1;
             }
@@ -1988,6 +2006,41 @@ impl Session {
                 "unknown import extension '.{other}' (supported: .dwg, .dxf, .obj, .stl, .gltf, .glb, .dae, .3dm, .step, .stp, .ifc, .epw, .geojson, .las, .laz, .e57)"
             ))),
         }
+    }
+
+    /// `material2 <sel> texture <file> [size w h]` (#360): read and prepare
+    /// the image, then run the logged `Material2` that stores it (only when
+    /// the store lacks it) and textures the targets.
+    fn material2_texture(&mut self, targets: Selector, path: String, size: [f32; 2]) -> Result<ApplyOutcome, ExecError> {
+        if !(size[0] > 0.0 && size[1] > 0.0 && size[0].is_finite() && size[1].is_finite()) {
+            return Err(ExecError::Invalid("material2 texture: size must be positive (metres)".into()));
+        }
+        let path = if !std::path::Path::new(&path).is_file() && crate::workdir::get().is_some() {
+            crate::workdir::resolve_within(&path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(ExecError::Invalid)?
+        } else {
+            path
+        };
+        let bytes = read_import_bytes(&path)?;
+        let prep = crate::texture::prepare(&bytes).map_err(|e| ExecError::Invalid(format!("'{path}': {e}")))?;
+        let id = prep.image.id();
+        let material = itsjustcad_doc::ObjectMaterial::Texture {
+            image: id,
+            size,
+            color: prep.average,
+            roughness: 0.6,
+            metallic: 0.0,
+        };
+        let image = (!self.doc.images.contains_key(&id)).then_some(prep.image);
+        let mut out = self.run(Command::Material2 { targets, material, image })?;
+        if let Some((w, h)) = prep.scaled_from {
+            out.message.push_str(&format!(
+                " (scaled from {w}×{h} to {} px max)",
+                itsjustcad_doc::MAX_IMAGE_PX
+            ));
+        }
+        Ok(out)
     }
 
     /// Import a file into an ISOLATED scratch session and harvest its geometry as
@@ -14669,8 +14722,24 @@ fn apply_forward(
                 },
             ))
         }
-        Command::Material2 { targets, material } => {
+        Command::Material2 { targets, material, image } => {
+            // A texture (#360) needs its image: in the op, or already stored.
+            let added = match (material.texture(), &image) {
+                (Some((id, _)), Some(img)) => {
+                    if img.id() != id {
+                        return Err(ExecError::Invalid(format!("material2: image bytes do not match id {id}")));
+                    }
+                    (!doc.images.contains_key(&id)).then_some(id)
+                }
+                (Some((id, _)), None) if !doc.images.contains_key(&id) => {
+                    return Err(ExecError::Invalid(format!("material2: no stored image {id}")));
+                }
+                _ => None,
+            };
             let ids = resolve(doc, &targets)?;
+            if let (Some(id), Some(img)) = (added, &image) {
+                doc.images.insert(id, img.clone());
+            }
             let mut prev = Vec::with_capacity(ids.len());
             for id in &ids {
                 let obj = doc.get_mut(*id).expect("resolved");
@@ -14684,10 +14753,13 @@ fn apply_forward(
                 itsjustcad_doc::ObjectMaterial::Custom { .. } => {
                     format!("custom (rough {rough:.2}, metal {metal:.2})")
                 }
+                itsjustcad_doc::ObjectMaterial::Texture { image, size, .. } => {
+                    format!("texture {image} ({} × {} m tile)", size[0], size[1])
+                }
             };
             Ok((
-                Command::Material2 { targets, material },
-                Inverse::ObjectMaterial(prev),
+                Command::Material2 { targets, material, image },
+                Inverse::TextureMaterial { prev, added },
                 ApplyOutcome {
                     created: Vec::new(),
                     message: format!("material2 {label} on {} object(s)", ids.len()),
@@ -17866,6 +17938,7 @@ fn apply_forward(
         | Command::Amend { .. }
         | Command::Option(..)
         | Command::Import { .. }
+        | Command::Material2Texture { .. }
         | Command::Geocode { .. }
         | Command::Terrain { .. }
         | Command::OsmFile { .. }
@@ -18061,6 +18134,7 @@ fn describe(cmd: &Command) -> &'static str {
         Command::Export { .. } => "export",
         Command::ControlImages { .. } => "controlimages",
         Command::Import { .. } => "import",
+        Command::Material2Texture { .. } => "material2",
         Command::Terrain { .. } => "terrain",
         Command::OsmFile { .. } => "osmfile",
         Command::OsmFetch { .. } => "osmfetch",
@@ -26157,6 +26231,110 @@ mod tests {
         let json = crate::io::to_json(&s);
         let loaded = crate::io::from_json(&json).unwrap();
         assert_eq!(crate::io::to_json(&loaded), json, "replay-stable json");
+    }
+
+    /// A 4×4 checker PNG written to a fresh temp dir (#360).
+    fn checker_png(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ijc_tex_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("checker.png");
+        let img = image::RgbImage::from_fn(4, 4, |x, y| {
+            if (x + y) % 2 == 0 { image::Rgb([255, 255, 255]) } else { image::Rgb([0, 0, 0]) }
+        });
+        img.save(&path).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn material2_texture_saves_reopens_and_replays_identically() {
+        let (dir, png) = checker_png("save");
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        run(&mut s, &format!("material2 last texture {} size 0.5 0.5", png.display()));
+        run(&mut s, "box 3,0,0 4,4,4");
+        // The same picture again: stored once, the second op carries no bytes.
+        run(&mut s, &format!("material2 last texture {}", png.display()));
+        assert_eq!(s.doc.images.len(), 1);
+        let (id, img) = s.doc.images.iter().next().map(|(k, v)| (*k, v.clone())).unwrap();
+        assert_eq!((img.width, img.height), (4, 4));
+        let mat = s.doc.objects().next().unwrap().material.unwrap();
+        assert_eq!(mat.texture(), Some((id, [0.5, 0.5])));
+        // Mid grey on average (half white, half black, in linear light).
+        let ([r, g, b], _, _) = mat.pbr();
+        assert!((r - 0.5).abs() < 0.02 && r == g && g == b, "{r} {g} {b}");
+
+        let json = crate::io::to_json(&s);
+        assert_eq!(json.matches("\"bytes\"").count(), 1, "bytes stored once");
+        // Offline: the source file is gone, the document still opens.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let path = std::env::temp_dir().join(format!("ijc_tex_doc_{}.ijc", std::process::id()));
+        crate::io::save_file(&s, &path).unwrap();
+        let loaded = crate::io::load_file(&path).unwrap();
+        assert_eq!(loaded.doc.images, s.doc.images);
+        assert_eq!(loaded.doc.objects().map(|o| o.material).collect::<Vec<_>>(),
+            s.doc.objects().map(|o| o.material).collect::<Vec<_>>());
+        assert_eq!(crate::io::to_json(&loaded), json, "replay-stable json");
+        let full = crate::io::from_json(&json).unwrap();
+        assert_eq!(full.doc, loaded.doc, "checkpoint open equals full replay");
+        let _ = std::fs::remove_file(&path);
+        let mut cp = path.into_os_string();
+        cp.push(".checkpoint");
+        let _ = std::fs::remove_file(cp);
+    }
+
+    #[test]
+    fn material2_texture_undo_drops_the_image_and_redo_restores_it() {
+        let (dir, png) = checker_png("undo");
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        run(&mut s, "material2 last glass");
+        run(&mut s, &format!("material2 last texture {}", png.display()));
+        assert_eq!(s.doc.images.len(), 1);
+        run(&mut s, "undo");
+        assert!(s.doc.images.is_empty());
+        assert!(matches!(
+            s.doc.objects().next().unwrap().material,
+            Some(itsjustcad_doc::ObjectMaterial::Preset { .. })
+        ));
+        run(&mut s, "redo");
+        assert_eq!(s.doc.images.len(), 1);
+        assert!(s.doc.objects().next().unwrap().material.unwrap().texture().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn material2_texture_errors_are_clean() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        let err = s.run(parse("material2 last texture /nonexistent/ijc/x.png").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("cannot read"), "{err}");
+        // A logged op naming an image the store lacks is refused.
+        let material = itsjustcad_doc::ObjectMaterial::Texture {
+            image: itsjustcad_doc::ImageId(7),
+            size: [1.0, 1.0],
+            color: [0.5; 3],
+            roughness: 0.5,
+            metallic: 0.0,
+        };
+        let err = s
+            .run(Command::Material2 { targets: Selector::Last { n: 1 }, material, image: None })
+            .unwrap_err();
+        assert!(err.to_string().contains("no stored image"), "{err}");
+        assert!(parse("material2 last texture").is_err());
+        assert!(parse("material2 last texture a.png size 0 1").is_err());
+        assert!(matches!(
+            parse("material2 last texture my brick.png size 2 1").unwrap(),
+            Command::Material2Texture { path, size: [2.0, 1.0], .. } if path == "my brick.png"
+        ));
+    }
+
+    #[test]
+    fn files_without_textures_save_no_image_store() {
+        let mut s = Session::default();
+        run(&mut s, "box 0,0,0 2,2,2");
+        run(&mut s, "material2 last metal");
+        assert!(!crate::io::to_json(&s).contains("\"image\""));
+        assert!(!serde_json::to_string(&s.doc).unwrap().contains("\"images\""));
     }
 
     #[test]

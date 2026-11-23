@@ -176,7 +176,7 @@ Inputs are consumed; one result mesh replaces them.
 | `color` | `color <selector> <r,g,b \| off>` — per-object colour |
 | `lineweight` | `lineweight <selector> <mm \| iso-name \| off>` — per-object print lineweight |
 | `showweights` | `showweights <on\|off>` — draw real lineweights in the viewport |
-| `material2` | `material2 <selector> <concrete\|glass\|metal\|wood \| roughness=.. metallic=.. color=r,g,b \| off>` — render appearance material (distinct from structural `material`) |
+| `material2` | `material2 <selector> <concrete\|glass\|metal\|wood \| roughness=.. metallic=.. color=r,g,b \| texture <file.png\|jpg> [size <w> <h>] \| off>` — render appearance material (distinct from structural `material`); a texture is box-mapped, one tile every w × h m, and saved in the file |
 | `units` | `units <m \| cm \| mm \| ft \| in \| ftin>` |
 | `block` | `block <selector> <name>` — define a reusable block |
 | `insert` | `insert <name> <pos> [rotation deg] [scale] [param=value …]` |

@@ -14,7 +14,8 @@ wgpu.workspace = true
 glam.workspace = true
 serde.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+# jpeg: material textures (#360) are stored as imported, PNG or JPEG.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
 serde_json.workspace = true

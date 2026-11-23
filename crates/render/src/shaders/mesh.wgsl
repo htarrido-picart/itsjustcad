@@ -79,6 +79,40 @@ fn fs_face(in: VsFaceOut) -> @location(0) vec4<f32> {
     return fogged(occluded(shade_fill(in.normal, in.world, in.color), in.world), in.world);
 }
 
+// Textured meshes (#360): the vertex carries its box-mapped uv (xy of the
+// third attribute); the image at group 2 replaces `object.color.rgb`, lit
+// like any fill. `textures off` (camera.edges.w = 1) keeps the object colour,
+// the image's average. Sampled before the cut's discard, in uniform flow.
+@group(2) @binding(0) var material_tex: texture_2d<f32>;
+@group(2) @binding(1) var material_smp: sampler;
+
+struct VsTexOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    @location(1) world: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_tex(in: VsFaceIn) -> VsTexOut {
+    var out: VsTexOut;
+    out.clip = camera.view_proj * vec4(in.position, 1.0);
+    out.normal = in.normal;
+    out.world = in.position;
+    out.uv = in.color.xy;
+    return out;
+}
+
+@fragment
+fn fs_tex(in: VsTexOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(material_tex, material_smp, in.uv).rgb;
+    if (cut_away(in.world)) {
+        discard;
+    }
+    let base = select(texel, object.color.rgb, camera.edges.w > 0.5);
+    return fogged(occluded(shade_fill(in.normal, in.world, base), in.world), in.world);
+}
+
 // Hemispheric ambient fill: sky colour when the normal faces up, ground colour
 // when it faces down, blended by the up-facing fraction. This is the ambient
 // FLOOR — even a face turned fully away from the key light gets sky/ground
