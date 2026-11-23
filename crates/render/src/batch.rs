@@ -252,6 +252,9 @@ pub(crate) struct Batch {
     pub params: Vec<ObjectParams>,
     /// First slot of `params` in the shared [`ParamBuffer`].
     pub slot_base: u32,
+    /// Bumped whenever the geometry or the draws change, so derived GPU
+    /// data (the AO prepass's flat indices, #358) knows to rebuild.
+    pub version: u64,
 }
 
 impl Batch {
@@ -264,6 +267,7 @@ impl Batch {
             draws: Vec::new(),
             params: Vec::new(),
             slot_base: 0,
+            version: 0,
         }
     }
 
@@ -283,9 +287,26 @@ impl Batch {
             self.indices = s.indices;
             uploaded = true;
         }
+        if uploaded || s.draws != self.draws {
+            self.version += 1;
+        }
         self.draws = s.draws;
         self.params = s.params;
         uploaded
+    }
+
+    /// Every draw's indices made absolute (base vertex added), in draw order:
+    /// the whole indexed batch as one draw, for passes that need no
+    /// per-object parameters (the AO prepass, #358).
+    pub fn flat_indices(&self) -> Vec<u32> {
+        self.draws
+            .iter()
+            .flat_map(|d| {
+                self.indices[d.first as usize..(d.first + d.count) as usize]
+                    .iter()
+                    .map(move |&i| (i as i64 + d.base_vertex as i64) as u32)
+            })
+            .collect()
     }
 
     /// Like [`Batch::set`] for a batch built before any queue exists (the
@@ -435,6 +456,20 @@ mod tests {
             ]
         );
         assert_eq!(s.params, vec![p(0.1), p(0.3)]);
+    }
+
+    #[test]
+    fn flat_indices_add_each_base_vertex() {
+        // #358: the AO prepass draws a whole batch at once.
+        let mut s = Staged::default();
+        let tri = [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let n = [[0.0, 0.0, 1.0]; 3];
+        s.push_mesh(&tri, &n, &[0, 1, 2], p(0.1));
+        s.push_mesh(&tri, &n, &[2, 1, 0], p(0.3));
+        let mut b = Batch::new("t");
+        b.indices = s.indices;
+        b.draws = s.draws;
+        assert_eq!(b.flat_indices(), vec![0, 1, 2, 5, 4, 3]);
     }
 
     #[test]

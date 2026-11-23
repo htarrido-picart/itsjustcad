@@ -436,6 +436,8 @@ pub struct ViewState {
     pub edges: ViewEdges,
     /// Fog — the checks in View ▸ Fog (#363).
     pub fog: ViewFog,
+    /// Ambient occlusion on — the check on View ▸ Ambient Occlusion (#358).
+    pub ao: bool,
     /// The built-in style the active pane matches — the check in View ▸
     /// Styles (#362). `None` when a saved style (or none) matches.
     pub style: Option<itsjustcad_render::BuiltinStyle>,
@@ -859,6 +861,9 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
                     radio("fog_custom", tr("menu.view.fog_custom"), "fog colour custom", !view.fog.background),
                 ],
             },
+            // Ambient occlusion (#358): the toggle; distance, intensity and
+            // colour are typed (`ao distance 5%`, `ao intensity 0.6`).
+            radio("ao", tr("menu.view.ao"), "ao", view.ao),
             NativeItem::Separator,
             // Viewport layout.
             ex("vp1", tr("menu.view.vp1"), "viewports 1"),
@@ -1377,6 +1382,7 @@ pub fn demo_open(
         show_axes: true,
         edges: ViewEdges::default(),
         fog: ViewFog::default(),
+        ao: false,
         style: Some(itsjustcad_render::BuiltinStyle::Modelling),
     };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
@@ -2130,6 +2136,26 @@ mod tests {
         assert_eq!(view_check(on, "View/fog_show"), Some(true));
         assert_eq!(view_check(on, "View/fog_bg"), Some(false));
         assert_eq!(view_check(on, "View/fog_custom"), Some(true));
+    }
+
+    #[test]
+    fn view_ao_toggle_checks_and_fires_the_verb() {
+        // #358: View ▸ Ambient Occlusion toggles with the command-line verb
+        // and is checked when on.
+        let menus = native_model(MenuStyle::Modeler, true, ViewState::default());
+        let view = menus.iter().find(|m| m.title == tr("menu.view")).expect("View menu");
+        let (label, action) = flat(&view.items)
+            .into_iter()
+            .find_map(|it| match it {
+                NativeItem::Check { id, label, action, .. } if id == "View/ao" => Some((label.clone(), action.clone())),
+                _ => None,
+            })
+            .expect("View ▸ Ambient Occlusion");
+        assert_eq!(label, tr("menu.view.ao"));
+        assert_eq!(action, MenuAction::Execute("ao".into()));
+        assert!(crate::app_verbs::classify("ao").is_some());
+        assert_eq!(view_check(ViewState::default(), "View/ao"), Some(false));
+        assert_eq!(view_check(ViewState { ao: true, ..Default::default() }, "View/ao"), Some(true));
     }
 
     #[test]

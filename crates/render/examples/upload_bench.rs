@@ -7,7 +7,10 @@
 //! Writes PNGs of a fixed view after open and after the recolor so two builds
 //! can be compared pixel for pixel.
 //!
+//! The orbit runs twice: plain, then with ambient occlusion on (#358).
+//!
 //! Usage: cargo run --release -p itsjustcad-render --example upload_bench -- scene.itsjustcad.json out_dir
+//! (`synthetic:<n>` instead of a path builds an n x n grid of boxes.)
 
 use std::time::Instant;
 
@@ -48,8 +51,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let scene_path = args.get(1).expect("scene path");
     let out_dir = std::path::PathBuf::from(args.get(2).map_or(".", |s| s.as_str()));
-    let mut session =
-        itsjustcad_commands::io::load_file(std::path::Path::new(scene_path)).expect("load scene");
+    let mut session = match scene_path.strip_prefix("synthetic:") {
+        Some(n) => synthetic(n.parse().expect("grid size")),
+        None => itsjustcad_commands::io::load_file(std::path::Path::new(scene_path)).expect("load scene"),
+    };
     let theme = Theme::Dark;
 
     let instance = wgpu::Instance::default();
@@ -79,7 +84,7 @@ fn main() {
         camera.distance = (bb.size().length() as f32 * 0.6).max(5.0);
     }
     let target = Target::new(&device);
-    target.render(&device, &queue, &mut renderer, &camera, theme);
+    target.render(&device, &queue, &mut renderer, &camera, theme, None);
     target.save(&device, &queue, &out_dir.join("open.png"));
 
     // Selection recolor: select every 50th object (a generation bump).
@@ -87,7 +92,7 @@ fn main() {
     session.doc.selection.extend(ids);
     upload("select", &mut renderer, &session.doc);
     counts("select", &device);
-    target.render(&device, &queue, &mut renderer, &camera, theme);
+    target.render(&device, &queue, &mut renderer, &camera, theme, None);
     target.save(&device, &queue, &out_dir.join("select.png"));
 
     // One geometry edit: add a box.
@@ -97,23 +102,42 @@ fn main() {
     upload("edit", &mut renderer, &session.doc);
     counts("edit", &device);
 
-    // Orbit: 120 frames around the target, each waited on.
-    let mut frames = Vec::new();
-    let (t, c) = (Instant::now(), cpu_s());
-    for i in 0..120 {
-        camera.yaw = i as f32 * std::f32::consts::TAU / 120.0;
-        let f = Instant::now();
-        target.render(&device, &queue, &mut renderer, &camera, theme);
-        frames.push(f.elapsed().as_secs_f64() * 1e3);
+    // Orbit: 120 frames around the target, each waited on; then again with
+    // ambient occlusion (#358).
+    let ao = itsjustcad_render::AoStyle { on: true, ..Default::default() };
+    for (label, ao) in [("orbit", None), ("orbit+ao", Some(&ao))] {
+        let mut frames = Vec::new();
+        let (t, c) = (Instant::now(), cpu_s());
+        for i in 0..120 {
+            camera.yaw = i as f32 * std::f32::consts::TAU / 120.0;
+            let f = Instant::now();
+            target.render(&device, &queue, &mut renderer, &camera, theme, ao);
+            frames.push(f.elapsed().as_secs_f64() * 1e3);
+        }
+        frames.sort_by(f64::total_cmp);
+        println!(
+            "{label} 120 frames: median {:.2} ms, p90 {:.2} ms, total {:.0} ms wall, {:.3} cpu-s",
+            frames[60],
+            frames[108],
+            t.elapsed().as_secs_f64() * 1e3,
+            cpu_s() - c
+        );
     }
-    frames.sort_by(f64::total_cmp);
-    println!(
-        "orbit 120 frames: median {:.2} ms, p90 {:.2} ms, total {:.0} ms wall, {:.3} cpu-s",
-        frames[60],
-        frames[108],
-        t.elapsed().as_secs_f64() * 1e3,
-        cpu_s() - c
-    );
+    target.render(&device, &queue, &mut renderer, &camera, theme, Some(&ao));
+    target.save(&device, &queue, &out_dir.join("ao.png"));
+}
+
+/// An `n` x `n` grid of boxes of varied heights.
+fn synthetic(n: usize) -> itsjustcad_commands::Session {
+    let mut session = itsjustcad_commands::Session::default();
+    for i in 0..n {
+        for j in 0..n {
+            let (x, y, h) = (i as f32 * 3.0, j as f32 * 3.0, 1.0 + ((i * 7 + j * 13) % 10) as f32);
+            let line = format!("box {x},{y},0 2,2,{h}");
+            session.run(itsjustcad_commands::parse(&line).expect("parse box")).expect("run box");
+        }
+    }
+    session
 }
 
 struct Target {
@@ -152,10 +176,13 @@ impl Target {
         renderer: &mut SceneRenderer,
         camera: &OrbitCamera,
         theme: Theme,
+        ao: Option<&itsjustcad_render::AoStyle>,
     ) {
         let cam = itsjustcad_render::camera_uniform(camera.view_proj(W as f32 / H as f32), camera.eye());
-        renderer.write_camera(device, queue, 0, &cam);
+        let shaded = itsjustcad_render::DisplayMode::Shaded;
+        renderer.write_camera(device, queue, 0, &cam.with_ao(&ao.copied().unwrap_or_default(), shaded));
         let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.render_ao(device, queue, &mut encoder, 0, [W, H]);
         {
             let [r, g, b, a] = theme.background();
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

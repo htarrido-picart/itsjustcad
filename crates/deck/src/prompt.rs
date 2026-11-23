@@ -63,6 +63,12 @@ Fog:
   fog <start%> <end%>                           fade from start to end, % of the view depth              e.g. fog 20 100
   fog colour bg|#rrggbb                         fog colour: background (default) or custom               e.g. fog colour #ffffff
 
+Ambient occlusion:
+  ao on|off                                     corners and crevices darken (shaded, pencil)             e.g. ao on
+  ao distance <n%|n>                            reach: % of the scene, or metres                         e.g. ao distance 5%
+  ao intensity <0..1>                           how dark occluded faces get                              e.g. ao intensity 0.6
+  ao colour #rrggbb                             what they darken toward (black default)                  e.g. ao colour #000000
+
 Styles (one-step bundles of the display settings above):
   style <name> [all]                            modelling|presentation|sketch|hiddenline|xray|massing    e.g. style presentation
                                                 or a saved one; active pane (all: every pane)

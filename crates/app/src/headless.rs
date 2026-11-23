@@ -161,6 +161,8 @@ pub struct HeadlessView {
     pub edge_style: itsjustcad_render::EdgeStyle,
     /// Fog, from `fog` (#363). Off by default.
     pub fog_style: itsjustcad_render::FogStyle,
+    /// Ambient occlusion, from `ao` (#358). Off by default.
+    pub ao_style: itsjustcad_render::AoStyle,
     /// Sky/ground gradient from a named style (#362); `None` follows
     /// `profile_edges`.
     pub background_gradient: Option<bool>,
@@ -178,6 +180,7 @@ impl HeadlessView {
             sketchy: self.sketchy,
             edges: self.edge_style,
             fog: self.fog_style,
+            ao: self.ao_style,
             grid: self.show_grid,
             axes: self.show_axes,
             gradient: self.background_gradient,
@@ -194,6 +197,7 @@ impl HeadlessView {
         self.sketchy = s.sketchy;
         self.edge_style = s.edges;
         self.fog_style = s.fog;
+        self.ao_style = s.ao;
         self.show_grid = s.grid;
         self.show_axes = s.axes;
         self.background_gradient = s.gradient;
@@ -218,6 +222,7 @@ impl Default for HeadlessView {
             parallel: None,
             edge_style: Default::default(),
             fog_style: Default::default(),
+            ao_style: Default::default(),
             background_gradient: None,
         }
     }
@@ -289,6 +294,9 @@ pub fn run_script_lines(
             ) => view.edge_style = crate::app_verbs::apply_edge_style(view.edge_style, &verb),
             Some(verb @ AppVerb::Fog(_)) => {
                 view.fog_style = crate::app_verbs::apply_fog_style(view.fog_style, &verb)
+            }
+            Some(verb @ AppVerb::Ao(_)) => {
+                view.ao_style = crate::app_verbs::apply_ao_style(view.ao_style, &verb)
             }
             Some(AppVerb::Style(verb)) => {
                 use crate::view_styles::{self as vs, StyleVerb};
@@ -871,7 +879,8 @@ pub fn render_headless(
     // Target size for the dash patterns (#364); no fat-stroke width.
     let cam = itsjustcad_render::CameraUniform { screen: [W as f32, H as f32, 0.0, 1.0], ..cam }
         .with_edge_style(&view.edge_style, 1.0)
-        .with_fog(&view.fog_style, theme.background());
+        .with_fog(&view.fog_style, theme.background())
+        .with_ao(&view.ao_style, mode);
     renderer.write_camera(&device, &queue, 0, &cam);
 
     let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -899,6 +908,8 @@ pub fn render_headless(
 
     let [br, bg, bb, ba] = theme.background();
     let mut encoder = device.create_command_encoder(&Default::default());
+    // Ambient occlusion (#358) before the scene; a no-op when off.
+    renderer.render_ao(&device, &queue, &mut encoder, 0, [W, H]);
     {
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("hl_pass"),
@@ -1051,6 +1062,7 @@ mod tests {
         assert_eq!(view.view_style(), p);
         assert_eq!(view.light, LightMode::Sun);
         assert!(view.profile_edges && view.fog_style.on && view.edge_style.depth_cue);
+        assert!(view.ao_style.on, "presentation turns AO on (#358)");
         // Save the current settings, switch away, switch back.
         let lines: Vec<String> =
             ["display xray", "grid off", "style save mine", "style modelling", "style mine"]
@@ -1065,6 +1077,19 @@ mod tests {
         assert!(run_script_lines(Session::default(), &bad).err().expect("fails").1.contains("no style"));
         let bad: Vec<String> = ["style save sketch"].map(String::from).to_vec();
         assert!(run_script_lines(Session::default(), &bad).err().expect("fails").1.contains("read-only"));
+    }
+
+    #[test]
+    fn ao_verbs_affect_view() {
+        use itsjustcad_render::{AoStyle, AoUnits};
+        // #358: the ao verb runs headless and accumulates.
+        assert_eq!(HeadlessView::default().ao_style, AoStyle::default());
+        let lines: Vec<String> =
+            ["ao distance 0.5", "ao intensity 0.8", "ao colour #102030"].map(String::from).to_vec();
+        let (_, view) = run_script_lines(Session::default(), &lines).expect("verbs run");
+        let a = view.ao_style;
+        assert!(a.on);
+        assert_eq!((a.distance, a.units, a.intensity, a.color), (0.5, AoUnits::World, 0.8, [16, 32, 48]));
     }
 
     #[test]
