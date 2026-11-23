@@ -228,7 +228,7 @@ impl NativeMenuBar {
             }
         }
         // Show Grid / Show Axes checks (#364), View ▸ Edges (#361), View ▸
-        // Fog (#363) and View ▸ Ambient Occlusion (#358).
+        // Fog (#363), View ▸ Ambient Occlusion (#358) and View ▸ Shadows (#357).
         use itsjustcad_render::EdgeColor;
         let e = view.edges;
         for (id, on) in [
@@ -245,6 +245,7 @@ impl NativeMenuBar {
             ("View/fog_bg", view.fog.background),
             ("View/fog_custom", !view.fog.background),
             ("View/ao", view.ao),
+            ("View/shadows", view.shadows),
         ] {
             if let Some(it) = self.check_items.get(id) {
                 it.set_checked(on);

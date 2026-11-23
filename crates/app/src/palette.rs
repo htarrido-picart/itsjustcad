@@ -75,6 +75,7 @@ const APP_VERB_ENTRIES: &[(&str, &str, &str)] = &[
     ("extension", "Display", "extension [on|off] [m]"),
     ("fog", "Display", "fog [on|off] | fog <start%> <end%> | fog colour bg|#rrggbb"),
     ("ao", "Display", "ao [on|off] | ao distance <n%|n> | ao intensity <0..1> | ao colour #rrggbb"),
+    ("shadows", "Display", "shadows [on|off] | shadows light|dark <0..1> | shadows ground on|off | shadows panel"),
     ("style", "Display", "style <name> [all] | style save|update|delete <name> | style list"),
     ("parallel", "Camera", "parallel [on|off]"),
     ("edgefx", "Display", "edgefx jitter=.. extension=.."),

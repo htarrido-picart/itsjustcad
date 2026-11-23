@@ -222,6 +222,7 @@ fn main() {
         edge_style: Default::default(),
         fog: Default::default(),
         ao: Default::default(),
+        shadows: Default::default(),
         background: [0.0; 4],
     };
 }

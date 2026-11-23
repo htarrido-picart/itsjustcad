@@ -11,8 +11,11 @@
 //
 // Pencil hidden-line mode is orthogonal: signalled by camera.misc.x < 0.
 
-// Camera, occluded() (#358) and fogged() come from common.wgsl. Ambient
-// occlusion darkens the fill first; the fog then covers it.
+// Camera, sun_visibility() (#357), occluded() (#358) and fogged() come from
+// common.wgsl. Sun shadows (#357) are part of the shading: with them on, the
+// sun is the key light (in every lighting mode), the Light and Dark sliders
+// scale the key and the ambient floor, and shadowed points lose the key.
+// Ambient occlusion then darkens the fill; the fog covers it last.
 
 struct ObjectParams {
     color: vec4<f32>,
@@ -103,7 +106,11 @@ fn shade_fill(normal: vec3<f32>, world: vec3<f32>, base: vec3<f32>) -> vec4<f32>
     if (camera.misc.x < 0.0) {
         let l = normalize(camera.eye.xyz - world);
         let lambert = max(dot(n, l), 0.0);
-        let shade = 0.90 + 0.07 * lambert;
+        var shade = 0.90 + 0.07 * lambert;
+        if (camera.shadow.x > 0.5) {
+            // Paper in shadow takes a grey wash, lighter with more Dark.
+            shade *= mix(0.6 + 0.4 * camera.shadow.z, 1.0, sun_visibility(world, n));
+        }
         return vec4(shade, shade, shade * 0.98, 1.0);
     }
 
@@ -119,12 +126,20 @@ fn shade_fill(normal: vec3<f32>, world: vec3<f32>, base: vec3<f32>) -> vec4<f32>
     if (mode == 1.0 && has_sun) {
         key_dir = normalize(sun);
     }
-    let key = max(dot(n, key_dir), 0.0);
+    let shadows = camera.shadow.x > 0.5;
+    if (shadows) {
+        key_dir = camera.shadow_dir.xyz;
+    }
+    var key = max(dot(n, key_dir), 0.0);
 
     // Diffuse = hemispheric ambient floor + soft directional key. The key is
     // deliberately gentle (0.55) so the ambient floor dominates and no face
     // crushes to black. Result is a matte, readable surface.
-    let diffuse = ambient + 0.55 * key;
+    var diffuse = ambient + 0.55 * key;
+    if (shadows) {
+        key *= sun_visibility(world, n);
+        diffuse = ambient * shadow_ambient() + 0.55 * key * shadow_direct();
+    }
     var lit = base * diffuse;
 
     // Presentation mode only: Blinn-Phong specular from the material presets.

@@ -1,7 +1,7 @@
 // Shared by the scene shaders (mesh, curve, grid, underlay, ao): prepended to
 // each when its module is built (see `scene_shader` in renderer.rs). Holds the
-// camera uniform, the background gradient, the fog (#363) and the ambient
-// occlusion lookup (#358).
+// camera uniform, the background gradient, the fog (#363), the ambient
+// occlusion lookup (#358) and the sun shadow lookup (#357).
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -33,11 +33,27 @@ struct Camera {
     ao: vec4<f32>,
     // Colour occluded faces darken toward.
     ao_color: vec4<f32>,
+    // Sun shadows (#357): x = 1 on, y = direct light (0..1), z = ambient
+    // (0..1), w = 1 the ground catches them.
+    shadow: vec4<f32>,
+    // Unit direction toward the sun (xyz): the shadows' and the key light's.
+    shadow_dir: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 // The pane's blurred occlusion (0 = open, 1 = fully occluded), see ao.rs.
 @group(0) @binding(1) var ao_tex: texture_2d<f32>;
+
+// The sun shadow map shared by every pane (#357), see shadow.rs: the light's
+// view-projection and params (x = 1 when it holds casters, y = one texel in
+// uv, z = one texel in world units, w = depth bias).
+struct ShadowMap {
+    light_view_proj: mat4x4<f32>,
+    params: vec4<f32>,
+};
+@group(0) @binding(5) var<uniform> shadow_map: ShadowMap;
+@group(0) @binding(6) var shadow_tex: texture_depth_2d;
+@group(0) @binding(7) var shadow_cmp: sampler_comparison;
 
 fn unproject(ndc: vec2<f32>, depth: f32) -> vec3<f32> {
     let p = camera.inv_view_proj * vec4(ndc, depth, 1.0);
@@ -124,4 +140,64 @@ fn occluded(c: vec4<f32>, p: vec3<f32>) -> vec4<f32> {
     let px = clamp(vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * dims, vec2(0.0), dims - 1.0);
     let occ = textureLoad(ao_tex, vec2<i32>(px), 0).r;
     return vec4(mix(c.rgb, camera.ao_color.rgb, occ * camera.ao.y), c.a);
+}
+
+// The Light and Dark sliders (#357) as gains on the direct key and the
+// ambient floor: 1 at their defaults (SHADOW_LIGHT 0.8, SHADOW_DARK 0.45),
+// so turning shadows on keeps the sunlit faces' shading.
+fn shadow_direct() -> f32 {
+    return camera.shadow.y / 0.8;
+}
+
+fn shadow_ambient() -> f32 {
+    return camera.shadow.z / 0.45;
+}
+
+// How much sun reaches world point `p` with normal `n` (#357): 1 lit, 0 in
+// shadow, 3x3 PCF between. Faces turned from the sun, and every face when it
+// is below the horizon, are in shadow. With shadows off, 1.
+fn sun_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    if (camera.shadow.x < 0.5) {
+        return 1.0;
+    }
+    let l = camera.shadow_dir.xyz;
+    if (l.z <= 0.0 || dot(n, l) <= 0.0) {
+        return 0.0;
+    }
+    if (shadow_map.params.x < 0.5) {
+        return 1.0;
+    }
+    // Normal offset: look up a point lifted off the surface by a texel and a
+    // half, against acne on the receiver.
+    let c = shadow_map.light_view_proj * vec4(p + n * (shadow_map.params.z * 1.5), 1.0);
+    let uv = vec2(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);
+    // Outside the casters' footprint, or nearer the sun than all of them:
+    // nothing is in the way.
+    if (any(uv < vec2(0.0)) || any(uv > vec2(1.0)) || c.z < 0.0) {
+        return 1.0;
+    }
+    let d = min(c.z, 1.0) - shadow_map.params.w;
+    let t = shadow_map.params.y;
+    var lit = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            lit += textureSampleCompareLevel(shadow_tex, shadow_cmp, uv + vec2(f32(x), f32(y)) * t, d);
+        }
+    }
+    return lit / 9.0;
+}
+
+// How much the ground at world point `p` darkens in shadow (#357): 0 lit, up
+// to the share the sun adds to an up-facing face (the same light/dark
+// balance as the faces). 0 with shadows or the ground catcher off.
+fn ground_shadow(p: vec3<f32>) -> f32 {
+    if (camera.shadow.x < 0.5 || camera.shadow.w < 0.5) {
+        return 0.0;
+    }
+    let direct = 0.55 * shadow_direct() * max(camera.shadow_dir.z, 0.0);
+    let total = 0.65 * shadow_ambient() + direct;
+    if (direct <= 0.0 || total <= 0.0) {
+        return 0.0;
+    }
+    return (1.0 - sun_visibility(p, vec3(0.0, 0.0, 1.0))) * direct / total;
 }

@@ -685,6 +685,19 @@ pub struct App {
     /// colour. Off by default; persisted to `ui.json` as one object (named
     /// styles bundle it). GPU-only view state, never logged.
     ao_style: itsjustcad_render::AoStyle,
+    /// Viewport sun shadows (#357): on/off, light, dark, on ground. Off by
+    /// default; persisted to `ui.json` as one object (named styles bundle
+    /// it). View state, never logged: the sun they fall from is the
+    /// document's (`sun`, `location`).
+    shadow_style: itsjustcad_render::ShadowStyle,
+    /// The Shadows panel's local clock (#357), in `ui.json`; releasing a
+    /// slider sets the document sun from it.
+    shadow_clock: crate::shadow_clock::ShadowClock,
+    /// The Shadows panel is open (`shadows panel`, View ▸ Shadow Settings…).
+    show_shadow_panel: bool,
+    /// The sun previewed while a Shadows panel slider is dragged (#357):
+    /// overrides the document sun in the viewport until the release.
+    shadow_preview_sun: Option<[f32; 3]>,
     /// Sky/ground gradient behind the scene, set by a named style (#362).
     /// `None` (the default) follows `profile_edges`, the coupling the
     /// `massing` preset has always had. View state, never logged.
@@ -1648,6 +1661,10 @@ impl App {
             edge_style: edge_style_from(&load_ui_json()),
             fog_style: fog_style_from(&load_ui_json()),
             ao_style: ao_style_from(&load_ui_json()),
+            shadow_style: shadow_style_from(&load_ui_json()),
+            shadow_clock: shadow_clock_from(&load_ui_json()),
+            show_shadow_panel: false,
+            shadow_preview_sun: None,
             background_gradient: None,
             msaa: load_msaa().unwrap_or(itsjustcad_render::DEFAULT_MSAA),
             msaa_supported,
@@ -2360,6 +2377,12 @@ impl App {
             Some("ao" | "ambientocclusion") => match crate::app_verbs::classify(line) {
                 Some(verb) => self.apply_ao_verb(verb),
                 None => self.command_line.push_line(AO_USAGE),
+            },
+            // Sun shadows (#357): view state, never logged; persisted to
+            // ui.json. The panel's sliders set the (logged) document sun.
+            Some("shadows" | "shadow") => match crate::app_verbs::classify(line) {
+                Some(verb) => self.apply_shadow_verb(verb),
+                None => self.command_line.push_line(SHADOW_USAGE),
             },
             Some("style") => match crate::app_verbs::classify(line) {
                 Some(crate::app_verbs::AppVerb::Style(verb)) => self.run_style_verb(line, verb),
@@ -3733,6 +3756,115 @@ impl App {
         self.command_line.push_line(self.ao_style.summary());
     }
 
+    /// Apply a `shadows` verb (#357), persist the setting and report it;
+    /// `shadows panel` shows or hides the panel.
+    fn apply_shadow_verb(&mut self, verb: crate::app_verbs::AppVerb) {
+        use crate::app_verbs::{AppVerb, ShadowVerb};
+        if verb == AppVerb::Shadows(ShadowVerb::Panel) {
+            self.show_shadow_panel = !self.show_shadow_panel;
+            return;
+        }
+        self.shadow_style = crate::app_verbs::apply_shadow_style(self.shadow_style, &verb);
+        save_shadow_style(&self.shadow_style);
+        self.command_line.push_line(self.shadow_style.summary());
+    }
+
+    /// The Shadows panel (#357, SketchUp's Shadows window): the toggle, the
+    /// time-of-day and date sliders (they set the document sun on release,
+    /// previewing it while dragged), light, dark and on ground.
+    fn shadow_panel(&mut self, ctx: &egui::Context) {
+        use crate::i18n::t;
+        use crate::shadow_clock::{date_label, this_year, time_label};
+        if !self.show_shadow_panel {
+            return;
+        }
+        let mut open = true;
+        let (mut style_changed, mut commit) = (false, false);
+        let mut preview = None;
+        let loc = self.session.doc.location;
+        let sun = self.session.doc.sun;
+        let year = this_year();
+        egui::Window::new(t("shadows.title"))
+            .collapsible(true)
+            .resizable(false)
+            .default_width(320.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 10.0;
+                        ui.spacing_mut().slider_width = 180.0;
+                        style_changed |= ui.checkbox(&mut self.shadow_style.on, t("shadows.show")).changed();
+                        ui.add_enabled_ui(loc.is_some(), |ui| {
+                            let clock = &mut self.shadow_clock;
+                            let time = ui.add(
+                                egui::Slider::new(&mut clock.minute, 0..=1439)
+                                    .step_by(5.0)
+                                    .text(t("shadows.time"))
+                                    .custom_formatter(|v, _| time_label(v as u16))
+                                    .custom_parser(|s| {
+                                        let (h, m) = s.trim().split_once(':')?;
+                                        Some(h.parse::<f64>().ok()? * 60.0 + m.parse::<f64>().ok()?)
+                                    }),
+                            );
+                            let date = ui.add(
+                                egui::Slider::new(&mut clock.day, 1..=365)
+                                    .text(t("shadows.date"))
+                                    .custom_formatter(|v, _| date_label(v as u16)),
+                            );
+                            for r in [&time, &date] {
+                                // Logged once on release (or a click / typed
+                                // value), previewed while dragged.
+                                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                                    commit = true;
+                                } else if r.dragged() && r.changed() {
+                                    preview = Some(());
+                                }
+                            }
+                        });
+                        let status = match (loc, sun) {
+                            (None, _) => t("shadows.no_location").to_string(),
+                            (Some(_), Some(s)) => {
+                                format!("{}: az {:.0}° · alt {:.0}°", t("shadows.sun"), s.azimuth_deg, s.altitude_deg)
+                            }
+                            (Some(_), None) => String::new(),
+                        };
+                        if !status.is_empty() {
+                            ui.add(egui::Label::new(egui::RichText::new(status).weak()).wrap());
+                        }
+                        ui.separator();
+                        let style = &mut self.shadow_style;
+                        style_changed |= ui
+                            .add(egui::Slider::new(&mut style.light, 0.0..=1.0).text(t("shadows.light")))
+                            .changed();
+                        style_changed |= ui
+                            .add(egui::Slider::new(&mut style.dark, 0.0..=1.0).text(t("shadows.dark")))
+                            .changed();
+                        style_changed |= ui.checkbox(&mut style.ground, t("shadows.ground")).changed();
+                    });
+            });
+        if !open {
+            self.show_shadow_panel = false;
+        }
+        if style_changed {
+            save_shadow_style(&self.shadow_style);
+        }
+        if let Some(loc) = loc {
+            if preview.is_some() {
+                self.shadow_preview_sun = Some(self.shadow_clock.sun_dir(year, &loc));
+            }
+            if commit {
+                self.shadow_preview_sun = None;
+                save_shadow_clock(&self.shadow_clock);
+                let place = self.session.doc.place_name.clone();
+                for line in self.shadow_clock.sun_lines(year, &loc, place.as_deref()) {
+                    self.execute_line(line);
+                }
+            }
+        }
+    }
+
     /// The display settings of the active pane as a named style (#362).
     fn current_view_style(&self) -> itsjustcad_render::ViewStyle {
         let slot = self.effective_camera_index(self.active_pane);
@@ -3746,6 +3878,7 @@ impl App {
             edges: self.edge_style,
             fog: self.fog_style,
             ao: self.ao_style,
+            shadows: self.shadow_style,
             grid: self.show_grid,
             axes: self.show_axes,
             gradient: self.background_gradient,
@@ -3780,6 +3913,8 @@ impl App {
         save_fog_style(&s.fog);
         self.ao_style = s.ao;
         save_ao_style(&s.ao);
+        self.shadow_style = s.shadows;
+        save_shadow_style(&s.shadows);
     }
 
     /// The name of the style the active pane's settings match (#362).
@@ -5654,8 +5789,10 @@ impl App {
                 hover_seen |= self.update_hover(ui, pane, rect, pos, view_proj, blocked);
             }
 
-            let sun_dir = self.session.doc.sun.map(|s| {
-                itsjustcad_solar::sun_direction(s.azimuth_deg, s.altitude_deg)
+            // A Shadows panel drag previews its sun (#357) until the release
+            // logs it.
+            let sun_dir = self.shadow_preview_sun.or_else(|| {
+                self.session.doc.sun.map(|s| itsjustcad_solar::sun_direction(s.azimuth_deg, s.altitude_deg))
             });
             // Skip the wgpu 3D callback in off-screen preview snapshots (no depth
             // attachment in kittest's egui pass). `scene.take()` still runs so the
@@ -5684,6 +5821,7 @@ impl App {
                         edge_style: self.edge_style,
                         fog: self.fog_style,
                         ao: self.ao_style,
+                        shadows: self.shadow_style,
                         background: self.viewport_background(ui.visuals().dark_mode),
                     },
                 ));
@@ -10562,6 +10700,7 @@ impl App {
             edges: self.edge_style.into(),
             fog: self.fog_style.into(),
             ao: self.ao_style.on,
+            shadows: self.shadow_style.on,
             style: self
                 .active_style_name()
                 .and_then(|n| itsjustcad_render::BuiltinStyle::parse(&n)),
@@ -11921,6 +12060,38 @@ fn save_ao_style(style: &itsjustcad_render::AoStyle) {
     save_ui_json(&v);
 }
 
+/// ui.json key of the sun shadows (#357).
+const SHADOW_STYLE_KEY: &str = "shadow_style";
+/// ui.json key of the Shadows panel's clock (#357).
+const SHADOW_CLOCK_KEY: &str = "shadow_clock";
+
+/// Usage of the shadows verb (#357).
+const SHADOW_USAGE: &str =
+    "usage: shadows on|off · shadows light <0..1> · shadows dark <0..1> · shadows ground on|off · shadows panel";
+
+/// The shadows saved in ui.json contents; defaults (off) for missing or
+/// unreadable keys.
+fn shadow_style_from(ui: &serde_json::Value) -> itsjustcad_render::ShadowStyle {
+    serde_json::from_value(ui[SHADOW_STYLE_KEY].clone()).unwrap_or_default()
+}
+
+fn save_shadow_style(style: &itsjustcad_render::ShadowStyle) {
+    let mut v = load_ui_json();
+    v[SHADOW_STYLE_KEY] = serde_json::to_value(style).unwrap_or_default();
+    save_ui_json(&v);
+}
+
+/// The Shadows panel's clock saved in ui.json contents.
+fn shadow_clock_from(ui: &serde_json::Value) -> crate::shadow_clock::ShadowClock {
+    serde_json::from_value(ui[SHADOW_CLOCK_KEY].clone()).unwrap_or_default()
+}
+
+fn save_shadow_clock(clock: &crate::shadow_clock::ShadowClock) {
+    let mut v = load_ui_json();
+    v[SHADOW_CLOCK_KEY] = serde_json::to_value(clock).unwrap_or_default();
+    save_ui_json(&v);
+}
+
 /// Usage line of the `camera` verb.
 const CAMERA_USAGE: &str =
     "usage: camera parallel|persp|2point|pano|fisheye [fov]|phone [lens]|<15|24|35|50|85>mm";
@@ -13222,6 +13393,8 @@ impl eframe::App for App {
         // LLM ▸ Keybindings… editor (W4). Mutates + saves self.keybindings live.
         self.keybindings_editor
             .ui(ui.ctx(), &mut self.show_keybindings, &mut self.keybindings);
+        // View ▸ Shadow Settings… (#357).
+        self.shadow_panel(ui.ctx());
         // Render ▸ Local Renderer Setup panel (SD twin of Model Setup).
         self.render_setup_ui(ui.ctx());
         // Compact corner chip so a download can continue with the panel hidden.
@@ -13752,6 +13925,36 @@ mod tests {
         assert!(is_destructive_verb("Delete"));
         for v in ["offset", "box", "line"] {
             assert!(!is_destructive_verb(v), "{v} should NOT be destructive");
+        }
+    }
+
+    #[test]
+    fn shadow_verbs_apply_and_persist_in_ui_json() {
+        use crate::app_verbs::{apply_shadow_style, classify};
+        use crate::shadow_clock::ShadowClock;
+        use itsjustcad_render::ShadowStyle;
+        // #357: no key (or a broken one) is no shadows and the default clock.
+        assert_eq!(shadow_style_from(&serde_json::json!({})), ShadowStyle::default());
+        assert_eq!(shadow_style_from(&serde_json::json!({ SHADOW_STYLE_KEY: "on" })), ShadowStyle::default());
+        assert_eq!(shadow_clock_from(&serde_json::json!({})), ShadowClock::default());
+        let mut sh = ShadowStyle::default();
+        for line in ["shadows light 0.6", "shadows dark 0.3", "shadows ground off"] {
+            sh = apply_shadow_style(sh, &classify(line).unwrap());
+        }
+        assert!(sh.on && !sh.ground);
+        assert_eq!((sh.light, sh.dark), (0.6, 0.3));
+        // One object under one key, read back whole; AO is untouched.
+        let clock = ShadowClock { day: 172, minute: 600 };
+        let ui = serde_json::json!({
+            "zoom": 1.0,
+            SHADOW_STYLE_KEY: serde_json::to_value(sh).unwrap(),
+            SHADOW_CLOCK_KEY: serde_json::to_value(clock).unwrap(),
+        });
+        assert_eq!(shadow_style_from(&ui), sh);
+        assert_eq!(shadow_clock_from(&ui), clock);
+        assert_eq!(ao_style_from(&ui), itsjustcad_render::AoStyle::default());
+        for form in ["shadows on|off", "shadows light <0..1>", "shadows dark <0..1>", "shadows ground on|off", "shadows panel"] {
+            assert!(SHADOW_USAGE.contains(form), "{form}");
         }
     }
 

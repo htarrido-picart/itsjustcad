@@ -63,6 +63,7 @@ pub const APP_VERBS: &[&str] = &[
     "extension",
     "fog",
     "ao",
+    "shadows",
     "style",
     "view",
     "template",
