@@ -2,6 +2,7 @@
 // Copyright © 2026 Hector Tarrido-Picart
 
 use bytemuck::{Pod, Zeroable};
+use itsjustcad_doc::LineType;
 use kernel_mesh::RenderMesh;
 
 use crate::batch::{Batch, ObjectParams, ParamBuffer, Staged};
@@ -17,12 +18,35 @@ pub struct CameraUniform {
     /// y,z,w = sun direction xyz (all-zero = no sun / headlight fallback).
     pub misc: [f32; 4],
     /// x = lighting mode (0 = Working hemispheric, 1 = Sun, 2 = Presentation).
-    /// y,z,w spare. GPU-only view state; never serialized (no replay concern).
+    /// y = background gradient flag. z = 1 hides the ground grid lines, w = 1
+    /// hides the world axes (#364; see [`CameraUniform::with_overlays`]).
+    /// GPU-only view state; never serialized (no replay concern).
     pub light: [f32; 4],
     /// Screen-space stroke (itsjustcad-ios#174): x,y = target size in device
-    /// px, z = stroke width in device px, w spare. All zero (the default) keeps
+    /// px, z = stroke width in device px, w = device px per logical px (the
+    /// dash pattern scale, #364; 0 reads as 1). Zero x,y,z (the default) keeps
     /// the 1-device-px hardware hairline; see [`DisplayMode::line_pt`].
     pub screen: [f32; 4],
+}
+
+impl CameraUniform {
+    /// The same camera with the ground grid lines and the world axes shown or
+    /// hidden for the pane (`grid on|off`, `axes on|off`, #364).
+    pub fn with_overlays(mut self, grid: bool, axes: bool) -> Self {
+        self.light[2] = if grid { 0.0 } else { 1.0 };
+        self.light[3] = if axes { 0.0 } else { 1.0 };
+        self
+    }
+
+    /// Whether the grid lines are shown (see [`Self::with_overlays`]).
+    pub fn shows_grid(&self) -> bool {
+        self.light[2] <= 0.5
+    }
+
+    /// Whether the world axes are shown (see [`Self::with_overlays`]).
+    pub fn shows_axes(&self) -> bool {
+        self.light[3] <= 0.5
+    }
 }
 
 /// Lighting model applied to mesh fills. Decoupled from [`DisplayMode`]: a pane
@@ -352,25 +376,79 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 4] {
 /// on the endpoints (1e5 is exactly representable; 2e5 m total span).
 pub const AXIS_EXTENT: f32 = 1.0e5;
 
-/// World-axis overlay geometry: the X (red) and Y (green) datum lines on z=0,
-/// returned as `(endpoints, rgba)` per axis. These are drawn as REAL line
-/// segments through the hairline pipeline — the old analytic tint in
-/// `grid.wgsl` wandered at far zoom (f32 precision in the per-fragment
-/// unproject jitters the hit point by meters), which rendered the axes as
-/// jagged dotted staircases.
-pub fn world_axis_lines() -> [([[f32; 3]; 2], [f32; 4]); 2] {
-    [
-        // X axis: red, along y=0.
-        (
-            [[-AXIS_EXTENT, 0.0, 0.0], [AXIS_EXTENT, 0.0, 0.0]],
-            [0.85, 0.25, 0.25, 1.0],
-        ),
-        // Y axis: green, along x=0.
-        (
-            [[0.0, -AXIS_EXTENT, 0.0], [0.0, AXIS_EXTENT, 0.0]],
-            [0.25, 0.75, 0.30, 1.0],
-        ),
-    ]
+/// SketchUp axis colours, X red, Y green, Z blue: the world axes here and
+/// the app's inference tips and rubber bands (#372/#376) share them.
+pub const AXIS_RGBA: [[f32; 4]; 3] = [
+    [225.0 / 255.0, 85.0 / 255.0, 85.0 / 255.0, 1.0],
+    [110.0 / 255.0, 200.0 / 255.0, 110.0 / 255.0, 1.0],
+    [95.0 / 255.0, 145.0 / 255.0, 1.0, 1.0],
+];
+
+/// One half of a world axis: `points` run from the origin outward.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AxisLine {
+    pub points: [[f32; 3]; 2],
+    pub color: [f32; 4],
+    /// The negative half: drawn dotted, SketchUp style (#364).
+    pub dotted: bool,
+}
+
+/// Dash pattern of the dotted negative axis halves, logical px.
+pub const AXIS_DOTS: [f32; 4] = [2.0, 4.0, 2.0, 4.0];
+
+/// World-axis overlay geometry: the X (red), Y (green) and Z (blue) axes
+/// through the origin, each as a solid positive half and a dotted negative
+/// half. These are drawn as REAL line segments through the hairline
+/// pipelines — the old analytic tint in `grid.wgsl` wandered at far zoom (f32
+/// precision in the per-fragment unproject jitters the hit point by meters),
+/// which rendered the axes as jagged dotted staircases.
+pub fn world_axis_lines() -> [AxisLine; 6] {
+    let half = |axis: usize, sign: f32| {
+        let mut end = [0.0; 3];
+        end[axis] = sign * AXIS_EXTENT;
+        AxisLine { points: [[0.0; 3], end], color: AXIS_RGBA[axis], dotted: sign < 0.0 }
+    };
+    [half(0, 1.0), half(1, 1.0), half(2, 1.0), half(0, -1.0), half(1, -1.0), half(2, -1.0)]
+}
+
+/// Line-list vertices `[x, y, z, s]` for a polyline strip, `s` the world
+/// distance along it from the first point, so a dash pattern runs on across
+/// the strip's segments (#364).
+fn dashed_strip(points: &[[f32; 3]]) -> Vec<[f32; 4]> {
+    let mut out = Vec::with_capacity(points.len().saturating_sub(1) * 2);
+    let mut s = 0.0;
+    for w in points.windows(2) {
+        let len = glam::Vec3::from(w[0]).distance(glam::Vec3::from(w[1]));
+        out.push([w[0][0], w[0][1], w[0][2], s]);
+        s += len;
+        out.push([w[1][0], w[1][1], w[1][2], s]);
+    }
+    out
+}
+
+/// Line-list vertices `[x, y, z, s]` for a segment soup: every segment
+/// starts its pattern afresh, as mesh edges come in no particular order.
+fn dashed_soup(points: &[[f32; 3]]) -> Vec<[f32; 4]> {
+    points
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|[a, b]| {
+            let len = glam::Vec3::from(*a).distance(glam::Vec3::from(*b));
+            [[a[0], a[1], a[2], 0.0], [b[0], b[1], b[2], len]]
+        })
+        .collect()
+}
+
+/// Screen-space dash pattern of a linetype in logical px, `[on, off, on,
+/// off]`; `None` for a solid line (#364).
+pub fn linetype_dash(lt: LineType) -> Option<[f32; 4]> {
+    match lt {
+        LineType::Continuous => None,
+        LineType::Dashed => Some([9.0, 5.0, 9.0, 5.0]),
+        LineType::Dotted => Some([2.0, 4.0, 2.0, 4.0]),
+        LineType::DashDot => Some([12.0, 4.0, 2.0, 4.0]),
+    }
 }
 
 struct GpuUnderlay {
@@ -418,6 +496,12 @@ pub struct SceneData {
     /// wireframe/x-ray/ghosted display modes. Lineweight follows the object's
     /// effective weight.
     pub edges: Vec<(Vec<[f32; 3]>, [f32; 4], f32)>,
+    /// Linetype of each `lines` entry (#364): curves on a dashed, dotted or
+    /// dash-dot layer draw with that screen-space pattern. Entries past the
+    /// end of the list (or an empty list) draw solid.
+    pub line_types: Vec<LineType>,
+    /// Linetype of each `edges` entry, as [`Self::line_types`].
+    pub edge_types: Vec<LineType>,
     /// PROFILE / silhouette feature edges — the subset of `edges` that lie on
     /// the object's outline (boundary edges or sharp creases). Drawn THICKER
     /// than interior edges to get the SketchUp "objects have lineweight" look.
@@ -460,6 +544,13 @@ struct Pipelines {
     /// coplanar grid plane (which writes an ANALYTIC frag_depth that quantizes
     /// differently from rasterized line depth) cannot stipple over the axes.
     axis_pipeline: wgpu::RenderPipeline,
+    /// Dashed hairlines (#364): LineList of `[x, y, z, s]` vertices, the dash
+    /// pattern measured in screen px from the distance `s` along the stroke.
+    /// Carries the axis pipeline's depth nudge, as the dotted negative axes
+    /// use it too.
+    dash_pipeline: wgpu::RenderPipeline,
+    /// Fat-stroke variant of `dash_pipeline` (one instance per segment).
+    fat_dash_pipeline: wgpu::RenderPipeline,
     /// PointList pipeline for point-cloud geometry.
     point_pipeline: wgpu::RenderPipeline,
     /// Textured-quad pipeline (underlay and basemap).
@@ -753,6 +844,61 @@ impl Pipelines {
             cache: None,
         });
 
+        // Dashed strokes (#364): the curve shader's dash entry points over
+        // `[x, y, z, s]` vertices. Both topologies must share the MSAA count.
+        let dash = |label: &str, fat: bool| {
+            let hair = wgpu::vertex_attr_array![0 => Float32x4];
+            let pair = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&mesh_layout),
+                vertex: wgpu::VertexState {
+                    module: &curve_shader,
+                    entry_point: Some(if fat { "vs_fat_dash" } else { "vs_dash" }),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: if fat { 32 } else { 16 },
+                        step_mode: if fat {
+                            wgpu::VertexStepMode::Instance
+                        } else {
+                            wgpu::VertexStepMode::Vertex
+                        },
+                        attributes: if fat { &pair } else { &hair },
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &curve_shader,
+                    entry_point: Some(if fat { "fs_fat_dash" } else { "fs_dash" }),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: if fat {
+                    wgpu::PrimitiveState::default()
+                } else {
+                    wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::LineList,
+                        ..Default::default()
+                    }
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: ms,
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let dash_pipeline = dash("dash_pipeline", false);
+        let fat_dash_pipeline = dash("fat_dash_pipeline", true);
+
         // Point cloud: same shader as curves, PointList topology.
         let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("point_pipeline"),
@@ -858,6 +1004,8 @@ impl Pipelines {
             edge_pipeline,
             fat_pipeline,
             axis_pipeline,
+            dash_pipeline,
+            fat_dash_pipeline,
             point_pipeline,
             underlay_pipeline,
         }
@@ -878,6 +1026,8 @@ pub struct SceneRenderer {
     curve_segments: Batch,
     /// Per pane: whether its last camera asked for fat strokes.
     fat_lines: Vec<bool>,
+    /// Per pane: whether its last camera hid the world axes (#364).
+    axes_hidden: Vec<bool>,
     camera_layout: wgpu::BindGroupLayout,
     /// One camera UBO + bind group per viewport pane. egui-wgpu runs every
     /// callback's `prepare` before any `paint`, so panes must not share a
@@ -906,10 +1056,17 @@ pub struct SceneRenderer {
     /// commit/cancel. Drawn as hairline segments over the scene, under the grid.
     /// Independent of the scene `generation` so it updates between doc changes.
     ghost_lines: Batch,
-    /// Persistent world X/Y axis segments (see [`world_axis_lines`]). Built
-    /// once in [`SceneRenderer::new`]; drawn every frame wherever the grid is
-    /// drawn, independent of document content.
+    /// Persistent solid positive world-axis halves (see [`world_axis_lines`]).
+    /// Built once in [`SceneRenderer::new`]; drawn every frame unless the
+    /// pane's camera hides the axes, independent of document content.
     axis_lines: Batch,
+    /// The dotted negative axis halves, `[x, y, z, s]` (dash pipeline).
+    axis_dots: Batch,
+    /// Curves and mesh edges on a dashed-linetype layer (#364), `[x, y, z,
+    /// s]` line lists drawn by the dash pipelines instead of `lines` /
+    /// `curve_segments` / `edges`.
+    dash_lines: Batch,
+    dash_edges: Batch,
     underlay: Option<GpuUnderlay>,
     basemap: Option<GpuUnderlay>,
     /// Document generation the GPU buffers were built from.
@@ -996,13 +1153,21 @@ impl SceneRenderer {
         );
 
         let mut axis_lines = Batch::new("axis");
+        let mut axis_dots = Batch::new("axis_dots");
         let mut axis = Staged::default();
-        for (points, color) in world_axis_lines() {
-            axis.push_segments(&points, ObjectParams::stroke(color));
+        let mut dots = Staged::default();
+        for a in world_axis_lines() {
+            if a.dotted {
+                dots.push_dashed(&dashed_strip(&a.points), ObjectParams::dashed(a.color, AXIS_DOTS));
+            } else {
+                axis.push_segments(&a.points, ObjectParams::stroke(a.color));
+            }
         }
         let mut axis_params = ParamBuffer::new(device);
-        axis_params.init(device, &object_layout, axis.params.iter());
+        axis_params.init(device, &object_layout, axis.params.iter().chain(&dots.params));
+        axis_dots.slot_base = axis.params.len() as u32;
         axis_lines.init(device, axis);
+        axis_dots.init(device, dots);
 
         Self {
             pipes,
@@ -1011,6 +1176,7 @@ impl SceneRenderer {
             msaa: Default::default(),
             curve_segments: Batch::new("curve_segments"),
             fat_lines: Vec::new(),
+            axes_hidden: Vec::new(),
             camera_layout,
             cameras: Vec::new(),
             scene_params: ParamBuffer::new(device),
@@ -1026,6 +1192,9 @@ impl SceneRenderer {
             point_clouds: Batch::new("point_clouds"),
             ghost_lines: Batch::new("ghost_lines"),
             axis_lines,
+            axis_dots,
+            dash_lines: Batch::new("dash_lines"),
+            dash_edges: Batch::new("dash_edges"),
             underlay: None,
             basemap: None,
             generation: u64::MAX,
@@ -1089,9 +1258,11 @@ impl SceneRenderer {
         queue.write_buffer(&self.cameras[viewport].0, 0, bytemuck::bytes_of(cam));
         if self.fat_lines.len() <= viewport {
             self.fat_lines.resize(viewport + 1, false);
+            self.axes_hidden.resize(viewport + 1, false);
         }
         self.fat_lines[viewport] =
             cam.screen[0] > 0.0 && cam.screen[1] > 0.0 && cam.screen[2] > 0.0;
+        self.axes_hidden[viewport] = !cam.shows_axes();
     }
 
     /// Replace the mesh fill only, leaving the other scene batches as they
@@ -1122,18 +1293,26 @@ impl SceneRenderer {
         self.meshes.set(device, queue, stage_meshes(&scene.meshes));
         let mut faces = Staged::default();
         for (mesh, rgb, color, rm) in &scene.face_meshes {
-            let params = ObjectParams { color: *color, material: [rm[0], rm[1], 0.0, 0.0] };
+            let params = ObjectParams::surface(*color, [rm[0], rm[1], 0.0, 0.0]);
             faces.push_face_mesh(&mesh.positions, &mesh.normals, rgb, &mesh.indices, params);
         }
         self.face_meshes.set(device, queue, faces);
 
         // Curves: strips for the hairline pass, plus LineList copies of the
         // same strips for the fat-stroke pass.
+        // Dashed-linetype curves and edges go to their own `[x, y, z, s]`
+        // batches instead (#364).
         let mut lines = Staged::default();
         let mut segments = Staged::default();
-        for (points, color, _lw_mm) in &scene.lines {
+        let mut dash_lines = Staged::default();
+        for (i, (points, color, _lw_mm)) in scene.lines.iter().enumerate() {
             if points.len() < 2 {
                 continue; // a strip needs at least one segment
+            }
+            let lt = scene.line_types.get(i).copied().unwrap_or_default();
+            if let Some(dash) = linetype_dash(lt) {
+                dash_lines.push_dashed(&dashed_strip(points), ObjectParams::dashed(*color, dash));
+                continue;
             }
             let pairs: Vec<[f32; 3]> = points.windows(2).flatten().copied().collect();
             segments.push_segments(&pairs, ObjectParams::stroke(*color));
@@ -1141,14 +1320,23 @@ impl SceneRenderer {
         }
         self.lines.set(device, queue, lines);
         self.curve_segments.set(device, queue, segments);
+        self.dash_lines.set(device, queue, dash_lines);
 
         let mut edges = Staged::default();
-        for (points, color, _lw_mm) in &scene.edges {
-            if points.len() >= 2 {
-                edges.push_segments(points, ObjectParams::stroke(*color));
+        let mut dash_edges = Staged::default();
+        for (i, (points, color, _lw_mm)) in scene.edges.iter().enumerate() {
+            if points.len() < 2 {
+                continue;
+            }
+            let lt = scene.edge_types.get(i).copied().unwrap_or_default();
+            match linetype_dash(lt) {
+                Some(dash) => dash_edges
+                    .push_dashed(&dashed_soup(points), ObjectParams::dashed(*color, dash)),
+                None => edges.push_segments(points, ObjectParams::stroke(*color)),
             }
         }
         self.edges.set(device, queue, edges);
+        self.dash_edges.set(device, queue, dash_edges);
 
         // Profile edges: tessellate into ribbon meshes, drawn with the solid
         // mesh pipeline. Fully matte so they read as flat ink.
@@ -1158,7 +1346,7 @@ impl SceneRenderer {
                 continue;
             }
             let ribbon = build_edge_ribbon(points, *half);
-            let params = ObjectParams { color: *color, material: [1.0, 0.0, 0.0, 0.0] };
+            let params = ObjectParams::surface(*color, [1.0, 0.0, 0.0, 0.0]);
             ribbons.push_mesh(&ribbon.positions, &ribbon.normals, &ribbon.indices, params);
         }
         self.profile_ribbons.set(device, queue, ribbons);
@@ -1200,17 +1388,29 @@ impl SceneRenderer {
             curve_segments,
             lines,
             point_clouds,
+            dash_lines,
+            dash_edges,
             scene_params,
             object_layout,
             ..
         } = self;
-        let params = [&*meshes, &*edges, &*profile_ribbons, &*curve_segments, &*lines, &*point_clouds, &*face_meshes]
-            .into_iter()
+        let params = [
+            &*meshes,
+            &*edges,
+            &*profile_ribbons,
+            &*curve_segments,
+            &*lines,
+            &*point_clouds,
+            &*face_meshes,
+            &*dash_lines,
+            &*dash_edges,
+        ]
+        .into_iter()
             .flat_map(|b| b.params.iter());
         scene_params.write(device, queue, object_layout, params);
     }
 
-    fn scene_batches_mut(&mut self) -> [&mut Batch; 7] {
+    fn scene_batches_mut(&mut self) -> [&mut Batch; 9] {
         [
             &mut self.meshes,
             &mut self.edges,
@@ -1219,6 +1419,8 @@ impl SceneRenderer {
             &mut self.lines,
             &mut self.point_clouds,
             &mut self.face_meshes,
+            &mut self.dash_lines,
+            &mut self.dash_edges,
         ]
     }
 
@@ -1393,6 +1595,9 @@ impl SceneRenderer {
             render_pass.set_pipeline(&self.pipes.edge_pipeline);
             draw_ranges(render_pass, &self.edges, scene);
         }
+        if draw_edges {
+            self.draw_dashed(render_pass, &self.dash_edges, fat);
+        }
 
         // Profile / silhouette ribbons: thick outline meshes. Drawn with the
         // solid mesh pipeline (depth-writing) so they read as fat ink edges on
@@ -1412,6 +1617,7 @@ impl SceneRenderer {
             render_pass.set_pipeline(&self.pipes.curve_pipeline);
             draw_ranges(render_pass, &self.lines, scene);
         }
+        self.draw_dashed(render_pass, &self.dash_lines, fat);
 
         // Point clouds: rendered as PointList after lines so they appear on top
         // of surfaces but below the grid.
@@ -1428,18 +1634,39 @@ impl SceneRenderer {
         }
 
         // Grid last: blends over background, depth-tested against meshes.
+        // A hidden grid (`grid off`, camera `light.z`) is dropped in the
+        // shader, which still paints the gradient background (#364).
         render_pass.set_pipeline(&self.pipes.grid_pipeline);
         render_pass.draw(0..3, 0..1);
 
-        // World X/Y axes: the z=0 datum lines (incl. the horizontal datum in
-        // Front/Back elevations), as real line geometry so they stay straight
-        // at any zoom. Drawn after the grid (whose gradient mode is opaque)
-        // with the depth-biased axis pipeline so the coplanar grid plane does
-        // not stipple over them; still depth-tested, so meshes occlude them.
-        // They share the grid's visibility: any view that paints the grid
-        // paints the axes.
-        render_pass.set_pipeline(&self.pipes.axis_pipeline);
-        draw_ranges(render_pass, &self.axis_lines, &self.axis_params);
+        // World axes: X/Y are the z=0 datum lines (incl. the horizontal datum
+        // in Front/Back elevations), Z the vertical through the origin; real
+        // line geometry so they stay straight at any zoom. Drawn after the
+        // grid (whose gradient mode is opaque) with the depth-nudged axis and
+        // dash pipelines so the coplanar grid plane does not stipple over
+        // them; still depth-tested, so meshes occlude them. `axes off`
+        // (camera `light.w`) hides them for the pane (#364).
+        if !self.axes_hidden.get(viewport).copied().unwrap_or(false) {
+            render_pass.set_pipeline(&self.pipes.axis_pipeline);
+            draw_ranges(render_pass, &self.axis_lines, &self.axis_params);
+            render_pass.set_pipeline(&self.pipes.dash_pipeline);
+            draw_ranges(render_pass, &self.axis_dots, &self.axis_params);
+        }
+    }
+
+    /// Draw a dashed batch as hairlines, or as fat strokes when the pane's
+    /// camera asks for them (#364).
+    fn draw_dashed(&self, pass: &mut wgpu::RenderPass<'static>, batch: &Batch, fat: bool) {
+        if batch.draws.is_empty() {
+            return;
+        }
+        if fat {
+            pass.set_pipeline(&self.pipes.fat_dash_pipeline);
+            draw_fat(pass, batch, &self.scene_params);
+        } else {
+            pass.set_pipeline(&self.pipes.dash_pipeline);
+            draw_ranges(pass, batch, &self.scene_params);
+        }
     }
 }
 
@@ -1447,7 +1674,7 @@ impl SceneRenderer {
 fn stage_meshes(meshes: &[(RenderMesh, [f32; 4], [f32; 2])]) -> Staged {
     let mut s = Staged::default();
     for (mesh, color, rm) in meshes {
-        let params = ObjectParams { color: *color, material: [rm[0], rm[1], 0.0, 0.0] };
+        let params = ObjectParams::surface(*color, [rm[0], rm[1], 0.0, 0.0]);
         s.push_mesh(&mesh.positions, &mesh.normals, &mesh.indices, params);
     }
     s
@@ -1495,32 +1722,75 @@ fn draw_fat(pass: &mut wgpu::RenderPass<'static>, batch: &Batch, params: &ParamB
 
 #[cfg(test)]
 mod tests {
-    use super::{curve_px, world_axis_lines, DisplayMode, LightMode, AXIS_EXTENT, RHINO_CURVE_PX};
+    use super::{
+        curve_px, dashed_soup, dashed_strip, linetype_dash, world_axis_lines, DisplayMode,
+        LightMode, LineType, AXIS_EXTENT, AXIS_RGBA, RHINO_CURVE_PX,
+    };
 
     #[test]
     fn world_axis_lines_geometry() {
         let axes = world_axis_lines();
-        assert_eq!(axes.len(), 2);
-
-        let (x_pts, x_color) = axes[0];
-        let (y_pts, y_color) = axes[1];
-
-        // Finite, f32-exact extent, symmetric about the origin.
+        assert_eq!(axes.len(), 6);
         assert!(AXIS_EXTENT.is_finite() && AXIS_EXTENT > 0.0);
-        assert_eq!(x_pts, [[-AXIS_EXTENT, 0.0, 0.0], [AXIS_EXTENT, 0.0, 0.0]]);
-        assert_eq!(y_pts, [[0.0, -AXIS_EXTENT, 0.0], [0.0, AXIS_EXTENT, 0.0]]);
-
-        // Both axes lie exactly on the z=0 datum plane.
-        for p in x_pts.iter().chain(y_pts.iter()) {
-            assert_eq!(p[2], 0.0);
+        for (axis, color) in AXIS_RGBA.iter().enumerate() {
+            // Red X, green Y, blue Z: that channel dominates, fully opaque.
+            assert!((0..3).all(|c| c == axis || color[axis] > color[c]), "{axis}: {color:?}");
+            assert_eq!(color[3], 1.0);
+            let halves: Vec<_> = axes.iter().filter(|a| a.color == *color).collect();
+            assert_eq!(halves.len(), 2, "axis {axis}: a positive and a negative half");
+            for a in halves {
+                // From the origin outward along this axis only, f32-exact.
+                assert_eq!(a.points[0], [0.0; 3]);
+                let end = a.points[1][axis];
+                assert_eq!(end.abs(), AXIS_EXTENT);
+                assert!((0..3).all(|c| c == axis || a.points[1][c] == 0.0));
+                // SketchUp: solid positive half, dotted negative half.
+                assert_eq!(a.dotted, end < 0.0);
+            }
         }
+        // The blue Z axis rises from the origin (#364).
+        assert!(axes.iter().any(|a| a.points[1] == [0.0, 0.0, AXIS_EXTENT] && !a.dotted));
+    }
 
-        // X is the red axis, Y the green one (red channel dominates on X,
-        // green on Y), both fully opaque.
-        assert!(x_color[0] > x_color[1] && x_color[0] > x_color[2]);
-        assert!(y_color[1] > y_color[0] && y_color[1] > y_color[2]);
-        assert_eq!(x_color[3], 1.0);
-        assert_eq!(y_color[3], 1.0);
+    #[test]
+    fn camera_overlays_toggle_grid_and_axes() {
+        let cam = crate::camera_uniform(glam::Mat4::IDENTITY, glam::Vec3::ZERO);
+        assert!(cam.shows_grid() && cam.shows_axes(), "shown by default");
+        let off = cam.with_overlays(false, true);
+        assert!(!off.shows_grid() && off.shows_axes());
+        assert_eq!(off.light[2], 1.0, "grid.wgsl reads light.z");
+        let off = cam.with_overlays(true, false);
+        assert!(off.shows_grid() && !off.shows_axes());
+        assert_eq!(off.light[3], 1.0);
+        assert_eq!(off.light[..2], cam.light[..2], "lighting flags untouched");
+    }
+
+    #[test]
+    fn dashed_strokes_carry_distance_along() {
+        // A strip runs its distance on across segments.
+        let strip = dashed_strip(&[[0.0; 3], [3.0, 4.0, 0.0], [3.0, 4.0, 2.0]]);
+        let s: Vec<f32> = strip.iter().map(|v| v[3]).collect();
+        assert_eq!(s, [0.0, 5.0, 5.0, 7.0]);
+        assert_eq!(strip[2][..3], [3.0, 4.0, 0.0]);
+        // A soup restarts every segment; an odd trailing point is dropped.
+        let soup = dashed_soup(&[[0.0; 3], [2.0, 0.0, 0.0], [5.0, 0.0, 0.0], [5.0, 1.0, 0.0], [9.0; 3]]);
+        let s: Vec<f32> = soup.iter().map(|v| v[3]).collect();
+        assert_eq!(s, [0.0, 2.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn linetypes_map_to_dash_patterns() {
+        assert_eq!(linetype_dash(LineType::Continuous), None);
+        let mut seen = Vec::new();
+        for lt in [LineType::Dashed, LineType::Dotted, LineType::DashDot] {
+            let d = linetype_dash(lt).expect("a pattern");
+            assert!(d.iter().all(|v| *v > 0.0), "{lt:?}: every dash and gap visible");
+            assert!(!seen.contains(&d), "{lt:?}: distinct pattern");
+            seen.push(d);
+        }
+        // Dash-dot: a long dash then a short dot.
+        let dd = linetype_dash(LineType::DashDot).unwrap();
+        assert!(dd[0] > dd[2]);
     }
 
     #[test]

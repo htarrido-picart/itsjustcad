@@ -9,6 +9,7 @@ struct Camera {
     misc: vec4<f32>,
     light: vec4<f32>,
     // x,y = target size (device px), z = stroke width (device px); see vs_fat.
+    // w = device px per logical px, scaling the dash patterns (0 reads as 1).
     screen: vec4<f32>,
 };
 
@@ -16,6 +17,9 @@ struct Camera {
 
 struct ObjectParams {
     color: vec4<f32>,
+    material: vec4<f32>,
+    // Dash pattern in logical px: on, off, on, off. All zero = solid (#364).
+    dash: vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> object: ObjectParams;
@@ -98,6 +102,10 @@ fn vs_fat(
     @location(0) a: vec3<f32>,
     @location(1) b: vec3<f32>,
 ) -> FatOut {
+    return fat_quad(vi, a, b);
+}
+
+fn fat_quad(vi: u32, a: vec3<f32>, b: vec3<f32>) -> FatOut {
     var out: FatOut;
     var ca = pulled_clip(a);
     var cb = pulled_clip(b);
@@ -146,13 +154,104 @@ fn vs_fat(
 
 @fragment
 fn fs_fat(in: FatOut) -> @location(0) vec4<f32> {
+    return fat_ink(in.local, in.len_px);
+}
+
+fn fat_ink(local: vec2<f32>, len_px: f32) -> vec4<f32> {
     let c = ink();
     // Distance to the segment (not just across it): round caps.
-    let past = max(-in.local.y, in.local.y - in.len_px);
-    let dist = length(vec2(in.local.x, max(past, 0.0)));
+    let past = max(-local.y, local.y - len_px);
+    let dist = length(vec2(local.x, max(past, 0.0)));
     let cover = clamp(camera.screen.z * 0.5 + 0.5 - dist, 0.0, 1.0);
     if (cover <= 0.0) {
         discard; // keep the cap corners out of the depth buffer
     }
     return vec4(c.rgb, c.a * cover);
+}
+
+// Dashed strokes (#364). Every vertex carries `s`, its world distance along
+// the stroke. The pattern is laid out in screen px: the world length of one
+// period at the fragment's depth is snapped up to a power of two, so the
+// dashes stay put on the geometry while zooming (no crawling) and keep a
+// steady on-screen size within a factor of two, like the grid's levels.
+struct DashOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) s: f32,
+    // Clip w: the eye depth in perspective, 1 in parallel views.
+    @location(1) w: f32,
+};
+
+// Whether the dash pattern is "on" at distance `s` along the stroke, for a
+// fragment at clip depth `w`.
+fn dash_on(s: f32, w: f32) -> bool {
+    let pat = object.dash * max(camera.screen.w, 1.0);
+    let period = pat.x + pat.y + pat.z + pat.w;
+    if (period <= 0.0) {
+        return true;
+    }
+    // World size of one device px at this depth: 2 w / (P11 * height). The
+    // projection's y row (P11 times the unit view row) gives P11.
+    var h = camera.screen.y;
+    if (h <= 0.0) {
+        h = 1000.0;
+    }
+    let row_y = vec3(camera.view_proj[0].y, camera.view_proj[1].y, camera.view_proj[2].y);
+    let wpp = 2.0 * abs(w) / max(length(row_y) * h, 1e-12);
+    let world_period = exp2(ceil(log2(max(period * wpp, 1e-12))));
+    let phase = fract(s / world_period) * period;
+    let first = pat.x + pat.y;
+    return phase < pat.x || (phase >= first && phase < first + pat.z);
+}
+
+@vertex
+fn vs_dash(@location(0) p: vec4<f32>) -> DashOut {
+    var out: DashOut;
+    // The dotted negative world axes use this too: same depth nudge as vs_axis.
+    var clip = camera.view_proj * vec4(p.xyz, 1.0);
+    clip.z -= 5e-7 * clip.w;
+    out.pos = clip;
+    out.s = p.w;
+    out.w = clip.w;
+    return out;
+}
+
+@fragment
+fn fs_dash(in: DashOut) -> @location(0) vec4<f32> {
+    if (!dash_on(in.s, in.w)) {
+        discard;
+    }
+    return ink();
+}
+
+struct FatDashOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) @interpolate(linear) local: vec2<f32>,
+    @location(1) @interpolate(flat) len_px: f32,
+    @location(2) s: f32,
+    @location(3) w: f32,
+};
+
+@vertex
+fn vs_fat_dash(
+    @builtin(vertex_index) vi: u32,
+    @location(0) a: vec4<f32>,
+    @location(1) b: vec4<f32>,
+) -> FatDashOut {
+    let q = fat_quad(vi, a.xyz, b.xyz);
+    var out: FatDashOut;
+    out.pos = q.pos;
+    out.local = q.local;
+    out.len_px = q.len_px;
+    // Corners 1, 4 and 5 sit at the segment's end (see `corners` above).
+    out.s = select(a.w, b.w, vi == 1u || vi == 4u || vi == 5u);
+    out.w = q.pos.w;
+    return out;
+}
+
+@fragment
+fn fs_fat_dash(in: FatDashOut) -> @location(0) vec4<f32> {
+    if (!dash_on(in.s, in.w)) {
+        discard;
+    }
+    return fat_ink(in.local, in.len_px);
 }

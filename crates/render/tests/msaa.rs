@@ -13,6 +13,7 @@ use itsjustcad_render::{
     camera_uniform, pick_sample_count, supported_sample_counts, DisplayMode, SceneData,
     SceneRenderer, UnderlayData, DEPTH_FORMAT,
 };
+use itsjustcad_doc::LineType;
 use kernel_mesh::RenderMesh;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -61,7 +62,7 @@ fn view_proj() -> (Mat4, Vec3) {
 }
 
 /// A scene touching every pipeline: meshes, face meshes, curves, edges,
-/// profile ribbons, points, underlay and basemap.
+/// dashed curves and edges, profile ribbons, points, underlay and basemap.
 fn full_scene() -> SceneData {
     let tri = || quad_mesh([[-1.5, 5.0, 10.5], [1.5, 5.0, 13.5], [1.5, 5.0, 10.5]]);
     let underlay = || UnderlayData {
@@ -74,8 +75,11 @@ fn full_scene() -> SceneData {
     SceneData {
         meshes: vec![(tri(), [0.8, 0.2, 0.2, 1.0], [0.5, 0.0])],
         face_meshes: vec![(tri(), vec![[0.1, 0.9, 0.1]; 2], [1.0; 4], [0.5, 0.0])],
+        // Dashed curve and dash-dot edge: the dash pipelines (#364).
         lines: vec![(vec![[-2.0, 5.0, 11.0], [2.0, 5.0, 13.0]], [0.0, 0.0, 0.0, 1.0], 0.5)],
         edges: vec![(vec![[-2.0, 5.0, 12.0], [2.0, 5.0, 12.0]], [0.0, 0.0, 0.0, 1.0], 0.25)],
+        line_types: vec![LineType::Dashed],
+        edge_types: vec![LineType::DashDot],
         profile_edges: vec![(vec![[-2.0, 5.0, 11.5], [2.0, 5.0, 11.5]], [0.0, 0.0, 0.0, 1.0], 0.02)],
         points: vec![(vec![[0.0, 5.0, 12.0]], [0.0, 0.0, 1.0, 1.0])],
         underlay: Some(underlay()),
@@ -289,6 +293,8 @@ fn diagonal_edge_is_smoothed() {
         face_meshes: vec![],
         lines: vec![],
         edges: vec![],
+        line_types: vec![],
+        edge_types: vec![],
         profile_edges: vec![],
         points: vec![],
         underlay: None,
@@ -306,4 +312,55 @@ fn diagonal_edge_is_smoothed() {
     // Interior coverage is unchanged by MSAA.
     let solid_on = on.chunks(4).filter(|p| p[3] == 255).count();
     assert!(solid_on.abs_diff(solid) < solid / 10, "{solid_on} vs {solid}");
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn dashed_lines_draw_gaps_at_every_sample_count() {
+    // #364: a dashed curve across the frame covers clearly fewer pixels than
+    // the same curve solid, as a hairline and as a fat stroke, with the dash
+    // pipelines validating against every sample count.
+    let g = gpu();
+    let scene = |lt| SceneData {
+        meshes: vec![],
+        face_meshes: vec![],
+        lines: vec![(vec![[-4.0, 5.0, 12.0], [4.0, 5.0, 12.0]], [1.0, 0.0, 0.0, 1.0], 0.25)],
+        edges: vec![],
+        line_types: vec![lt],
+        edge_types: vec![],
+        profile_edges: vec![],
+        points: vec![],
+        underlay: None,
+        basemap: None,
+        show_lineweights: false,
+    };
+    let drawn = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[3] > 8).count();
+    for &n in &g.counts {
+        for mode in [DisplayMode::Shaded, DisplayMode::HiddenLine] {
+            let scope = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let draw = |lt| {
+                let mut r = renderer(&g, &scene(lt), n);
+                let (vp, eye) = view_proj();
+                let mut cam = camera_uniform(vp, eye).with_overlays(false, false);
+                cam.screen = [W as f32, H as f32, mode.line_px(1.0), 1.0];
+                r.write_camera(&g.device, &g.queue, 0, &cam);
+                if n > 1 {
+                    let mut enc = g.device.create_command_encoder(&Default::default());
+                    r.render_msaa_pane(&g.device, &mut enc, 0, [W, H], mode, true);
+                    g.queue.submit([enc.finish()]);
+                    return read_rgba(&g, r.msaa_target(0).expect("target").resolve_texture());
+                }
+                window_pass(&g, wgpu::Color::TRANSPARENT, |pass| r.paint(pass, 0, mode, true))
+            };
+            let solid = drawn(&draw(LineType::Continuous));
+            let dashed = drawn(&draw(LineType::Dashed));
+            let err = pollster::block_on(scope.pop());
+            assert!(err.is_none(), "{n}x {mode:?}: {err:?}");
+            assert!(solid > W as usize / 2, "{n}x {mode:?}: solid line in frame ({solid} px)");
+            assert!(
+                dashed * 10 < solid * 9 && dashed * 10 > solid * 3,
+                "{n}x {mode:?}: dashed {dashed} px vs solid {solid} px"
+            );
+        }
+    }
 }

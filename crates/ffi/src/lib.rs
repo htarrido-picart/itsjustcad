@@ -3286,12 +3286,13 @@ pub(crate) fn render_view(app: &mut AppHandle, cam: u32, surface: u32) -> bool {
     let vp = camera.view_proj(aspect);
     let eye = camera.eye();
     let mut cam = camera_uniform_with_mode(vp, eye, app.mode);
-    // Hidden-line and sketchy strokes (#174), in device px for this screen.
+    // Hidden-line and sketchy strokes (#174), in device px for this screen;
+    // w scales the dashed-linetype patterns (#364).
     cam.screen = [
         tw as f32,
         th.max(1) as f32,
         app.mode.line_px(app.pixel_scale),
-        0.0,
+        app.pixel_scale,
     ];
     gpu.renderer.write_camera(&gpu.device, &gpu.queue, 0, &cam);
 

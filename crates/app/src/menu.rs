@@ -424,6 +424,10 @@ pub struct ViewState {
     pub lang: Lang,
     /// Active mouse-navigation preset — drives the check on Theme ▸ Mouse.
     pub mouse_nav: MouseNav,
+    /// Ground grid lines shown — the check on View ▸ Show Grid (#364).
+    pub show_grid: bool,
+    /// World axes shown — the check on View ▸ Show Axes (#364).
+    pub show_axes: bool,
 }
 
 /// The display-mode radio choices the View menu offers, in menu order. A copy of
@@ -447,10 +451,13 @@ pub enum LightModeTag {
 
 /// The camera-projection radio choices the View menu offers, in menu order.
 /// Mirrors the `camera <mode>` verb family (perspective / two-point / panorama /
-/// fisheye); ortho standard views check nothing (projection is view-implied).
+/// fisheye) plus parallel projection (#364).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CameraTag {
     Perspective,
+    /// Parallel projection (`camera parallel`, #364), incl. the standard
+    /// plan/elevation views.
+    Parallel,
     TwoPoint,
     Panorama,
     Fisheye,
@@ -735,6 +742,7 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             // is implied by the view. Fires the same `camera <mode>` verbs the
             // command line and the deck use.
             radio("cam_persp", tr("menu.view.cam_persp"), "camera persp", view.camera == Some(CameraTag::Perspective)),
+            radio("cam_parallel", tr("menu.view.cam_parallel"), "camera parallel", view.camera == Some(CameraTag::Parallel)),
             radio("cam_2point", tr("menu.view.cam_2point"), "camera 2point", view.camera == Some(CameraTag::TwoPoint)),
             radio("cam_pano", tr("menu.view.cam_pano"), "camera pano", view.camera == Some(CameraTag::Panorama)),
             radio("cam_fisheye", tr("menu.view.cam_fisheye"), "camera fisheye", view.camera == Some(CameraTag::Fisheye)),
@@ -744,6 +752,10 @@ pub fn native_model(_style: MenuStyle, has_selection: bool, view: ViewState) -> 
             radio("aa_2x", tr("menu.view.aa_2x"), "antialias 2", view.antialias == 2),
             radio("aa_4x", tr("menu.view.aa_4x"), "antialias 4", view.antialias == 4),
             radio("aa_8x", tr("menu.view.aa_8x"), "antialias 8", view.antialias == 8),
+            NativeItem::Separator,
+
+            radio("grid", tr("menu.view.grid"), "grid", view.show_grid),
+            radio("axes", tr("menu.view.axes"), "axes", view.show_axes),
             NativeItem::Separator,
             // Viewport layout.
             ex("vp1", tr("menu.view.vp1"), "viewports 1"),
@@ -1206,6 +1218,8 @@ pub fn demo_open(
         skin: CadOrigin::None,
         lang: Lang::En,
         mouse_nav: MouseNav::Right,
+        show_grid: true,
+        show_axes: true,
     };
     let Some(menu) = native_model(style, false, view).into_iter().find(|m| m.title == title) else {
         return;
@@ -1757,6 +1771,30 @@ mod tests {
         assert_eq!(view_check(v, "View/light_sun"), Some(true));
         assert_eq!(view_check(v, "View/light_working"), Some(false));
         assert_eq!(view_check(v, "View/light_present"), Some(false));
+    }
+
+    #[test]
+    fn view_grid_axes_and_parallel_items_check_and_fire_verbs() {
+        // #364: Show Grid / Show Axes reflect the toggles and fire the bare
+        // (flipping) verbs; Parallel Projection is a camera radio.
+        let action = |v: ViewState, want: &str| {
+            native_model(MenuStyle::Modeler, true, v)
+                .into_iter()
+                .flat_map(|m| m.items)
+                .find_map(|it| match it {
+                    NativeItem::Check { id, action, .. } if id == want => Some(action),
+                    _ => None,
+                })
+        };
+        let on = ViewState { show_grid: true, show_axes: false, ..Default::default() };
+        assert_eq!(view_check(on, "View/grid"), Some(true));
+        assert_eq!(view_check(on, "View/axes"), Some(false));
+        assert_eq!(action(on, "View/grid"), Some(MenuAction::Execute("grid".into())));
+        assert_eq!(action(on, "View/axes"), Some(MenuAction::Execute("axes".into())));
+        let par = ViewState { camera: Some(CameraTag::Parallel), ..Default::default() };
+        assert_eq!(view_check(par, "View/cam_parallel"), Some(true));
+        assert_eq!(view_check(par, "View/cam_persp"), Some(false));
+        assert_eq!(action(par, "View/cam_parallel"), Some(MenuAction::Execute("camera parallel".into())));
     }
 
     #[test]
