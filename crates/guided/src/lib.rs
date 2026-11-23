@@ -43,6 +43,7 @@ mod array;
 mod boolean;
 mod creation;
 mod curve_edit;
+pub mod inference;
 mod offset;
 mod organize;
 mod reference_hatch;

@@ -24,6 +24,7 @@ use std::ffi::{CStr, c_char};
 use glam::{DVec3, Vec2};
 use itsjustcad_commands::Session;
 use itsjustcad_doc::{Document, Geometry, ObjectId};
+use itsjustcad_guided::inference::{self, AxisLock};
 use itsjustcad_guided::{GuidedTool, ObjFilter, StartResult, Step, StepResult};
 use kernel_curve::Curve;
 use serde_json::{Value, json};
@@ -50,11 +51,29 @@ pub(crate) struct GuidedState {
     /// Last result-preview command and its outcome segments (re-used while the
     /// finger moves without changing the command).
     cached: Option<(String, Vec<Vec<DVec3>>)>,
+    /// Axis lock for the current point step (#372), set with
+    /// [`ijc_guided_set_draw_axis`]; lapses once the next point is picked.
+    axis_lock: AxisLock,
 }
 
 impl GuidedState {
     fn clear_preview(&mut self) {
         self.cached = None;
+    }
+
+    /// The point a coloured axis band runs from: the last picked point on a
+    /// point step (move/copy target, …), except a rotate (its axis is
+    /// `ijc_guided_set_axis`).
+    fn axis_anchor(&self) -> Option<DVec3> {
+        let t = &self.tool;
+        (t.current_is_point() && !t.supports_axis_lock())
+            .then(|| t.last_point())
+            .flatten()
+    }
+
+    /// The locked draw axis in effect, if any.
+    fn draw_axis(&self) -> Option<char> {
+        self.axis_lock.get(self.axis_anchor())
     }
 }
 
@@ -63,7 +82,8 @@ fn v3(p: DVec3) -> Value {
 }
 
 /// The current step as JSON (see [`ijc_guided_state_json`]).
-fn state_value(tool: &GuidedTool) -> Value {
+fn state_value(g: &GuidedState) -> Value {
+    let tool = &g.tool;
     let (Some(verb), Some(step)) = (tool.active_verb(), tool.current()) else {
         return json!({ "active": false });
     };
@@ -85,6 +105,9 @@ fn state_value(tool: &GuidedTool) -> Value {
         // Rotation axis in effect ("x"|"y"|"z") for verbs that take one
         // (`rotate`), else null. Change it with `ijc_guided_set_axis`.
         "axis": tool.axis().map(|a| a.to_string()),
+        // Point-step axis lock ("x"|"y"|"z", SketchUp red/green/blue) set
+        // with `ijc_guided_set_draw_axis`, else null.
+        "drawAxis": g.draw_axis().map(|a| a.to_string()),
     });
     let (kind, prompt) = match *step {
         Step::PickPoint { prompt } => ("pickPoint", prompt),
@@ -192,7 +215,7 @@ fn finish(app: &mut AppHandle, r: StepResult) -> String {
         "error": error,
         "command": command,
         "run": run,
-        "state": state_value(&app.guided.tool),
+        "state": state_value(&app.guided),
     })
     .to_string()
 }
@@ -200,7 +223,7 @@ fn finish(app: &mut AppHandle, r: StepResult) -> String {
 fn idle(app: Option<&AppHandle>, error: &str) -> *mut c_char {
     let state = app.map_or_else(
         || json!({ "active": false }),
-        |a| state_value(&a.guided.tool),
+        |a| state_value(&a.guided),
     );
     into_c_string(
         json!({ "status": "idle", "error": error, "command": null, "run": null, "state": state })
@@ -284,7 +307,7 @@ pub unsafe extern "C" fn ijc_guided_start(h: *mut AppHandle, verb: *const c_char
         into_c_string(
             json!({
                 "status": status, "error": null, "command": null, "run": null,
-                "state": state_value(&app.guided.tool),
+                "state": state_value(&app.guided),
             })
             .to_string(),
         )
@@ -306,7 +329,7 @@ pub unsafe extern "C" fn ijc_guided_state_json(h: *mut AppHandle) -> *mut c_char
     guard_ffi(std::ptr::null_mut(), || {
         let state = (unsafe { handle_ref(h) }).map_or_else(
             || json!({ "active": false }),
-            |a| state_value(&a.guided.tool),
+            |a| state_value(&a.guided),
         );
         into_c_string(state.to_string())
     })
@@ -547,6 +570,42 @@ pub unsafe extern "C" fn ijc_guided_set_axis(h: *mut AppHandle, axis: *const c_c
     })
 }
 
+/// Lock the rubber band of a point step to a world axis (`"x"` red, `"y"`
+/// green, `"z"` blue; SketchUp's arrow keys, #372): the same axis again
+/// unlocks, and null/empty clears. While locked, [`ijc_guided_snap_json`] and
+/// [`ijc_guided_pick`] put the point on that axis through `state.lastPoint`
+/// (an object snap only sets the distance along it; blue follows the touch
+/// up the vertical line). The lock lapses once the next point is picked.
+/// Returns the answer envelope (`"more"` with `state.drawAxis`; `error` when
+/// the step is not a point step after a first point, or `axis` is not one).
+///
+/// # Safety
+/// `h` must be null or a live handle; `axis` null or a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ijc_guided_set_draw_axis(
+    h: *mut AppHandle,
+    axis: *const c_char,
+) -> *mut c_char {
+    with_active(h, |app| {
+        let text = c_str(axis).unwrap_or_default().trim();
+        let mut chars = text.chars();
+        let g = &mut app.guided;
+        let r = match (g.axis_anchor(), chars.next(), chars.next()) {
+            (_, None, _) => {
+                g.axis_lock.clear();
+                StepResult::NeedMore
+            }
+            (Some(anchor), Some(a), None) if itsjustcad_guided::axis_vector(a).is_some() => {
+                g.axis_lock.toggle(a, anchor);
+                StepResult::NeedMore
+            }
+            (None, ..) => StepResult::Error("axis lock needs a point step after a first point".into()),
+            _ => StepResult::Error("axis must be x, y or z".into()),
+        };
+        finish(app, r)
+    })
+}
+
 /// Cancel the running guided command (nothing runs). Returns whether one was
 /// running.
 ///
@@ -569,6 +628,9 @@ pub unsafe extern "C" fn ijc_guided_cancel(h: *mut AppHandle) -> bool {
 struct Snap {
     point: DVec3,
     kind: &'static str,
+    /// The world axis the point lies on from the step's last point (lock,
+    /// inference or coincidence), for the host's red/green/blue band.
+    axis: Option<char>,
 }
 
 /// Snap candidates of one object (end/mid/center of curves, small-mesh
@@ -624,7 +686,46 @@ fn snap_candidates(geom: &Geometry, out: &mut Vec<(DVec3, &'static str)>) {
 /// Resolve a screen position (drawable pixels) to a world point: the nearest
 /// snap candidate within `radius_px`, else the surface under the ray, else the
 /// construction plane rounded to the 10 cm grid.
+/// [`snap_raw`] put on a world axis through the point step's last point: a
+/// lock forces it (object snaps keep only their distance along the axis); in
+/// empty space a touch within a few degrees of an axis on screen infers it.
 fn snap_at(app: &AppHandle, x_px: f32, y_px: f32, radius_px: f32) -> Option<Snap> {
+    let mut snap = snap_raw(app, x_px, y_px, radius_px)?;
+    let Some(anchor) = app.guided.axis_anchor() else {
+        return Some(snap);
+    };
+    let (w, h) = viewport_size(app)?;
+    let vp = app.camera.view_proj(w / h);
+    let ray = screen_ray(vp, w, h, x_px, y_px);
+    let object_snap = !matches!(snap.kind, "grid" | "surface");
+    if let Some(a) = app.guided.draw_axis() {
+        snap.point =
+            inference::constrain_to_axis(anchor, a, object_snap.then_some(snap.point), ray);
+    } else if snap.kind == "grid"
+        && let (Some(anchor_px), Some((ro, rd))) = (boxsel::project(vp, w, h, anchor), ray)
+    {
+        // A world step of a tenth of the eye distance shows each axis's
+        // on-screen direction at the anchor.
+        let step = anchor.distance(ro).max(1e-6) * 0.1;
+        let axis_px = |a: char| {
+            let u = itsjustcad_guided::axis_vector(a)?;
+            Some(boxsel::project(vp, w, h, anchor + u * step)? - anchor_px)
+        };
+        if let Some(a) =
+            inference::infer_axis(Vec2::new(x_px, y_px) - anchor_px, axis_px, inference::INFER_TOL_DEG)
+            && let Some(u) = itsjustcad_guided::axis_vector(a)
+            && let Some(p) = inference::closest_on_line_to_ray(anchor, u, ro, rd)
+        {
+            snap.point = p;
+        }
+    }
+    snap.axis = inference::axis_of(anchor, snap.point);
+    Some(snap)
+}
+
+/// The raw snapped point under a screen position: object snap, surface hit,
+/// else the construction plane's grid.
+fn snap_raw(app: &AppHandle, x_px: f32, y_px: f32, radius_px: f32) -> Option<Snap> {
     let (w, h) = viewport_size(app)?;
     let vp = app.camera.view_proj(w / h);
     let (origin, dir) = screen_ray(vp, w, h, x_px, y_px)?;
@@ -643,7 +744,7 @@ fn snap_at(app: &AppHandle, x_px: f32, y_px: f32, radius_px: f32) -> Option<Snap
         .filter(|(d, ..)| *d <= radius_px.max(0.0))
         .min_by(|a, b| a.0.total_cmp(&b.0));
     if let Some((_, point, kind)) = best {
-        return Some(Snap { point, kind });
+        return Some(Snap { point, kind, axis: None });
     }
     let surface = doc
         .objects()
@@ -654,12 +755,14 @@ fn snap_at(app: &AppHandle, x_px: f32, y_px: f32, radius_px: f32) -> Option<Snap
         return Some(Snap {
             point: origin + dir * t,
             kind: "surface",
+            axis: None,
         });
     }
     let t = ray_plane(&doc.cplane, origin, dir)?;
     Some(Snap {
         point: grid_snap(origin + dir * t),
         kind: "grid",
+        axis: None,
     })
 }
 
@@ -741,9 +844,13 @@ fn pick_object_at(
 
 /// Resolve a screen position (drawable pixels, as [`super::ijc_pick`]) to a
 /// snapped world point for a point step, without answering:
-/// `{"point":[x,y,z],"snap":"end"|"mid"|"cen"|"vtx"|"surface"|"grid"}` or
-/// `{"point":null}`. Snaps to curve end/mid/center points and small-mesh
-/// vertices within `radius_px`. Hosts use it while a finger drags, feeding
+/// `{"point":[x,y,z],"snap":"end"|"mid"|"cen"|"vtx"|"surface"|"grid",
+/// "axis":"x"|"y"|"z"|null}` or `{"point":null}`. Snaps to curve
+/// end/mid/center points and small-mesh vertices within `radius_px`. On a
+/// point step after a first point the result follows the axis lock
+/// ([`ijc_guided_set_draw_axis`]) or infers an axis in empty space; `axis`
+/// names the axis the band from `state.lastPoint` runs along (draw it red /
+/// green / blue). Hosts use it while a finger drags, feeding
 /// the point to [`ijc_guided_preview_json`]. Caller must
 /// [`super::ijc_string_free`] the result.
 ///
@@ -759,8 +866,12 @@ pub unsafe extern "C" fn ijc_guided_snap_json(
     guard_ffi(std::ptr::null_mut(), || {
         let snap = (unsafe { handle_ref(h) }).and_then(|app| snap_at(app, x_px, y_px, radius_px));
         let v = match snap {
-            Some(s) => json!({ "point": v3(s.point), "snap": s.kind }),
-            None => json!({ "point": null, "snap": null }),
+            Some(s) => json!({
+                "point": v3(s.point),
+                "snap": s.kind,
+                "axis": s.axis.map(|a| a.to_string()),
+            }),
+            None => json!({ "point": null, "snap": null, "axis": null }),
         };
         into_c_string(v.to_string())
     })
@@ -960,6 +1071,57 @@ mod tests {
         let (x, y) = screen(h, DVec3::new(5.03, 5.04, 0.0));
         let s = take(unsafe { ijc_guided_snap_json(h, x, y, 4.0) });
         assert_eq!(s["snap"], "grid", "{s}");
+        unsafe { ijc_free(h) };
+    }
+
+    #[test]
+    fn point_step_axis_lock_and_inference() {
+        let h = ijc_init_headless();
+        unsafe { ijc_resize(h, 1200, 900) };
+        run(h, "box 5,5,0 6,6,1");
+        run(h, "select all");
+        run(h, "ze");
+        let set = |a: &str| {
+            let a = CString::new(a).unwrap();
+            take(unsafe { ijc_guided_set_draw_axis(h, a.as_ptr()) })
+        };
+        let verb = CString::new("move").unwrap();
+        take(unsafe { ijc_guided_start(h, verb.as_ptr()) });
+        // No first point yet: nothing to lock from.
+        assert_eq!(set("x")["status"], "error");
+        let r = take(unsafe { ijc_guided_answer_point(h, 0.0, 0.0, 0.0) });
+        assert_eq!(r["state"]["drawAxis"], Value::Null, "{r}");
+
+        // Blue lock: the touch climbs the vertical line through the base.
+        let r = set("z");
+        assert_eq!(r["state"]["drawAxis"], "z", "{r}");
+        let (x, y) = screen(h, DVec3::new(0.0, 0.0, 3.0));
+        let s = take(unsafe { ijc_guided_snap_json(h, x, y, 4.0) });
+        assert_eq!(s["axis"], "z", "{s}");
+        let p: Vec<f64> = serde_json::from_value(s["point"].clone()).unwrap();
+        assert!(p[0] == 0.0 && p[1] == 0.0 && (p[2] - 3.0).abs() < 1e-3, "{s}");
+        // Same axis again unlocks; a bad axis is an error.
+        assert_eq!(set("z")["state"]["drawAxis"], Value::Null);
+        assert_eq!(set("w")["status"], "error");
+
+        // Unlocked: a touch just off the red axis on screen infers it.
+        let (x, y) = screen(h, DVec3::new(3.0, 0.0, 0.0));
+        let s = take(unsafe { ijc_guided_snap_json(h, x, y + 2.0, 4.0) });
+        assert_eq!(s["axis"], "x", "{s}");
+        assert_eq!(s["point"][1], 0.0);
+        // Far off any axis: the plain grid point, no axis.
+        let (x, y) = screen(h, DVec3::new(2.0, 3.0, 0.0));
+        let s = take(unsafe { ijc_guided_snap_json(h, x, y, 4.0) });
+        assert_eq!(s["axis"], Value::Null, "{s}");
+
+        // A locked pick lands on the axis.
+        set("y");
+        let (x, y) = screen(h, DVec3::new(2.0, 3.0, 0.0));
+        let done = take(unsafe { ijc_guided_pick(h, x, y, 4.0) });
+        assert_eq!(done["status"], "done", "{done}");
+        let cmd = done["command"].as_str().unwrap();
+        // The move vector is pure green: no X, no Z.
+        assert!(cmd.starts_with("move sel 0,") && cmd.matches(',').count() == 1, "{cmd}");
         unsafe { ijc_free(h) };
     }
 }
